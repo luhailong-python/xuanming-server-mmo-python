@@ -1,0 +1,83 @@
+syntax = "proto3";
+option go_package = "common/component";
+
+
+// Normal login
+message NormalLogin
+{
+}
+
+// Session takeover login
+message CoverLogin
+{
+}
+
+message Player
+{
+}
+
+message Account
+{
+	string account = 1;
+}
+
+message UnregisterPlayer
+{
+	// Wall-clock millis when HandleExitGameNode was called (and SavePlayer
+	// was enqueued). Used to detect saves that outrun the player_locator
+	// reconnect lease (30s). See todo.md #280 / NOTES Part 2 P0.
+	int64 logout_initiated_ms = 1;
+}
+
+// NOTE: PlayerFrozenComp is intentionally NOT defined here.
+// It is a pure runtime marker (no persistence, no serialization, no IPC),
+// declared in cpp/libs/services/scene/player/comp/player_frozen_comp.h as
+// a plain C++ struct — proto is the wrong tool for "transient ECS tag".
+// See docs/design/cross-zone-readiness-audit.md §3.2 件 2.
+
+message PlayerUint64Comp
+{
+	uint64 registration_timestamp  = 1;
+}
+
+message PlayerUint32Comp
+{
+	uint32 class  = 1;
+}
+
+// 角色展示资料(名字)。
+// 真源是 data_service 全局库的 player_name 表(全服唯一,docs/design/guild-phase2/03-names.md §3.0);
+// 这里是随 player_database 一起走的只读副本,由 login 首次入场补齐
+// (go/login/.../player_class_backfill.go backfillPlayerIdentity)。
+// scene 只读、只原样存回:战斗快照 player_battle.cpp 取的就是这一份,
+// 组件缺失 / name 为空时快照留空,battle 照常结算(名字是展示数据,fail-open)。
+// v1 无改名,所以副本内容不会变;但副本可能缺失(self-heal 恢复出的空记录、
+// 早于首次入场的回档快照),任何"要拿到名字"的读侧都必须能回源 BatchGetPlayerName。
+message PlayerProfileComp
+{
+	string name = 1;
+	// 随存档原样往返；login 首次入场从账号补空，scene/战斗/队伍只读。
+	string appearance_id = 2;
+	uint32 gender = 3; // 1=男 2=女；0=旧存档未补齐，与外观 ID 独立。
+}
+
+// Stress-test instrumentation for player-data persistence.
+//
+// Stamped by the producer (Scene's SavePlayer when an env-var probe
+// is enabled, or by the data_stress driver / robot data-stress mode) and
+// verified by tools/cmd/verifier so we can prove "last write wins" through
+// the Kafka -> DB -> MySQL+Redis pipeline without doing per-field deep
+// diffs. Fields default-empty in normal play, so they cost nothing on disk
+// or wire when unused.
+message PlayerStressTestProbe
+{
+	// Monotonic per-(player_id, msg_type) sequence. Verifier asserts
+	// MySQL.test_seq == Redis.test_seq == max(test_seq) ever published.
+	uint64 test_seq = 1;
+	// HMAC-style signature over (player_id || msg_type || test_seq || nonce).
+	// Used to detect torn / mis-routed / replayed payloads — if test_sig
+	// matches the recomputed value we know the row was not silently
+	// reassembled or fed from a different stream.
+	bytes  test_sig = 2;
+}
+

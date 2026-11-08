@@ -1,0 +1,28 @@
+{
+ "data": [
+  {
+   "base_points": 0,
+   "desc": "每升一级获得 5 点,分配到体质/灵力/力量/敏捷",
+   "dimension_cap": 0,
+   "id": 1,
+   "name": "属性点",
+   "owner_type": 0,
+   "points_per_level": 5,
+   "reset_cost_gold": 500,
+   "reset_free_below_level": 30,
+   "unlock_level": 1
+  },
+  {
+   "base_points": 0,
+   "desc": "宝宝每升一级获得 5 点,分配到体质/灵力/力量/敏捷",
+   "dimension_cap": 0,
+   "id": 4,
+   "name": "宝宝属性点",
+   "owner_type": 1,
+   "points_per_level": 5,
+   "reset_cost_gold": 300,
+   "reset_free_below_level": 30,
+   "unlock_level": 1
+  }
+ ]
+}

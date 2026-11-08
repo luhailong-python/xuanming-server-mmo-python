@@ -1,0 +1,44 @@
+zone_id = 1
+scene_node_type = 0
+physical_region = 1
+release_track = "stable"
+max_battle_connections = 4096
+etcd = "etcd:2379"
+kafka = "kafka:9092"
+kafka_generation = 1
+audit_generation = 1
+kafka_partitions = 256
+router = "client-rpc-router:50600"
+player_store = "db:6000"
+player_inbox = "player-inbox:50950"
+data_service = "data-service:9000"
+scene_manager = "scene-manager:60000"
+redis = "redis://redis-player:6379/0"
+redis_cluster = false
+scene_control_redis = "redis://redis-scene-control:6379/0"
+match = "match:50500"
+
+[gate]
+node_id = 101
+host = "0.0.0.0"
+port = 8610
+rpc_port = 8615
+advertise_host = "gate-101"
+client_host = "gate-101.example.com"
+client_port = 8610
+
+[scene]
+node_id = 102
+host = "0.0.0.0"
+port = 8611
+grpc_port = 8612
+advertise_host = "scene-102"
+
+[battle]
+node_id = 103
+host = "0.0.0.0"
+port = 8613
+grpc_port = 8614
+advertise_host = "battle-103"
+client_host = "battle-103.example.com"
+client_port = 8613

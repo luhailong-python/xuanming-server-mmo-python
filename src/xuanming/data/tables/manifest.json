@@ -1,0 +1,1140 @@
+{
+  "schema_version": 1,
+  "version": 33,
+  "content_digest": "52686314aef9e77a21c97cdd4dcb1d47f7060c913462621171a3dcb42f43cf2c",
+  "generated_at": "2026-10-30T07:06:43Z",
+  "source_rev": {
+    "commit": "72017963846c68712cc0c5a0b37ccdd97bae9a02",
+    "data_dirty": true
+  },
+  "table_count": 49,
+  "tables": [
+    {
+      "name": "ActivitySchedule",
+      "rows": 3,
+      "source": {
+        "file": "ActivitySchedule.xlsx",
+        "size": 4673,
+        "sha256": "300d1fed804f7ee28efa60bf6e78cbd8ac5468861b5dd09c5277f9aa2c877371"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "activityschedule.json",
+          "size": 697,
+          "sha256": "413d7a3c41d1c20ef04c325333e6ecc80434f49d08cb8e94287d8ed5fb63173a"
+        },
+        {
+          "kind": "binary",
+          "file": "activityschedule.pb",
+          "size": 105,
+          "sha256": "73b4c6d9f193e71786ff9e22c4834e20fb52fbaf756771239db54ceb5aa49ef9"
+        }
+      ]
+    },
+    {
+      "name": "ActivityVitalityReward",
+      "rows": 0,
+      "source": {
+        "file": "ActivityVitalityReward.xlsx",
+        "size": 4969,
+        "sha256": "d920a0b7e0fd75116188bd39dcbf5a6a064fb693dcd76c2871cf3b25e843fd65"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "activityvitalityreward.json",
+          "size": 15,
+          "sha256": "595a549a5de073eb5fee728c3af3648336c50740abc97edb72f83b1e4b99454a"
+        },
+        {
+          "kind": "binary",
+          "file": "activityvitalityreward.pb",
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "name": "ActivityVitalityRule",
+      "rows": 0,
+      "source": {
+        "file": "ActivityVitalityRule.xlsx",
+        "size": 5008,
+        "sha256": "a41985cf0c7f4b327cd8a5f9345d1b90d22a17bcbe855c6bd963975d2757c077"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "activityvitalityrule.json",
+          "size": 15,
+          "sha256": "595a549a5de073eb5fee728c3af3648336c50740abc97edb72f83b1e4b99454a"
+        },
+        {
+          "kind": "binary",
+          "file": "activityvitalityrule.pb",
+          "size": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    {
+      "name": "ActorActionCombatState",
+      "rows": 4,
+      "source": {
+        "file": "ActorActionCombatState.xlsx",
+        "size": 4128,
+        "sha256": "dcd08d69048ac51c300e5ff6808dfbfa2c580a1a5e4e29798ddf806de3423659"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "actoractioncombatstate.json",
+          "size": 844,
+          "sha256": "6cb16b9316beabace8eb45a7cb07f19a5495370cb541ab1fc6527efcaa3b234d"
+        },
+        {
+          "kind": "binary",
+          "file": "actoractioncombatstate.pb",
+          "size": 58,
+          "sha256": "d585219ab1a168f089b170680c53fee1662a69dfb774d5cd8a2b9bc3926c346c"
+        }
+      ]
+    },
+    {
+      "name": "ActorActionState",
+      "rows": 4,
+      "source": {
+        "file": "ActorActionState.xlsx",
+        "size": 4124,
+        "sha256": "06eb45c8a0902e33cefbe2846ed28120fa051c28156a5c6b99424b7c885d5dc9"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "actoractionstate.json",
+          "size": 844,
+          "sha256": "6cb16b9316beabace8eb45a7cb07f19a5495370cb541ab1fc6527efcaa3b234d"
+        },
+        {
+          "kind": "binary",
+          "file": "actoractionstate.pb",
+          "size": 58,
+          "sha256": "d585219ab1a168f089b170680c53fee1662a69dfb774d5cd8a2b9bc3926c346c"
+        }
+      ]
+    },
+    {
+      "name": "AttributeAllocRatio",
+      "rows": 8,
+      "source": {
+        "file": "AttributeAllocRatio.xlsx",
+        "size": 5652,
+        "sha256": "a07521fc4f5a2f783a266a59ad79c203bf629d90b33164a990952ccb99996f3c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "attributeallocratio.json",
+          "size": 2012,
+          "sha256": "bc3d441d29f44a9060b08804ded9f4b9bbfed79162c559c59a40b724a75e0b9f"
+        },
+        {
+          "kind": "binary",
+          "file": "attributeallocratio.pb",
+          "size": 525,
+          "sha256": "05a24453aee1015f5e6949cdabaa740b333044b66f7e4587962d3c85d59a26f0"
+        }
+      ]
+    },
+    {
+      "name": "AttributeAutoPlan",
+      "rows": 6,
+      "source": {
+        "file": "AttributeAutoPlan.xlsx",
+        "size": 5619,
+        "sha256": "8da8076f0a3ebaeefab887972a0703f89e278d015ecf3656517bcac712d34f6e"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "attributeautoplan.json",
+          "size": 1266,
+          "sha256": "ef7eac0f699e1a8bbf670e49b95e00f496018ff07b3294cbf5dafe6d7a5a8533"
+        },
+        {
+          "kind": "binary",
+          "file": "attributeautoplan.pb",
+          "size": 441,
+          "sha256": "a43d6b300b046c80008efe9bbb3a63c61c362dd9208396f8097409d0fb15ca39"
+        }
+      ]
+    },
+    {
+      "name": "AttributeDimension",
+      "rows": 8,
+      "source": {
+        "file": "AttributeDimension.xlsx",
+        "size": 5694,
+        "sha256": "27c0d9fef8e26d1062f5df7d74f771293d07b1027f246b35bc28204bd82c2747"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "attributedimension.json",
+          "size": 2230,
+          "sha256": "a2c735d91e224679871251c949fb233b69b263920e62140a7af967e5ae17896e"
+        },
+        {
+          "kind": "binary",
+          "file": "attributedimension.pb",
+          "size": 538,
+          "sha256": "fbe9afb39d332e9da93c251f85dff7c88e1c20750fc4e3c708b0eced63a38843"
+        }
+      ]
+    },
+    {
+      "name": "AttributePool",
+      "rows": 2,
+      "source": {
+        "file": "AttributePool.xlsx",
+        "size": 5363,
+        "sha256": "f25e8c8749717010407b44fdc8149a94f6876433a11bc41104ec3199b5cc138b"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "attributepool.json",
+          "size": 612,
+          "sha256": "212dc47d3c60f684696ea729cad0ace2f4dbb91da4cb659fc772c915bc657481"
+        },
+        {
+          "kind": "binary",
+          "file": "attributepool.pb",
+          "size": 188,
+          "sha256": "ad93ca4f5c4babf821cfa722cbf99c2bc4235f70cd9a810ca081365db1e3f470"
+        }
+      ]
+    },
+    {
+      "name": "AttributeRule",
+      "rows": 1,
+      "source": {
+        "file": "AttributeRule.xlsx",
+        "size": 5283,
+        "sha256": "6c8b8995d9cb5d637c43de14aba945c558d27cc40178f8a56e70cac724c68242"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "attributerule.json",
+          "size": 218,
+          "sha256": "30ea478dd1eeed0f258f0618bd09ba81659ec6ad9223bf9d908ee203b2f0e029"
+        },
+        {
+          "kind": "binary",
+          "file": "attributerule.pb",
+          "size": 15,
+          "sha256": "44bce0102b6e5ed0551507d649f04788a47f084c62d8b279c2f7f8bf9139212c"
+        }
+      ]
+    },
+    {
+      "name": "BaseScene",
+      "rows": 21,
+      "source": {
+        "file": "BaseScene.xlsx",
+        "size": 5519,
+        "sha256": "17142d3be150bf92041fab2523c85c1b145c5c47168af46c17c89800208073bb"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "basescene.json",
+          "size": 2927,
+          "sha256": "5abbc27307221c5347a48a527dcb7725a8481815c79a8cce4c93aaa717a02485"
+        },
+        {
+          "kind": "binary",
+          "file": "basescene.pb",
+          "size": 1219,
+          "sha256": "13e645420fecc53bf95f708450906f7f683a669ab8c7f8d9c3b5cc5008b3ce39"
+        }
+      ]
+    },
+    {
+      "name": "Buff",
+      "rows": 26,
+      "source": {
+        "file": "Buff.xlsx",
+        "size": 8188,
+        "sha256": "1afe5f0275eba11d301ac8a6228c7b0b64e7d885f333a4194ad720243b733ab0"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "buff.json",
+          "size": 13170,
+          "sha256": "483757381997028fa14395bb0319db723a75a3729859b996e8b7c98917792873"
+        },
+        {
+          "kind": "binary",
+          "file": "buff.pb",
+          "size": 2056,
+          "sha256": "f4919d2541afd5fe196bfb3ac04c0a83edf1fecc2d9965915260615c3775dc12"
+        }
+      ]
+    },
+    {
+      "name": "Class",
+      "rows": 9,
+      "source": {
+        "file": "Class.xlsx",
+        "size": 5415,
+        "sha256": "1057552b163dff70b76ae93ed9a3b3b3a58213dba410318ea9d0867f8d45a0ea"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "class.json",
+          "size": 2019,
+          "sha256": "1afead7271dad93e85afdb455d247e410f66ecc1670a0d18271551ba54219bce"
+        },
+        {
+          "kind": "binary",
+          "file": "class.pb",
+          "size": 238,
+          "sha256": "c1a05fb66799893e0046037bcf7a12859cfb8fbf676db9f2fdba0f91ddbb26e2"
+        }
+      ]
+    },
+    {
+      "name": "Condition",
+      "rows": 29,
+      "source": {
+        "file": "Condition.xlsx",
+        "size": 6145,
+        "sha256": "8f8205556138384f4fe0d16c962bc32460d49cecd395e8a2d1a9f780987ce64f"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "condition.json",
+          "size": 4362,
+          "sha256": "21f9c3ce67062f7ba683b350bd5876213c4eab2a53745bbf57b01f51236343ae"
+        },
+        {
+          "kind": "binary",
+          "file": "condition.pb",
+          "size": 329,
+          "sha256": "619c34f8158f653d728e5947a11de0a916dde0efc000d73433c6d6e80bf7fb2f"
+        }
+      ]
+    },
+    {
+      "name": "Cooldown",
+      "rows": 9,
+      "source": {
+        "file": "Cooldown.xlsx",
+        "size": 5006,
+        "sha256": "e3391fe9bf9223c6c3bbf8a06f65e5d8bb343b3c496303db1f008f01c9d2bce5"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "cooldown.json",
+          "size": 386,
+          "sha256": "24f5516717ec14542a40e6ff0fb821496b70074e80748a38ac9f0bb5599a9bdd"
+        },
+        {
+          "kind": "binary",
+          "file": "cooldown.pb",
+          "size": 64,
+          "sha256": "870ffb8768aab80ed9edea9c081e8dc40b2f544d35bd2a9df57398c2c4297031"
+        }
+      ]
+    },
+    {
+      "name": "Dungeon",
+      "rows": 3,
+      "source": {
+        "file": "Dungeon.xlsx",
+        "size": 5143,
+        "sha256": "a6b0435885848b4b615ff4c6679bec5c877741cd5b7c518cbdc7f28f54e67634"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "dungeon.json",
+          "size": 387,
+          "sha256": "a4740be2c5c30be3e2c9089a07e0940db7a5a5ee9aad6868a13831a138509b7c"
+        },
+        {
+          "kind": "binary",
+          "file": "dungeon.pb",
+          "size": 46,
+          "sha256": "6ccf6b110d4fa81e8b05b039cab4695dac1c917a3d38e01f752f23dc2f694d71"
+        }
+      ]
+    },
+    {
+      "name": "EquipAffixPool",
+      "rows": 29,
+      "source": {
+        "file": "EquipAffixPool.xlsx",
+        "size": 5566,
+        "sha256": "f708613a57113defbdefafd2eb90b34b8b711302f7e6f07b695fb011079d1585"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipaffixpool.json",
+          "size": 2207,
+          "sha256": "7a0d87e840504d772a68bc74424fbe695e5b0f63afdf07899957ed85d451a72d"
+        },
+        {
+          "kind": "binary",
+          "file": "equipaffixpool.pb",
+          "size": 319,
+          "sha256": "124f1680f09058126d4efa83b328b20f69237ff8aed028bb35d03098bee11d58"
+        }
+      ]
+    },
+    {
+      "name": "EquipAffixRule",
+      "rows": 1,
+      "source": {
+        "file": "EquipAffixRule.xlsx",
+        "size": 5119,
+        "sha256": "c0872cc2dfbdcdacf39e7e1181c65affdf6d7869a61787457fe25c57422d1b2a"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipaffixrule.json",
+          "size": 118,
+          "sha256": "129e75dc5a5a031cc0d29f1199530dfb6f68b71ae14bca33f84da3236fd915c6"
+        },
+        {
+          "kind": "binary",
+          "file": "equipaffixrule.pb",
+          "size": 14,
+          "sha256": "4d27688b600a96b059dff1dedb887c546c3df60c7a37cda0949f7e060c0ff2f3"
+        }
+      ]
+    },
+    {
+      "name": "EquipAttribute",
+      "rows": 26,
+      "source": {
+        "file": "EquipAttribute.xlsx",
+        "size": 6202,
+        "sha256": "e38560c9ea9363de0728f1f92a33686e8e5cb542c5b3b3bd98e5e7446532eb9c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipattribute.json",
+          "size": 3046,
+          "sha256": "ee309d68de67ed428bc25d5278ae6e99567660d317c6aaedba19fd636558a93b"
+        },
+        {
+          "kind": "binary",
+          "file": "equipattribute.pb",
+          "size": 602,
+          "sha256": "fc8c481e720c8fd7d9593b1cb7e5945fc806948aa9b485b880f075ae543db2a8"
+        }
+      ]
+    },
+    {
+      "name": "EquipAttributeCap",
+      "rows": 125,
+      "source": {
+        "file": "EquipAttributeCap.xlsx",
+        "size": 7803,
+        "sha256": "4551f81f37dd31ae1270ae2ff8aa8f29cce476437b379049acbda57fbfa4008f"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipattributecap.json",
+          "size": 11256,
+          "sha256": "03acfe3633b5f5c8d79bfcd77686dfd13b036cd884f17b439c3f6254ab3644a4"
+        },
+        {
+          "kind": "binary",
+          "file": "equipattributecap.pb",
+          "size": 1708,
+          "sha256": "2bcd6cf6c7aabff30c45a4e658c41de0a3d5648d241bd850a478db29bda8a5ed"
+        }
+      ]
+    },
+    {
+      "name": "EquipEnhance",
+      "rows": 12,
+      "source": {
+        "file": "EquipEnhance.xlsx",
+        "size": 5732,
+        "sha256": "ce004f47a0eb848b359dd6b80818b7cb45bc338561f92455bb671bd8f4d83fc3"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipenhance.json",
+          "size": 2046,
+          "sha256": "18d80c980eed7d3564b558a7c29ea20545bc4604bccffbf95201524084efd77d"
+        },
+        {
+          "kind": "binary",
+          "file": "equipenhance.pb",
+          "size": 222,
+          "sha256": "2943562bd154b698912917b44fd430ecbe978d52890e89c5f0807e0c37f4d797"
+        }
+      ]
+    },
+    {
+      "name": "EquipGem",
+      "rows": 12,
+      "source": {
+        "file": "EquipGem.xlsx",
+        "size": 5345,
+        "sha256": "d898635b0082794443170d1a43eac85d5a679cba9dd5b71003fd17cc4e24eea4"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipgem.json",
+          "size": 910,
+          "sha256": "8a0d29602745d98608f7a70c31b36d998f288de37b4ee136ff8f1a548de73220"
+        },
+        {
+          "kind": "binary",
+          "file": "equipgem.pb",
+          "size": 133,
+          "sha256": "7eb2456f35f78d0ff9d2673873ac72532fc10759fc3eb567311a79fec3ec81fe"
+        }
+      ]
+    },
+    {
+      "name": "EquipGemSocket",
+      "rows": 6,
+      "source": {
+        "file": "EquipGemSocket.xlsx",
+        "size": 5369,
+        "sha256": "3bd0ec6672e6de74d175e86844bf492ca2382344524b75bb5b36bea8593c3a80"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipgemsocket.json",
+          "size": 628,
+          "sha256": "abe27e6f58517f0671005a985bf652cfb5b2b28397816e3d3d5bd5cdf8a72f7f"
+        },
+        {
+          "kind": "binary",
+          "file": "equipgemsocket.pb",
+          "size": 122,
+          "sha256": "d186753ba374d02be907176f3137749ed591729863aaf872da55fe3a2edfb186"
+        }
+      ]
+    },
+    {
+      "name": "EquipSlot",
+      "rows": 7,
+      "source": {
+        "file": "EquipSlot.xlsx",
+        "size": 5229,
+        "sha256": "c0b56e38ba8dddfe6ae1d2d75d1ab288c6af03763cb6833e47a00583ce51c328"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipslot.json",
+          "size": 384,
+          "sha256": "6caf2da681dc7b3a13ee305caaf6173222ff642c35f29eee182cab3b4f0669ae"
+        },
+        {
+          "kind": "binary",
+          "file": "equipslot.pb",
+          "size": 72,
+          "sha256": "f29c2bd81b384f32bf1eb391078eb3e29b40e88ed0e172fcce0926351c04308d"
+        }
+      ]
+    },
+    {
+      "name": "GlobalVariable",
+      "rows": 16,
+      "source": {
+        "file": "GlobalVariable.xlsx",
+        "size": 5151,
+        "sha256": "d8782db2bc7d0b3881b8bcedc8968186b702ec3316e6b3b41d4dce19617cb737"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "globalvariable.json",
+          "size": 343,
+          "sha256": "40896e822b41bf113491984fb00424503eaeeeffbd76b3610be1f7985560f38e"
+        },
+        {
+          "kind": "binary",
+          "file": "globalvariable.pb",
+          "size": 64,
+          "sha256": "0fd0146b30b8dc7719d3925b2edb3cecde46741d5381bb5a88629aca535fc45f"
+        }
+      ]
+    },
+    {
+      "name": "GuildActivity",
+      "rows": 3,
+      "source": {
+        "file": "GuildActivity.xlsx",
+        "size": 5915,
+        "sha256": "d3559daa229a81c3a05f25e39a2cc958bd9a77a4117f23e3b2007d7e46d4e6d0"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "guildactivity.json",
+          "size": 1010,
+          "sha256": "91eb84e4a1f20c348987072c5a5e2206c60309cabcb1eba0b5dcfcc71af9997f"
+        },
+        {
+          "kind": "binary",
+          "file": "guildactivity.pb",
+          "size": 106,
+          "sha256": "e7cbc20d1377218ca096468ec0b203457ed6b1a9b572e3e8b3849a80f2d92026"
+        }
+      ]
+    },
+    {
+      "name": "GuildDonate",
+      "rows": 3,
+      "source": {
+        "file": "GuildDonate.xlsx",
+        "size": 5441,
+        "sha256": "053335c5eb7dc45bbe6d896edec8cf9005ebe4a6bf109b2b765cdcf8bc5181bd"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "guilddonate.json",
+          "size": 595,
+          "sha256": "55636091453cb76d002b9d87bf55e50b3ab13eb30e12ad862c7354bbc1485d35"
+        },
+        {
+          "kind": "binary",
+          "file": "guilddonate.pb",
+          "size": 94,
+          "sha256": "0601bca03ea6288602fa5397fec091e0fe4da7659ae1503c2a4c930fa0ab35ba"
+        }
+      ]
+    },
+    {
+      "name": "GuildLevel",
+      "rows": 10,
+      "source": {
+        "file": "GuildLevel.xlsx",
+        "size": 5263,
+        "sha256": "99129c0a3768dc1841eea06886340f9250ec1af33695d539991af4dd9d88487c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "guildlevel.json",
+          "size": 982,
+          "sha256": "499603f3e7bfdef8cac0ec0c05c37816f0b1ef1be5b227b21b1fa6a5a93df3f2"
+        },
+        {
+          "kind": "binary",
+          "file": "guildlevel.pb",
+          "size": 116,
+          "sha256": "482875085dad8f51772a79fc27995ef2d92dae868e6fa4006e0b2e18388d0bb8"
+        }
+      ]
+    },
+    {
+      "name": "GuildRule",
+      "rows": 1,
+      "source": {
+        "file": "GuildRule.xlsx",
+        "size": 5483,
+        "sha256": "90f60b1d1530f07c8c168b0a53a442f419703cd8f327f55391274eb311118da1"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "guildrule.json",
+          "size": 377,
+          "sha256": "864d4ebc1963e17962c236f5485340356f66611b216a330f8676e50c8401972f"
+        },
+        {
+          "kind": "binary",
+          "file": "guildrule.pb",
+          "size": 22,
+          "sha256": "2047d097275e79d19ea7adfe8a237952131d50c3723024067013db7d54d04711"
+        }
+      ]
+    },
+    {
+      "name": "GuildShop",
+      "rows": 11,
+      "source": {
+        "file": "GuildShop.xlsx",
+        "size": 5991,
+        "sha256": "1f899177f2b9f5658e30a53c108b4aad3dfe3011cecda73131507d1122b75cba"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "guildshop.json",
+          "size": 2284,
+          "sha256": "5479099197dafe84a6bc006c5a1aabb402832f76b022001090294f5e1c473c55"
+        },
+        {
+          "kind": "binary",
+          "file": "guildshop.pb",
+          "size": 351,
+          "sha256": "21a8ef5067d224f50315ce87c6fe031ba8701e004b1cbfe9a7d3b61ad5588e06"
+        }
+      ]
+    },
+    {
+      "name": "Item",
+      "rows": 77,
+      "source": {
+        "file": "Item.xlsx",
+        "size": 9754,
+        "sha256": "f219e80b4624234e1540f598956ddf2bdc9042f92a924874bbe123fa8d322ece"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "item.json",
+          "size": 21767,
+          "sha256": "2ed6fb6c5008475d791f5fb7bc0f39377abe0b6d8a1d0de0df6580a1d21bf357"
+        },
+        {
+          "kind": "binary",
+          "file": "item.pb",
+          "size": 4351,
+          "sha256": "8440b3c590ea2784ddaa2a3fb8bd44ad3d39570d3ddb7293c479d2f5f0219aa2"
+        }
+      ]
+    },
+    {
+      "name": "MessageLimiter",
+      "rows": 87,
+      "source": {
+        "file": "MessageLimiter.xlsx",
+        "size": 6394,
+        "sha256": "23f620ca2fbad84aa870670374f4505596a6c03aa9e14b50689ccfaac28b520c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "messagelimiter.json",
+          "size": 7769,
+          "sha256": "3d39b753435e51876750c7a3e39da79a0bf8e8b528e3b9433069d6ae77407995"
+        },
+        {
+          "kind": "binary",
+          "file": "messagelimiter.pb",
+          "size": 1025,
+          "sha256": "83487f29e81ca87e6e0babcf4573e759f3298aab73cf55377e92ca1e74245a76"
+        }
+      ]
+    },
+    {
+      "name": "Mirror",
+      "rows": 2,
+      "source": {
+        "file": "Mirror.xlsx",
+        "size": 4960,
+        "sha256": "e1449def0ebccf640967a9633b8a8dff559c143368d1676db67f841603ab0b27"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "mirror.json",
+          "size": 140,
+          "sha256": "9d36ba159b61d3c5426d3e6b2959cfcfd34b9cbf17a6d21055d7297653840b8b"
+        },
+        {
+          "kind": "binary",
+          "file": "mirror.pb",
+          "size": 16,
+          "sha256": "4910f422bddccf6285fbfa478790cee111ab352ffe790c45896715772892425e"
+        }
+      ]
+    },
+    {
+      "name": "Mission",
+      "rows": 17,
+      "source": {
+        "file": "Mission.xlsx",
+        "size": 5759,
+        "sha256": "68ae8916048442e8205f7311fed0a74b5bd44d9a18d1f2e773a80c8759223733"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "mission.json",
+          "size": 3289,
+          "sha256": "e6ed7780e53dfea6e40c165a81c797ffa6838953bf2dfe482aa6e37e56d826ee"
+        },
+        {
+          "kind": "binary",
+          "file": "mission.pb",
+          "size": 298,
+          "sha256": "a28fa9b16e9e342bba1c5f4b99a8ce82a97d83e4f8626eab11b6e46870aaf2f1"
+        }
+      ]
+    },
+    {
+      "name": "Monster",
+      "rows": 16,
+      "source": {
+        "file": "Monster.xlsx",
+        "size": 5986,
+        "sha256": "48893b5570bfc478125125fb450b98a63e7c43d9a49e22d3f62e2343faee9576"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "monster.json",
+          "size": 3148,
+          "sha256": "3170a0aea196f79fd3751bdf417be0373ef025cf050495195a01e4f34adf6a67"
+        },
+        {
+          "kind": "binary",
+          "file": "monster.pb",
+          "size": 400,
+          "sha256": "0834aa59994fe230fba0e5e247b1c030bff7ef401efd4548514d001c2e582d93"
+        }
+      ]
+    },
+    {
+      "name": "MysteryMerchantGoods",
+      "rows": 12,
+      "source": {
+        "file": "MysteryMerchantGoods.xlsx",
+        "size": 5846,
+        "sha256": "dae118bc28c816778490077b02c4bc573bc7066db34b83f843c1856c69d11e4a"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "mysterymerchantgoods.json",
+          "size": 1910,
+          "sha256": "306cfbdae16eeb5bc65913caaacc9620271b93c5c5e38e42b6ac3e0bf91736b7"
+        },
+        {
+          "kind": "binary",
+          "file": "mysterymerchantgoods.pb",
+          "size": 304,
+          "sha256": "01ad6ccf78d984372ac0dc6375cc8363f63df259bd259a9198a59deeaca3696a"
+        }
+      ]
+    },
+    {
+      "name": "MysteryMerchantRule",
+      "rows": 1,
+      "source": {
+        "file": "MysteryMerchantRule.xlsx",
+        "size": 5420,
+        "sha256": "6d407d92337ebcc76002fb2a8fe2dc53000e78f519580cfe991763b753b05737"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "mysterymerchantrule.json",
+          "size": 265,
+          "sha256": "898547e83ba91dcf724ad34659cf06ac35bb4acc3fd43b29a2c257862546e584"
+        },
+        {
+          "kind": "binary",
+          "file": "mysterymerchantrule.pb",
+          "size": 54,
+          "sha256": "aaff379f7094ccc041ca77f5319abcf4e622b06c162727217585248df1b35cfa"
+        }
+      ]
+    },
+    {
+      "name": "MysteryMerchantSpot",
+      "rows": 6,
+      "source": {
+        "file": "MysteryMerchantSpot.xlsx",
+        "size": 5370,
+        "sha256": "05427b3bc455cfb4c7647a33047a794af48067c1f20eb6484022fc78b9bb697c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "mysterymerchantspot.json",
+          "size": 819,
+          "sha256": "56efa7627de774d3c9452c719dbedb9643d447c3e5405aa443b3394b419f1bc5"
+        },
+        {
+          "kind": "binary",
+          "file": "mysterymerchantspot.pb",
+          "size": 341,
+          "sha256": "b4a12c60ae23b84a10b1ce9a45f97f8bbb088d1cd136e1ec6fa7ccc5ff4fad37"
+        }
+      ]
+    },
+    {
+      "name": "Pet",
+      "rows": 22,
+      "source": {
+        "file": "Pet.xlsx",
+        "size": 6991,
+        "sha256": "70cc943ae15f89cb12511e666d56b8202cbdadf682d5195ab9302f6640afbba6"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "pet.json",
+          "size": 8870,
+          "sha256": "6f45465b2d61fc9c396cfa593d0acb75318e3faca28777e17307b2f4b3749e26"
+        },
+        {
+          "kind": "binary",
+          "file": "pet.pb",
+          "size": 2001,
+          "sha256": "3e7ff3df38bf0c4e617a67b004025293a1b9b1ea8f591fd63f17c3e58341e6f1"
+        }
+      ]
+    },
+    {
+      "name": "PetRule",
+      "rows": 1,
+      "source": {
+        "file": "PetRule.xlsx",
+        "size": 4551,
+        "sha256": "612fcfe6d7b4918b38c063744121e6085cf0d4d38206ee9d1d1a373cd0defaba"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "petrule.json",
+          "size": 185,
+          "sha256": "2e79b6c9941e3801d9f3610ac71792c1e39359bd4303b211cd7aa444c8bb1f33"
+        },
+        {
+          "kind": "binary",
+          "file": "petrule.pb",
+          "size": 47,
+          "sha256": "374815d77fbd54146b043dafc9d34de36d33ba631587f8d34996ef683276c917"
+        }
+      ]
+    },
+    {
+      "name": "PlayMode",
+      "rows": 6,
+      "source": {
+        "file": "PlayMode.xlsx",
+        "size": 5514,
+        "sha256": "018f74fd078f40a36fb0e98bac74f1c00e2eb7efa3c6938f19c4f26b38c8d375"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "playmode.json",
+          "size": 670,
+          "sha256": "d0626962219740b36fd648b497f9841b4139874ee5eb0bba1b834d7d322d71c9"
+        },
+        {
+          "kind": "binary",
+          "file": "playmode.pb",
+          "size": 64,
+          "sha256": "b6fa0c5bef946b4ba69e6d31a4185efa2e2f1b5bfda967997e821b2f9b71b986"
+        }
+      ]
+    },
+    {
+      "name": "Reward",
+      "rows": 7,
+      "source": {
+        "file": "Reward.xlsx",
+        "size": 5034,
+        "sha256": "155199c48c3b413fbf01a5316ec4f71381ec57b67419a81cea7bc77f1253e4bc"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "reward.json",
+          "size": 1122,
+          "sha256": "58aceb61038bdb56d78c23bf0d98c52696040d2936a9fb993f43bd4fd2a2b7ca"
+        },
+        {
+          "kind": "binary",
+          "file": "reward.pb",
+          "size": 112,
+          "sha256": "ffcf85dda3c8bef361c10650378bf4fb254a235c86662fe2006f132ca8e08028"
+        }
+      ]
+    },
+    {
+      "name": "RoleNameRule",
+      "rows": 1,
+      "source": {
+        "file": "RoleNameRule.xlsx",
+        "size": 5201,
+        "sha256": "ca4f1674b5ad25db6c151450927ef43dda33ae73478164d752cdf0e5eb56d5a4"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "rolenamerule.json",
+          "size": 199,
+          "sha256": "b004e910ab8c5ed46d56afcdb646e0f36de8c32714252105553fd2ee39aa6d7e"
+        },
+        {
+          "kind": "binary",
+          "file": "rolenamerule.pb",
+          "size": 37,
+          "sha256": "bf1490a12a559ce1c219b74280eddddba8163aaef5228553a938d6dbcc295cf3"
+        }
+      ]
+    },
+    {
+      "name": "Skill",
+      "rows": 46,
+      "source": {
+        "file": "Skill.xlsx",
+        "size": 15308,
+        "sha256": "5b37d6fe487cb2a8fffac1b26c0f69eaa199522122c30db3bcb5379a3611076a"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "skill.json",
+          "size": 73595,
+          "sha256": "e7dcfe7310e5545b436405bdeae651729dcda6f32c9112b459c0adb5da040bbb"
+        },
+        {
+          "kind": "binary",
+          "file": "skill.pb",
+          "size": 8474,
+          "sha256": "e56980a87215234e9bd39fded85edf4dda12c8be11c94e8adda11298b81f762c"
+        }
+      ]
+    },
+    {
+      "name": "SkillPermission",
+      "rows": 3,
+      "source": {
+        "file": "SkillPermission.xlsx",
+        "size": 4032,
+        "sha256": "d1060b9faa7de7944a6493faff53b3a2d001dbe51c9af60435ece26332b1b5eb"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "skillpermission.json",
+          "size": 204,
+          "sha256": "fad1d43fd908cff71adc13c54a7bc0a8e8944ff1eaab9c2f83181a3651c0cbbb"
+        },
+        {
+          "kind": "binary",
+          "file": "skillpermission.pb",
+          "size": 32,
+          "sha256": "4b598209d9948db06351613b9fd12bffc0e60823bee131cc824f7894b2f78b8f"
+        }
+      ]
+    },
+    {
+      "name": "Test",
+      "rows": 6,
+      "source": {
+        "file": "Test.xlsx",
+        "size": 5467,
+        "sha256": "65b871586bb1fbadc53e3e76fac6f8ba1029fb36f95d984fcf354796a33aa656"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "test.json",
+          "size": 2687,
+          "sha256": "558a8f6083bcd08acde2c7fa9f8af6018f2d2a927f838b4287dfd5afdb65cfb0"
+        },
+        {
+          "kind": "binary",
+          "file": "test.pb",
+          "size": 449,
+          "sha256": "c3b9ec1e511c21946af3773f8d2b3c68683ef16c787e4ffd9aae4f9b1be459ec"
+        }
+      ]
+    },
+    {
+      "name": "TestMultiKey",
+      "rows": 6,
+      "source": {
+        "file": "TestMultiKey.xlsx",
+        "size": 5767,
+        "sha256": "a14e550507854c014db96e52ff2f5341dab290103068e4449069f0b59fbc6c3c"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "testmultikey.json",
+          "size": 3716,
+          "sha256": "5426b3b92efeba917a8945f93517385ab6d1ab6bbc475eceb580d2d7b626f123"
+        },
+        {
+          "kind": "binary",
+          "file": "testmultikey.pb",
+          "size": 563,
+          "sha256": "01f8898595d6c55d6171ad325263302047a46c0aa83c08d087bf3dd71545401c"
+        }
+      ]
+    },
+    {
+      "name": "World",
+      "rows": 16,
+      "source": {
+        "file": "World.xlsx",
+        "size": 5100,
+        "sha256": "3a40c7f27a1cffb26d1e243e21ebc8abd584a424bfd642bd6159027a73a039cc"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "world.json",
+          "size": 638,
+          "sha256": "6fa232e2cf85588ef813c29c947e494e3a59a092da2cf4757fd48b2a3f61b74b"
+        },
+        {
+          "kind": "binary",
+          "file": "world.pb",
+          "size": 96,
+          "sha256": "d107e92a1a1767083ef043760e5eadebdd34f278885d72a17fc08e76651de8c4"
+        }
+      ]
+    },
+    {
+      "name": "ZoneGroup",
+      "rows": 2,
+      "source": {
+        "file": "ZoneGroup.xlsx",
+        "size": 5170,
+        "sha256": "8913720f650231732ed0c96f159da1ae9651de28c9dbf69243c763c4962e265b"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "zonegroup.json",
+          "size": 174,
+          "sha256": "66842f941f4b758896ba4723d6f9b11a5c2f52113361380250fdb3d1806dedf7"
+        },
+        {
+          "kind": "binary",
+          "file": "zonegroup.pb",
+          "size": 21,
+          "sha256": "1bca00a2caa3d9a0f7dce41f23aef0384991bf00bdfacd878780c0420890fd6b"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+ "data": [
+  {
+   "class_id": 0,
+   "defense": 0.0,
+   "desc": "力量满投：物伤提高100%",
+   "dimension_id": 103,
+   "id": 1,
+   "magic_attack": 0.0,
+   "max_health": 0.0,
+   "max_mana": 0.0,
+   "physical_attack": 1.0,
+   "speed": 0.0
+  },
+  {
+   "class_id": 1,
+   "defense": 0.0,
+   "desc": "破军力量满投：物伤提高125%",
+   "dimension_id": 103,
+   "id": 2,
+   "magic_attack": 0.0,
+   "max_health": 0.0,
+   "max_mana": 0.0,
+   "physical_attack": 1.25,
+   "speed": 0.0
+  },
+  {
+   "class_id": 0,
+   "defense": 0.0,
+   "desc": "灵力满投：法伤提高100%，法力提高50%",
+   "dimension_id": 102,
+   "id": 3,
+   "magic_attack": 1.0,
+   "max_health": 0.0,
+   "max_mana": 0.5,
+   "physical_attack": 0.0,
+   "speed": 0.0
+  },
+  {
+   "class_id": 2,
+   "defense": 0.0,
+   "desc": "玄霄灵力满投：法伤提高125%，法力提高50%",
+   "dimension_id": 102,
+   "id": 4,
+   "magic_attack": 1.25,
+   "max_health": 0.0,
+   "max_mana": 0.5,
+   "physical_attack": 0.0,
+   "speed": 0.0
+  },
+  {
+   "class_id": 0,
+   "defense": 0.0,
+   "desc": "敏捷满投：速度提高100%",
+   "dimension_id": 104,
+   "id": 5,
+   "magic_attack": 0.0,
+   "max_health": 0.0,
+   "max_mana": 0.0,
+   "physical_attack": 0.0,
+   "speed": 1.0
+  },
+  {
+   "class_id": 4,
+   "defense": 0.0,
+   "desc": "逐风敏捷满投：速度提高125%",
+   "dimension_id": 104,
+   "id": 6,
+   "magic_attack": 0.0,
+   "max_health": 0.0,
+   "max_mana": 0.0,
+   "physical_attack": 0.0,
+   "speed": 1.25
+  },
+  {
+   "class_id": 0,
+   "defense": 0.8,
+   "desc": "体质满投：气血提高200%，防御提高80%",
+   "dimension_id": 101,
+   "id": 7,
+   "magic_attack": 0.0,
+   "max_health": 2.0,
+   "max_mana": 0.0,
+   "physical_attack": 0.0,
+   "speed": 0.0
+  },
+  {
+   "class_id": 3,
+   "defense": 1.0,
+   "desc": "丹心体质满投：气血提高250%，防御提高100%",
+   "dimension_id": 101,
+   "id": 8,
+   "magic_attack": 0.0,
+   "max_health": 2.5,
+   "max_mana": 0.0,
+   "physical_attack": 0.0,
+   "speed": 0.0
+  }
+ ]
+}

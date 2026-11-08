@@ -1,0 +1,83 @@
+syntax = "proto3";
+package monopoly;
+
+import "proto/common/base/tip.proto";
+import "proto/db/proto_option.proto";
+import "proto/monopoly/board_state.proto";
+
+option (OptionFileDefaultNode) = NODE_SCENE;
+
+service MonopolyClientPlayer {
+  option (OptionIsClientProtocolService) = true;
+  option (OptionIsPlayerService) = true;
+
+  rpc GetBoard(GetBoardRequest) returns (GetBoardResponse);
+  rpc RollDice(RollDiceRequest) returns (RollDiceResponse);
+  rpc UpgradeLandmark(UpgradeLandmarkRequest) returns (UpgradeLandmarkResponse);
+}
+
+enum TileKind {
+  TILE_KIND_UNSPECIFIED = 0;
+  TILE_KIND_START = 1;
+  TILE_KIND_PROPERTY = 2;
+  TILE_KIND_BONUS = 3;
+  TILE_KIND_EMPTY = 4;
+}
+
+message BoardTile {
+  uint32 position = 1;
+  TileKind kind = 2;
+  uint64 coin_reward = 3;
+}
+
+message GetBoardRequest {}
+
+message GetBoardResponse {
+  BoardState state = 1;
+  repeated BoardTile tiles = 2;
+  uint64 pass_start_reward = 3;
+  repeated BoardLandmark landmarks = 4;
+  uint64 next_upgrade_seq = 5;
+  uint32 board_id = 6;
+  BoardCompletion last_completion = 7;
+  uint64 completion_reward = 8;
+  string board_name = 9;
+  TipInfoMessage error_message = 10;
+  uint32 dice_cap = 11;
+  uint64 dice_refill_interval_ms = 12;
+}
+
+message BoardLandmark {
+  uint32 landmark_id = 1;
+  string name = 2;
+  uint32 level = 3;
+  uint32 max_level = 4;
+  uint64 next_cost = 5;  // 满级时为 0。
+}
+
+message RollDiceRequest {
+  // 新请求使用 GetBoard 返回的 next_roll_seq；超时重试保持原序号。
+  uint64 roll_seq = 1;
+  uint32 board_id = 2;  // 兼容首张棋盘的旧客户端，省略视为 1。
+}
+
+message RollDiceResponse {
+  TipInfoMessage error_message = 1;
+  RollResult result = 2;
+  bool durable = 3;
+  bool replayed = 4;
+}
+
+message UpgradeLandmarkRequest {
+  uint32 landmark_id = 1;
+  uint32 expected_level = 2;  // 0→1 为首次建造。
+  uint64 upgrade_seq = 3;  // 超时重试保持原序号、地标和预期等级。
+  uint32 board_id = 4;  // 重试携带原请求的棋盘。
+}
+
+message UpgradeLandmarkResponse {
+  TipInfoMessage error_message = 1;
+  LandmarkUpgradeResult result = 2;
+  bool durable = 3;
+  bool replayed = 4;
+}

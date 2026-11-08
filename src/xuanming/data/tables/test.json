@@ -1,0 +1,206 @@
+{
+ "data": [
+  {
+   "id": 1,
+   "immune_tag": {
+    "Control": "None",
+    "Wood": "None"
+   },
+   "level": 0,
+   "tag": {
+    "Metal": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  },
+  {
+   "effect": [
+    1,
+    1
+   ],
+   "id": 2,
+   "immune_tag": {
+    "Control": "None",
+    "Water": "None"
+   },
+   "level": 1,
+   "tag": {
+    "Wood": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  },
+  {
+   "effect": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "id": 3,
+   "immune_tag": {
+    "Control": "None",
+    "None": "None"
+   },
+   "level": 1,
+   "tag": {
+    "Water": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  },
+  {
+   "effect": [
+    1
+   ],
+   "id": 4,
+   "immune_tag": {
+    "Control": "None",
+    "Earth": "None"
+   },
+   "level": 1,
+   "tag": {
+    "Fire": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 1,
+     "testobj_value": 1
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  },
+  {
+   "effect": [
+    1,
+    1,
+    1
+   ],
+   "id": 5,
+   "immune_tag": {
+    "Control": "None",
+    "Metal": "None"
+   },
+   "level": 100,
+   "tag": {
+    "Earth": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 100,
+     "testobj_value": 100
+    },
+    {
+     "testobj_key": 100,
+     "testobj_value": 100
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  },
+  {
+   "effect": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "id": 6,
+   "immune_tag": {
+    "Control": "None",
+    "Wood": "None"
+   },
+   "level": 100,
+   "tag": {
+    "Metal": "Control"
+   },
+   "testobj": [
+    {
+     "testobj_key": 100,
+     "testobj_value": 100
+    },
+    {
+     "testobj_key": 100,
+     "testobj_value": 100
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    },
+    {
+     "testobj_key": 0,
+     "testobj_value": 0
+    }
+   ]
+  }
+ ]
+}

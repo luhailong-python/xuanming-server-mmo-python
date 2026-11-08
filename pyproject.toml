@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xuanming-server-mmo-python"
+version = "0.1.0"
+description = "Python 版玄冥游戏服务端运行框架"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["protobuf>=6.31,<8", "grpcio>=1.75,<2"]
+
+[project.optional-dependencies]
+cluster = ["aiokafka>=0.12,<1", "redis>=6.2,<9", "aiohttp>=3.11,<4"]
+dev = ["pytest>=8,<10", "grpcio-tools>=1.75,<2"]
+
+[project.scripts]
+xuanming-server = "xuanming.__main__:main"
+
+[tool.setuptools.package-data]
+xuanming = ["contracts/*"]
+"xuanming.data" = ["_table_descriptors.pb", "tables/*.json", "tables/*.pb", "nav/*.bin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

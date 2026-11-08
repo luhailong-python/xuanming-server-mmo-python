@@ -1,0 +1,57 @@
+syntax = "proto3";
+package monopoly;
+
+message BoardState {
+  uint32 position = 1;
+  uint32 dice_remaining = 2;
+  uint64 coins = 3;
+  uint64 next_roll_seq = 4;
+  uint64 next_dice_at_ms = 5;  // UTC 毫秒，满额时为 0。
+}
+
+message DiceRecovery {
+  uint32 dice_remaining = 1;
+  uint64 anchor_ms = 2;  // 上一次记入的恢复时刻，或从满额首次消耗的时刻。
+}
+
+// 客户端回执也是存档中的最近一次掷骰原件。
+message RollResult {
+  uint64 roll_seq = 1;
+  uint32 die_one = 2;
+  uint32 die_two = 3;
+  uint32 from_position = 4;
+  uint32 to_position = 5;
+  bool passed_start = 6;
+  uint64 landing_reward = 7;
+  uint64 pass_start_reward = 8;
+  uint64 coins_credited = 9;  // 实际到账，已有欠款由原钱包规则先行抵扣。
+  BoardState state = 10;
+  uint32 board_id = 11;
+}
+
+message BoardCompletion {
+  uint32 board_id = 1;
+  uint32 next_board_id = 2;  // 0 表示当前没有后续棋盘。
+  uint64 coin_reward = 3;
+  uint64 coins_credited = 4;
+}
+
+message LandmarkUpgradeResult {
+  uint64 upgrade_seq = 1;
+  uint32 landmark_id = 2;
+  uint32 previous_level = 3;
+  uint32 level = 4;
+  uint64 coins_spent = 5;
+  uint64 coins_after = 6;
+  uint64 next_upgrade_seq = 7;
+  uint32 board_id = 8;
+  BoardCompletion completion = 9;
+}
+
+message LandmarkProgress {
+  // 未建造的地标不写入，读取时等级为 0。
+  map<uint32, uint32> levels = 1;
+  LandmarkUpgradeResult last_upgrade = 2;
+  uint32 board_id = 3;  // 旧存档未写入时按 1 处理。
+  BoardCompletion last_completion = 4;
+}

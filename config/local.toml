@@ -1,0 +1,13 @@
+zone_id = 1
+database = "../run/players.sqlite3"
+
+[gate]
+port = 8610
+
+[scene]
+port = 8611
+grpc_port = 8612
+
+[battle]
+port = 8613
+grpc_port = 8614
