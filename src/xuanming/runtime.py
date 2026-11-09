@@ -21,6 +21,7 @@ from .nodes.gate_spectate import GateSpectate
 from .nodes.monopoly import Monopoly
 from .nodes.player_inbox import BATTLE as INBOX_BATTLE, InboxPeer, LocalInbox, SceneInbox
 from .nodes.scene import SceneNode
+from .nodes.scene_admin import SceneAdmin
 from .nodes.scene_activity import Activities
 from .nodes.scene_assets import SceneAssets
 from .nodes.scene_attributes import SceneAttributes, initialize_attribute_schemes
@@ -268,7 +269,7 @@ class Runtime:
         scene.tables = tables
         scene.navigation = load_navigation(tables)
         self.scene = scene
-        links.bind(scene)
+        links.bind(scene, admin=SceneAdmin(scene, self.request_shutdown))
         methods = {"CreateScene": scene.create, "DestroyScene": scene.destroy, "ReleasePlayer": scene.release}
         match_call = redis = None
         account_secret = b""
@@ -321,6 +322,7 @@ class Runtime:
             async def merchant_reader():
                 return await control_redis.hget(redis_key(info.zone_id), "state")
 
+        scene.channels.control_redis = control_redis
         scene.landing = SceneLanding(scene, player_redis=redis, control_redis=control_redis)
         scene.landing.register()
         self._stack.push_async_callback(scene.landing.close)

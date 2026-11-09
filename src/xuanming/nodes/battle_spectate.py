@@ -30,11 +30,12 @@ def spectate_kafka_route(channel: str, gate_id: int, battle_id: int, generation:
 class SpectateChannels:
     relay_gates: dict[int, str] = field(default_factory=dict)
     broadcast: bool = False
-    last_frame_ms: int | None = None
+    last_frame_steady_ms: int | None = None
 
-    def due(self, now_ms: int, deadline_ms: int) -> bool:
-        return self.last_frame_ms is not None and (now_ms - self.last_frame_ms >= KEEPALIVE_MS
-                                                    and now_ms < deadline_ms + DEADLINE_GRACE_MS)
+    def due(self, steady_ms: int, now_ms: int, deadline_ms: int) -> bool:
+        if deadline_ms and now_ms >= deadline_ms + DEADLINE_GRACE_MS:
+            self.last_frame_steady_ms = None
+        return self.last_frame_steady_ms is not None and steady_ms - self.last_frame_steady_ms >= KEEPALIVE_MS
 
     def frame(self, protocol, *, battle_id: int, instance_id: str, deadline_ms: int,
               kind: int, round_index: int, message: Message) -> Message:
@@ -43,12 +44,12 @@ class SpectateChannels:
                                 battle_instance_id=instance_id, round_index=round_index, kind=kind,
                                 client_frame=envelope.SerializeToString(), deadline_ms=deadline_ms)
 
-    def attach(self, gate_id: int, instance_id: str, now_ms: int) -> bool:
+    def attach(self, gate_id: int, instance_id: str, steady_ms: int) -> bool:
         if self.broadcast or self.relay_gates.get(gate_id) == instance_id:
             return False
         self.relay_gates[gate_id] = instance_id
-        if self.last_frame_ms is None:
-            self.last_frame_ms = now_ms
+        if self.last_frame_steady_ms is None:
+            self.last_frame_steady_ms = steady_ms
         return True
 
     def targets(self) -> tuple[tuple[str, int, str], ...]:

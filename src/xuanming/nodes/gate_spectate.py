@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from google.protobuf.message import DecodeError
 
 KINDS = {1: (161, "SpectateStateS2C"), 2: (158, "TurnResultS2C"), 3: (166, "SpectateEndS2C")}
+_SOFT_WATERMARK_BYTES = 256 * 1024
 
 
 @dataclass(slots=True)
@@ -70,10 +71,19 @@ class GateSpectate:
         else:
             entry.deadline_ms = ticket.deadline_ms or entry.deadline_ms
             self.subscriptions[session_id] = battle
-            entry.subscribers[session_id] = bool(entry.first)
-            if entry.first is not None:
-                session.emit(entry.first)
+            entry.subscribers[session_id] = False
+            self._send_first(session, entry)
         return None
+
+    @staticmethod
+    def _send_first(session, entry) -> None:
+        if entry.first is not None and GateSpectate._can_send_state(session):
+            session.emit(entry.first)
+            entry.subscribers[session.session_id] = True
+
+    @staticmethod
+    def _can_send_state(session) -> bool:
+        return not session.outbound.full() and session.buffered_output_bytes <= _SOFT_WATERMARK_BYTES
 
     def _ticket(self, session, request):
         try:
@@ -161,10 +171,10 @@ class GateSpectate:
                 session.emit(entry.terminal)
                 self.close_session(session_id, battle)
                 continue
-            if not entry.subscribers.get(session_id) and entry.first is not None and session.outbound.qsize() < 64:
-                session.emit(entry.first)
-                entry.subscribers[session_id] = True
-            if not first_only and turn and session.outbound.qsize() < 64:
+            if not entry.subscribers.get(session_id):
+                self._send_first(session, entry)
+                continue
+            if not first_only and turn and self._can_send_state(session):
                 session.emit(turn)
 
     async def sweep(self) -> None:

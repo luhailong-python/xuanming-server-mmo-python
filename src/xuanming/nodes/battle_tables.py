@@ -173,7 +173,7 @@ class BattleBuff:
     infinite: bool = False
     interval_rounds: int = 0
     interval_count: int = 0
-    interval_damage: float = 0.0
+    interval_damage: float | None = None
     health_regeneration: Callable[[float, float], float] | None = None
     sub_buffs: tuple[int, ...] = ()
     target_sub_buffs: tuple[int, ...] = ()
@@ -195,7 +195,7 @@ class BattleTables:
                 immune_tags=frozenset(row.immune_tag), dispel_tags=frozenset(row.dispel_tag), max_layer=row.max_layer,
                 duration_rounds=rounds_from_seconds(row.duration) if row.duration > 0 else 0,
                 infinite=bool(row.infinite_duration), interval_rounds=rounds_from_seconds(row.interval) if row.interval > 0 else 0,
-                interval_count=row.interval_count, interval_damage=next(iter(row.interval_effect), 0.0),
+                interval_count=row.interval_count, interval_damage=next(iter(row.interval_effect), None),
                 health_regeneration=_expression(row.health_regeneration), sub_buffs=tuple(row.sub_buff),
                 target_sub_buffs=tuple(row.target_sub_buff),
             ) for row in tables["Buff"].rows()
@@ -288,10 +288,15 @@ class BattleTables:
         dungeon = self.tables["Dungeon"].get(request.battle_config_id)
         return ceil(dungeon.time_limit * 1000 / _ROUND_MS) if dungeon is not None and dungeon.time_limit else default
 
-    def add_rewards(self, request: Message, settlement: Message) -> None:
-        profile = self.rewards.get(request.battle_config_id, self.rewards.get(0))
+    def reward_profile(self, battle_config_id: int) -> Message:
+        profile = self.rewards.get(battle_config_id, self.rewards.get(0))
         if profile is None:
             raise ValueError("PVE reward profile unavailable")
+        return type(profile).FromString(profile.SerializeToString())
+
+    def add_rewards(self, request: Message, settlement: Message, *, profile: Message | None = None) -> None:
+        if profile is None:
+            profile = self.reward_profile(request.battle_config_id)
         settlement.exp_gain = profile.exp_gain
         settlement.currency_gains.extend(profile.currencies)
         total_weight = sum(item.weight for item in profile.random_items)

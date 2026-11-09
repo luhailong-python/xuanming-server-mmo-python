@@ -268,10 +268,12 @@ class SceneLinks:
         self._peers: dict[str, _GatePeer] = {}
         self._channels: set[RpcChannel] = set()
         self._scene = None
+        self._admin = None
         self._closing = False
 
-    def bind(self, scene) -> None:
+    def bind(self, scene, *, admin=None) -> None:
         self._scene = scene
+        self._admin = admin
 
     async def serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self._scene is None or self._closing:
@@ -302,6 +304,9 @@ class SceneLinks:
             self._gate(peer)
             return self._scene.destroy(_parse(self._protocol, "DestroySceneRequest", body)).SerializeToString()
 
+        async def administrative(method, body: bytes):
+            return await method(body, on_authorized=timer.cancel)
+
         ids = self._protocol.message_ids
         handlers = {
             ids["SceneNodeHandshake"]: handshake,
@@ -310,6 +315,11 @@ class SceneLinks:
             ids["SceneCreateScene"]: create,
             ids["SceneDestroyScene"]: destroy,
         }
+        if self._admin is not None:
+            handlers.update({
+                ids["SceneSceneGmGracefulShutdown"]: partial(administrative, self._admin.shutdown),
+                ids["SceneSceneGmDescribeEntity"]: partial(administrative, self._admin.describe),
+            })
         channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT)
         peer = _GatePeer(channel)
         self._channels.add(channel)

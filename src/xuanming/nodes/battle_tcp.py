@@ -7,15 +7,15 @@ from collections import deque
 
 from google.protobuf.message import DecodeError
 
-from ..transport import FrameError, Packet, encode_packet, read_packet, write_packet
+from ..transport import DEFAULT_GATE_FRAME_SIZE, FrameError, Packet, encode_packet, read_packet, write_packet
+from ..transport.client_limits import illegal_packet_threshold
 from .battle import CLIENT_REQUESTS, BattleError
 
 logger = logging.getLogger(__name__)
 
-_MAX_FRAME_SIZE = 4096
+_MAX_FRAME_SIZE = DEFAULT_GATE_FRAME_SIZE
 _MAX_REQUEST_SIZE = 1024
 _MAX_BUFFERED_OUTPUT = 2 * 1024 * 1024
-_ILLEGAL_LIMIT = 50
 _SHUTDOWN_DRAIN_SECONDS = 5
 _PROBE_START = "match.NetworkProbeStart"
 _PROBE_ECHO = "match.NetworkProbeEcho"
@@ -32,6 +32,7 @@ class BattleClients:
         self._draining_writers = set()
         self._connections = set()
         self._stopping = False
+        self._illegal_threshold = illegal_packet_threshold()
         self._limits = {}
         if battle.tables is not None:
             limits = battle.tables.tables["MessageLimiter"]
@@ -138,7 +139,7 @@ class BattleClients:
                 content = self._dispatch(ticket, request, len(packet.payload), requests)
                 if content.error_message.id:
                     illegal += 1
-                if not enqueue(content) or illegal >= _ILLEGAL_LIMIT:
+                if not enqueue(content) or self._illegal_threshold and illegal >= self._illegal_threshold:
                     return
         except (OSError, FrameError, DecodeError, TimeoutError):
             logger.debug("Battle 连接结束", exc_info=True)

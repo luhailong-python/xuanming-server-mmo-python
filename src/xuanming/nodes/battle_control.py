@@ -168,6 +168,8 @@ class BattleControl:
                 _LOG.warning("battle control drain deadline reached; unresolved outcomes: %s", pending)
             finally:
                 self._closed = True
+                if node is not None:
+                    node.stop_spectate_keepalive()
                 tasks = tuple(self._pending.values())
                 if self._sender is not None:
                     tasks += (self._sender,)
@@ -179,6 +181,7 @@ class BattleControl:
     async def _drain_outcomes(self, node: BattleNode) -> None:
         loop = asyncio.get_running_loop()
         while pending := node.pending_outcome_ids():
+            node.pump_spectate_keepalive()
             retry_at = loop.time() + _SHUTDOWN_RETRY_SECONDS
             for battle_id in pending:
                 self.outcome(battle_id, 0)

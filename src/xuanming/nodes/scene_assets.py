@@ -520,7 +520,7 @@ class SceneAssets(AssetInventory):
         battle = getattr(self.scene, "battle", None)
         return battle is not None and battle.frozen(player.player_id)
 
-    async def _save(self, player, data, tx_type=0, **audit_options) -> bool:
+    async def _save(self, player, data, tx_type=0, *, on_committed=None, **audit_options) -> bool:
         before = self.scene.rows.assemble(player.snapshot)
         worn_changed = self.entries(before.bag_component, 2) != self.entries(data.bag_component, 2)
         if worn_changed:
@@ -531,11 +531,14 @@ class SceneAssets(AssetInventory):
         def committed(snapshot):
             if audit is not None:
                 audit(snapshot)
-            attributes.notify(player)
+            if attributes is not None:
+                attributes.notify(player)
+            if on_committed is not None:
+                on_committed(snapshot)
 
-        on_committed = committed if attributes is not None else audit
+        callback = committed if attributes is not None or on_committed is not None else audit
         try:
-            await self.scene.commit_player_data(player, data, on_committed=on_committed)
+            await self.scene.commit_player_data(player, data, on_committed=callback)
         except (StoreRejected, StoreUnavailable, OSError):
             logger.warning("玩家资产存盘未获确认 player_id=%s", player.player_id, exc_info=True)
             return False
@@ -649,8 +652,10 @@ class SceneAssets(AssetInventory):
         error, changed = self.retrieve_temporary(data, request.item_id, request.take_all)
         if error:
             return self._client_answer(route, error)
+        inbox = self.scene.inbox
         if changed and not await self._save(
             player, data, 13, retirement_only=True, item_extra={"source": "temporary-retrieve"},
+            on_committed=(lambda _snapshot: inbox.on_bag_space_freed(player)) if inbox is not None else None,
         ):
             return self._client_answer(route, UNAVAILABLE)
         return self._paired_bags(route, player, 3, "temporary")

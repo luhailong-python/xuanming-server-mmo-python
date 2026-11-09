@@ -17,6 +17,8 @@ from ..grpc_runtime import session_metadata
 from ..node_link import GATE_BROADCAST_METHODS, SceneLinkNotReady, SceneNodeNotFound
 from ..protocol import RouteNode, RpcKind
 from ..transport import FrameError, Packet, RpcError, read_packet, write_packet
+from ..transport.client_limits import illegal_packet_threshold as _illegal_packet_threshold
+from ..transport.client_output import ClientOutputQueue
 from .gate_chat import WorldChatFanout
 from .gate_entry import FORCE_CLOSE_DELAY, PendingSceneEntry, retry_entry
 
@@ -46,14 +48,6 @@ def _native_message_limits():
     return {row.id: (row.max_requests, row.time_window) for row in ConfigTables()["MessageLimiter"].rows()}
 
 
-def _illegal_packet_threshold() -> int:
-    try:
-        threshold = int(os.getenv("GATE_ILLEGAL_PACKET_THRESHOLD", "50"))
-    except ValueError:
-        return 50
-    return threshold if 0 <= threshold < 1 << 32 else 50
-
-
 def issue_gate_ticket(protocol, node_id: int, zone_id: int, secret: bytes, *, ttl: int = 600, player_id: int = 0):
     payload = protocol.message(
         "GateTokenPayload", gate_node_id=node_id, zone_id=zone_id,
@@ -71,7 +65,7 @@ class Session:
     session_id: int
     incarnation: int
     writer: asyncio.StreamWriter
-    outbound: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(128))
+    outbound: ClientOutputQueue = field(default_factory=ClientOutputQueue)
     requests: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(32))
     message_timestamps: dict[int, deque[float]] = field(default_factory=dict)
     illegal_packets: int = 0
@@ -104,12 +98,17 @@ class Session:
     def close(self) -> None:
         self.writer.close()
 
+    @property
+    def buffered_output_bytes(self) -> int:
+        transport = getattr(self.writer, "transport", None)
+        return self.outbound.buffered_bytes + (transport.get_write_buffer_size() if transport is not None else 0)
+
     def emit(self, message) -> None:
         if self.writer.is_closing():
             return
         try:
             self.outbound.put_nowait(message)
-        except asyncio.QueueFull:
+        except (asyncio.QueueFull, FrameError):
             self.close()
 
 

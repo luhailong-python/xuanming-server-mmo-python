@@ -46,7 +46,7 @@ def runtime():
     published = []
     node = BattleNode(
         protocol, node_id=4, instance_id="battle-process", host="127.0.0.1", port=8000,
-        ticket_secret=b"battle-ticket-keys-for-test-only", physical_region=2, now_ms=clock,
+        ticket_secret=b"battle-ticket-keys-for-test-only", physical_region=2, now_ms=clock, steady_ms=clock,
         on_outcome=lambda *values: outcomes.append(values), on_lobby_push=lambda *values: published.append(values),
     )
     return protocol, node, clock, outcomes, published
@@ -183,7 +183,7 @@ def test_direct_spectator_node_quota_counts_seats_and_snapshot_counts_live_conne
     protocol, original, clock, _, _ = runtime
     node = BattleNode(protocol, node_id=original.node_id, instance_id=original.instance_id,
                       host=original.host, port=original.port, ticket_secret=original.ticket_secret,
-                      physical_region=2, now_ms=clock, max_observers=2, max_connections=12,
+                      physical_region=2, now_ms=clock, steady_ms=clock, max_observers=2, max_connections=12,
                       on_outcome=lambda *_: None)
     for battle_id in (10, 11):
         request = create_request(protocol)
@@ -230,16 +230,86 @@ def test_direct_spectator_node_quota_counts_seats_and_snapshot_counts_live_conne
     assert node.add_observer(first).error_message.id == 1005
 
 
+def test_observer_reconnect_grace_uses_elapsed_time_across_wall_clock_adjustments(runtime):
+    protocol, node, wall, _, _ = runtime
+    steady = Clock(5000)
+    node._steady_ms = steady
+    assert not node.create(create_request(protocol)).error_message.id
+    operation = "01900000-0000-7000-8000-000000000001"
+    request = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                               spectator_operation_id=operation, target_instance_id=node.instance_id,
+                               admit_before_ms=15_000, routing={"gate_instance_id": "gate-process"})
+    assert not node.add_observer(request).error_message.id
+    assignment = issue(protocol, node, 303, operation)
+    ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+    socket = Socket()
+    close = socket.close
+    node.attach(ticket, socket.emit, close)
+    node.detach(ticket, close)
+
+    wall.now = 40_000
+    node.tick()
+    assert 303 in node.rooms[10].observers
+    wall.now = 500
+    steady.now += 29_999
+    node.tick()
+    assert 303 in node.rooms[10].observers
+    steady.now += 1
+    node.tick()
+    assert 303 not in node.rooms[10].observers
+    with pytest.raises(BattleError, match="not in this battle"):
+        node.authorize(assignment.token_payload, assignment.token_signature)
+
+
+def test_pending_outcome_retries_and_abandonment_ignore_wall_clock_adjustments(runtime):
+    protocol, node, wall, attempts, _ = runtime
+    steady = Clock(5000)
+    node._steady_ms = steady
+    assert not node.create(create_request(protocol, health=20)).error_message.id
+    for player_id in (101, 202):
+        assignment = issue(protocol, node, player_id)
+        ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+        action = protocol.message("SubmitBattleActionRequest", battle_id=10, action={"action_type": 1})
+        assert not node.dispatch(ticket, 149, action).error_message.id
+    original = node.outcome_request(10).SerializeToString(deterministic=True)
+    result = protocol.parse("contracts.kafka.BattleResultEvent", node.outcome_request(10).raw_result_payload)
+    assert result.finished_at_ms == wall.now
+
+    wall.now += 40 * 3_600_000
+    node.tick()
+    assert attempts == [(10, 1)] and 10 in node.rooms
+    wall.now = 1
+    steady.now += 5000
+    node.tick()
+    assert attempts == [(10, 1), (10, 1)]
+    assert node.outcome_request(10).SerializeToString(deterministic=True) == original
+    steady.now = 5000 + 6 * 3_600_000
+    node.tick()
+    assert len(attempts) == 3
+    steady.now += 59_999
+    node.tick()
+    assert len(attempts) == 3
+    steady.now += 1
+    node.tick()
+    assert len(attempts) == 4
+    steady.now = 5000 + 30 * 3_600_000
+    node.tick()
+    assert 10 not in node.rooms and len(attempts) == 4
+
+
 def test_pve_spawns_from_config_tables_and_freezes_seeded_rewards(runtime):
     protocol, original, clock, _, _ = runtime
     node = BattleNode(protocol, node_id=original.node_id, instance_id=original.instance_id,
                       host=original.host, port=original.port, ticket_secret=original.ticket_secret,
-                      physical_region=2, now_ms=clock, on_outcome=lambda *_: None,
+                      physical_region=2, now_ms=clock, steady_ms=clock, on_outcome=lambda *_: None,
                       tables=ConfigTables())
     request = create_request(protocol, match_mode=4)
     del request.players[1:]
     request.players[0].physical_attack = 100_000
     assert not node.create(request).error_message.id
+    node.tables.rewards[0].exp_gain = 9999
+    node.tables.rewards[0].ClearField("random_items")
+    node.tables.rewards[0].ClearField("currencies")
     assignment = issue(protocol, node, 101)
     ticket = node.authorize(assignment.token_payload, assignment.token_signature)
     snapshot = node.dispatch(ticket, 140, protocol.message("GetBattleStateRequest", battle_id=10))
@@ -330,12 +400,14 @@ def test_live_grpc_match_receipt_must_authenticate_and_replays_same_result(runti
 
 def test_shutdown_retries_pending_match_outcome_and_drains_spectator_frames(runtime, monkeypatch):
     protocol, node, clock, _, _ = runtime
+    steady = Clock(clock.now)
+    node._steady_ms = steady
     path = "/match.MatchInternal/CommitBattleOutcome"
     secret = b"separate-match-outcome-signing-key-for-test"
     monkeypatch.setattr("xuanming.nodes.battle_control._SHUTDOWN_RETRY_SECONDS", 0.01)
 
     async def exercise():
-        attempts, frames = [], []
+        attempts, frames, heartbeats = [], [], []
         first_started, finish_first = asyncio.Event(), asyncio.Event()
 
         async def match(request):
@@ -357,6 +429,8 @@ def test_shutdown_retries_pending_match_outcome_and_drains_spectator_frames(runt
             if envelope.message_id == 166:
                 end = protocol.parse("SpectateEndS2C", envelope.serialized_message)
                 frames.append((battle_id, end.reason, end.outcome))
+            elif envelope.message_id == 161:
+                heartbeats.append((battle_id, protocol.parse("SpectateStateS2C", envelope.serialized_message)))
 
         server, port = await serve_grpc(protocol, "127.0.0.1:0", {
             "match.MatchInternal": {"CommitBattleOutcome": match},
@@ -384,6 +458,14 @@ def test_shutdown_retries_pending_match_outcome_and_drains_spectator_frames(runt
             await asyncio.sleep(0.03)
             assert len(attempts) == 1 and 10 in node.rooms
             assert not node.admitting
+            assert len(heartbeats) == 2
+            steady.now += 10_000
+            async with asyncio.timeout(1):
+                while len(heartbeats) < 3:
+                    await asyncio.sleep(0.01)
+            battle_id, heartbeat = heartbeats[-1]
+            assert battle_id == 10 and heartbeat.state.outcome == 0
+            assert all(not actor.is_dead for actor in heartbeat.state.actors)
             clock.now += 200_000
             node.tick()
             assert node.outcome_request(11) is None
@@ -392,6 +474,10 @@ def test_shutdown_retries_pending_match_outcome_and_drains_spectator_frames(runt
             assert len(attempts) == 2 and attempts[0] == attempts[1]
             assert 10 not in node.rooms and 11 in node.rooms
             assert frames == [(11, 4, 0), (10, 1, 1)]
+            before = len(heartbeats)
+            steady.now += 10_000
+            node.pump_spectate_keepalive()
+            assert len(heartbeats) == before
         finally:
             finish_first.set()
             await control.close()
@@ -444,6 +530,60 @@ def test_observer_stop_ack_is_sent_before_tcp_eof(runtime):
             await server.wait_closed()
 
     asyncio.run(exercise())
+
+
+def test_shutdown_timeout_keeps_unknown_result_and_stops_spectate_keepalive(runtime, monkeypatch):
+    p, node, clock, _, _ = runtime
+    monkeypatch.setattr("xuanming.nodes.battle_control._SHUTDOWN_DRAIN_SECONDS", 0.05)
+    monkeypatch.setattr("xuanming.nodes.battle_control._SHUTDOWN_RETRY_SECONDS", 0.01)
+
+    class UnavailableMatch:
+        closed = False
+
+        async def call(self, *_):
+            await asyncio.Future()
+
+        async def close(self):
+            self.closed = True
+
+    async def run():
+        frames = []
+
+        async def publish(*args):
+            frames.append(args[-1])
+
+        control = BattleControl(p, match_endpoint="127.0.0.1:1", outcome_secret=b"m" * 32, publish=publish)
+        await control.match.close()
+        control.match = UnavailableMatch()
+        control.bind(node)
+        node.on_outcome = control.outcome
+        node.on_spectate_frame = control.spectate
+        try:
+            assert not node.create(create_request(p, health=20)).error_message.id
+            assert not node.promote_spectate_broadcast(p.message(
+                "PromoteSpectateBroadcastRequest", battle_id=10, target_instance_id=node.instance_id,
+            )).error_message.id
+            for player_id in (101, 202):
+                assignment = issue(p, node, player_id)
+                ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+                action = p.message("SubmitBattleActionRequest", battle_id=10, action={"action_type": 1})
+                assert not node.dispatch(ticket, 149, action).error_message.id
+            original = node.outcome_request(10).SerializeToString(deterministic=True)
+            clock.now += 10_000
+            await control.close()
+            assert [frame.kind for frame in frames] == [1, 1]
+            assert control.match.closed and not control._pending
+            assert node.outcome_request(10).SerializeToString(deterministic=True) == original
+
+            extra = []
+            node.on_spectate_frame = lambda *record: extra.append(record)
+            clock.now += 10_000
+            node.pump_spectate_keepalive()
+            assert not extra
+        finally:
+            await control.close()
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("overflow", [False, True])
@@ -500,6 +640,55 @@ def test_battle_tcp_connection_limit_and_output_drain(runtime, monkeypatch, over
             server.close()
             await clients.close()
             await server.wait_closed()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("threshold", [0, 3])
+def test_battle_tcp_honors_shared_illegal_threshold_and_native_frame_limit(runtime, monkeypatch, threshold):
+    monkeypatch.setenv("GATE_ILLEGAL_PACKET_THRESHOLD", str(threshold))
+    protocol, node, _, _, _ = runtime
+
+    async def exercise():
+        clients = BattleClients(protocol, node)
+        async with await asyncio.start_server(clients.serve, "127.0.0.1", 0) as server:
+            node.port = server.sockets[0].getsockname()[1]
+            assert not node.create(create_request(protocol)).error_message.id
+            assignment = issue(protocol, node, 101)
+            reader, writer = await asyncio.open_connection("127.0.0.1", node.port)
+            try:
+                async with asyncio.timeout(3):
+                    verify = protocol.message("BattleTokenVerifyRequest", payload=assignment.token_payload,
+                                              signature=assignment.token_signature)
+                    await write_packet(writer, Packet.from_message(verify))
+                    reply = await read_packet(reader)
+                    assert protocol.parse(reply.type_name, reply.payload).success
+                    # A frame above 4 KiB still gets the native 1 KiB envelope error.
+                    oversized = protocol.message("ClientRequest", id=1, message_id=140, body=b"x" * 5000)
+                    await write_packet(writer, Packet.from_message(oversized))
+                    reply = await read_packet(reader)
+                    assert protocol.parse(reply.type_name, reply.payload).error_message.id == 1010
+                    count = threshold - 1 if threshold else 55
+                    for index in range(count):
+                        request = protocol.message("ClientRequest", id=index + 2, message_id=999999)
+                        await write_packet(writer, Packet.from_message(request))
+                        reply = await read_packet(reader)
+                        if threshold and index == count - 1:
+                            assert reply is None
+                        else:
+                            assert protocol.parse(reply.type_name, reply.payload).error_message.id == 1005
+                    if not threshold:
+                        query = protocol.message("GetBattleStateRequest", battle_id=10)
+                        request = protocol.message("ClientRequest", id=99, message_id=140, body=query.SerializeToString())
+                        await write_packet(writer, Packet.from_message(request))
+                        reply = await read_packet(reader)
+                        envelope = protocol.parse(reply.type_name, reply.payload)
+                        assert envelope.id == 99 and not envelope.error_message.id
+                        assert protocol.parse("BattleStateS2C", envelope.serialized_message).battle_id == 10
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                await clients.close()
 
     asyncio.run(exercise())
 
@@ -602,6 +791,56 @@ def test_spectate_promotion_keeps_turn_and_end_on_same_broadcast_partition(runti
         assert not frame.target_gate_id and not frame.target_instance_id
         envelope = p.parse("MessageContent", frame.client_frame)
         assert envelope.message_id == {1: 161, 2: 158, 3: 166}[frame.kind]
+
+
+def test_spectate_keepalive_uses_elapsed_time_and_retires_expired_channels(runtime):
+    p, node, wall, _, _ = runtime
+    steady, frames = Clock(5000), []
+    node._steady_ms = steady
+    node.on_spectate_frame = lambda *record: frames.append(record)
+    assert not node.create(create_request(p)).error_message.id
+
+    def attach(gate_id):
+        request = p.message("AttachRelayGateRequest", battle_id=10, gate_node_id=gate_id,
+                            gate_instance_id=f"gate-{gate_id}", target_instance_id=node.instance_id)
+        assert not node.attach_relay_gate(request).error_message.id
+
+    attach(33)
+    assert len(frames) == 1
+    wall.now += 9000
+    node.pump_spectate_keepalive()
+    assert len(frames) == 1
+    wall.now = 500
+    steady.now += 9999
+    node.tick()
+    assert len(frames) == 1
+    steady.now += 1
+    node.tick()
+    assert len(frames) == 2
+    assert frames[-1][:3] == ("relay", 33, 10) and frames[-1][3].kind == 1
+
+    steady.now += 9999
+    attach(34)
+    assert len(frames) == 3
+    steady.now += 1
+    node.tick()
+    assert [(role, gate) for role, gate, _, _ in frames[-2:]] == [("relay", 33), ("relay", 34)]
+
+    promote = p.message("PromoteSpectateBroadcastRequest", battle_id=10, target_instance_id=node.instance_id)
+    assert not node.promote_spectate_broadcast(promote).error_message.id
+    steady.now += 10_000
+    node.tick()
+    assert frames[-1][:3] == ("broadcast", 0, 10) and frames[-1][3].kind == 1
+
+    before = len(frames)
+    wall.now = node.rooms[10].deadline_ms + 60_000
+    steady.now += 10_000
+    node.pump_spectate_keepalive()
+    assert len(frames) == before
+    wall.now = 500
+    steady.now += 10_000
+    node.pump_spectate_keepalive()
+    assert len(frames) == before
 
 
 def test_scene_prepare_confirm_cannot_be_cancelled_by_late_compensation(runtime):

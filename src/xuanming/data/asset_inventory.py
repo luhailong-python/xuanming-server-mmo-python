@@ -474,8 +474,10 @@ class AssetInventory:
         retired = set()
         for entry, item in sorted(selected, key=order):
             config = self.tables["Item"].get(item.config_id)
-            if config is None or not config.max_stack_size or item.size > config.max_stack_size:
+            if (config is None or not config.max_stack_size
+                    or config.max_stack_size == 1 and item.size != 1):
                 return INVALID_DATA, False
+            # Existing stacks above the current cap retain their identity and remaining count.
             if not item.HasField("equip") and self.countable(item):
                 for target, held in sorted(inventory, key=order):
                     if held.config_id == item.config_id and self._mergeable(held, config.max_stack_size):

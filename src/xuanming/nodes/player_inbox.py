@@ -10,7 +10,7 @@ from itertools import count
 from google.protobuf.message import DecodeError
 
 from .battle_control import sign_service_call
-from .battle_settlement import known_message
+from .battle_settlement import BAG_SPACE_DEFERRED, known_message
 
 logger = logging.getLogger(__name__)
 _SERVICE = "/player_inbox.PlayerInbox"
@@ -145,6 +145,7 @@ class SceneInbox:
         self._due = {}
         self._jobs = {}
         self._halted = set()
+        self._bag_deferred = {}
         self._published = {}
         self._serial = count(1)
         self._stopping = False
@@ -158,11 +159,20 @@ class SceneInbox:
             key = player.player_id, domain
             self._due.pop(key, None)
             self._halted.discard(key)
+            self._bag_deferred.pop(key, None)
         self._published.pop(player.entity, None)
 
     def wake(self, player_id, domain):
         if domain in (GM, BATTLE) and player_id in self.scene.locations:
             self._due[(player_id, domain)] = self._clock()
+
+    def on_bag_space_freed(self, player):
+        if self._player(player.player_id) is not player:
+            return
+        for domain in (BATTLE, GM):
+            key = player.player_id, domain
+            if self._bag_deferred.get(key) is player and key not in self._halted:
+                self._due[key] = self._clock()
 
     def tick(self):
         if self._stopping:
@@ -190,6 +200,7 @@ class SceneInbox:
 
     async def _poll(self, player_id, domain) -> None:
         key = player_id, domain
+        self._bag_deferred.pop(key, None)
         identity = None
         try:
             async with self.scene._lock(player_id):
@@ -254,22 +265,26 @@ class SceneInbox:
             raise RuntimeError("收件箱拒绝当前写权")
 
     def _cursor(self, data, domain):
-        matching = [cursor for cursor in data.inbox_ledger.cursors if cursor.domain == domain]
-        if len(matching) > 1:
-            raise VersionSkew("收件箱持久账本包含重复域")
-        if not matching:
-            return None
-        cursor = matching[0]
-        if (
-            not known_message(cursor) or len(cursor.recent) > MAX_RECENT
-            or any(a.seq >= b.seq for a, b in zip(cursor.recent, cursor.recent[1:]))
-            or any(not entry.seq or entry.seq > cursor.decided_through_seq or not entry.request_id
-                   or entry.outcome not in (APPLIED, REJECTED, SKIPPED) for entry in cursor.recent)
-        ):
-            raise VersionSkew("收件箱持久账本不可解释")
+        domains = {}
+        for cursor in data.inbox_ledger.cursors:
+            if not cursor.domain or cursor.domain in domains:
+                raise VersionSkew("收件箱持久账本包含零值或重复域")
+            if (
+                len(cursor.recent) > MAX_RECENT
+                or any(a.seq >= b.seq for a, b in zip(cursor.recent, cursor.recent[1:]))
+                or any(not entry.seq or entry.seq > cursor.decided_through_seq
+                       or entry.outcome not in (APPLIED, REJECTED, SKIPPED) for entry in cursor.recent)
+            ):
+                raise VersionSkew("收件箱持久账本不可解释")
+            domains[cursor.domain] = cursor
+        cursor = domains.get(domain)
+        if cursor is not None and not known_message(cursor):
+            raise VersionSkew("收件箱当前域包含未知字段")
         return cursor
 
     async def _consume(self, player, domain, item):
+        key = player.player_id, domain
+        self._bag_deferred.pop(key, None)
         if not item.seq or not item.request_id or domain == BATTLE and (item.msg_type != 4 or item.directive):
             raise VersionSkew("收件箱条目与域契约不符")
         data = self.scene.rows.assemble(player.snapshot)
@@ -298,8 +313,12 @@ class SceneInbox:
                 entry.request_id == item.request_id and entry.outcome == APPLIED and entry.msg_type == 4
                 for entry in cursor.recent
             )
-            if not duplicate and not await self.settlement.apply(player, data, settlement, audits=audits):
-                return None
+            if not duplicate:
+                deferred = []
+                if not await self.settlement.apply(player, data, settlement, audits=audits, defer_reasons=deferred):
+                    if BAG_SPACE_DEFERRED in deferred:
+                        self._bag_deferred[key] = player
+                    return None
             outcome, reason = APPLIED, 0
         elif item.directive == 1:
             if item.void_reason not in (1, 2):

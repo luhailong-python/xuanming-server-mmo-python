@@ -203,7 +203,7 @@ class BattleEffects:
             missing = (target.max_health - target.attributes.health) & U64_MAX
             value = landed_heal(target, rule.health_regeneration(target.level, missing))
             target.attributes.health += value
-        elif rule.buff_type in (50, 51):
+        elif rule.buff_type in (50, 51) and rule.interval_damage is not None:
             value = landed_damage(target, rule.interval_damage * max(1, entry.layer))
             target.attributes.health -= value
         else:
@@ -212,4 +212,5 @@ class BattleEffects:
             turn.events.add(event_type=7, source_id=caster_id, target_id=target.actor_id,
                             buff_table_id=entry.buff_table_id, value=value, group_id=group,
                             target_health_after=target.attributes.health, target_mana_after=target.attributes.mana)
-        self.engine._death(turn, group, target, caster_id)
+        if rule.buff_type in (50, 51):
+            self.engine._death(turn, group, target, caster_id)

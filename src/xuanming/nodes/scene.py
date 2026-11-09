@@ -13,8 +13,10 @@ from google.protobuf.message import DecodeError
 
 from ..data import PlayerRowKind, PlayerSnapshot, StoreRejected, StoreUnavailable
 from ..protocol import RouteNode, RpcKind
+from .scene_afk import FRAME_MASK, FrameActivity
 from .scene_actor_sync import SceneActorSync
 from .scene_aoi import SceneAoi
+from .scene_channels import SceneChannels
 from .scene_connection_hold import (
     HOLD_WINDOW, SWEEP_INTERVAL, HoldDecision, SceneConnectionHolds, decide_hold, session_bound,
 )
@@ -90,6 +92,7 @@ class Player:
     battle_expired_id: int = 0
     asset_anomaly: dict | None = None
     asset_wake_after: float = 0.
+    activity: FrameActivity = field(default_factory=FrameActivity)
 
     @property
     def role_identity(self):
@@ -162,6 +165,7 @@ class SceneNode:
         self._ids = count(1)
         self._locks = [asyncio.Lock() for _ in range(64)]
         self._closing = False
+        self.current_frame = 0
         self.battle = None
         self.travel = None
         self.inbox = None
@@ -170,6 +174,7 @@ class SceneNode:
         self.connection_holds = SceneConnectionHolds(on_hosting=self._hosting_started, hold_seconds=disconnect_grace)
         self.navigation = {}
         self.actor_sync = SceneActorSync(self, emit_many)
+        self.channels = SceneChannels(self)
         self.buffs = None
         self.skill_casts = None
         self.initialize_player = None
@@ -267,6 +272,8 @@ class SceneNode:
         player_id = request.player_id
         if self._closing or not all((player_id, request.owner_revision)) or not session_bound(request.session_id):
             raise ValueError("入场身份不完整")
+        if self.travel and not all((request.owner_epoch, request.login_generation)):
+            raise ValueError("入场身份不完整")
         async with self._lock(player_id):
             if self._closing:
                 raise ValueError("场景正在关闭")
@@ -280,7 +287,20 @@ class SceneNode:
                 previous = self.locations.get(player_id)
                 old = previous.players[player_id] if previous is not None else None
                 published = old is not None and self.travel and self.travel.published(player_id)
+                replacement_admission = None
+                if old is not None:
+                    same_session = (old.gate_uuid, old.session_id) == key
+                    # 原版 enter_fence：同一绑定会话允许迟到请求，先校验再处理交接。
+                    if not same_session and request.login_generation <= old.generation:
+                        raise ValueError("过期的场景入场请求")
                 if published and request.owner_epoch > old.snapshot.owner_epoch:
+                    # 原版 RoleAdmission 在废黜旧实体前完成；新账号修订由权威服务验证。
+                    replacement_admission = await self.travel.admit(request)
+                    try:
+                        await self.travel.confirm(replacement_admission)
+                    except BaseException:
+                        await self.travel.retire(replacement_admission)
+                        raise
                     self.travel.superseded(old)
                     self._evict(previous, old)
                     try:
@@ -291,16 +311,13 @@ class SceneNode:
                 if old is not None:
                     if self.battle and self.battle.frozen(player_id) and previous is not world:
                         raise ValueError("角色备战期间不可切换场景")
-                    same_session = (old.gate_uuid, old.session_id) == key
                     if (
-                        request.login_generation < old.generation
-                        or request.login_generation == old.generation and not same_session
-                        or request.owner_epoch and request.owner_epoch < old.snapshot.owner_epoch
+                        request.owner_epoch and request.owner_epoch < old.snapshot.owner_epoch
                         or request.owner_revision != old.owner_revision
                     ):
                         raise ValueError("过期的场景入场请求")
                     same_epoch = request.owner_epoch in (0, old.snapshot.owner_epoch)
-                    rebound = not same_session or old.generation != request.login_generation
+                    rebound = not same_session or old.generation < request.login_generation
                     if published and (rebound or not same_epoch):
                         raise ValueError("玩家原入场世代正在交接")
                     if self.connection_holds.held(old) and not self.connection_holds.resumable(
@@ -338,7 +355,7 @@ class SceneNode:
                             old.motion = Motion()
                             self.actor_sync.mark(old, "velocity")
                             self.sessions[key] = old
-                        old.generation = request.login_generation
+                        old.generation = max(old.generation, request.login_generation)
                         if previous is not world:
                             self._relocate(previous, world, old)
                         elif rebound or request.enter_gs_type in (2, 3):
@@ -353,7 +370,7 @@ class SceneNode:
                             self.team.entered(old)
                         return self.protocol.message("Empty")
                     await self._remove(previous, old, release_credential=False)
-                player = await self._load_player(request, gate_uuid, world)
+                player = await self._load_player(request, gate_uuid, world, admission=replacement_admission)
                 world.add(player)
                 self.locations[player_id] = world
                 self.sessions[key] = player
@@ -369,8 +386,9 @@ class SceneNode:
                     self.team.entered(player)
         return self.protocol.message("Empty")
 
-    async def _load_player(self, request, gate_uuid, world):
-        admission = await self.travel.admit(request) if self.travel else None
+    async def _load_player(self, request, gate_uuid, world, *, admission=None):
+        if admission is None and self.travel:
+            admission = await self.travel.admit(request)
         try:
             snapshot = await self.store.load_and_claim(
                 request.player_id, self.info.node_uuid.encode(), request.owner_epoch,
@@ -387,6 +405,7 @@ class SceneNode:
                 self._actor_id(), request.player_id, request.session_id,
                 gate_uuid, request.login_generation, request.owner_revision, snapshot, transform,
                 home_zone_id=request.home_zone_id or self.info.zone_id, admission=admission,
+                activity=FrameActivity(self.current_frame),
             )
             if self.initialize_player:
                 self.initialize_player(saved)
@@ -504,6 +523,13 @@ class SceneNode:
                     return reply
                 raise ValueError("场景会话已被替换")
             world = self.locations[player.player_id]
+            route = self.protocol.routes.get(content.message_id)
+            handler = None
+            if route and route.node_type == RouteNode.SCENE and route.client_protocol:
+                handler = self._handlers.get(route.service, {}).get(route.method)
+            if (leaving or handler is not None) and not self._releasing(player) and player.disconnect_at is None:
+                # 原版在解析和业务校验前记录活动；未知 RPC 与旧会话不会到这里。
+                player.activity.record(self.current_frame)
             if leaving:
                 reason = self.protocol.parse("GameNodeExitGameRequest", content.serialized_message).reason
                 if reason == 2:
@@ -512,10 +538,6 @@ class SceneNode:
                     await self._remove(world, player)
                 reply.message_content.CopyFrom(self.protocol.content(content.message_id, content.id))
                 return reply
-            route = self.protocol.routes.get(content.message_id)
-            handler = None
-            if route and route.node_type == RouteNode.SCENE and route.client_protocol:
-                handler = self._handlers.get(route.service, {}).get(route.method)
             error, body = 0, b""
             if handler is None or player.disconnect_at is not None or self._closing:
                 error = 1003
@@ -730,6 +752,13 @@ class SceneNode:
             self.buffs.discard(player)
 
     async def tick(self, delta: float) -> None:
+        for world in self.worlds.values():
+            for player in world.players.values():
+                was_afk = player.activity.afk
+                player.activity.update(self.current_frame, frozen=bool(self.travel and self.travel.frozen(player.player_id)))
+                if player.activity.afk != was_afk:
+                    logger.info("Scene player activity changed player_id=%d afk=%s frame=%d",
+                                player.player_id, player.activity.afk, self.current_frame)
         now = time.monotonic()
         self.connection_holds.sweep(now)
         if self.battle:
@@ -756,7 +785,7 @@ class SceneNode:
                     self._maintenance[player.player_id] = asyncio.create_task(self._maintain(world, player))
                 if player.disconnect_at is not None:
                     continue
-                if (player.motion.velocity != ZERO and self.mutable(player)
+                if (player.motion.velocity != ZERO and not player.activity.afk and self.mutable(player)
                         and not (self.battle and self.battle.frozen(player.player_id))
                         and not (self.team and self.team.driven(player.player_id))):
                     position = tuple(a + b * delta for a, b in zip(
@@ -777,6 +806,7 @@ class SceneNode:
                 self._visibility(world, world.aoi.move(entity, world.actors[entity].transform.position))
             world.aoi_reentry.clear()
         self.actor_sync.tick()
+        self.current_frame = (self.current_frame + 1) & FRAME_MASK
 
     async def _maintain(self, world, player) -> None:
         try:
@@ -815,6 +845,7 @@ class SceneNode:
 
     async def close(self) -> None:
         self._closing = True
+        await self.channels.close()
         await self.connection_holds.close()
         if self.travel:
             await self.travel.stop()
@@ -834,8 +865,7 @@ class SceneNode:
                             logger.exception("停机角色存盘失败，player_id=%s", player.player_id)
 
     def _scene_info(self, world, player, route, request):
-        self._push(player, "SceneSceneClientPlayerNotifySceneInfo",
-                   self.protocol.message("SceneInfoS2C", scene_info=[world.info]))
+        self.channels.query(world, player, request)
 
     def _teleport_request(self, _world, _player, _route, _request):
         # 与原版一致，缺少传送规则时明确返回业务不可用。

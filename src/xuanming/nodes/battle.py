@@ -111,7 +111,7 @@ class TurnEngine:
         self.round_index = 1
         self.outcome = 0
         self.actors: dict[int, Message] = {}
-        self.items: dict[int, dict[int, int]] = {}
+        self.items: dict[int, list[Message]] = {}
         self.pending: dict[int, Message] = {}
         self.items_used: Counter[int] = Counter()
         self.items_consumed: dict[int, Counter[int]] = {}
@@ -135,10 +135,12 @@ class TurnEngine:
                 actor.combat.CopyFrom(player.combat)
             actor.buffs.extend(player.buffs)
             self.skills.initialize(actor, player)
-            self.items[actor_id] = {}
+            self.items[actor_id] = []
             for item in player.items:
                 if item.count:
-                    self.items[actor_id].setdefault(item.item_table_id, item.count)
+                    entry = type(item)()
+                    entry.CopyFrom(item)
+                    self.items[actor_id].append(entry)
 
         pet_ids: set[int] = set()
         for player in request.players:
@@ -202,9 +204,9 @@ class TurnEngine:
             if actor.actor_id != viewer:
                 actor.ClearField("skill_cooldown_rounds")
         state.ClearField("self_items")
-        for item_id, count in sorted(self.items.get(viewer, {}).items()):
-            if count:
-                state.self_items.add(item_table_id=item_id, count=count)
+        for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
+            if item.count:
+                state.self_items.add().CopyFrom(item)
 
     def validate(self, actor: Message, action: Message) -> int:
         if not _active(actor):
@@ -228,7 +230,8 @@ class TurnEngine:
             return 1001
         if not rule.usable or not (rule.heal_health or rule.heal_mana):
             return _INVALID
-        if not self.items.get(actor.actor_id, {}).get(item_id):
+        if not any(item.item_table_id == item_id and item.count
+                   for item in self.items.get(actor.actor_id, ())):
             return 6007
         if not self.pve and self.items_used[actor.actor_id] >= 5:
             return _INVALID
@@ -361,7 +364,9 @@ class TurnEngine:
         old_health, old_mana = target.attributes.health, target.attributes.mana
         target.attributes.health = old_health + landed_heal(target, float(rule.heal_health))
         target.attributes.mana = old_mana + min(rule.heal_mana, max(0, target.max_mana - old_mana))
-        self.items[actor.actor_id][action.item_table_id] -= 1
+        item = next(entry for entry in self.items[actor.actor_id]
+                    if entry.item_table_id == action.item_table_id and entry.count)
+        item.count -= 1
         self.items_used[actor.actor_id] += 1
         self.items_consumed.setdefault(actor.actor_id, Counter())[action.item_table_id] += 1
         mana_delta = target.attributes.mana - old_mana
@@ -457,6 +462,7 @@ class _Room:
     deadline_ms: int
     action_deadline_ms: int
     routing: dict[int, Message]
+    reward_profile: Message | None = None
     observers: dict[int, _Observer] = field(default_factory=dict)
     connections: dict[int, _Connection] = field(default_factory=dict)
     visible_before_terminal: dict[int, Message] = field(default_factory=dict)
@@ -464,6 +470,7 @@ class _Room:
     proposed_outcome: int = 0
     outcome_retry_ms: int = 0
     outcome_finished_ms: int = 0
+    outcome_since_ms: int = 0
     outcome_payload: bytes = b""
     confirm_retry_ms: int = 0
     confirm_until_ms: int = 0
@@ -479,6 +486,7 @@ class BattleNode:
         self, protocol: Protocol, *, node_id: int, instance_id: str, host: str, port: int,
         ticket_secret: bytes | str, physical_region: int = 1, max_rooms: int = 1024,
         max_observers: int = 20, max_connections: int = 4096, now_ms: Callable[[], int] | None = None,
+        steady_ms: Callable[[], int] | None = None,
         on_lobby_push: Callable[[Message, int, int, Message], None] | None = None,
         on_confirm: Callable[[Message, int, int, int], None] | None = None,
         on_outcome: Callable[[int, int], None] | None = None,
@@ -507,6 +515,7 @@ class BattleNode:
         self.max_connections = max_connections
         self.max_rounds = max_rounds
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
+        self._steady_ms = steady_ms or (lambda: time.monotonic_ns() // 1_000_000)
         self.on_lobby_push = on_lobby_push
         self.on_confirm = on_confirm
         self.on_outcome = on_outcome
@@ -569,12 +578,14 @@ class BattleNode:
                 )
                 return self._error(response, _FEATURE)
         try:
+            reward_profile = (self.tables.reward_profile(request.battle_config_id)
+                              if self.tables and request.match_mode in _PVE_MODES else None)
             monsters = self.monster_factory(request) if self.monster_factory and request.match_mode in _PVE_MODES else ()
             max_rounds = self.tables.max_rounds(request, self.max_rounds) if self.tables else self.max_rounds
             engine = TurnEngine(self.protocol, request, monsters=monsters, skills=self.skills, items=self.items,
                                 max_rounds=max_rounds, buffs=self.buffs,
                                 silence_permissions=self.tables.silence_permissions if self.tables else None)
-        except BattleError:
+        except (BattleError, ValueError):
             return self._error(response, _INVALID_TABLE)
         if request.admit_before_ms <= self.now_ms():
             return self._error(response, _INVALID)
@@ -583,6 +594,7 @@ class BattleNode:
         original.CopyFrom(request)
         routing = {player.player_id: player.routing for player in original.players}
         room = _Room(engine, original, deadline, now + _ACTION_MS, routing,
+                     reward_profile=reward_profile,
                      confirm_retry_ms=now + 10_000, confirm_until_ms=now + 180_000)
         if request.record_replay:
             fingerprint = self.tables.fingerprint if self.tables else ""
@@ -756,7 +768,7 @@ class BattleNode:
         if room is not None and self.owns_connection(ticket, close):
             del room.connections[ticket.player_id]
             if ticket.role == _OBSERVER:
-                room.observers[ticket.player_id].expires_ms = self.now_ms() + _OBSERVER_GRACE_MS
+                room.observers[ticket.player_id].expires_ms = self._steady_ms() + _OBSERVER_GRACE_MS
 
     def add_observer(self, request: Message) -> Message:
         response = self.protocol.message("AddObserverResponse")
@@ -792,7 +804,7 @@ class BattleNode:
             elif not self.ticket_secret or not self.port:
                 receipt.error = _UNAVAILABLE
             else:
-                room.observers[player] = _Observer(operation, now + _OBSERVER_GRACE_MS)
+                room.observers[player] = _Observer(operation, self._steady_ms() + _OBSERVER_GRACE_MS)
                 receipt.error = 0
             if receipt.error:
                 return self._error(response, receipt.error)
@@ -867,7 +879,7 @@ class BattleNode:
         response.battle_instance_id = self.instance_id
         response.deadline_ms = room.deadline_ms
         response.broadcast = room.spectate.broadcast
-        if room.spectate.attach(request.gate_node_id, request.gate_instance_id, self.now_ms()):
+        if room.spectate.attach(request.gate_node_id, request.gate_instance_id, self._steady_ms()):
             self._spectate_state(room, targets=(("relay", request.gate_node_id, request.gate_instance_id),))
         return response
 
@@ -895,7 +907,7 @@ class BattleNode:
             targets = room.spectate.targets()
             if not targets:
                 return
-            room.spectate.last_frame_ms = None if kind == END else self.now_ms()
+            room.spectate.last_frame_steady_ms = None if kind == END else self._steady_ms()
         original = room.spectate.frame(self.protocol, battle_id=room.engine.battle_id, instance_id=self.instance_id,
                                        deadline_ms=room.deadline_ms, kind=kind, round_index=round_index, message=message)
         for channel, gate_id, gate_instance in targets:
@@ -980,9 +992,11 @@ class BattleNode:
             self._spectate_frame(room, TURN, turn.round_index, turn)
 
     def _propose_outcome(self, room: _Room, outcome: int, now: int) -> None:
+        steady = self._steady_ms()
         if not room.proposed_outcome:
             room.proposed_outcome = outcome
             room.outcome_finished_ms = now
+            room.outcome_since_ms = steady
             room.action_deadline_ms = 0
             for state in room.visible_before_terminal.values():
                 state.action_deadline_ms = 0
@@ -991,8 +1005,8 @@ class BattleNode:
             if room.replay is not None:
                 room.outcome_replay = room.replay.freeze(outcome, result.total_rounds, now)
                 room.replay = None
-        age = now - room.outcome_finished_ms
-        room.outcome_retry_ms = now + (5000 if age < 6 * 3_600_000 else 60_000)
+        age = steady - room.outcome_since_ms
+        room.outcome_retry_ms = steady + (5000 if age < 6 * 3_600_000 else 60_000)
         if self.on_outcome:
             self._publish(self.on_outcome, room.engine.battle_id, outcome)
 
@@ -1033,7 +1047,7 @@ class BattleNode:
                 for monster_id in engine.defeated_monsters:
                     settlement.defeated_monsters.add(monster_config_id=monster_id, count=1)
                 if self.tables:
-                    self.tables.add_rewards(request, settlement)
+                    self.tables.add_rewards(request, settlement, profile=room.reward_profile)
         for side, players in sorted(teams.items()):
             event.teams.add(team_index=side, player_ids=players)
         return event
@@ -1080,6 +1094,7 @@ class BattleNode:
         if self._draining:
             return
         now = self.now_ms()
+        steady = self._steady_ms()
         for battle_id, receipt in tuple(self.receipts.items()):
             if receipt.expires_ms <= now and battle_id not in self.rooms:
                 del self.receipts[battle_id]
@@ -1088,17 +1103,17 @@ class BattleNode:
                 del self.observer_receipts[key]
         for room in tuple(self.rooms.values()):
             for player, observer in tuple(room.observers.items()):
-                if 0 < observer.expires_ms <= now:
+                if 0 < observer.expires_ms <= steady:
                     self._drop_observer(room, player)
             if room.proposed_outcome:
-                if now - room.outcome_finished_ms >= 30 * 3_600_000:
+                if steady - room.outcome_since_ms >= 30 * 3_600_000:
                     for connection in room.connections.values():
                         self._publish(connection.close)
                     del self.rooms[room.engine.battle_id]
                     if self.on_rooms_changed:
                         self._publish(self.on_rooms_changed, len(self.rooms))
                     _LOG.error("battle outcome still unconfirmed after replay window: %s", room.engine.battle_id)
-                elif room.outcome_retry_ms <= now:
+                elif room.outcome_retry_ms <= steady:
                     self._propose_outcome(room, room.proposed_outcome, now)
             elif room.deadline_ms <= now:
                 room.visible_before_terminal = self._terminal_visibility(room)
@@ -1111,8 +1126,17 @@ class BattleNode:
                 room.confirm_retry_ms = now + 10_000
                 for player, route in room.routing.items():
                     self._publish(self.on_confirm, route, player, room.engine.battle_id, room.deadline_ms)
-            if room.engine.battle_id in self.rooms and room.spectate.due(now, room.deadline_ms):
+        self.pump_spectate_keepalive()
+
+    def pump_spectate_keepalive(self) -> None:
+        steady, now = self._steady_ms(), self.now_ms()
+        for room in tuple(self.rooms.values()):
+            if room.spectate.due(steady, now, room.deadline_ms):
                 self._spectate_state(room)
+
+    def stop_spectate_keepalive(self) -> None:
+        for room in self.rooms.values():
+            room.spectate.last_frame_steady_ms = None
 
     def begin_shutdown(self) -> None:
         if self._draining:

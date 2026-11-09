@@ -539,6 +539,12 @@ class SceneTravel:
                         return
                     trip.scene_id = reply.scene_id
                 reply = await self._enter(trip, client_pick=trip.client_pick)
+                if trip.silent:
+                    # 自动跟随只换本节点场景。被拒后释放请求槽位，等下一次队伍信号。
+                    if reply.error_code:
+                        _LOG.info("Team-follow scene change rejected player_id=%d scene_id=%d code=%d",
+                                  player.player_id, trip.scene_id, reply.error_code)
+                    return
                 if reply.error_code != _HANDOFF_PENDING:
                     if reply.error_code:
                         self._tip(trip, failure)
@@ -553,6 +559,10 @@ class SceneTravel:
                     player.motion.velocity = (0., 0., 0.)
             await self._handoff(trip, failure)
         except Exception:
+            if trip.silent and not trip.frozen:
+                _LOG.info("Team-follow scene change failed player_id=%d scene_id=%d",
+                          player.player_id, trip.scene_id, exc_info=True)
+                return
             _LOG.exception("场景切换失败 player=%d", player.player_id)
             if trip.marked:
                 if trip.enter_sent_at:

@@ -3,7 +3,7 @@ from hashlib import sha256
 
 from xuanming.data import ConfigTables
 from xuanming.nodes.battle import TurnEngine
-from xuanming.nodes.battle_tables import BattleBuff, BattleSkill, battle_table_fingerprint
+from xuanming.nodes.battle_tables import BattleBuff, BattleItem, BattleSkill, battle_table_fingerprint
 from xuanming.protocol import Protocol
 
 
@@ -40,6 +40,30 @@ def test_battle_fingerprint_matches_native_protobuf_for_same_tables():
     expected = "19ee31807f2393e449dcebebb5cca233"
     assert battle_table_fingerprint(ConfigTables()) == expected
     assert battle_table_fingerprint(ConfigTables(fmt="pb")) == expected
+
+
+def test_duplicate_item_snapshot_entries_are_consumed_in_original_order():
+    p = Protocol()
+    request = p.message("CreateBattleRequest", battle_id=1, match_mode=7, seed=5489)
+    first = request.players.add(player_id=1, team_index=0, max_health=100)
+    first.base_attributes.health = 50
+    first.items.add(item_table_id=9, count=1)
+    first.items.add(item_table_id=9, count=2)
+    enemy = request.players.add(player_id=2, team_index=1, max_health=100)
+    enemy.base_attributes.health = 100
+    engine = TurnEngine(p, request, skills={}, items={9: BattleItem(10, 0, True)}, max_rounds=20)
+    use = p.message("BattleAction", action_type=4, item_table_id=9)
+    defend = p.message("BattleAction", action_type=3)
+
+    assert [item.count for item in engine.snapshot(0, viewer=1).self_items] == [1, 2]
+    for remaining in ([2], [1], []):
+        assert engine.validate(engine.actors[1], use) == 0
+        engine.pending.update({1: use, 2: defend})
+        turn = engine.resolve()
+        assert [item.count for item in engine.snapshot(0, viewer=1).self_items] == remaining
+        assert any(event.event_type == 10 for event in turn.events)
+    assert engine.items_consumed[1][9] == 3
+    assert engine.validate(engine.actors[1], use) == 6007
 
 
 def test_class_rank_clamps_and_group_cast_spends_once_with_initiative():
@@ -93,6 +117,21 @@ def test_class_auto_heals_weakest_then_buff_expiry_keeps_full_rounds():
     assert not engine.actors[1].buffs and any(e.event_type == 6 and e.buff_table_id == 90 for e in turn.events)
 
 
+def test_class_auto_compares_attack_skill_against_combo_expectation():
+    attack = BattleSkill(20, class_id=1, unlock_level=1, max_rank=10, target_team=1,
+                         max_targets=1, physical=True)
+    _, engine = _build({1: attack})
+    actor = engine.actors[1]
+
+    # Without a combo the skill is worth using, but a guaranteed extra hit
+    # makes the normal attack better than the same skill.
+    actor.combat.combo_rate = 0
+    action = engine.skills.auto_action(actor)
+    assert action is not None and action.skill_table_id == 1 and action.target_id == 3
+    actor.combat.combo_rate = 100
+    assert engine.skills.auto_action(actor) is None
+
+
 def test_legacy_poison_uses_defense_tick_resist_and_source_order():
     poison = BattleSkill(0, target_modes=(2,), skill_types=(1,), effects=(90,), cooldown_rounds=1)
     rules = {90: BattleBuff(buff_type=50, duration_rounds=2, interval_rounds=1, interval_damage=40, max_layer=2)}
@@ -109,6 +148,26 @@ def test_legacy_poison_uses_defense_tick_resist_and_source_order():
     turn = engine.resolve()
     assert engine.actors[4].attributes.health == 460 and not engine.actors[4].buffs
     assert [e.event_type for e in turn.events if e.buff_table_id == 90] == [7, 6]
+
+
+def test_periodic_effects_only_declare_death_for_configured_damage():
+    rules = {
+        90: BattleBuff(buff_type=40, duration_rounds=2, interval_rounds=1,
+                       health_regeneration=lambda _level, _missing: 0),
+        91: BattleBuff(buff_type=50, duration_rounds=2, interval_rounds=1),
+        92: BattleBuff(buff_type=50, duration_rounds=2, interval_rounds=1, interval_damage=0),
+    }
+    p, engine = _build({}, buffs=rules)
+    for actor_id, buff_id in ((1, 90), (2, 91), (3, 92)):
+        actor = engine.actors[actor_id]
+        actor.attributes.health = 0
+        actor.buffs.add(buff_id=buff_id, buff_table_id=buff_id, remain_rounds=2, layer=1)
+    _defend(p, engine)
+    turn = engine.resolve()
+    assert not engine.actors[1].is_dead
+    assert not engine.actors[2].is_dead
+    assert engine.actors[3].is_dead
+    assert [event.target_id for event in turn.events if event.event_type == 8] == [3]
 
 
 def test_counter_has_its_own_event_group_and_does_not_chain():

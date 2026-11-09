@@ -3,6 +3,7 @@
 import logging
 from collections import Counter
 
+from ..data.asset_inventory import BAG_FULL
 from .scene_mission import now_ms
 from .scene_stats import pet_stats, player_stats
 
@@ -12,6 +13,7 @@ MAX_LINES = 32
 MAX_ITEM_COUNT = (1 << 32) - 1
 MAX_CURRENCY_AMOUNT = (1 << 63) - 1
 ASSET_BLOCKED = 27005
+BAG_SPACE_DEFERRED = 6006  # Native kBagItemNotStacked executor defer reason.
 
 
 def known_message(message) -> bool:
@@ -48,7 +50,9 @@ class BattleSettlement:
             player.seen_battles.update(live.intersection(request.battle_ids))
         return response
 
-    async def apply(self, player, data, settlement, *, audits: list | None = None) -> bool:
+    async def apply(
+        self, player, data, settlement, *, audits: list | None = None, defer_reasons: list[int] | None = None,
+    ) -> bool:
         if (
             not settlement.battle_id or settlement.player_id != player.player_id
             or settlement.outcome not in (1, 2, 3) or not known_message(settlement)
@@ -90,8 +94,12 @@ class BattleSettlement:
         self._audit(player, checkpoint, data, 13, audits, correlation=settlement.battle_id, item_extra=details)
         checkpoint = self._checkpoint(data, audits)
         gains = []
-        if gained and await self.assets.add_items(data, gained, overflow=True, gains=gains):
-            return False
+        if gained:
+            error = await self.assets.add_items(data, gained, overflow=True, gains=gains)
+            if error:
+                if error == BAG_FULL and defer_reasons is not None:
+                    defer_reasons.append(BAG_SPACE_DEFERRED)
+                return False
         self._audit(player, checkpoint, data, 20, audits, correlation=settlement.battle_id, item_extra=details, gains=gains)
         stats = player_stats(self.protocol, self.tables, data)
         base = data.derived_attributes_component

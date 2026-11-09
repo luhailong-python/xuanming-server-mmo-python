@@ -48,6 +48,13 @@ class Packet:
         return message
 
 
+def message_frame_size(message: Message) -> int:
+    """计算 Protobuf 客户端帧长度，包含长度头、类型名和校验和。"""
+    size = 3 * _WORD_SIZE + len(message.DESCRIPTOR.full_name.encode("ascii")) + 1 + message.ByteSize()
+    _validate_size(size - _WORD_SIZE, _MIN_PACKET_SIZE, _MAX_WIRE_SIZE)
+    return size
+
+
 def _validate_size(size: int, min_size: int, max_size: int) -> None:
     if not min_size <= size <= min(max_size, _MAX_WIRE_SIZE):
         raise FrameError(f"invalid frame size {size}")

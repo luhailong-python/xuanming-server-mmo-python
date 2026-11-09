@@ -228,3 +228,53 @@ def test_agones_returns_to_ready_after_late_allocate_and_stops_pending_permits(m
             assert calls.count("/ready") == 2 and "/shutdown" not in calls
 
     asyncio.run(exercise())
+
+
+def test_agones_allocation_recovers_after_sidecar_failures_and_preserves_live_rooms(monkeypatch):
+    monkeypatch.setattr(battle_agones, "_READY_INITIAL_BACKOFF", 0.01)
+
+    async def exercise():
+        calls = []
+
+        async def handler(request):
+            calls.append(request.path)
+            if request.path == "/allocate" and calls.count("/allocate") <= 3:
+                return web.Response(status=503)
+            if request.path == "/ready" and calls.count("/ready") == 2:
+                return web.Response(status=503)
+            return web.json_response({"object_meta": {}})
+
+        async with sdk(handler) as port:
+            lifecycle = BattleAgones("127.0.0.1", port)
+            lifecycle.start()
+            try:
+                await wait_until(lambda: lifecycle.admitting)
+
+                async def acquire():
+                    async with lifecycle.permit() as granted:
+                        return granted
+
+                assert await asyncio.gather(acquire(), acquire()) == [False, False]
+                assert calls.count("/allocate") == 3
+                async with lifecycle.permit() as granted:
+                    assert granted
+                    lifecycle.rooms_changed(1)
+                assert calls.count("/allocate") == 4
+                await asyncio.sleep(0)
+                assert calls.count("/ready") == 1
+
+                lifecycle.rooms_changed(0)
+                await wait_until(lambda: calls.count("/ready") == 2)
+                await wait_until(lambda: lifecycle._transition is None)
+                async with lifecycle.permit() as granted:
+                    assert granted
+                    lifecycle.rooms_changed(1)
+                # A rejected /ready leaves the confirmed allocation usable.
+                assert calls.count("/allocate") == 4
+                lifecycle.rooms_changed(0)
+                await wait_until(lambda: calls.count("/ready") == 3)
+            finally:
+                await lifecycle.close()
+            assert "/shutdown" not in calls
+
+    asyncio.run(exercise())

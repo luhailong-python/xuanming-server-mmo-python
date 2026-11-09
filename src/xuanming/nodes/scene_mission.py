@@ -119,6 +119,9 @@ class Missions:
         if row.id in scope.completed_mission_ids or row.id in scope.claimable_mission_ids:
             return 5001
         for key in scope.mission_list.missions:
+            # Native RebuildIndexes preserves completed progress without reserving its type.
+            if key in scope.completed_mission_ids:
+                continue
             existing = self.tables["Mission"].get(key)
             if existing and (existing.mission_type, existing.mission_sub_type) == (row.mission_type, row.mission_sub_type):
                 return 5000
