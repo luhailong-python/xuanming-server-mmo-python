@@ -79,6 +79,11 @@ class BattleSettlement:
         checkpoint = self._checkpoint(data, audits)
         gains = []
         for kind, amount in tuple(currencies.items()):
+            # A blocked reward is skipped permanently, so its debt need not
+            # be interpreted by this version of the server.
+            if self.assets.currency_blocked(data, kind):
+                del currencies[kind]
+                continue
             if any(debt.currency_type == kind and not known_message(debt) for debt in data.currency.debts):
                 return False
             error = self.assets.add_currency(data, kind, amount, gains=gains)

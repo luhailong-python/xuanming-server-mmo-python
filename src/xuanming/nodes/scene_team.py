@@ -195,6 +195,8 @@ class SceneTeam:
         formation = group.trail
         formation.trim_tail_for_newcomer(rank)
         tail = formation.trail.tail
+        if self.scene._missing_required_navigation(group.world):
+            return False
         path = group.world.nav.find_path(position, tail) if group.world.nav else (position, tail)
         if not path or horizontal_distance(path[-1], tail) > 0.5:
             return False
@@ -222,8 +224,10 @@ class SceneTeam:
         self.scene.set_velocity(player, ZERO)
         player.motion.teleport_until = 0.0
         if place:
-            self.scene.teleport(group.world, player, formation.trail.point_at(cursor), leader.transform.rotation,
-                                reason=_REGROUP_TELEPORT)
+            if not self.scene.teleport(group.world, player, formation.trail.point_at(cursor), leader.transform.rotation,
+                                       reason=_REGROUP_TELEPORT):
+                self._detach(player_id, _LEFT)
+                return
         self._send_slot(player_id, leader_id)
 
     def _send_slot(self, player_id, leader_id) -> None:
@@ -325,14 +329,23 @@ class SceneTeam:
                 group.trail.set_suspended(member.player_id, self._held(world.players[member.player_id]))
 
             def walkable(a, b):
-                return world.nav.validate_move(a, b)[0]
+                return world.nav.validate_move(a, b)[0] if world.nav else False
 
-            for step in group.trail.tick(position, delta, walkable if world.nav else None):
+            missing_navigation = self.scene._missing_required_navigation(world)
+            for step in group.trail.tick(position, delta, walkable if world.nav or missing_navigation else None):
                 player, follower = world.players[step.player_id], self._followers[step.player_id]
-                if step.placed:
-                    self.scene.teleport(world, player, step.position, leader.transform.rotation, reason=_REGROUP_TELEPORT)
+                if step.suspended:
+                    self._motion(world, player, follower, ZERO)
+                elif step.placed:
+                    if not self.scene.teleport(world, player, step.position, leader.transform.rotation,
+                                               reason=_REGROUP_TELEPORT):
+                        self._detach(step.player_id, _LEFT)
+                        continue
                     follower.last, follower.frames = TeamFollowBroadcastState(), 0
-                elif step.moved and not step.suspended:
+                elif step.moved:
+                    if missing_navigation:
+                        self._detach(step.player_id, _LEFT)
+                        continue
                     previous = player.transform.position
                     self.scene._move_position(world, player, step.position)
                     self._motion(world, player, follower, tuple((b - a) / delta for a, b in zip(previous, step.position)))

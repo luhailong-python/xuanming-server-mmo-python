@@ -474,6 +474,12 @@ class SceneNode:
             return world.nav.snap(spawn) or spawn
         return spawn
 
+    def _missing_required_navigation(self, world: World) -> bool:
+        if world.nav is not None or self.tables is None:
+            return False
+        row = self.tables["BaseScene"].get(world.info.scene_config_id)
+        return bool(row and row.nav_bin_file.startswith("data/scene_nav_bin/festival_maps/"))
+
     def _resolve_entry_position(self, world, position, *, force_spawn=False) -> Position:
         if force_spawn or position == ZERO or not all(map(math.isfinite, position)):
             return self._spawn_position(world)
@@ -796,6 +802,9 @@ class SceneNode:
                         position = clamped or player.transform.position
                         if not walkable:
                             self.set_velocity(player, ZERO)
+                    elif self._missing_required_navigation(world):
+                        position = player.transform.position
+                        self.set_velocity(player, ZERO)
                     self._move_position(world, player, position)
                     if player.motion.velocity == ZERO:
                         self._broadcast_move(world, player)
@@ -901,7 +910,10 @@ class SceneNode:
             _, position = world.nav.validate_move(player.transform.position, reported)
             if position is None:
                 position = world.nav.snap(reported) or self._spawn_position(world)
-        previous_velocity = motion.velocity
+        missing_navigation = self._missing_required_navigation(world)
+        if missing_navigation:
+            position, velocity = player.transform.position, ZERO
+        previous_velocity = ZERO if missing_navigation else motion.velocity
         changed = (velocity != previous_velocity or rotation != player.transform.rotation
                    or position != player.transform.position)
         motion.sequence, player.transform.rotation = seq, rotation
@@ -943,7 +955,9 @@ class SceneNode:
             self._push(player, "SceneMovementClientPlayerNotifyActorMove", message)
         self._push_many(self.watchers(world, player), "SceneMovementClientPlayerNotifyActorMove", message)
 
-    def teleport(self, world, player, position, rotation, *, reason) -> None:
+    def teleport(self, world, player, position, rotation, *, reason) -> bool:
+        if self._missing_required_navigation(world):
+            return False
         player.transform.rotation = rotation
         self.set_velocity(player, ZERO)
         self.actor_sync.mark(player, "transform", "velocity")
@@ -955,6 +969,7 @@ class SceneNode:
                 "TeleportS2C", entity=player.entity, transform=player.transform.wire(), reason=reason,
             ))
         self._broadcast_move(world, player)
+        return True
 
     def _actor(self, player: Player | Npc):
         if isinstance(player, Npc):

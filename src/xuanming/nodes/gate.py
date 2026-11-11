@@ -16,7 +16,7 @@ from ..data.config_tables import ConfigTables
 from ..grpc_runtime import session_metadata
 from ..node_link import GATE_BROADCAST_METHODS, SceneLinkNotReady, SceneNodeNotFound
 from ..protocol import RouteNode, RpcKind
-from ..transport import FrameError, Packet, RpcError, read_packet, write_packet
+from ..transport import FrameError, Packet, RpcError, encode_packet, read_packet, write_packet
 from ..transport.client_limits import illegal_packet_threshold as _illegal_packet_threshold
 from ..transport.client_output import ClientOutputQueue
 from .gate_chat import WorldChatFanout
@@ -639,10 +639,25 @@ class GateNode:
             elif event_id == ids["ContractsKafkaKickPlayerEvent"]:
                 event = self.protocol.parse("contracts.kafka.KickPlayerEvent", command.payload)
                 session = self.sessions.get(event.session_id)
-                if session and session.player_id == event.player_id and (
-                    not event.login_generation or session.login_generation < event.login_generation
+                if session and (
+                    not event.player_id or (
+                        session.player_id not in (0, (1 << 64) - 1)
+                        and session.player_id == event.player_id
+                        and (not event.login_generation or session.login_generation < event.login_generation)
+                    )
                 ):
-                    session.close()
+                    # The native Gate writes the reason before a graceful shutdown.
+                    # Write synchronously into the transport so close() can flush it;
+                    # enqueuing it would race with cancellation of the writer task.
+                    kick = self.protocol.message("GameKickPlayerRequest", reason={"id": 2017})
+                    content = self.protocol.content(
+                        self.protocol.message_ids["SceneClientPlayerCommonKickPlayer"],
+                        body=kick.SerializeToString(),
+                    )
+                    try:
+                        session.writer.write(encode_packet(Packet.from_message(content)))
+                    finally:
+                        session.close()
             elif event_id in (
                 ids["ContractsKafkaBroadcastToPlayersEvent"], ids["ContractsKafkaBroadcastToSceneEvent"],
                 ids["ContractsKafkaBroadcastToAllEvent"],
