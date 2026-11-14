@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from ..data import StoreRejected, StoreUnavailable
 from .battle_tables import BattleTables
 from .scene_buffs import ACTOR_COMBAT, USE_SKILL, SceneBuffs
+from .scene_facing import rotation_toward
 from .scene_stats import effective_level, player_stats
 
 
@@ -172,12 +173,14 @@ class SceneSkillCasts:
     def _xyz(vector) -> tuple[float, float, float]:
         return vector.x, vector.y, vector.z
 
-    @staticmethod
-    def _face(player, look) -> None:
-        dx, dy, dz = (value - before for value, before in zip(look, player.transform.position))
-        distance = math.hypot(dx, dy, dz)
-        if distance >= 1e-6 and math.isfinite(distance):
-            player.transform.rotation = (math.asin(dz / distance), 0.0, math.atan2(dy, dx))
+    def _face(self, player, look) -> None:
+        dx, dy = look[0] - player.transform.position[0], look[1] - player.transform.position[1]
+        rotation = rotation_toward(dx, dy)
+        if rotation is not None:
+            player.transform.rotation = rotation
+            actor_sync = getattr(self.scene, "actor_sync", None)
+            if actor_sync is not None:
+                actor_sync.mark(player, "transform")
 
     def _broadcast(self, world, player, message_name, message) -> None:
         watchers = getattr(self.scene, "watchers", None)

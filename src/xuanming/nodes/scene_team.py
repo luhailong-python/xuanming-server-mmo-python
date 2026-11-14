@@ -8,6 +8,7 @@ import logging
 import math
 
 from .scene import ZERO
+from .scene_facing import rotation_toward
 from .team_follow_formation import (
     MAX_LEADER_JUMP, MAX_MEMBERS, TeamFollowBroadcastState, TeamFollowFormation,
     TeamFollowMember, horizontal_distance, should_broadcast,
@@ -289,8 +290,8 @@ class SceneTeam:
     def _motion(self, world, player, follower, velocity) -> None:
         self.scene.set_velocity(player, velocity)
         moving = velocity != ZERO
-        if velocity[0] or velocity[1]:
-            player.transform.rotation = (0., 0., math.degrees(math.atan2(velocity[1], velocity[0])))
+        if (rotation := rotation_toward(velocity[0], velocity[1])) is not None:
+            player.transform.rotation = rotation
         now = TeamFollowBroadcastState(moving, velocity[0], velocity[1])
         follower.frames += 1
         if should_broadcast(follower.last, now, follower.frames):
