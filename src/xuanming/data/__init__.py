@@ -4,6 +4,7 @@ from .config_tables import ConfigTable, ConfigTableError, ConfigTableRegistry, C
 from .player_rows import PlayerRowCodec, PlayerRowKind
 from .player_store import (
     DataServicePlayerStore,
+    JsonPlayerStore,
     PlayerSnapshot,
     PlayerStore,
     SaveInDoubt,
@@ -18,6 +19,7 @@ __all__ = [
     "ConfigTableRegistry",
     "ConfigTables",
     "DataServicePlayerStore",
+    "JsonPlayerStore",
     "PlayerRowCodec",
     "PlayerRowKind",
     "PlayerSnapshot",

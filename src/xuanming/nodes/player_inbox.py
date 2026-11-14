@@ -5,6 +5,7 @@ import logging
 import sqlite3
 import time
 from contextlib import closing
+from inspect import isawaitable
 from itertools import count
 
 from google.protobuf.message import DecodeError
@@ -335,9 +336,11 @@ class SceneInbox:
                           outcome=outcome, reason=reason)
         if len(cursor.recent) > MAX_RECENT:
             del cursor.recent[:-MAX_RECENT]
-        def committed(snapshot):
+        async def committed(snapshot):
             for audit in audits:
-                audit(snapshot)
+                result = audit(snapshot)
+                if isawaitable(result):
+                    await result
 
         await self.scene.commit_player_data(player, data, on_committed=committed if audits else None)
         if settlement is not None and not duplicate:

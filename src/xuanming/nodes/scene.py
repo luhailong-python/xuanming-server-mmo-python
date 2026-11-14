@@ -659,7 +659,9 @@ class SceneNode:
             player.pending_save = None
             if pending.on_committed is not None:
                 try:
-                    pending.on_committed(player.snapshot)
+                    result = pending.on_committed(player.snapshot)
+                    if inspect.isawaitable(result):
+                        await result
                 except Exception:
                     logger.exception("执行存档后的通知失败 player_id=%s", player.player_id)
 

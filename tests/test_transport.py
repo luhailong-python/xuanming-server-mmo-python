@@ -20,6 +20,8 @@ from xuanming.transport import (
     RpcInvalidResponse,
     RpcLinkHeartbeat,
     RpcMessageType,
+    WebSocketPacketReader,
+    WebSocketPacketWriter,
     decode_packet,
     decode_rpc_frame,
     encode_packet,
@@ -87,6 +89,48 @@ def test_gate_frame_stream_handles_partial_and_concatenated_reads():
         reader.feed_eof()
         with pytest.raises(FrameError, match="truncated frame body"):
             await read_packet(reader)
+
+    asyncio.run(scenario())
+
+
+def test_websocket_adapters_keep_one_original_frame_per_binary_message(protocol):
+    class MemoryWebSocket:
+        def __init__(self, incoming=()):
+            self.incoming = list(incoming)
+            self.outgoing = []
+
+        async def recv(self):
+            if not self.incoming:
+                raise RuntimeError("no queued frame")
+            return self.incoming.pop(0)
+
+        async def send(self, frame):
+            self.outgoing.append(frame)
+
+        async def close(self, **_kwargs):
+            return None
+
+    async def scenario():
+        request = protocol.message("ClientHeartbeatRequest", seq=42)
+        frame = encode_packet(Packet.from_message(request))
+        websocket = MemoryWebSocket([frame])
+        reader = WebSocketPacketReader(websocket)
+        assert await reader.readexactly(4) == frame[:4]
+        assert await reader.readexactly(len(frame) - 4) == frame[4:]
+
+        writer = WebSocketPacketWriter(websocket)
+        writer.write(frame)
+        await writer.drain()
+        assert websocket.outgoing == [frame]
+        assert decode_packet(websocket.outgoing[0]).parse_as(type(request)) == request
+
+        text_socket = MemoryWebSocket(["text"])
+        with pytest.raises(FrameError, match="二进制"):
+            await WebSocketPacketReader(text_socket).readexactly(4)
+
+        combined = MemoryWebSocket([frame + frame])
+        with pytest.raises(FrameError):
+            await WebSocketPacketReader(combined).readexactly(4)
 
     asyncio.run(scenario())
 

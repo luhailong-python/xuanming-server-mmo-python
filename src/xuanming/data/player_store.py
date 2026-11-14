@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
+import json
+import logging
+import os
 import random
 import sqlite3
+import tempfile
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import closing
@@ -16,9 +21,12 @@ from types import MappingProxyType
 from typing import Protocol
 from weakref import WeakValueDictionary
 
+from filelock import FileLock, Timeout as FileLockTimeout
 from google.protobuf.message import DecodeError, Message
 
 from .player_rows import PlayerRowKind
+
+logger = logging.getLogger(__name__)
 
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_WIRE_BYTES = (4 * 1024 - 64) * 1024
@@ -358,6 +366,241 @@ class SqlitePlayerStore(_SnapshotStore):
                 "UPDATE player_owner SET owner_epoch = ?, save_seq = ?, released = ? WHERE player_id = ?",
                 (str(snapshot.owner_epoch), str(save_seq), int(release), key),
             )
+
+
+class JsonPlayerStore(_SnapshotStore):
+    """本地角色行存档。跨进程串行化，完整快照通过同目录原子替换提交。"""
+
+    _FORMAT_VERSION = 1
+
+    def __init__(
+        self, path: str | Path, *, legacy_sqlite: str | Path | None = None,
+        auto_create: bool = True, piggyback_fallback: float = 300.0
+    ) -> None:
+        super().__init__(piggyback_fallback=piggyback_fallback)
+        self._path = Path(path)
+        if self._path == Path("") or self._path == Path(":memory:"):
+            raise ValueError("JSON 玩家存档需要持久化文件路径")
+        self._legacy_sqlite = Path(legacy_sqlite) if legacy_sqlite is not None else None
+        self._auto_create = auto_create
+
+    def _locked(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        return FileLock(str(self._path) + ".lock", timeout=30)
+
+    def _read_document(self) -> dict:
+        if not self._path.exists():
+            return {"format_version": self._FORMAT_VERSION, "players": {}}
+        try:
+            document = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise StoreUnavailable("JSON 玩家存档损坏或不可读") from exc
+        if (not isinstance(document, dict) or document.get("format_version") != self._FORMAT_VERSION
+                or not isinstance(document.get("players"), dict)):
+            raise StoreUnavailable("JSON 玩家存档格式版本无效")
+        return document
+
+    def _read_or_import_document(self) -> dict:
+        if self._path.exists() or self._legacy_sqlite is None or not self._legacy_sqlite.exists():
+            return self._read_document()
+        try:
+            with closing(sqlite3.connect(self._legacy_sqlite, timeout=10.0)) as connection:
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('player_owner','player_row')"
+                )}
+                if "player_owner" not in tables or "player_row" not in tables:
+                    return self._read_document()
+                owners = connection.execute(
+                    "SELECT player_id, owner_epoch, holder, save_seq, released, schema_gen FROM player_owner"
+                ).fetchall()
+                stored_rows: dict[str, dict[int, bytes]] = {}
+                for player_id, kind, payload in connection.execute(
+                    "SELECT player_id, kind, payload FROM player_row"
+                ):
+                    stored_rows.setdefault(str(player_id), {})[int(kind)] = bytes(payload)
+        except (sqlite3.Error, OSError) as exc:
+            raise StoreUnavailable("从旧 SQLite 玩家存档迁移失败") from exc
+        players = {}
+        for player_id, epoch, owner, save_seq, released, schema_gen in owners:
+            players[str(player_id)] = self._encode_player(
+                int(epoch), bytes(owner), int(save_seq), bool(released), int(schema_gen),
+                _validate_rows(stored_rows.get(str(player_id), {})),
+            )
+        document = {"format_version": self._FORMAT_VERSION, "players": players}
+        self._write_document(document)
+        logger.info("已将 %s 个角色快照从 SQLite 导入 JSON", len(players))
+        return document
+
+    @staticmethod
+    def _decode_player(raw: object) -> tuple[int, bytes, int, bool, dict[int, bytes]]:
+        if not isinstance(raw, dict):
+            raise StoreUnavailable("JSON 玩家记录格式无效")
+        try:
+            epoch = int(raw["owner_epoch"])
+            owner = base64.b64decode(raw["holder"], validate=True)
+            save_seq = int(raw["save_seq"])
+            schema_gen = raw["schema_gen"]
+            released = raw["released"]
+            encoded_rows = raw["rows"]
+            if (type(schema_gen) is not int or schema_gen < 1 or type(released) is not bool
+                    or not isinstance(encoded_rows, dict) or not 0 <= epoch <= _MAX_UINT64
+                    or not 0 <= save_seq <= _MAX_UINT64 or not 1 <= len(owner) <= 64):
+                raise ValueError("invalid player record")
+            rows = _validate_rows({int(kind): base64.b64decode(payload, validate=True)
+                                   for kind, payload in encoded_rows.items()})
+        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+            raise StoreUnavailable("JSON 玩家记录内容无效") from exc
+        return epoch, owner, save_seq, released, rows
+
+    @staticmethod
+    def _encode_player(epoch: int, owner: bytes, save_seq: int, released: bool,
+                       schema_gen: int, rows: Mapping[int, bytes]) -> dict:
+        return {
+            "owner_epoch": str(epoch),
+            "holder": base64.b64encode(owner).decode("ascii"),
+            "save_seq": str(save_seq),
+            "released": released,
+            "schema_gen": schema_gen,
+            "rows": {str(kind): base64.b64encode(payload).decode("ascii")
+                     for kind, payload in sorted(rows.items())},
+        }
+
+    def _write_document(self, document: dict) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self._path)
+            if os.name != "nt":
+                directory_fd = os.open(self._path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    async def load_and_claim(
+        self, player_id: int, owner: bytes, owner_epoch: int = 0
+    ) -> PlayerSnapshot:
+        _check_owner(player_id, owner, owner_epoch, allow_zero=True)
+        async with self._lock(player_id):
+            try:
+                snapshot = await asyncio.to_thread(self._claim, player_id, owner, owner_epoch)
+            except (OSError, FileLockTimeout) as exc:
+                raise StoreUnavailable("JSON 玩家认领暂不可用") from exc
+            return self._claimed(snapshot)
+
+    def _claim(self, player_id: int, owner: bytes, owner_epoch: int) -> PlayerSnapshot:
+        key = str(player_id)
+        with self._locked():
+            document = self._read_or_import_document()
+            raw = document["players"].get(key)
+            if raw is None:
+                if not self._auto_create:
+                    raise StoreRejected("LOAD_AND_CLAIM_NO_OWNER")
+                epoch = owner_epoch or 1
+                document["players"][key] = self._encode_player(epoch, owner, 0, False, 1, {})
+                self._write_document(document)
+                return PlayerSnapshot(player_id, owner, epoch, 0, {})
+            stored_epoch, holder, save_seq, _released, rows = self._decode_player(raw)
+            epoch = owner_epoch or (stored_epoch if holder == owner else _next(stored_epoch))
+            if epoch < stored_epoch:
+                raise StoreRejected("LOAD_AND_CLAIM_STALE_OWNER")
+            if epoch == stored_epoch and holder and holder != owner:
+                raise StoreRejected("LOAD_AND_CLAIM_NOT_HOLDER")
+            if raw["schema_gen"] > 1:
+                raise StoreRejected("LOAD_AND_CLAIM_SCHEMA_TOO_NEW")
+            document["players"][key] = self._encode_player(epoch, owner, save_seq, False, raw["schema_gen"], rows)
+            self._write_document(document)
+            return PlayerSnapshot(player_id, owner, epoch, save_seq, rows, schema_gen=raw["schema_gen"])
+
+    async def release_detached(self, player_id: int, owner: bytes, owner_epoch: int) -> bool:
+        _check_owner(player_id, owner, owner_epoch)
+        async with self._lock(player_id):
+            try:
+                return await asyncio.to_thread(self._release_detached, player_id, owner, owner_epoch)
+            except (OSError, FileLockTimeout, StoreRejected):
+                return False
+
+    def _release_detached(self, player_id: int, owner: bytes, owner_epoch: int) -> bool:
+        key = str(player_id)
+        with self._locked():
+            document = self._read_or_import_document()
+            raw = document["players"].get(key)
+            if raw is None:
+                return True
+            epoch, holder, save_seq, _released, rows = self._decode_player(raw)
+            if owner_epoch < epoch or holder != owner:
+                return True
+            if raw["schema_gen"] != 1:
+                raise StoreRejected("SAVE_PLAYER_SCHEMA_REGRESSED")
+            document["players"][key] = self._encode_player(
+                owner_epoch, owner, _next(save_seq), True, 1, rows,
+            )
+            self._write_document(document)
+            return True
+
+    async def commit(
+        self,
+        snapshot: PlayerSnapshot,
+        rows: Mapping[int, bytes],
+        *,
+        release: bool = False,
+        force: bool = False,
+        periodic: bool = False,
+    ) -> PlayerSnapshot:
+        rows = _validate_rows(rows)
+        _check_owner(snapshot.player_id, snapshot.owner, snapshot.owner_epoch)
+        async with self._lock(snapshot.player_id):
+            revision = self._revision(snapshot)
+            changes = self._changes(
+                snapshot, revision, rows, release=release, force=force, periodic=periodic,
+            )
+            if changes is None:
+                return snapshot
+            _check_save_size(changes)
+            save_seq = _next(snapshot.save_seq)
+            try:
+                await asyncio.to_thread(self._write, snapshot, changes, save_seq, release)
+            except (OSError, FileLockTimeout) as exc:
+                raise StoreUnavailable("JSON 玩家存档未获确认") from exc
+            return self._saved(snapshot, revision, changes, save_seq, release)
+
+    def _write(
+        self, snapshot: PlayerSnapshot, changes: Mapping[int, bytes], save_seq: int, release: bool
+    ) -> None:
+        key = str(snapshot.player_id)
+        with self._locked():
+            document = self._read_or_import_document()
+            raw = document["players"].get(key)
+            if raw is None:
+                raise StoreRejected("SAVE_PLAYER_NO_OWNER")
+            epoch, holder, old_seq, was_released, existing = self._decode_player(raw)
+            if snapshot.owner_epoch < epoch:
+                raise StoreRejected("SAVE_PLAYER_STALE_OWNER")
+            if holder != snapshot.owner:
+                result = "SAVE_PLAYER_NOT_HOLDER" if snapshot.owner_epoch == epoch else "SAVE_PLAYER_UNCLAIMED"
+                raise StoreRejected(result)
+            expected = {**snapshot.rows, **changes}
+            if save_seq == old_seq and existing == expected and was_released == release:
+                return
+            if save_seq <= old_seq:
+                raise StoreRejected("SAVE_PLAYER_OLDER_SEQ")
+            if snapshot.schema_gen != raw["schema_gen"]:
+                raise StoreRejected("SAVE_PLAYER_SCHEMA_REGRESSED")
+            updated = {**existing, **changes}
+            document["players"][key] = self._encode_player(
+                snapshot.owner_epoch, snapshot.owner, save_seq, release, snapshot.schema_gen, updated,
+            )
+            self._write_document(document)
 
 
 class DataServicePlayerStore(_SnapshotStore):

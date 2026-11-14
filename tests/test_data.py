@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import multiprocessing
 import shutil
 
 import pytest
@@ -10,6 +11,7 @@ from xuanming.data import (
     ConfigTableRegistry,
     ConfigTables,
     DataServicePlayerStore,
+    JsonPlayerStore,
     PlayerRowCodec,
     PlayerRowKind,
     PlayerSnapshot,
@@ -18,6 +20,15 @@ from xuanming.data import (
     StoreRejected,
 )
 from xuanming.protocol import Protocol
+
+
+def _json_store_process(path: str, player_id: int) -> None:
+    async def save():
+        store = JsonPlayerStore(path)
+        snapshot = await store.load_and_claim(player_id, f"scene-{player_id}".encode())
+        await store.commit(snapshot, {PlayerRowKind.WALLET: f"wallet-{player_id}".encode()})
+
+    asyncio.run(save())
 
 
 def test_config_tables_keep_source_indices_and_encoding_parity(tmp_path):
@@ -100,6 +111,60 @@ def test_sqlite_snapshot_is_durable_and_old_writer_cannot_save(tmp_path):
         assert latest.rows == location
         with pytest.raises(StoreRejected, match="SAVE_PLAYER_STALE_OWNER"):
             await store.commit(reconnected, location, force=True)
+
+    asyncio.run(exercise())
+
+
+def test_json_snapshot_is_atomic_fenced_and_cross_process_safe(tmp_path):
+    async def exercise():
+        path = tmp_path / "data" / "players.json"
+        store = JsonPlayerStore(path)
+        missing = JsonPlayerStore(path, auto_create=False)
+        with pytest.raises(StoreRejected, match="LOAD_AND_CLAIM_NO_OWNER"):
+            await missing.load_and_claim(100, b"scene-1")
+        snapshot = await store.load_and_claim(7, b"scene-1", 9)
+        rows = {PlayerRowKind.WALLET: b"wallet"}
+        saved = await store.commit(snapshot, rows)
+        assert saved.save_seq == 1 and saved.rows == rows
+        with pytest.raises(StoreRejected, match="SAVE_PLAYER_OLDER_SEQ"):
+            await store.commit(snapshot, rows)
+        replacement = await JsonPlayerStore(path).load_and_claim(7, b"scene-2", 10)
+        assert replacement.rows == rows
+        with pytest.raises(StoreRejected, match="SAVE_PLAYER_STALE_OWNER"):
+            await store.commit(saved, {PlayerRowKind.WALLET: b"stale"}, force=True)
+
+        context = multiprocessing.get_context("spawn")
+        processes = [context.Process(target=_json_store_process, args=(str(path), player_id))
+                     for player_id in (21, 22)]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(20)
+            assert process.exitcode == 0
+
+        reloaded = JsonPlayerStore(path, auto_create=False)
+        for player_id in (21, 22):
+            claimed = await reloaded.load_and_claim(player_id, f"verify-{player_id}".encode())
+            assert claimed.rows[PlayerRowKind.WALLET] == f"wallet-{player_id}".encode()
+
+    asyncio.run(exercise())
+
+
+def test_json_store_imports_existing_sqlite_player_rows_once(tmp_path):
+    async def exercise():
+        legacy = SqlitePlayerStore(tmp_path / "players.sqlite3")
+        snapshot = await legacy.load_and_claim(73, b"scene-1", 8)
+        saved = await legacy.commit(snapshot, {PlayerRowKind.WALLET: b"existing-wallet"})
+        json_store = JsonPlayerStore(tmp_path / "players.json", legacy_sqlite=tmp_path / "players.sqlite3")
+        imported = await json_store.load_and_claim(73, b"scene-1")
+        assert imported.rows[PlayerRowKind.WALLET] == b"existing-wallet"
+        assert imported.save_seq == saved.save_seq and imported.owner_epoch == saved.owner_epoch
+        updated = await json_store.commit(imported, {PlayerRowKind.WALLET: b"json-wallet"})
+        assert updated.rows[PlayerRowKind.WALLET] == b"json-wallet"
+
+        reloaded = JsonPlayerStore(tmp_path / "players.json", legacy_sqlite=tmp_path / "players.sqlite3")
+        latest = await reloaded.load_and_claim(73, b"scene-1")
+        assert latest.rows[PlayerRowKind.WALLET] == b"json-wallet"
 
     asyncio.run(exercise())
 

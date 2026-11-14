@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import os
+from pathlib import Path
+import tempfile
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Literal
+
+from filelock import FileLock
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +42,147 @@ class _GainBucket:
     amount: int = 0
 
 
+class _AnomalyJournal:
+    """Atomic JSON journal for rolling windows and a retryable alert outbox."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def _locked(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return FileLock(str(self.path) + ".lock", timeout=30)
+
+    def _read(self) -> dict:
+        if not self.path.exists():
+            return {"format_version": 1, "players": {}, "outbox": []}
+        try:
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("资产告警 JSON 日志损坏或不可读") from exc
+        if (not isinstance(document, dict) or document.get("format_version") != 1
+                or not isinstance(document.get("players"), dict) or not isinstance(document.get("outbox"), list)):
+            raise RuntimeError("资产告警 JSON 日志格式无效")
+        return document
+
+    def _write(self, document: dict) -> None:
+        encoded = json.dumps(document, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            if os.name != "nt":
+                directory_fd = os.open(self.path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    def record(self, player_id: int, gain: AssetGain, timestamp: int, threshold: AnomalyThreshold,
+               *, enqueue_alert: bool) -> tuple[list[tuple[int, int]], int, int, bytes | None]:
+        with self._locked():
+            document = self._read()
+            if timestamp - int(document.get("last_sweep", 0)) >= 60:
+                for stored_player_id, buckets in tuple(document["players"].items()):
+                    if not isinstance(buckets, dict):
+                        del document["players"][stored_player_id]
+                        continue
+                    for stored_key, stored_bucket in tuple(buckets.items()):
+                        if isinstance(stored_bucket, dict):
+                            window = max(0, int(stored_bucket.get("window_seconds", 600)))
+                            old_events = stored_bucket.get("events", [])
+                        else:
+                            window, old_events = 600, stored_bucket
+                        start = max(0, timestamp - window)
+                        live = [row for row in old_events if isinstance(row, list) and len(row) == 2
+                                and int(row[0]) >= start]
+                        if live:
+                            buckets[stored_key] = {"window_seconds": window, "events": live}
+                        else:
+                            del buckets[stored_key]
+                    if not buckets:
+                        del document["players"][stored_player_id]
+                document["last_sweep"] = timestamp
+            player = document["players"].setdefault(str(player_id), {})
+            key = f"{gain.category}:{gain.sub_key}"
+            stored_bucket = player.get(key, [])
+            if isinstance(stored_bucket, dict):
+                old_events = stored_bucket.get("events", [])
+            else:
+                old_events = stored_bucket
+            if not isinstance(old_events, list):
+                raise RuntimeError("资产收益窗口记录格式无效")
+            start = max(0, timestamp - threshold.window_seconds)
+            events = [(int(row[0]), int(row[1])) for row in old_events
+                      if isinstance(row, list) and len(row) == 2 and int(row[0]) >= start]
+            events.append((timestamp, gain.amount))
+            total = sum(amount for _, amount in events)
+            player[key] = {"window_seconds": threshold.window_seconds, "events": events}
+            exceeded = len(events) > threshold.count or total > threshold.amount
+            payload = None
+            if exceeded and enqueue_alert:
+                alert = {
+                    "player_id": player_id, "category": gain.category, "sub_key": gain.sub_key,
+                    "count": len(events), "total_amount": total, "threshold_count": threshold.count,
+                    "threshold_amount": threshold.amount, "window_seconds": threshold.window_seconds,
+                    "timestamp": timestamp,
+                }
+                payload = json.dumps(alert, separators=(",", ":")).encode()
+                alert_id = hashlib.sha256(uuid.uuid4().bytes + payload).hexdigest()
+                document["outbox"].append({
+                    "id": alert_id, "payload": base64.b64encode(payload).decode("ascii"),
+                    "attempts": 0, "lease_owner": "", "lease_until": 0,
+                })
+            self._write(document)
+            return events, len(events), total, payload
+
+    def has_outbox(self) -> bool:
+        with self._locked():
+            return bool(self._read()["outbox"])
+
+    def claim(self, worker_id: str, now: int) -> tuple[str, bytes] | None:
+        with self._locked():
+            document = self._read()
+            for item in document["outbox"]:
+                if int(item.get("lease_until", 0)) > now:
+                    return None
+                item["lease_owner"] = worker_id
+                item["lease_until"] = now + 30
+                self._write(document)
+                return item["id"], base64.b64decode(item["payload"], validate=True)
+            return None
+
+    def acknowledge(self, alert_id: str, worker_id: str) -> None:
+        with self._locked():
+            document = self._read()
+            document["outbox"] = [item for item in document["outbox"]
+                                  if not (item.get("id") == alert_id and item.get("lease_owner") == worker_id)]
+            self._write(document)
+
+    def retry(self, alert_id: str, worker_id: str, now: int) -> float:
+        with self._locked():
+            document = self._read()
+            delay = 1.0
+            for item in document["outbox"]:
+                if item.get("id") == alert_id and item.get("lease_owner") == worker_id:
+                    item["attempts"] = int(item.get("attempts", 0)) + 1
+                    delay = min(60.0, float(2 ** min(item["attempts"], 6)))
+                    item["lease_until"] = now + int(delay)
+                    item["lease_owner"] = ""
+                    break
+            self._write(document)
+            return delay
+
+
 class AssetAnomaly:
-    def __init__(self, is_current, emit=None, *, clock=time.time) -> None:
+    def __init__(self, is_current, emit=None, *, clock=time.time, journal_path: str | Path | None = None) -> None:
         self.default_threshold = AnomalyThreshold()
         self.currency_thresholds: dict[int, AnomalyThreshold] = {}
         self.item_thresholds: dict[int, AnomalyThreshold] = {}
@@ -45,48 +192,96 @@ class AssetAnomaly:
         self._pending = asyncio.Queue(maxsize=2048)
         self._worker: asyncio.Task | None = None
         self._closed = False
+        self._journal = _AnomalyJournal(journal_path) if journal_path is not None else None
+        self._wake = asyncio.Event()
+        self._worker_id = uuid.uuid4().hex
+        self._started = self._journal is None
+
+    async def start(self) -> None:
+        self._started = True
+        if self.emit is not None and self._journal is not None:
+            try:
+                if await asyncio.to_thread(self._journal.has_outbox):
+                    self._wake.set()
+                    self._ensure_worker()
+            except Exception:
+                logger.exception("读取持久资产告警队列失败")
 
     def now(self) -> int:
         return int(self.clock())
 
-    def record(self, player, gain: AssetGain, timestamp: int) -> bool:
+    async def record(self, player, gain: AssetGain, timestamp: int) -> bool:
         if player is None or not self.is_current(player):
             return False
         thresholds = self.currency_thresholds if gain.category == "currency" else self.item_thresholds
         threshold = thresholds.get(gain.sub_key, self.default_threshold)
         if not (threshold.count or threshold.amount):
             return False
+        key = gain.category, gain.sub_key
+        if self._journal is None:
+            if player.asset_anomaly is None:
+                player.asset_anomaly = {}
+            bucket = player.asset_anomaly.get(key)
+            if bucket is None:
+                bucket = player.asset_anomaly[key] = _GainBucket()
+            start = max(0, timestamp - threshold.window_seconds)
+            while bucket.events and bucket.events[0][0] < start:
+                _, expired = bucket.events.popleft()
+                bucket.amount -= expired
+            bucket.events.append((timestamp, gain.amount))
+            bucket.amount += gain.amount
+            count, total = len(bucket.events), bucket.amount
+            payload = self._payload(player.player_id, gain, count, total, threshold, timestamp)
+        else:
+            try:
+                events, count, total, payload = await asyncio.to_thread(
+                    self._journal.record, player.player_id, gain, timestamp, threshold,
+                    enqueue_alert=self.emit is not None,
+                )
+            except Exception:
+                logger.exception("持久化资产收益窗口失败 player_id=%s", player.player_id)
+                return self._record_memory(player, gain, timestamp, threshold)
+            if player.asset_anomaly is None:
+                player.asset_anomaly = {}
+            player.asset_anomaly[key] = _GainBucket(deque(events), total)
+        if count <= threshold.count and total <= threshold.amount:
+            return False
+        player_id = player.player_id
+        logger.warning(
+            "资产收益超出窗口阈值 player_id=%s category=%s sub_key=%s count=%s total_amount=%s "
+            "threshold_count=%s threshold_amount=%s window_seconds=%s",
+            player_id, gain.category, gain.sub_key, count, total,
+            threshold.count, threshold.amount, threshold.window_seconds,
+        )
+        if self.emit is not None and payload is not None:
+            self._enqueue(player_id, payload)
+        return True
+
+    def _record_memory(self, player, gain, timestamp, threshold) -> bool:
         if player.asset_anomaly is None:
             player.asset_anomaly = {}
-        key = gain.category, gain.sub_key
-        bucket = player.asset_anomaly.get(key)
-        if bucket is None:
-            bucket = player.asset_anomaly[key] = _GainBucket()
+        bucket = player.asset_anomaly.setdefault((gain.category, gain.sub_key), _GainBucket())
         start = max(0, timestamp - threshold.window_seconds)
         while bucket.events and bucket.events[0][0] < start:
             _, expired = bucket.events.popleft()
             bucket.amount -= expired
         bucket.events.append((timestamp, gain.amount))
         bucket.amount += gain.amount
-        count = len(bucket.events)
-        if count <= threshold.count and bucket.amount <= threshold.amount:
+        if len(bucket.events) <= threshold.count and bucket.amount <= threshold.amount:
             return False
-        player_id = player.player_id
-        logger.warning(
-            "资产收益超出窗口阈值 player_id=%s category=%s sub_key=%s count=%s total_amount=%s "
-            "threshold_count=%s threshold_amount=%s window_seconds=%s",
-            player_id, gain.category, gain.sub_key, count, bucket.amount,
-            threshold.count, threshold.amount, threshold.window_seconds,
-        )
+        payload = self._payload(player.player_id, gain, len(bucket.events), bucket.amount, threshold, timestamp)
         if self.emit is not None:
-            payload = json.dumps({
-                "player_id": player_id, "category": gain.category, "sub_key": gain.sub_key,
-                "count": count, "total_amount": bucket.amount, "threshold_count": threshold.count,
-                "threshold_amount": threshold.amount, "window_seconds": threshold.window_seconds,
-                "timestamp": timestamp,
-            }, separators=(",", ":")).encode()
-            self._enqueue(player_id, payload)
+            self._enqueue(player.player_id, payload)
         return True
+
+    @staticmethod
+    def _payload(player_id, gain, count, total, threshold, timestamp) -> bytes:
+        return json.dumps({
+            "player_id": player_id, "category": gain.category, "sub_key": gain.sub_key,
+            "count": count, "total_amount": total, "threshold_count": threshold.count,
+            "threshold_amount": threshold.amount, "window_seconds": threshold.window_seconds,
+            "timestamp": timestamp,
+        }, separators=(",", ":")).encode()
 
     def currency_gain_count(self, player, kind: int) -> int:
         if player is None or not self.is_current(player) or player.asset_anomaly is None:
@@ -103,14 +298,36 @@ class AssetAnomaly:
             player.asset_anomaly = None
 
     def _enqueue(self, player_id: int, payload: bytes) -> None:
+        if self._journal is not None:
+            if self._started:
+                self._wake.set()
+                self._ensure_worker()
+            return
         if self._closed or self._pending.full():
             logger.error("资产告警队列不可用 player_id=%s", player_id)
             return
         self._pending.put_nowait((player_id, payload))
-        if self._worker is None or self._worker.done():
+        self._ensure_worker()
+
+    def _ensure_worker(self) -> None:
+        if not self._closed and (self._worker is None or self._worker.done()):
             self._worker = asyncio.create_task(self._publish())
+            self._worker.add_done_callback(self._worker_finished)
+
+    def _worker_finished(self, task) -> None:
+        if self._worker is task:
+            self._worker = None
+        if self._closed or self.emit is None:
+            return
+        if self._journal is None and not self._pending.empty():
+            self._ensure_worker()
+        elif self._journal is not None and self._started and self._wake.is_set():
+            self._ensure_worker()
 
     async def _publish(self) -> None:
+        if self._journal is not None:
+            await self._publish_journal()
+            return
         while not self._pending.empty():
             player_id, payload = self._pending.get_nowait()
             try:
@@ -120,6 +337,43 @@ class AssetAnomaly:
                         await sent
             except Exception:
                 logger.exception("发布资产收益告警失败 player_id=%s", player_id)
+
+    async def _publish_journal(self) -> None:
+        while not self._closed:
+            try:
+                item = await asyncio.to_thread(self._journal.claim, self._worker_id, int(time.time()))
+            except Exception:
+                logger.exception("读取持久资产告警失败")
+                await asyncio.sleep(1)
+                continue
+            if item is None:
+                try:
+                    if not await asyncio.to_thread(self._journal.has_outbox):
+                        return
+                except Exception:
+                    logger.exception("读取持久资产告警状态失败")
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=1)
+                except TimeoutError:
+                    pass
+                continue
+            alert_id, payload = item
+            try:
+                async with asyncio.timeout(5):
+                    sent = self.emit(json.loads(payload)["player_id"], payload)
+                    if isawaitable(sent):
+                        await sent
+                await asyncio.to_thread(self._journal.acknowledge, alert_id, self._worker_id)
+            except Exception:
+                logger.exception("发布持久资产收益告警失败 id=%s", alert_id)
+                try:
+                    delay = await asyncio.to_thread(self._journal.retry, alert_id, self._worker_id,
+                                                    int(time.time()))
+                    await asyncio.sleep(delay)
+                except Exception:
+                    logger.exception("更新持久资产告警重试状态失败 id=%s", alert_id)
+                    await asyncio.sleep(1)
 
     async def close(self) -> None:
         self._closed = True

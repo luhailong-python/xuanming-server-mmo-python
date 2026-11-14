@@ -7,7 +7,7 @@ import uuid
 from contextlib import AsyncExitStack
 
 from .cluster import BATTLE, GATE, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
-from .data import ConfigTables, DataServicePlayerStore, PlayerRowCodec, SqlitePlayerStore
+from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec, SqlitePlayerStore
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
 from .grpc_runtime import GrpcClient, GrpcUnavailable, serve_grpc
@@ -58,6 +58,7 @@ class Runtime:
         self._stack = AsyncExitStack()
         self._background: list[asyncio.Task] = []
         self._servers: list[asyncio.Server] = []
+        self._websocket_servers = []
         self._shutdown_requested = asyncio.Event()
         self.gate = None
         self.scene = None
@@ -98,6 +99,8 @@ class Runtime:
             self.battle.begin_shutdown()
         for server in self._servers:
             server.close()
+        for server in self._websocket_servers:
+            server.close()
         for task in self._background:
             task.cancel()
         await asyncio.gather(*self._background, return_exceptions=True)
@@ -114,6 +117,7 @@ class Runtime:
                 await self._stack.aclose()
             finally:
                 await asyncio.gather(*(server.wait_closed() for server in self._servers))
+                await asyncio.gather(*(server.wait_closed() for server in self._websocket_servers))
 
     async def _close_battle_registration(self) -> None:
         self.battle_info.admission = _ADMISSION_CLOSED
@@ -157,6 +161,20 @@ class Runtime:
         if options.client_host or options.client_port:
             info.client_endpoint.ip = options.client_host or host
             info.client_endpoint.port = options.client_port or port
+
+    async def _listen_websocket(self, role, handler) -> None:
+        options = getattr(self.settings, role)
+        if options.websocket_port is None:
+            return
+        from websockets.asyncio.server import serve
+        from .transport import DEFAULT_GATE_FRAME_SIZE
+
+        server = await serve(
+            handler, options.host, options.websocket_port,
+            max_size=DEFAULT_GATE_FRAME_SIZE + 4, max_queue=128, compression=None,
+            ping_interval=20, ping_timeout=30,
+        )
+        self._websocket_servers.append(server)
 
     async def _listen_grpc(self, role, info, services) -> None:
         options = getattr(self.settings, role)
@@ -206,6 +224,7 @@ class Runtime:
         gate.scene = links
         self._stack.push_async_callback(gate.close)
         await self._listen_tcp("gate", info, gate.handle_client)
+        await self._listen_websocket("gate", gate.handle_websocket)
         if self.settings.gate.rpc_port is not None:
             from .nodes.gate_rpc import GateRpcService
 
@@ -247,7 +266,8 @@ class Runtime:
         audit = anomaly = allocate_tx_id = None
         if self.local:
             self.settings.database.parent.mkdir(parents=True, exist_ok=True)
-            store = SqlitePlayerStore(self.settings.database)
+            path = self.settings.local_player_store or self.settings.database.with_name("players.json")
+            store = JsonPlayerStore(path, legacy_sqlite=self.settings.database)
             allocate_item_id = IdSegments.local(self.settings.database, "item")
         else:
             client = GrpcClient(self.settings.player_store, timeout=5, receive_limit=8 << 20)
@@ -303,7 +323,10 @@ class Runtime:
             scene, tables, allow_gm=self.local and os.getenv("SCENE_RUN_MODE", "") in ("dev", "test"),
             allocate_item_id=allocate_item_id,
             emit_audit=audit, allocate_tx_id=allocate_tx_id, emit_anomaly=anomaly,
+            anomaly_journal_path=(self.settings.anomaly_journal
+                                  or self.settings.database.with_name("asset-anomaly.json")),
         )
+        await scene.assets.anomaly.start()
         self._stack.push_async_callback(scene.assets.close)
         self._stack.push_async_callback(scene.close)
         scene.assets.register_client_handlers()
@@ -499,6 +522,7 @@ class Runtime:
             self._stack.push_async_callback(self._finish_local_outcomes)
         self._stack.push_async_callback(clients.close)
         await self._listen_tcp("battle", info, clients.serve)
+        await self._listen_websocket("battle", clients.serve_websocket)
         agones_endpoint = await lifecycle.client_endpoint() if endpoint.source == "agones" else None
         self._resolve_client_endpoint(info, endpoint, agones=agones_endpoint)
         battle.host = info.client_endpoint.ip or info.endpoint.ip

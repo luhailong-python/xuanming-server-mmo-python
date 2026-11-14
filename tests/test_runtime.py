@@ -11,6 +11,7 @@ from xuanming.protocol import Protocol, RouteNode, RpcKind
 from xuanming.runtime import Runtime, grpc_address
 from xuanming.settings import Settings
 from xuanming.smoke import smoke
+from xuanming.transport import Packet, decode_packet, encode_packet
 
 
 def test_protocol_keeps_client_and_cluster_route_boundaries():
@@ -27,6 +28,53 @@ def test_protocol_keeps_client_and_cluster_route_boundaries():
 
 def test_end_to_end():
     assert len(asyncio.run(smoke())) == 2
+
+
+def test_gate_websocket_carries_the_existing_ticket_frame(tmp_path):
+    async def exercise():
+        from websockets.asyncio.client import connect
+
+        settings = Settings()
+        settings = replace(
+            settings, database=tmp_path / "players.sqlite3",
+            gate=replace(settings.gate, port=0, websocket_port=0),
+            scene=replace(settings.scene, port=0, grpc_port=0),
+            battle=replace(settings.battle, port=0, grpc_port=0),
+        )
+        async with Runtime(settings, "local", dev_token="websocket-test") as runtime:
+            port = runtime._websocket_servers[0].sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}", compression=None) as websocket:
+                await websocket.send(encode_packet(Packet.from_message(runtime.gate.issue_ticket())))
+                packet = decode_packet(await websocket.recv())
+                response = runtime.protocol.parse(packet.type_name, packet.payload)
+                assert packet.type_name == "ClientTokenVerifyResponse" and response.success
+
+    asyncio.run(exercise())
+
+
+def test_local_battle_does_not_ack_an_empty_personal_outcome(tmp_path):
+    async def exercise():
+        settings = Settings()
+        settings = replace(
+            settings, database=tmp_path / "players.sqlite3",
+            gate=replace(settings.gate, port=0),
+            scene=replace(settings.scene, port=0, grpc_port=0),
+            battle=replace(settings.battle, port=0, grpc_port=0),
+        )
+        async with Runtime(settings, "local", dev_token="empty-outcome-test") as runtime:
+            request = runtime.protocol.message("match.CommitBattleOutcomeRequest", battle_id=91)
+            enqueued, decisions = [], []
+
+            async def enqueue(_settlements):
+                enqueued.append(True)
+
+            runtime.battle.outcome_request = lambda _battle_id: request
+            runtime.battle.decide_outcome = lambda *_args, **_kwargs: decisions.append(True)
+            runtime.local_inbox.enqueue = enqueue
+            await runtime._local_commit(91)
+            assert not enqueued and not decisions
+
+    asyncio.run(exercise())
 
 
 def test_battle_grpc_keeps_native_placement_guards(tmp_path):

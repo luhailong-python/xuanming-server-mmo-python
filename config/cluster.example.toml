@@ -17,6 +17,7 @@ redis = "redis://redis-player:6379/0"
 redis_cluster = false
 scene_control_redis = "redis://redis-scene-control:6379/0"
 match = "match:50500"
+anomaly_journal = "/var/lib/xuanming/asset-anomaly.json"
 
 [gate]
 node_id = 101
@@ -26,6 +27,7 @@ rpc_port = 8615
 advertise_host = "gate-101"
 client_host = "gate-101.example.com"
 client_port = 8610
+websocket_port = 8616
 
 [scene]
 node_id = 102
@@ -42,3 +44,4 @@ grpc_port = 8614
 advertise_host = "battle-103"
 client_host = "battle-103.example.com"
 client_port = 8613
+websocket_port = 8617

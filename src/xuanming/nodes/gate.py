@@ -16,7 +16,10 @@ from ..data.config_tables import ConfigTables
 from ..grpc_runtime import session_metadata
 from ..node_link import GATE_BROADCAST_METHODS, SceneLinkNotReady, SceneNodeNotFound
 from ..protocol import RouteNode, RpcKind
-from ..transport import FrameError, Packet, RpcError, encode_packet, read_packet, write_packet
+from ..transport import (
+    FrameError, Packet, RpcError, WebSocketPacketReader, WebSocketPacketWriter,
+    encode_packet, read_packet, write_packet,
+)
 from ..transport.client_limits import illegal_packet_threshold as _illegal_packet_threshold
 from ..transport.client_output import ClientOutputQueue
 from .gate_chat import WorldChatFanout
@@ -213,6 +216,11 @@ class GateNode:
                     await self._disconnect(session)
             finally:
                 self._handlers.discard(task)
+
+    async def handle_websocket(self, websocket) -> None:
+        reader = WebSocketPacketReader(websocket)
+        writer = WebSocketPacketWriter(websocket)
+        await self.handle_client(reader, writer)
 
     async def _verify(self, reader, session: Session) -> bool:
         async with asyncio.timeout(10):

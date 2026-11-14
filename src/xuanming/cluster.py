@@ -216,12 +216,12 @@ class KafkaCommands:
             actual = self.consumer.partitions_for_topic(topic)
             if actual is None or len(actual) != self.partitions:
                 raise RuntimeError(f"命令 topic {topic} 的分区数与配置不一致")
-            if not await self.consumer.seek_to_end(target):
-                raise RuntimeError(f"无法定位命令 topic {topic} 的最新偏移")
+            await self.consumer.seek_to_end(target)
 
     async def consume(self, dispatch) -> None:
         async for record in self.consumer:
-            await dispatch(record.value)
+            if record.value is not None:
+                await dispatch(record.value)
 
     async def start_world_chat(self) -> None:
         from aiokafka import AIOKafkaConsumer, TopicPartition
@@ -234,8 +234,7 @@ class KafkaCommands:
         await consumer.start()
         if consumer.partitions_for_topic(topic) != partitions:
             raise RuntimeError(f"世界频道 topic {topic} 必须有 4 个分区")
-        if not await consumer.seek_to_end(*targets):
-            raise RuntimeError(f"无法定位世界频道 topic {topic} 的最新偏移")
+        await consumer.seek_to_end(*targets)
 
     async def consume_world_chat(self, dispatch) -> None:
         async for record in self.world_chat_consumer:
@@ -256,12 +255,12 @@ class KafkaCommands:
             actual = self.spectate_consumer.partitions_for_topic(topic)
             if actual is None or len(actual) != count:
                 raise RuntimeError(f"观战 topic {topic} 的分区数与配置不一致")
-        if not await self.spectate_consumer.seek_to_end(*targets):
-            raise RuntimeError("无法定位观战 topic 的最新偏移")
+        await self.spectate_consumer.seek_to_end(*targets)
 
     async def consume_spectate(self, dispatch) -> None:
         async for record in self.spectate_consumer:
-            await dispatch(record.topic, record.value)
+            if record.value is not None:
+                await dispatch(record.topic, record.value)
 
     async def publish_spectate(self, channel: str, gate_id: int, battle_id: int, message) -> None:
         from .nodes.battle_spectate import spectate_kafka_route

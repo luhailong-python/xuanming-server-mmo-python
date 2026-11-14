@@ -16,6 +16,7 @@ from xuanming.data import ConfigTables
 from xuanming.grpc_runtime import serve_grpc
 from xuanming.protocol import Protocol
 from xuanming.transport import Packet, read_packet, write_packet
+from xuanming.transport import decode_packet, encode_packet
 
 
 @dataclass
@@ -106,6 +107,31 @@ def test_create_idempotency_and_wire_ticket_fence(runtime):
     clock.now = assigned.expire_at_ms
     with pytest.raises(BattleError, match="expired"):
         node.authorize(assigned.token_payload, assigned.token_signature)
+
+
+def test_battle_websocket_carries_the_existing_battle_ticket_frame(runtime):
+    async def exercise():
+        from websockets.asyncio.client import connect
+        from websockets.asyncio.server import serve
+
+        protocol, node, _, _, _ = runtime
+        assert not node.create(create_request(protocol)).error_message.id
+        assignment = node._assignment(node.rooms[10], 101, 1)
+        clients = BattleClients(protocol, node)
+        async with serve(clients.serve_websocket, "127.0.0.1", 0, compression=None) as server:
+            port = server.sockets[0].getsockname()[1]
+            async with connect(f"ws://127.0.0.1:{port}", compression=None) as websocket:
+                verify = protocol.message(
+                    "BattleTokenVerifyRequest", payload=assignment.token_payload,
+                    signature=assignment.token_signature,
+                )
+                await websocket.send(encode_packet(Packet.from_message(verify)))
+                packet = decode_packet(await websocket.recv())
+                response = protocol.parse(packet.type_name, packet.payload)
+                assert packet.type_name == "BattleTokenVerifyResponse" and response.success
+        await clients.close()
+
+    asyncio.run(exercise())
 
 
 def test_reconnect_fences_late_close_and_turn_waits_for_sql(runtime):

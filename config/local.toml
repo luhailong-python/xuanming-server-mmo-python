@@ -1,5 +1,7 @@
 zone_id = 1
 database = "../run/players.sqlite3"
+local_player_store = "../run/players.json"
+anomaly_journal = "../run/asset-anomaly.json"
 
 [gate]
 port = 8610

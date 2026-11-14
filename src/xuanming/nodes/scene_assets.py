@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from inspect import isawaitable
 from secrets import randbelow
 
 from google.protobuf.message import DecodeError
@@ -73,6 +74,7 @@ class SceneAssets(AssetInventory):
         emit_audit=None,
         allocate_tx_id=None,
         emit_anomaly=None,
+        anomaly_journal_path=None,
     ) -> None:
         super().__init__(scene.protocol, tables, allocate_item_id, blocked_gain=blocked_gain)
         self.scene = scene
@@ -91,7 +93,9 @@ class SceneAssets(AssetInventory):
         self._audit = None if emit_audit is None else AssetAudit(
             self.protocol, scene.info.zone_id, self.currency_types, tables, emit_audit, allocate_tx_id,
         )
-        self.anomaly = AssetAnomaly(self._is_current_player, emit_anomaly)
+        self.anomaly = AssetAnomaly(
+            self._is_current_player, emit_anomaly, journal_path=anomaly_journal_path,
+        )
 
     async def close(self) -> None:
         await self.anomaly.close()
@@ -115,11 +119,11 @@ class SceneAssets(AssetInventory):
         earned = tuple(gains)
         timestamp = self.anomaly.now()
 
-        def committed(_snapshot):
+        async def committed(_snapshot):
             if batch is not None and batch.entries:
                 self._audit.enqueue(batch)
             for gain in earned:
-                self.anomaly.record(player, gain, timestamp)
+                await self.anomaly.record(player, gain, timestamp)
 
         return committed
 
@@ -528,13 +532,17 @@ class SceneAssets(AssetInventory):
         audit = self.make_audit_callback(player, before, data, tx_type, **audit_options)
         attributes = getattr(self.scene, "attributes", None) if worn_changed else None
 
-        def committed(snapshot):
+        async def committed(snapshot):
             if audit is not None:
-                audit(snapshot)
+                result = audit(snapshot)
+                if isawaitable(result):
+                    await result
             if attributes is not None:
                 attributes.notify(player)
             if on_committed is not None:
-                on_committed(snapshot)
+                result = on_committed(snapshot)
+                if isawaitable(result):
+                    await result
 
         callback = committed if attributes is not None or on_committed is not None else audit
         try:

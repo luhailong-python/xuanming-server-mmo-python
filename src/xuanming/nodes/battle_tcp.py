@@ -7,7 +7,10 @@ from collections import deque
 
 from google.protobuf.message import DecodeError
 
-from ..transport import DEFAULT_GATE_FRAME_SIZE, FrameError, Packet, encode_packet, read_packet, write_packet
+from ..transport import (
+    DEFAULT_GATE_FRAME_SIZE, FrameError, Packet, WebSocketPacketReader, WebSocketPacketWriter,
+    encode_packet, read_packet, write_packet,
+)
 from ..transport.client_limits import illegal_packet_threshold
 from .battle import CLIENT_REQUESTS, BattleError
 
@@ -158,6 +161,11 @@ class BattleClients:
             self._writers.discard(writer)
             self._draining_writers.discard(writer)
             self._connections.discard(asyncio.current_task())
+
+    async def serve_websocket(self, websocket) -> None:
+        reader = WebSocketPacketReader(websocket, max_size=_MAX_FRAME_SIZE)
+        writer = WebSocketPacketWriter(websocket)
+        await self.serve(reader, writer)
 
     async def _probe(self, packet, reader, writer) -> None:
         signed = self.protocol.parse(_PROBE_START, packet.payload).grant

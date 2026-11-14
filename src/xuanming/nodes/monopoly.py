@@ -1,5 +1,6 @@
 """服务端棋盘移动、奖励与地标建造。"""
 
+from inspect import isawaitable
 from dataclasses import dataclass
 from secrets import randbelow
 from time import time_ns
@@ -311,11 +312,15 @@ class Monopoly:
             result.completion.CopyFrom(progress.last_completion)
         last.CopyFrom(result)
 
-        def audit(snapshot):
+        async def audit(snapshot):
             if debit_audit:
-                debit_audit(snapshot)
+                result = debit_audit(snapshot)
+                if isawaitable(result):
+                    await result
             if reward_audit:
-                reward_audit(snapshot)
+                result = reward_audit(snapshot)
+                if isawaitable(result):
+                    await result
 
         await self.scene.commit_player_data(player, data, on_committed=audit)
         response.result.CopyFrom(result)

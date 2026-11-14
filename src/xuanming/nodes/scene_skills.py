@@ -1,5 +1,7 @@
 """Scene class skill book, initial grants, and atomic paid upgrades."""
 
+from inspect import isawaitable
+
 from ..data import StoreRejected, StoreUnavailable
 from ..data.asset_inventory import balance, clone
 from .battle_tables import rounds_from_seconds
@@ -209,10 +211,13 @@ class SceneSkills:
         audit = assets.make_audit_callback(player, before, data, self.debit_tx, correlation=row.id)
         attributes = getattr(self.scene, "attributes", None) if old_stats is not None else None
 
-        def committed(snapshot):
+        async def committed(snapshot):
             if audit is not None:
-                audit(snapshot)
-            attributes.notify(player)
+                result = audit(snapshot)
+                if isawaitable(result):
+                    await result
+            if attributes is not None:
+                attributes.notify(player)
 
         try:
             await self.scene.commit_player_data(

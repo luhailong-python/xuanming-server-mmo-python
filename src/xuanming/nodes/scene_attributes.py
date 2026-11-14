@@ -1,5 +1,6 @@
 """角色属性面板、加点方案及其存档入口。"""
 
+from inspect import isawaitable
 import time
 
 from ..data import client_request
@@ -373,9 +374,11 @@ class SceneAttributes:
             await self.missions._event(data, self.missions.scopes(data)[0], LEVEL, level, level, stamp, gains=gains)
         audit = self.assets.make_audit_callback(player, before, data, self.mission_tx, gains=gains, credit=True)
 
-        def committed(snapshot):
+        async def committed(snapshot):
             if audit is not None:
-                audit(snapshot)
+                result = audit(snapshot)
+                if isawaitable(result):
+                    await result
             self.notify(player)
             if pets is not None:
                 pets.notify(player)

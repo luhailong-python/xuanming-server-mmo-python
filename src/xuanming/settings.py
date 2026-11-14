@@ -10,6 +10,7 @@ class NodeSettings:
     node_id: int
     host: str = "127.0.0.1"
     port: int = 0
+    websocket_port: int | None = None
     grpc_port: int = 0
     advertise_host: str = ""
     client_host: str = ""
@@ -30,6 +31,8 @@ class Settings:
     max_battle_connections: int = 4096
     scene_tick_seconds: float = 0.05
     database: Path = Path("run/players.sqlite3")
+    local_player_store: Path | None = None
+    anomaly_journal: Path | None = None
     etcd: str = ""
     kafka: str = ""
     kafka_generation: int = 1
@@ -57,8 +60,9 @@ class Settings:
                 settings = getattr(defaults, role)
                 merged = {field.name: getattr(settings, field.name) for field in fields(settings)}
                 values[role] = NodeSettings(**(merged | values[role]))
-        if "database" in values:
-            values["database"] = path.parent / values["database"]
+        for name in ("database", "local_player_store", "anomaly_journal"):
+            if name in values and values[name] is not None:
+                values[name] = path.parent / values[name]
         return cls(**values)
 
     def gate_uses_router(self) -> bool:
@@ -76,7 +80,10 @@ class Settings:
             node = getattr(self, name)
             if not 0 < node.node_id < (1 << (15 if name == "gate" else 17)):
                 raise ValueError(f"{name} 节点号无效")
-            if any(not 0 <= port <= 65535 for port in (node.port, node.grpc_port, node.client_port, node.rpc_port or 0)):
+            ports = [node.port, node.grpc_port, node.client_port, node.rpc_port or 0]
+            if node.websocket_port is not None:
+                ports.append(node.websocket_port)
+            if any(not 0 <= port <= 65535 for port in ports):
                 raise ValueError(f"{name} 端口无效")
             if role == "local" and not ipaddress.ip_address(node.host).is_loopback:
                 raise ValueError("本地开发模式只允许监听回环地址")

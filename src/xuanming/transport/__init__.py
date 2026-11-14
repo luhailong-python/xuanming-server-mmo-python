@@ -14,6 +14,7 @@ from .framing import (
     write_packet,
     write_rpc_frame,
 )
+from .websocket import WebSocketPacketReader, WebSocketPacketWriter
 from .rpc import (
     RpcBusy,
     RpcChannel,
@@ -50,4 +51,6 @@ __all__ = [
     "read_rpc_frame",
     "write_packet",
     "write_rpc_frame",
+    "WebSocketPacketReader",
+    "WebSocketPacketWriter",
 ]

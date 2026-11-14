@@ -8,7 +8,7 @@
 | Scene | RPC0、场景和角色归属代次、Redis 跨区交接、SQL 入场与封存、导航和组队跟随、断线保留和月卡托管、资产、属性、宠物、任务副本和实时技能 |
 | Battle | gRPC 建房、TCP 票据直连、原配表的职业技能和 Buff、PvE 奖励、战报和观战、Match SQL 终局、Agones 建房准入 |
 
-原有 muduo 客户端帧与 RPC0 保持各自的二进制格式。Python 使用 `asyncio` 管理连接、时钟和退出，使用 Protobuf 描述符解析原协议，使用 `grpc.aio` 和 `aiokafka` 对接基础设施。配置采用标准库 `tomllib`，本地存档采用 SQLite。运行节点共享协议和引擎代码，玩法状态由各自的场景或房间持有。
+原有 muduo 客户端帧与 RPC0 保持各自的二进制格式。Python 使用 `asyncio` 管理连接、时钟和退出，使用 Protobuf 描述符解析原协议，使用 `grpc.aio` 和 `aiokafka` 对接基础设施。配置采用标准库 `tomllib`。本地角色行存档采用带跨进程锁和原子替换的 JSON 文件；SQLite 继续保存本地收件箱与发号器。集群角色数据仍由 Go PlayerStore/DataService 写入现有 SQL/TiDB 路径。运行节点共享协议和引擎代码，玩法状态由各自的场景或房间持有。
 
 ## 本地启动
 
@@ -21,7 +21,7 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest -q
 ```
 
-`smoke` 使用临时 SQLite 和临时回环端口。持续运行时，设置开发登录令牌后可在同一进程启动三个角色。
+`smoke` 使用临时 JSON 角色存档、临时 SQLite 辅助账本和临时回环端口。持续运行时，设置开发登录令牌后可在同一进程启动三个角色。
 
 ```powershell
 $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
@@ -59,6 +59,12 @@ Agones 部署设置 `AGONES_SDK_HTTP_PORT`，可同时设置 `CLIENT_ENDPOINT_SO
 本机 Router 验收记录见 `build/interop-native-20261106/run-e064fc92/acceptance.json`。有对应原版服务和中间件的联调环境可运行 `python build/interop-native-20261106/smoke_full.py --ingress java --scene-landing --scene-team --monopoly-dice-recovery`。两个真实账号组队时，原版 Go `ApplyJoinTeam` 返回 4030。验收在隔离 MySQL 写入一条待审申请，由原版 Go `HandleApplication` 审批并提交成员关系，Python 通过原版签名读取和真实 TCP 验证了同场景跟随、同节点换场景跟随与移动纠正。
 
 Gate 直连验收记录见 `build/interop-native-20261106/run-ee0f1772/acceptance.json`。使用 `--ingress java --direct-gate --monopoly-board` 复验真实登录、棋盘通关与重登、跨区和战斗落库。
+
+## WebSocket 客户端承载
+
+Gate 和 Battle 保留原 TCP 监听，并可通过各自的 `websocket_port` 启用第二个客户端入口。每条 WebSocket 二进制消息必须恰好承载一条完整的原 muduo 帧，包括原长度头和校验和；票据、心跳、消息号和 protobuf 内容不变。文本消息、拼接帧、残帧都会被拒绝。Gate 和 Battle 的 WebSocket 端口单独配置，不改变原有节点发现字段。集群示例使用 Gate `8616`、Battle `8617`；未设置 `websocket_port` 时不会启动该监听器。
+
+本地配置将角色存档写入 `../run/players.json`，锁文件为同目录的 `.lock` 文件，存档通过同目录临时文件和 `os.replace` 提交。首次认领时，如果 JSON 文件尚不存在而旧 SQLite 中已有角色表，会先导入原角色快照。SQLite 继续保存本地收件箱和号段。资产收益窗口和待发送告警写入 `../run/asset-anomaly.json`；Kafka 不可用时告警保留并退避重试。集群配置可将 `anomaly_journal` 指向持久化挂载路径，默认写入 `run/asset-anomaly.json`；多个 Scene 进程要共享监测窗口时，应挂载同一支持文件锁和原子替换的目录。告警投递为至少一次，进程若在 Kafka 确认后、清除本地 outbox 前退出，重启后可能重复发布。
 
 ## 玩法扩展
 
