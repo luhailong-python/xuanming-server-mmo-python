@@ -285,7 +285,7 @@ class Runtime:
         links = SceneLinks(self.protocol, info, self.directory)
         self._stack.push_async_callback(links.close)
         scene = SceneNode(self.protocol, info, store, PlayerRowCodec(self.protocol), links.emit,
-                          emit_many=links.emit_many)
+                          emit_many=links.emit_many, tick_interval=self.settings.scene_tick_seconds)
         scene.tables = tables
         scene.navigation = load_navigation(tables)
         self.scene = scene

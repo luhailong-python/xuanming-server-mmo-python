@@ -16,6 +16,7 @@ from ..protocol import RouteNode, RpcKind
 from .scene_afk import FRAME_MASK, FrameActivity
 from .scene_actor_sync import SceneActorSync
 from .scene_aoi import SceneAoi
+from .scene_aoi_load import AoiLoadMonitor, PRESSURE_LEVELS
 from .scene_channels import SceneChannels
 from .scene_combat_engagement import SceneCombatEngagement
 from .scene_connection_hold import (
@@ -113,7 +114,7 @@ class Npc:
 class World:
     """事件循环持有实体和 AOI 空间索引。"""
 
-    def __init__(self, info, nav=None) -> None:
+    def __init__(self, info, nav=None, *, pressure: float = 0.0) -> None:
         self.info = info
         self.nav = nav
         self.players: dict[int, Player] = {}
@@ -121,7 +122,7 @@ class World:
         self.actors: dict[int, Player | Npc] = {}
         self.pending_entrants = 0
         self.draining = False
-        self.aoi = SceneAoi()
+        self.aoi = SceneAoi(pressure=pressure)
         self.aoi_reentry: set[int] = set()
 
     def add(self, player: Player) -> None:
@@ -147,7 +148,7 @@ class World:
 
 class SceneNode:
     def __init__(self, protocol, info, store, rows, emit, *, emit_many=None,
-                 disconnect_grace: float = HOLD_WINDOW) -> None:
+                 disconnect_grace: float = HOLD_WINDOW, tick_interval: float = 0.05) -> None:
         self.protocol = protocol
         self.info = info
         self.store = store
@@ -155,6 +156,10 @@ class SceneNode:
         self.emit = emit
         self.emit_many = emit_many
         self.disconnect_grace = disconnect_grace
+        self.tick_interval = tick_interval if math.isfinite(tick_interval) and tick_interval > 0 else 0.05
+        self.aoi_load = AoiLoadMonitor()
+        self._aoi_pressure_level = 0
+        self.aoi_trimmed_entries_total = 0
         self.worlds: dict[int, World] = {}
         self._placement: dict[int, tuple[int, int]] = {}
         self.locations: dict[int, World] = {}
@@ -222,7 +227,9 @@ class SceneNode:
             mirror_config_id=request.mirror_config_id, dungeon_config_id=request.dungeon_config_id,
             creators=dict.fromkeys(request.creator_ids, True),
         )
-        world = self.worlds.setdefault(scene_id, World(info, self.navigation.get(request.config_id)))
+        world = self.worlds.setdefault(
+            scene_id, World(info, self.navigation.get(request.config_id), pressure=self.aoi_load.pressure_factor),
+        )
         return self.protocol.message("CreateSceneResponse", scene_info=world.info)
 
     def destroy(self, request):
@@ -764,6 +771,7 @@ class SceneNode:
             self.buffs.discard(player)
 
     async def tick(self, delta: float) -> None:
+        step_started = time.monotonic()
         for world in self.worlds.values():
             for player in world.players.values():
                 was_afk = player.activity.afk
@@ -823,6 +831,22 @@ class SceneNode:
             world.aoi_reentry.clear()
         self.actor_sync.tick()
         self.current_frame = (self.current_frame + 1) & FRAME_MASK
+        if self.aoi_load.observe(time.monotonic() - step_started, self.tick_interval):
+            level = self.aoi_load.level
+            if level != self._aoi_pressure_level:
+                previous = self._aoi_pressure_level
+                pressure = self.aoi_load.pressure_factor
+                trimmed = 0
+                for world in tuple(self.worlds.values()):
+                    changes, count = world.aoi.apply_pressure(pressure)
+                    self._visibility(world, changes)
+                    trimmed += count
+                self._aoi_pressure_level = level
+                self.aoi_trimmed_entries_total += trimmed
+                logger.info(
+                    "Scene AOI pressure level changed: %d -> %d of %d, utilization=%.3f, trimmed_entries=%d",
+                    previous, level, PRESSURE_LEVELS, self.aoi_load.smoothed_utilization, trimmed,
+                )
 
     async def _maintain(self, world, player) -> None:
         try:

@@ -154,6 +154,7 @@ class SceneAoi:
         self._grid: dict[Hex, set[int]] = {}
         self._outgoing: dict[int, _Observer] = {}
         self._incoming: dict[int, set[int]] = {}
+        self._refill_needed: set[int] = set()
 
     def visible_targets(self, watcher: int) -> tuple[int, ...]:
         observer = self._outgoing.get(watcher)
@@ -229,11 +230,13 @@ class SceneAoi:
         if observer.visible_count < self._capacity(watcher):
             return True
         if not weight:
+            self._refill_needed.add(watcher)
             return False
         # 同权重保留原已显示条目。淘汰候选同分时，用网络号确定先后。
         victim = min(((self._weight(entry), -target) for target, entry in observer.entries.items() if entry.visible),
                      default=None)
         if victim is None or victim[0] >= weight:
+            self._refill_needed.add(watcher)
             return False
         target = -victim[1]
         entry = observer.entries[target]
@@ -242,18 +245,64 @@ class SceneAoi:
             self._show(watcher, observer, target, entry, False, changes)
         else:
             self._erase(watcher, observer, target, changes)
+            self._refill_needed.add(watcher)
         return True
 
     def _fill_slots(self, watcher: int, observer: _Observer, changes: list[VisibilityChange]) -> None:
         capacity = self._capacity(watcher)
-        if observer.visible_count >= capacity or len(observer.entries) == observer.visible_count:
+        if observer.visible_count < capacity and len(observer.entries) != observer.visible_count:
+            hidden = sorted(
+                (-self._weight(entry), target) for target, entry in observer.entries.items()
+                if not entry.visible and self._eligible(target, entry)
+            )
+            for _, target in hidden[:capacity - observer.visible_count]:
+                self._show(watcher, observer, target, observer.entries[target], True, changes)
+
+    def _refresh_nearby(self, entity: int, changes: list[VisibilityChange]) -> None:
+        actor = self._actors.get(entity)
+        if actor is None or actor.cell is None:
             return
-        hidden = sorted(
-            (-self._weight(entry), target) for target, entry in observer.entries.items()
-            if not entry.visible and self._eligible(target, entry)
-        )
-        for _, target in hidden[:capacity - observer.visible_count]:
-            self._show(watcher, observer, target, observer.entries[target], True, changes)
+        for other in self._actors_in(_neighborhood(actor.cell), entity):
+            self._add_spatial(entity, other, changes)
+            self._add_spatial(other, entity, changes)
+
+    def apply_pressure(self, pressure: float) -> tuple[tuple[VisibilityChange, ...], int]:
+        """Apply a node-wide pressure factor, trimming by priority then distance."""
+        pressure = min(1.0, max(0.0, pressure))
+        if pressure == self.pressure:
+            return (), 0
+        expanding = pressure < self.pressure
+        self.pressure = pressure
+        changes: list[VisibilityChange] = []
+        trimmed = 0
+        for watcher, observer in tuple(self._outgoing.items()):
+            capacity = self._capacity(watcher)
+            if observer.visible_count > capacity:
+                ranked = sorted(
+                    ((-self._weight(entry), math.dist(self._actors[watcher].position,
+                                                      self._actors[target].position), target)
+                     for target, entry in observer.entries.items() if entry.visible),
+                )
+                for _, _, target in ranked[capacity:]:
+                    entry = observer.entries.get(target)
+                    if entry is None or not entry.visible:
+                        continue
+                    entry.spatial = None
+                    trimmed += 1
+                    if entry.follows:
+                        self._show(watcher, observer, target, entry, False, changes)
+                    else:
+                        self._erase(watcher, observer, target, changes)
+                        self._refill_needed.add(watcher)
+            self._fill_slots(watcher, observer, changes)
+        if expanding:
+            for watcher in sorted(tuple(self._refill_needed)):
+                observer = self._outgoing.get(watcher)
+                if observer is None or observer.visible_count >= self._capacity(watcher):
+                    continue
+                self._refill_needed.discard(watcher)
+                self._refresh_nearby(watcher, changes)
+        return net_changes(changes), trimmed
 
     def _reconcile(self, watcher: int, target: int, entry: _Entry, changes: list[VisibilityChange]) -> None:
         observer = self._outgoing[watcher]
@@ -360,6 +409,7 @@ class SceneAoi:
         actor = self._actors.get(entity)
         if actor is None:
             return ()
+        self._refill_needed.discard(entity)
         observer = self._outgoing.pop(entity, None)
         if observer is not None:
             for target in observer.entries:
