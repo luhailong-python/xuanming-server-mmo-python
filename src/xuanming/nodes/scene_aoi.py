@@ -26,6 +26,7 @@ class Priority(IntEnum):
     QUEST_NPC = 3
     BOSS = 4
     PINNED = 5
+    COMBAT = 6
 
 
 class Policy(IntEnum):
@@ -35,9 +36,9 @@ class Policy(IntEnum):
 
 
 _WEIGHTS = {
-    Policy.OPEN_WORLD: (0, 1, 2, 3, 4, 255),
-    Policy.DUNGEON: (0, 2, 3, 1, 4, 255),
-    Policy.PVP_ARENA: (0, 2, 4, 1, 3, 255),
+    Policy.OPEN_WORLD: (0, 1, 2, 3, 4, 255, 5),
+    Policy.DUNGEON: (0, 2, 3, 1, 4, 255, 5),
+    Policy.PVP_ARENA: (0, 2, 4, 1, 3, 255, 5),
 }
 
 
@@ -80,6 +81,7 @@ def _neighborhood(cell: Hex | None) -> set[Hex]:
 class FollowKind(IntEnum):
     TEAM = 0
     SKILL = 1
+    COMBAT = 2
 
 
 @dataclass(frozen=True, slots=True)

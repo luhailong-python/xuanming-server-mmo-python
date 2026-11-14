@@ -17,6 +17,7 @@ from .scene_afk import FRAME_MASK, FrameActivity
 from .scene_actor_sync import SceneActorSync
 from .scene_aoi import SceneAoi
 from .scene_channels import SceneChannels
+from .scene_combat_engagement import SceneCombatEngagement
 from .scene_connection_hold import (
     HOLD_WINDOW, SWEEP_INTERVAL, HoldDecision, SceneConnectionHolds, decide_hold, session_bound,
 )
@@ -168,6 +169,7 @@ class SceneNode:
         self.current_frame = 0
         self.battle = None
         self.travel = None
+        self.combat_engagement = SceneCombatEngagement(self)
         self.inbox = None
         self.landing = None
         self.team = None
@@ -262,6 +264,7 @@ class SceneNode:
         world = npc.world
         if world.npcs.get(npc.entity) is not npc:
             return
+        self.combat_engagement.on_leave(npc)
         self._visibility(world, world.aoi.leave(npc.entity), departed=npc.entity)
         world.remove_npc(npc)
         self.actor_sync.discard(npc)
@@ -746,6 +749,7 @@ class SceneNode:
         if self.team:
             self.team.departed(player)
         self.actor_sync.discard(player)
+        self.combat_engagement.on_leave(player)
         self._visibility(world, world.aoi.leave(player.entity), departed=player.entity)
         world.remove(player)
         self.locations.pop(player.player_id)
@@ -775,6 +779,7 @@ class SceneNode:
             self.inbox.tick()
         if self.skill_casts is not None:
             await self.skill_casts.tick(delta)
+        self.combat_engagement.update(delta)
         for world in tuple(self.worlds.values()):
             if world.draining and self.travel:
                 self.travel.drain(world)

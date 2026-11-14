@@ -261,10 +261,15 @@ class SceneSkillCasts:
         if target_attrs is None:
             return
         was_alive = bool(target_attrs.health)
+        dealt_damage = False
 
         def finish(_snapshot=None):
             if not self._in_world(world, target) or self._frozen(target):
                 return
+            if dealt_damage:
+                self.scene.combat_engagement.record_damage(caster, target)
+                if not target_attrs.health:
+                    self.scene.combat_engagement.on_death(target)
             if was_alive:
                 self.buffs.reset_combat_idle(target)
             if apply_effects:
@@ -278,7 +283,9 @@ class SceneSkillCasts:
             damage = self._base_damage(source, source_attrs, target_attrs, target_stats, target_level, row, base)
             damage = self.buffs.before_damage(caster, target, damage)
             if math.isfinite(damage) and damage > 0:
-                target_attrs.health -= min(target_attrs.health, math.ceil(damage))
+                amount = min(target_attrs.health, math.ceil(damage))
+                target_attrs.health -= amount
+                dealt_damage = amount > 0
                 if player_target:
                     cast.committing = True
                     try:
