@@ -288,13 +288,15 @@ class SceneTeam:
                 self.refresh(player)
 
     def _motion(self, world, player, follower, velocity) -> None:
+        stopped_elsewhere = follower.last.moving and player.motion.velocity == ZERO
         self.scene.set_velocity(player, velocity)
         moving = velocity != ZERO
         if (rotation := rotation_toward(velocity[0], velocity[1])) is not None:
             player.transform.rotation = rotation
         now = TeamFollowBroadcastState(moving, velocity[0], velocity[1])
         follower.frames += 1
-        if should_broadcast(follower.last, now, follower.frames):
+        last = TeamFollowBroadcastState() if stopped_elsewhere and moving else follower.last
+        if should_broadcast(last, now, follower.frames):
             self.scene._broadcast_move(world, player, include_self=True)
             follower.last, follower.frames = now, 0
 
