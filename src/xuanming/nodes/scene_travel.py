@@ -539,8 +539,8 @@ class SceneTravel:
                         return
                     trip.scene_id = reply.scene_id
                 reply = await self._enter(trip, client_pick=trip.client_pick)
-                if trip.silent:
-                    # 自动跟随只换本节点场景。被拒后释放请求槽位，等下一次队伍信号。
+                if trip.silent and reply.error_code != _HANDOFF_PENDING:
+                    # 自动跟随被拒后释放请求槽位，等下一次队伍信号。
                     if reply.error_code:
                         _LOG.info("Team-follow scene change rejected player_id=%d scene_id=%d code=%d",
                                   player.player_id, trip.scene_id, reply.error_code)

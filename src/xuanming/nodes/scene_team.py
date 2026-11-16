@@ -143,8 +143,7 @@ class SceneTeam:
         location = await self.travel.team_leader_location(player_id, view.leader)
         if (self._player(player_id) is not player or self._identity(player) != identity
                 or self._leaving(player) or self._held(player) or location is None
-                or not location.scene_id or location.zone_id != self.scene.info.zone_id
-                or location.node_id != str(self.scene.info.node_id)):
+                or not location.scene_id or location.zone_id != self.scene.info.zone_id):
             return
         world = self.scene.locations[player_id]
         if location.scene_id != world.info.scene_id:

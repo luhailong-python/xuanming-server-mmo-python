@@ -94,7 +94,8 @@ def test_follow_respects_native_membership_and_scene_fences(tmp_path):
             locations[0].node_id = "6"
             team.hint(2)
             await drain()
-            assert not requested
+            assert requested == [(2, 2)]
+            requested.clear()
             locations[0].node_id = "5"
             location_started.clear()
             location_release.clear()

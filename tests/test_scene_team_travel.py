@@ -17,7 +17,7 @@ class _UnusedPeer:
 
 
 @pytest.mark.parametrize("outcome", (0, 17, 18, "unavailable"))
-def test_automatic_team_scene_change_never_upgrades_to_ownership_handoff(outcome):
+def test_automatic_team_scene_change_hands_off_only_when_required(outcome):
     async def exercise():
         protocol = Protocol()
         player = SimpleNamespace(
@@ -46,7 +46,7 @@ def test_automatic_team_scene_change_never_upgrades_to_ownership_handoff(outcome
         scene = SimpleNamespace(
             protocol=protocol, info=protocol.message("NodeInfo", node_id=2, zone_id=1, node_uuid="scene-a"),
             locations={42: world}, battle=None, register=lambda *_: None,
-            _push=lambda *_: notifications.append("push"),
+            _push=lambda *_: notifications.append("push"), _lock=lambda _: asyncio.Lock(),
         )
         travel = SceneTravel(scene, ConfigTables(), Manager(), _UnusedPeer(), _UnusedPeer(), b"x" * 32)
 
@@ -72,8 +72,9 @@ def test_automatic_team_scene_change_never_upgrades_to_ownership_handoff(outcome
             assert len(calls) == 1
             respond.set()
             await asyncio.gather(*tuple(travel._tasks))
-            assert not handoffs and not notifications and not travel.frozen(42)
-            assert player.snapshot is snapshot and player.motion.velocity == (2., 0., 0.)
+            assert len(handoffs) == int(outcome == 18) and not notifications and not travel.frozen(42)
+            assert player.snapshot is snapshot
+            assert player.motion.velocity == ((0., 0., 0.) if outcome == 18 else (2., 0., 0.))
             assert scene.locations[42] is world and world.players[42] is player
             assert 42 not in travel._trips
 
@@ -82,7 +83,7 @@ def test_automatic_team_scene_change_never_upgrades_to_ownership_handoff(outcome
             await asyncio.gather(*tuple(travel._tasks))
             assert len(calls) == 2 and calls[1].scene_id == 25
             assert calls[1].correlation_id != request.correlation_id
-            assert not handoffs and not notifications
+            assert len(handoffs) == 2 * int(outcome == 18) and not notifications
         finally:
             respond.set()
             await travel.close()
