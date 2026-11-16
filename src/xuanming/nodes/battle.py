@@ -17,6 +17,7 @@ from google.protobuf.message import DecodeError, Message
 
 from .battle_effects import FREEZE, STUN, U64_MAX, BattleEffects, landed_damage, landed_heal, rank_factor, scaled
 from .battle_replay import BattleReplayRecorder
+from .battle_script import BattleScriptRuntime
 from .battle_skills import BattleSkills, active as _active, base_stat
 from .battle_spectate import END, STATE, TURN, SpectateChannels, SpectateSink
 from .battle_tables import BattleBuff, BattleItem, BattleSkill, BattleTables, _Mt19937_64
@@ -99,6 +100,7 @@ class TurnEngine:
         self, protocol: Protocol, request: Message, *, monsters: Iterable[Message] = (),
         skills: Mapping[int, BattleSkill], items: Mapping[int, BattleItem], max_rounds: int,
         buffs: Mapping[int, BattleBuff] | None = None, silence_permissions: tuple[int, ...] | None = None,
+        monster_ids: set[int] | None = None,
     ):
         if not request.battle_id or not request.players:
             raise BattleError("battle needs an identity and players")
@@ -166,6 +168,7 @@ class TurnEngine:
         if {actor.team_index for actor in self.actors.values()} != {0, 1}:
             raise BattleError("both sides need a unit")
         self.effects.sanitize()
+        self.scripts = BattleScriptRuntime(self, request, monster_ids)
 
     def _actor(self, snapshot: Message, actor_id: int, actor_type: int, team: int,
                slots: list[int], name: str) -> Message:
@@ -201,7 +204,7 @@ class TurnEngine:
     def personalize(self, state: Message, viewer: int) -> None:
         for actor in state.actors:
             actor.ClearField("combat")
-            if actor.actor_id != viewer:
+            if not viewer or (actor.actor_id != viewer and actor.owner_player_id != viewer):
                 actor.ClearField("skill_cooldown_rounds")
         state.ClearField("self_items")
         for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
@@ -293,6 +296,7 @@ class TurnEngine:
         return turn
 
     def _fill_default_actions(self) -> None:
+        self.scripts.fill()
         for actor in self.actors.values():
             if not _active(actor) or actor.actor_id in self.pending:
                 continue
@@ -584,7 +588,8 @@ class BattleNode:
             max_rounds = self.tables.max_rounds(request, self.max_rounds) if self.tables else self.max_rounds
             engine = TurnEngine(self.protocol, request, monsters=monsters, skills=self.skills, items=self.items,
                                 max_rounds=max_rounds, buffs=self.buffs,
-                                silence_permissions=self.tables.silence_permissions if self.tables else None)
+                                silence_permissions=self.tables.silence_permissions if self.tables else None,
+                                monster_ids={row.id for row in self.tables.tables["Monster"].rows()} if self.tables else None)
         except (BattleError, ValueError):
             return self._error(response, _INVALID_TABLE)
         if request.admit_before_ms <= self.now_ms():
@@ -943,15 +948,18 @@ class BattleNode:
         if not _active(actor):
             return self._error(response, _INACTIVE)
         if message_id == 162:
+            was_ready = not engine.pending_players()
             actor.is_auto = request.enabled
+            if request.enabled and not was_ready and not engine.pending_players():
+                self._resolve(room, now)
         else:
             error = engine.validate(actor, request.action)
             if error:
                 return self._error(response, error)
             engine.pending[ticket.player_id] = self.protocol.message("BattleAction")
             engine.pending[ticket.player_id].CopyFrom(request.action)
-        if not engine.pending_players():
-            self._resolve(room, now)
+            if not engine.pending_players():
+                self._resolve(room, now)
         return response
 
     @staticmethod

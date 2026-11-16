@@ -923,3 +923,20 @@ def test_scene_prepare_confirm_cannot_be_cancelled_by_late_compensation(runtime)
         assert not battle.frozen(101)
 
     asyncio.run(exercise())
+
+
+def test_repeated_auto_battle_request_does_not_advance_round_early(runtime):
+    protocol, node, clock, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    room = node.rooms[10]
+    a = node.authorize(issue(protocol, node, 101).token_payload, issue(protocol, node, 101).token_signature)
+    b = node.authorize(issue(protocol, node, 202).token_payload, issue(protocol, node, 202).token_signature)
+    request = protocol.message('SetAutoBattleRequest', battle_id=10, enabled=True)
+    assert not node.dispatch(a, 162, request).error_message.id
+    assert room.engine.round_index == 1
+    assert not node.dispatch(b, 162, request).error_message.id
+    assert room.engine.round_index == 2
+    deadline = room.action_deadline_ms
+    assert deadline > clock.now
+    assert not node.dispatch(a, 162, request).error_message.id
+    assert room.engine.round_index == 2 and room.action_deadline_ms == deadline
