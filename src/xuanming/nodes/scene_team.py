@@ -8,6 +8,7 @@ import logging
 import math
 
 from .scene import ZERO
+from .scene_afk import FRAME_MASK
 from .scene_facing import rotation_toward
 from .team_follow_formation import (
     MAX_LEADER_JUMP, MAX_MEMBERS, TeamFollowBroadcastState, TeamFollowFormation,
@@ -18,6 +19,7 @@ _LOG = logging.getLogger(__name__)
 _LEFT, _TEAM_CHANGED, _LEADER_CHANGED, _BECAME_LEADER, _SCENE_CHANGED, _LEADER_GONE, _LEAVING = range(1, 8)
 _REGROUP_DISTANCE = 8.0
 _REGROUP_TELEPORT = 5
+_AWAIT_LEADER_FRAMES = 90 * 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +52,7 @@ class SceneTeam:
         self.intents: set[int] = set()
         self._followers: dict[int, _Follower] = {}
         self._formations: dict[int, _Formation] = {}
+        self._await_leader: dict[int, tuple[int, int]] = {}
         self._pending: dict[int, bool] = {}
         self._tasks: dict[int, asyncio.Task] = {}
         self._closing = False
@@ -63,6 +66,7 @@ class SceneTeam:
             self.refresh(player)
         else:
             self.intents.discard(player.player_id)
+            self._await_leader.pop(player.player_id, None)
             self._detach(player.player_id, _LEFT)
 
     def _player(self, player_id):
@@ -190,6 +194,7 @@ class SceneTeam:
                 world, view.team_id, TeamFollowFormation(leader.transform.position),
             )
         if len(group.trail.members) < MAX_MEMBERS:
+            self._await_leader.pop(player_id, None)
             self._place(group, player, leader, view.join_seq, walk)
 
     def _approach(self, group, rank, position) -> bool:
@@ -253,6 +258,8 @@ class SceneTeam:
                 self._formations.pop(follower.leader, None)
         player = self._player(player_id)
         if player is not None:
+            if reason == _LEADER_GONE and player_id in self.intents:
+                self._await_leader[player_id] = follower.leader, self.scene.current_frame
             player.motion.teleport_target = None
             self._motion(self.scene.locations[player_id], player, follower, ZERO)
             self._state(player_id, reason=reason)
@@ -271,6 +278,7 @@ class SceneTeam:
         self._detach(player_id, _LEAVING)
         self._dissolve(player_id, _LEADER_GONE)
         self.intents.discard(player_id)
+        self._await_leader.pop(player_id, None)
         self.membership.pop(player_id, None)
         self._pending.pop(player_id, None)
 
@@ -361,6 +369,16 @@ class SceneTeam:
                 else:
                     self._motion(world, player, follower, ZERO)
 
+        for player_id, (leader_id, since) in tuple(self._await_leader.items()):
+            leader = self._player(leader_id)
+            if leader is None or not self._leaving(leader):
+                del self._await_leader[player_id]
+                player = self._player(player_id)
+                if player is not None and player_id in self.intents and not self._leaving(player):
+                    self.refresh(player)
+            elif (self.scene.current_frame - since) & FRAME_MASK >= _AWAIT_LEADER_FRAMES:
+                del self._await_leader[player_id]
+
     async def close(self) -> None:
         self._closing = True
         tasks = tuple(self._tasks.values())
@@ -368,3 +386,4 @@ class SceneTeam:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._pending.clear()
+        self._await_leader.clear()

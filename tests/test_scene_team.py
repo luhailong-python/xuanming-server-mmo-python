@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from xuanming.data import PlayerRowCodec, SqlitePlayerStore
 from xuanming.nodes.scene import SceneNode
-from xuanming.nodes.scene_team import SceneTeam
+from xuanming.nodes.scene_team import SceneTeam, _AWAIT_LEADER_FRAMES, _LEADER_GONE, _Membership
 from xuanming.protocol import Protocol
 
 
@@ -110,6 +110,75 @@ def test_follow_respects_native_membership_and_scene_fences(tmp_path):
         finally:
             for player in roles.values():
                 player.admission = None
+            await team.close()
+            await scene.close()
+
+    asyncio.run(exercise())
+
+
+def test_follow_rechecks_after_leader_handoff_settles(tmp_path):
+    async def exercise():
+        protocol = Protocol()
+        scene = SceneNode(
+            protocol, protocol.message("NodeInfo", node_id=5, zone_id=1, node_uuid="test"),
+            SqlitePlayerStore(tmp_path / "await-team.sqlite"), PlayerRowCodec(protocol), lambda *args: None,
+        )
+        scene.create(protocol.message("CreateSceneRequest", scene_id=1, config_id=1))
+        for player_id in (1, 2):
+            await scene.enter(protocol.message(
+                "PlayerEnterGameNodeRequest", scene_id=1, session_id=player_id, player_id=player_id,
+                owner_revision=1, login_generation=1,
+            ), "gate")
+        world = scene.worlds[1]
+        leader, follower = world.players[1], world.players[2]
+        frozen = set()
+        scene.travel = SimpleNamespace(frozen=lambda player_id: player_id in frozen)
+        team = scene.team = SceneTeam(scene, None)
+        refreshed = []
+        team.refresh = lambda player, **kwargs: refreshed.append(player.player_id)
+
+        def attach():
+            team.intents.add(2)
+            team._attach(world, follower, leader, _Membership(20, (1, 1), 1, 2), True)
+            assert team.driven(2)
+
+        try:
+            attach()
+            frozen.add(1)
+            team.tick(.05)
+            assert not team.driven(2) and 2 in team._await_leader and not refreshed
+            frozen.clear()
+            team.tick(.05)
+            assert refreshed == [2] and 2 not in team._await_leader
+
+            attach()
+            frozen.add(1)
+            team.tick(.05)
+            team.follow(world, follower, None, protocol.message("TeamFollowC2S", follow=False))
+            frozen.clear()
+            team.tick(.05)
+            assert refreshed == [2] and not team._await_leader
+
+            attach()
+            frozen.add(1)
+            scene.current_frame = 0xfffffff0
+            team.tick(.05)
+            scene.current_frame = (scene.current_frame + _AWAIT_LEADER_FRAMES) & 0xffffffff
+            team.tick(.05)
+            assert refreshed == [2] and not team._await_leader
+
+            frozen.clear()
+            attach()
+            team._dissolve(1, _LEADER_GONE)
+            world.players.pop(1)
+            scene.locations.pop(1)
+            team.tick(.05)
+            assert refreshed == [2, 2] and not team._await_leader
+        finally:
+            # The last scenario removes the leader directly to simulate completed exit.
+            world.players[1] = leader
+            scene.locations[1] = world
+            scene.travel = None
             await team.close()
             await scene.close()
 
