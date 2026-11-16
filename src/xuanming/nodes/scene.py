@@ -36,6 +36,26 @@ DEFAULT_SPAWN: Position = (180., 200., 0.)
 SAVE_INTERVAL = 30
 STALE_SAVE_RESULTS = {"SAVE_PLAYER_STALE_OWNER", "SAVE_PLAYER_NOT_HOLDER", "SAVE_PLAYER_UNCLAIMED"}
 
+# 与 C++ player_handoff_gate 一致：默认不允许跨场景重放。
+_HANDOFF_SERVICES = frozenset({
+    "SceneBagClientPlayer", "SceneAttributeClientPlayer", "ScenePetClientPlayer",
+    "SceneMissionClientPlayer", "SceneCurrencyClientPlayer", "SceneActivityClientPlayer",
+    "SceneBattleResultClientPlayer",
+})
+_HANDOFF_METHODS = frozenset({
+    ("SceneSkillClientPlayer", "ListSkills"), ("SceneSkillClientPlayer", "UpgradeSkill"),
+    ("SceneSceneClientPlayer", "GetSyncDigest"), ("SceneSceneClientPlayer", "SceneInfoC2S"),
+})
+
+
+def _replayable_on_another_scene(route) -> bool:
+    return bool(route and route.client_protocol and route.node_type == RouteNode.SCENE
+                and (route.service in _HANDOFF_SERVICES or (route.service, route.method) in _HANDOFF_METHODS))
+
+
+def _may_retry_handoff(route) -> bool:
+    return bool(_replayable_on_another_scene(route) and route.kind == RpcKind.REQUEST)
+
 
 def xyz(value) -> Position:
     return value.x, value.y, value.z
@@ -573,12 +593,19 @@ class SceneNode:
     async def process(self, request, gate_uuid: str):
         player = self.sessions.get((gate_uuid, request.session_id))
         content = request.message_content
+        route = self.protocol.routes.get(content.message_id)
         reply = self.protocol.message("ProcessClientPlayerMessageResponse", session_id=request.session_id)
         leaving = content.message_id == self.protocol.message_ids["ScenePlayerExitGame"]
-        if player is None or player.player_id != request.player_id:
+        if player is None:
             if leaving:
                 reply.message_content.CopyFrom(self.protocol.content(content.message_id, content.id))
                 return reply
+            if _may_retry_handoff(route):
+                reply.dispatch_verdict = 1
+                return reply
+            raise ValueError("场景会话身份不匹配")
+        # 老版 Gate 未带 player_id；带值时必须与已认证会话绑定的玩家一致。
+        if request.player_id and player.player_id != request.player_id:
             raise ValueError("场景会话身份不匹配")
         async with self._lock(player.player_id):
             if self.sessions.get((gate_uuid, request.session_id)) is not player:
@@ -587,19 +614,17 @@ class SceneNode:
                     return reply
                 raise ValueError("场景会话已被替换")
             world = self.locations[player.player_id]
-            route = self.protocol.routes.get(content.message_id)
             handler = None
             if route and route.node_type == RouteNode.SCENE and route.client_protocol:
                 handler = self._handlers.get(route.service, {}).get(route.method)
             if (leaving or handler is not None) and not self._releasing(player) and player.disconnect_at is None:
                 # 原版在解析和业务校验前记录活动；未知 RPC 与旧会话不会到这里。
                 player.activity.record(self.current_frame)
-            switch = getattr(self, "kill_switch", None)
-            if switch is not None and switch.check_id(content.message_id):
-                reply.message_content.CopyFrom(self.protocol.content(content.message_id, content.id, error=1003))
-                return reply
             if leaving:
                 reason = self.protocol.parse("GameNodeExitGameRequest", content.serialized_message).reason
+                # 在旧场景路由下收到的退出不能作用于新场景。
+                if request.received_on_previous_route:
+                    return reply
                 if reason == 2:
                     await self._connection_lost(world, player)
                 else:
@@ -614,6 +639,26 @@ class SceneNode:
             else:
                 try:
                     message = self.protocol.parse(route.request_type, content.serialized_message)
+                    # 退出优先；只有明确仍在跨节点交接的玩家才允许重投。
+                    if self._releasing(player):
+                        if route.kind == RpcKind.REQUEST:
+                            response = self.protocol.message(route.response_type)
+                            tip = response.DESCRIPTOR.fields_by_name.get("error_message")
+                            if tip and tip.message_type and tip.message_type.full_name == "TipInfoMessage":
+                                response.error_message.id = 1006
+                            reply.message_content.CopyFrom(self.protocol.content(
+                                content.message_id, content.id, body=response.SerializeToString()))
+                        return reply
+                    handoff_frozen = getattr(self.travel, "handoff_frozen", None)
+                    if handoff_frozen is not None and handoff_frozen(player.player_id) and _may_retry_handoff(route):
+                        reply.dispatch_verdict = 1
+                        return reply
+                    if request.received_on_previous_route and not _replayable_on_another_scene(route):
+                        return reply
+                    switch = getattr(self, "kill_switch", None)
+                    if switch is not None and switch.check_id(content.message_id):
+                        reply.message_content.CopyFrom(self.protocol.content(content.message_id, content.id, error=1003))
+                        return reply
                     if (route.service, route.method) in self._mutating:
                         await self.flush_player_rows(player)
                     response = handler(world, player, route, message)

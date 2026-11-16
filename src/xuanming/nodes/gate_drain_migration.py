@@ -41,6 +41,7 @@ class GateDrainMigration:
     def classify(self, session, now):
         if (not session.verified or not session.logged_in or session.redirected or session.entry_failed
                 or session.writer.is_closing() or session.lane_busy or not session.requests.empty()
+                or session.scene_lane is not None and not session.scene_lane.idle
                 or session.pending_route is not None or session.routing.locked()):
             return None
         if session.player_id == (1 << 64) - 1:

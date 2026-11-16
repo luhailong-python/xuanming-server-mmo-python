@@ -26,6 +26,7 @@ from .gate_chat import WorldChatFanout
 from .gate_drain_migration import GateDrainMigration
 from .gate_entry import FORCE_CLOSE_DELAY, PendingSceneEntry, retry_entry
 from .gate_login_renewal import LoginRenewal, RENEW_ID, RENEW_PATH
+from .gate_scene_lane import SceneLane
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 10
@@ -100,6 +101,7 @@ class Session:
     redirected: bool = False
     lease_expired: bool = False
     lane_busy: bool = False
+    scene_lane: object = None
     last_enter_at: float | None = None
 
     def close(self) -> None:
@@ -222,6 +224,7 @@ class GateNode:
             incarnation = next(self._generation)
             session_id = self.info.node_id << 17 | incarnation & SESSION_MASK
         session = Session(session_id, incarnation, writer)
+        session.scene_lane = SceneLane(self, session)
         self.sessions[session_id] = session
         task = asyncio.current_task()
         self._handlers.add(task)
@@ -233,6 +236,7 @@ class GateNode:
                 asyncio.create_task(self._receive(reader, session)),
                 asyncio.create_task(self._write(session)),
                 asyncio.create_task(self._lane(session)),
+                asyncio.create_task(session.scene_lane.run()),
             ]
             done, _ = await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
             for completed in done:
@@ -316,6 +320,15 @@ class GateNode:
                     reply = self._error(request, UNAVAILABLE)
                     if reply is not None:
                         session.emit(reply)
+                    continue
+                route = self.protocol.routes.get(request.message_id)
+                if route is not None and route.node_type == RouteNode.SCENE:
+                    if bool(request.id) != (route.kind == RpcKind.REQUEST):
+                        reply = self._error(request, INVALID_PARAMETER)
+                        if reply is not None:
+                            session.emit(reply)
+                    else:
+                        session.scene_lane.admit(request, route.kind == RpcKind.ONE_WAY)
                     continue
                 try:
                     identity = (session.player_id, session.account, session.owner_revision) if session.account else None
@@ -459,18 +472,29 @@ class GateNode:
             return self.protocol.content(request.message_id, request.id, error=error)
         return None
 
-    async def _scene_request(self, session, request, *, one_way=False):
+    async def _scene_request(self, session, request, *, one_way=False, previous_route=False,
+                             on_sent=None, can_send=None, lane_response=False):
         target = self._scene_identity(session)
         payload = self.protocol.message(
             "ProcessClientPlayerMessageRequest", session_id=session.session_id, player_id=session.player_id,
             message_content=self.protocol.content(request.message_id, request.id, body=request.body),
+            received_on_previous_route=previous_route,
         )
+        options = {}
+        if on_sent is not None:
+            options["on_sent"] = on_sent
+        if can_send is not None:
+            options["can_send"] = can_send
         data = await self.scene.call(
             target[0], self.protocol.message_ids["SceneProcessClientPlayerMessage"],
-            payload, one_way=one_way, expected_uuid=target[3] or None,
+            payload, one_way=one_way, expected_uuid=target[3] or None, **options,
         )
         if not one_way:
             result = self.protocol.parse("ProcessClientPlayerMessageResponse", data)
+            if lane_response:
+                if result.session_id not in (0, session.session_id):
+                    raise ValueError("场景响应会话不匹配")
+                return result
             if (target != self._scene_identity(session)
                     or result.session_id != session.session_id
                     or result.message_content.message_id != request.message_id
@@ -483,6 +507,14 @@ class GateNode:
     def _scene_identity(session: Session) -> tuple:
         return (session.scene_node_id, session.scene_id, session.login_generation,
                 session.scene_instance_id, session.owner_epoch, session.owner_revision)
+
+    @staticmethod
+    def _scene_route(session: Session) -> tuple:
+        return session.scene_node_id, session.scene_id, session.scene_instance_id
+
+    @staticmethod
+    def _client_identity(session: Session) -> tuple:
+        return session.player_id, session.account, session.login_generation, session.owner_revision
 
     async def exit_scene(self, session: Session, reason: int) -> None:
         if not session.scene_node_id:
@@ -743,9 +775,15 @@ class GateNode:
         self.drain_migration.redirected(session)
         self._clear_scene_entry(session)
         session.last_scene_route = None
+        if session.scene_lane is not None:
+            session.scene_lane.redirect()
         while not session.requests.empty():
-            session.requests.get_nowait()
+            queued = session.requests.get_nowait()
             session.requests.task_done()
+            if isinstance(queued, tuple) and len(queued) == 3:
+                reply = self._error(queued[1], UNAVAILABLE)
+                if reply is not None:
+                    session.emit(reply)
         notify = self.protocol.message(
             "RedirectToGateNotify", target_ip=event.target_gate_ip, target_port=event.target_gate_port,
             token_payload=event.token_payload, token_signature=event.token_signature, token_deadline=event.token_deadline,
@@ -770,11 +808,13 @@ class GateNode:
         notify = self.protocol.message("RedirectToGateNotify", target_ip=response.target_gate_ip,
                                        target_port=response.target_gate_port, token_payload=response.token_payload,
                                        token_signature=response.token_signature, token_deadline=response.token_deadline)
+        session.redirected = True
+        if session.scene_lane is not None:
+            session.scene_lane.redirect()
         session.emit(self.protocol.content(self.protocol.message_ids["SceneClientPlayerCommonRedirectToGate"],
                                            body=notify.SerializeToString()))
         if session.writer.is_closing():
             return False
-        session.redirected = True
         self.drain_migration.redirected(session)
         return True
 

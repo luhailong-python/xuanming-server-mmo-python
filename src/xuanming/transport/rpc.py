@@ -135,7 +135,7 @@ class RpcChannel:
         self._receiver = self._loop.create_task(self._receive(), name="rpc0-receiver")
 
     async def call(self, message_id: int, body: bytes, *, timeout: float = 5.0,
-                   can_send: Callable[[], bool] | None = None) -> bytes:
+                   can_send: Callable[[], bool] | None = None, on_sent=None) -> bytes:
         """发送需要应答的请求。超时或断连时，调用可能已经执行。"""
         self._ensure_open()
         if len(self._pending) >= self._max_pending:
@@ -148,6 +148,8 @@ class RpcChannel:
         try:
             async with asyncio.timeout(timeout):
                 await self._write(self._envelope_type(id=call_id, message_id=message_id, request=body), can_send=can_send)
+                if on_sent is not None:
+                    on_sent()
                 result = await reply
             if isinstance(result, Exception):
                 raise result
@@ -155,9 +157,9 @@ class RpcChannel:
         finally:
             self._pending.pop(call_id, None)
 
-    async def send(self, message_id: int, body: bytes) -> None:
+    async def send(self, message_id: int, body: bytes, *, can_send=None) -> None:
         """发送单向请求，线上不分配调用号。"""
-        await self._write(self._envelope_type(message_id=message_id, request=body))
+        await self._write(self._envelope_type(message_id=message_id, request=body), can_send=can_send)
 
     async def send_heartbeat(self) -> None:
         await self._write(self._envelope_type(type=RpcMessageType.HEARTBEAT))

@@ -163,6 +163,8 @@ message BattleTokenVerifyResponse {
   bool success = 1;
   string error = 2;       // 失败原因(非敏感,可直接展示 / 记日志)
   uint64 battle_id = 3;   // 成功时回填,客户端据此把连接与本地战斗状态机对上
+  uint32 heartbeat_interval_ms = 4;
+  uint32 heartbeat_timeout_ms = 5;
 }
 
 // 落点分配(battle 节点 → 客户端,大厅公告:无直连时经大厅通道 Kafka gate-cmd 推送;D26):

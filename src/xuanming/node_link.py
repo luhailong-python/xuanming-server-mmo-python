@@ -83,6 +83,8 @@ class GateLinks:
         one_way: bool = False,
         expected_uuid: str | None = None,
         timeout: float = _SCENE_CALL_TIMEOUT,
+        on_sent=None,
+        can_send=None,
     ) -> bytes:
         route = self._protocol.routes.get(message_id)
         if route is None or route.service != "Scene" or route.request_type != protobuf.DESCRIPTOR.full_name:
@@ -92,9 +94,14 @@ class GateLinks:
         channel = await self._link(node_id, expected_uuid)
         body = protobuf.SerializeToString()
         if one_way:
-            await channel.send(message_id, body)
+            if can_send is None:
+                await channel.send(message_id, body)
+            else:
+                await channel.send(message_id, body, can_send=can_send)
             return b""
-        return await channel.call(message_id, body, timeout=timeout)
+        if on_sent is None and can_send is None:
+            return await channel.call(message_id, body, timeout=timeout)
+        return await channel.call(message_id, body, timeout=timeout, on_sent=on_sent, can_send=can_send)
 
     async def identity(self, node_id: int) -> str:
         if not 0 < node_id < (1 << 17):

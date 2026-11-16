@@ -272,8 +272,12 @@ class SceneTravel:
         return self._last_stamp
 
     def frozen(self, player_id: int) -> bool:
+        return self.sealed(player_id) or self.handoff_frozen(player_id)
+
+    def handoff_frozen(self, player_id: int) -> bool:
+        """交接冻结；角色交易封存不能视为可等待重投的场景迁移。"""
         trip = self._trips.get(player_id)
-        return self.sealed(player_id) or trip is not None and trip.frozen
+        return trip is not None and trip.frozen
 
     def sealed(self, player_id: int) -> bool:
         return player_id in self._trade_drains

@@ -40,12 +40,21 @@ message ProcessClientPlayerMessageRequest
   // 而新 gate 上同一个 session 号已经属于 B —— 不带玩家身份的话 B 的客户端消息
   // 会被派发到 A 的实体上执行。0 = 老 gate(灰度窗口),scene 放行不校验。
   uint64 player_id = 3;
+  // Gate 收包时的场景路由与转发时不同。
+  bool received_on_previous_route = 4;
+}
+
+enum ClientMessageDispatchVerdict
+{
+  CLIENT_MESSAGE_DISPATCH_VERDICT_UNSPECIFIED = 0;
+  CLIENT_MESSAGE_DISPATCH_VERDICT_RETRY_LATER = 1;
 }
 
 message ProcessClientPlayerMessageResponse
 {
   MessageContent message_content = 1;
   uint32 session_id = 2;
+  ClientMessageDispatchVerdict dispatch_verdict = 3;
 }
 
 message SessionDisconnectRequest

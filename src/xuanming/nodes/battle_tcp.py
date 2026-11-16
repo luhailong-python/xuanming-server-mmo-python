@@ -20,6 +20,9 @@ _MAX_FRAME_SIZE = DEFAULT_GATE_FRAME_SIZE
 _MAX_REQUEST_SIZE = 1024
 _MAX_BUFFERED_OUTPUT = 2 * 1024 * 1024
 _SHUTDOWN_DRAIN_SECONDS = 5
+HEARTBEAT_INTERVAL = 10
+HEARTBEAT_TIMEOUT = 30
+_LIVENESS_CHECK_PERIOD = 1
 _PROBE_START = "match.NetworkProbeStart"
 _PROBE_ECHO = "match.NetworkProbeEcho"
 _PROBE_GRANT_DOMAIN = b"xuanming.match.probe.grant.v1\0"
@@ -58,6 +61,34 @@ class BattleClients:
         illegal = 0
         requests: dict[int, deque[float]] = {}
         loop = asyncio.get_running_loop()
+        heartbeat_at = None
+        heartbeats = 0
+
+        def verify_response():
+            return self.protocol.message(
+                "BattleTokenVerifyResponse", success=True, battle_id=ticket.battle_id,
+                heartbeat_interval_ms=int(HEARTBEAT_INTERVAL * 1000),
+                heartbeat_timeout_ms=int(HEARTBEAT_TIMEOUT * 1000),
+            )
+
+        async def read_live_packet():
+            due = loop.time() + HEARTBEAT_TIMEOUT
+            read_task = asyncio.create_task(read_packet(reader, max_size=_MAX_FRAME_SIZE))
+            try:
+                while True:
+                    try:
+                        async with asyncio.timeout_at(due):
+                            return await asyncio.shield(read_task)
+                    except TimeoutError:
+                        now = loop.time()
+                        if now - due <= 2 * _LIVENESS_CHECK_PERIOD:
+                            raise
+                        # A blocked event loop may have left client input unread.
+                        due = now + _LIVENESS_CHECK_PERIOD
+            finally:
+                if not read_task.done():
+                    read_task.cancel()
+                await asyncio.gather(read_task, return_exceptions=True)
 
         def enqueue(message):
             nonlocal queued_bytes
@@ -117,9 +148,7 @@ class BattleClients:
                 try:
                     ticket = self.battle.authorize(verify.payload, verify.signature)
                     self.battle.attach(ticket, emit, close, is_live=is_live)
-                    response = self.protocol.message(
-                        "BattleTokenVerifyResponse", success=True, battle_id=ticket.battle_id,
-                    )
+                    response = verify_response()
                 except BattleError:
                     response = self.protocol.message("BattleTokenVerifyResponse", error="invalid battle token")
                 await write_packet(writer, Packet.from_message(response))
@@ -129,12 +158,26 @@ class BattleClients:
             if self.battle.owns_connection(ticket, close):
                 self.battle.on_verified(ticket)
             while not closing and self.battle.owns_connection(ticket, close):
-                packet = await read_packet(reader, max_size=_MAX_FRAME_SIZE)
+                packet = await read_live_packet()
                 if packet is None or not self.battle.owns_connection(ticket, close):
                     return
                 if packet.type_name == "BattleTokenVerifyRequest":
-                    if not enqueue(self.protocol.message("BattleTokenVerifyResponse", success=True, battle_id=ticket.battle_id)):
+                    if not enqueue(verify_response()):
                         return
+                    continue
+                if packet.type_name == "ClientHeartbeatRequest":
+                    request = self.protocol.parse(packet.type_name, packet.payload)
+                    now = loop.time()
+                    if heartbeat_at is None or now - heartbeat_at >= HEARTBEAT_INTERVAL:
+                        heartbeat_at, heartbeats = now, 0
+                    if heartbeats < 3:
+                        heartbeats += 1
+                        if not enqueue(self.protocol.message("ClientHeartbeatResponse", seq=request.seq)):
+                            return
+                    else:
+                        illegal += 1
+                        if self._illegal_threshold and illegal >= self._illegal_threshold:
+                            return
                     continue
                 if packet.type_name != "ClientRequest":
                     return

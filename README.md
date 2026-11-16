@@ -4,9 +4,9 @@
 
 | 节点 | 当前运行路径 |
 | --- | --- |
-| Gate | TCP 票据、心跳和限流、登录态续租、按会话保序、直连 Go 服务或经 Router、Kafka 推送、世界聊天、跨区重定向和大厅观战 |
+| Gate | TCP 票据、心跳和限流、登录态续租、场景交接期间的保序重投、直连 Go 服务或经 Router、Kafka 推送、世界聊天、跨区重定向和大厅观战 |
 | Scene | RPC0、场景和角色归属代次、Redis 跨区交接、SQL 入场与封存、导航和组队跟随、断线保留和月卡托管、资产、属性、宠物、任务副本和实时技能 |
-| Battle | gRPC 建房、TCP 票据直连、原配表的职业技能和 Buff、PvE 奖励、战报和观战、Match SQL 终局、Agones 建房准入 |
+| Battle | gRPC 建房、TCP 票据直连和心跳、战斗自动剧本、原配表的职业技能和 Buff、PvE 奖励、战报和观战、Match SQL 终局、Agones 建房准入 |
 
 原有 muduo 客户端帧与 RPC0 保持各自的二进制格式。Python 使用 `asyncio` 管理连接、时钟和退出，使用 Protobuf 描述符解析原协议，使用 `grpc.aio` 和 `aiokafka` 对接基础设施。配置采用标准库 `tomllib`。本地角色行存档采用带跨进程锁和原子替换的 JSON 文件；SQLite 继续保存本地收件箱与发号器。集群角色数据仍由 Go PlayerStore/DataService 写入现有 SQL/TiDB 路径。运行节点共享协议和引擎代码，玩法状态由各自的场景或房间持有。
 
