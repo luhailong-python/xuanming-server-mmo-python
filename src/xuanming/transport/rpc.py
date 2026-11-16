@@ -42,6 +42,7 @@ class RpcErrorCode(IntEnum):
     INVALID_REQUEST = 4
     HANDLER_FAILED = 7
     REPLY_DROPPED = 8
+    KILL_SWITCH_DENIED = 9
 
 
 class RpcError(Exception):
@@ -103,6 +104,7 @@ class RpcChannel:
         max_inbound: int = 1024,
         max_frame_size: int = DEFAULT_RPC_FRAME_SIZE,
         heartbeat: RpcLinkHeartbeat | None = None,
+        deny: Callable[[int], bool] | None = None,
     ) -> None:
         if min(max_pending, max_inbound) < 1:
             raise ValueError("RPC0 concurrency limits must be positive")
@@ -121,6 +123,7 @@ class RpcChannel:
         self._closed = False
         self._loop = asyncio.get_running_loop()
         self._heartbeat = heartbeat
+        self._deny = deny
         self._heartbeat_timer: asyncio.TimerHandle | None = None
         self._last_check = self._last_sent = self._last_received = self._loop.time()
         self._read_activity = False
@@ -277,6 +280,8 @@ class RpcChannel:
         handler = self._handlers.get(request.message_id)
         if request.message_id not in self._known_ids:
             await self._reply(request, error=RpcErrorCode.INVALID_REQUEST)
+        elif self._deny is not None and self._deny(request.message_id):
+            await self._reply(request, error=RpcErrorCode.KILL_SWITCH_DENIED)
         elif handler is None or len(self._inbound) >= self._max_inbound:
             await self._reply(request, error=RpcErrorCode.NO_SERVICE)
         else:

@@ -36,6 +36,10 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 
 集群密钥沿用原有配置名。Gate 使用 `MMORPG_GATE_TOKEN_SECRET` 和 `MMORPG_INTERNAL_AUTH_SECRET`。Battle 使用 `MMORPG_BATTLE_TOKEN_SECRET` 和 `MMORPG_MATCH_OUTCOME_SECRET_BATTLE`。Scene 使用 `MMORPG_PLAYER_STORE_SECRET_SCENE` 和 `MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE`。资产调用方按需配置 `MMORPG_ASSET_OP_SECRET_GUILD`、`MMORPG_ASSET_OP_SECRET_TRADE`、`MMORPG_ASSET_OP_SECRET_MAIL`、`MMORPG_ASSET_OP_SECRET_DATA_SERVICE`。角色封存另用 `MMORPG_ACCOUNT_DIRECTORY_SECRET_TRADE`，大厅观战另用 `MMORPG_SPECTATE_TOKEN_SECRET`。本地客户端 GM 同时要求 `GATE_RUN_MODE=dev` 和 `SCENE_RUN_MODE=dev`。Gate 和 Scene 的内部停机 RPC 与 Scene 实体诊断 RPC 使用独立的 `GATE_GM_ADMIN_SECRET`。Scene 诊断列出 Python 运行时的组件和值，实体编号和组件描述使用 Python 实现的格式。
 
+集群节点监听 etcd 的 `/mmorpg/killswitch/` 规则，可按实例、节点类型或全局短路 RPC。规则及优先级沿用 C++ 约定；etcd 长时间不可用时，超过 60 秒未同步的规则自动失效。本地模式不连接 etcd。
+
+战斗奖励转邮件需要配置与 Mail 服务一致的 `MAIL_PRODUCER_SECRET_BATTLE`。密钥或 Mail 服务不可用时，无法入包的结算会保留并重试。
+
 使用原版 Match 的地域探测时，Battle 和 Match 配置相同的 `MATCH_PROBE_SECRET`（至少 32 字节），并为 Battle 设置非零 `physical_region` 和客户端可访问的 `battle.client_host`、`battle.client_port`。设置 `GLOBAL_MATCH_ENABLED=true` 后，Battle 会在启动时检查探测密钥和机房编号。
 
 Agones 部署设置 `AGONES_SDK_HTTP_PORT`，可同时设置 `CLIENT_ENDPOINT_SOURCE=agones` 从 GameServer 的 `client` 端口读取对外地址。Battle 注册后按 SDK 就绪、分配和排空状态更新 etcd 建房准入。停机时关闭准入，向正在观战的客户端通知离场，并在限定时间内补交已结束的战斗结局。Agones 生命周期目前用本地模拟 SDK HTTP 验证。

@@ -390,6 +390,9 @@ class GateNode:
             return self._error(request, INVALID_PARAMETER)
         if bool(request.id) != (route.kind == RpcKind.REQUEST):
             return self._error(request, INVALID_PARAMETER)
+        switch = getattr(self, "kill_switch", None)
+        if switch is not None and switch.check_id(request.message_id):
+            return self._error(request, UNAVAILABLE)
         if route.node_type == RouteNode.GATE:
             return self.spectate.request(session, route, request) if self.spectate else self._error(request, UNAVAILABLE)
         if route.node_type == RouteNode.BATTLE:

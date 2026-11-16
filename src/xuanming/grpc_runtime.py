@@ -49,7 +49,7 @@ class GrpcClient:
         await self.channel.close()
 
 
-async def serve_grpc(protocol: Protocol, address: str, services: dict):
+async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_switch=None):
     server = grpc.aio.server(options=(("grpc.so_reuseport", 0),))
     for service_name, handlers in services.items():
         descriptor = protocol.pool.FindServiceByName(service_name)
@@ -57,7 +57,7 @@ async def serve_grpc(protocol: Protocol, address: str, services: dict):
         for name, handler in handlers.items():
             method = descriptor.methods_by_name[name]
             methods[name] = grpc.unary_unary_rpc_method_handler(
-                _grpc_handler(handler),
+                _grpc_handler(handler, kill_switch=kill_switch, service=service_name, method=name),
                 request_deserializer=protocol.message_class(method.input_type.full_name).FromString,
                 response_serializer=lambda message: message.SerializeToString(),
             )
@@ -69,9 +69,15 @@ async def serve_grpc(protocol: Protocol, address: str, services: dict):
     return server, port
 
 
-def _grpc_handler(handler):
+def _grpc_handler(handler, *, kill_switch=None, service="", method=""):
     async def invoke(request, context):
         try:
+            rule = kill_switch.check(service, method) if kill_switch is not None else None
+            if rule is not None:
+                code = next((item for item in grpc.StatusCode if item.value[0] == rule.grpc_code),
+                            grpc.StatusCode.UNAVAILABLE)
+                reason = f", reason: {rule.reason}" if rule.reason else ""
+                await context.abort(code, f"killswitch: method /{service}/{method} is disabled{reason}")
             response = handler(request)
             if inspect.isawaitable(response):
                 response = await response

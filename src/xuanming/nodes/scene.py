@@ -594,6 +594,10 @@ class SceneNode:
             if (leaving or handler is not None) and not self._releasing(player) and player.disconnect_at is None:
                 # 原版在解析和业务校验前记录活动；未知 RPC 与旧会话不会到这里。
                 player.activity.record(self.current_frame)
+            switch = getattr(self, "kill_switch", None)
+            if switch is not None and switch.check_id(content.message_id):
+                reply.message_content.CopyFrom(self.protocol.content(content.message_id, content.id, error=1003))
+                return reply
             if leaving:
                 reason = self.protocol.parse("GameNodeExitGameRequest", content.serialized_message).reason
                 if reason == 2:

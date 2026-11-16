@@ -155,7 +155,9 @@ class GateRpcService:
             ids["GateGmGracefulShutdown"]: self._shutdown,
             **{ids["Gate" + method]: partial(broadcast, method) for method in GATE_BROADCAST_METHODS},
         }
-        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT, max_inbound=32)
+        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT, max_inbound=32,
+                             deny=lambda mid: bool(getattr(self.gate, "kill_switch", None)
+                                                   and self.gate.kill_switch.check_id(mid)))
         address = writer.get_extra_info("peername")
         peer = _ScenePeer(channel, address[0] if address else "")
         self._channels.add(channel)

@@ -11,6 +11,7 @@ from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerR
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
 from .grpc_runtime import GrpcClient, GrpcUnavailable, serve_grpc
+from .kill_switch import EtcdKillSwitch, KillSwitch
 from .node_link import GateLinks, SceneLinks
 from .nodes.battle import BattleNode
 from .nodes.battle_agones import BattleAgones
@@ -70,6 +71,7 @@ class Runtime:
         self.battle_info = None
         self._local_outcomes: dict[int, asyncio.Task] = {}
         self._local_notices: set[asyncio.Task] = set()
+        self._kill_switches: dict[str, KillSwitch] = {}
 
     async def __aenter__(self):
         self.settings.validate(self.role)
@@ -180,7 +182,8 @@ class Runtime:
     async def _listen_grpc(self, role, info, services) -> None:
         options = getattr(self.settings, role)
         address = grpc_address(options.host, options.grpc_port)
-        server, port = await serve_grpc(self.protocol, address, services)
+        server, port = await serve_grpc(self.protocol, address, services,
+                                        kill_switch=self._kill_switches.get(info.node_uuid))
         self._stack.push_async_callback(server.stop, 3)
         info.grpc_endpoint.ip = options.advertise_host or options.host
         info.grpc_endpoint.port = port
@@ -195,8 +198,18 @@ class Runtime:
     def _spawn(self, coroutine, name) -> None:
         self._background.append(asyncio.create_task(coroutine, name=name))
 
+    def _configure_kill_switch(self, info):
+        switch = KillSwitch(self.protocol, info)
+        self._kill_switches[info.node_uuid] = switch
+        if not self.local:
+            sync = EtcdKillSwitch(self.protocol, self.settings.etcd, switch)
+            sync.start()
+            self._stack.push_async_callback(sync.close)
+        return switch
+
     async def _gate(self) -> None:
         info = self._info("gate", GATE)
+        switch = self._configure_kill_switch(info)
         endpoint = ClientEndpointSettings() if self.local else ClientEndpointSettings.from_env(os.environ)
         if endpoint.source == "agones":
             raise ValueError("Gate 不支持 CLIENT_ENDPOINT_SOURCE=agones")
@@ -219,8 +232,10 @@ class Runtime:
             self._stack.push_async_callback(forward.close)
         gate_secret = secret("MMORPG_GATE_TOKEN_SECRET", fallback=secrets.token_bytes(32) if self.local else b"")
         gate = GateNode(self.protocol, info, gate_secret, forward, max_connections=info.max_connections)
+        gate.kill_switch = switch
         self.gate = gate
         links = GateLinks(self.protocol, info, self.directory, gate.push, source_aware=True, on_broadcast=gate.broadcast)
+        links.kill_switch = switch
         self._stack.push_async_callback(links.close)
         gate.scene = links
         self._stack.push_async_callback(gate.close)
@@ -263,6 +278,7 @@ class Runtime:
 
     async def _scene(self) -> None:
         info = self._info("scene", SCENE)
+        switch = self._configure_kill_switch(info)
         tables = ConfigTables()
         audit = anomaly = allocate_tx_id = None
         if self.local:
@@ -287,6 +303,7 @@ class Runtime:
         self._stack.push_async_callback(links.close)
         scene = SceneNode(self.protocol, info, store, PlayerRowCodec(self.protocol), links.emit,
                           emit_many=links.emit_many, tick_interval=self.settings.scene_tick_seconds)
+        scene.kill_switch = switch
         scene.tables = tables
         scene.navigation = load_navigation(tables)
         self.scene = scene
@@ -439,6 +456,7 @@ class Runtime:
 
     async def _battle(self) -> None:
         info = self._info("battle", BATTLE)
+        switch = self._configure_kill_switch(info)
         info.admission = _ADMISSION_CLOSED
         options = self.settings.battle
         endpoint = ClientEndpointSettings() if self.local else ClientEndpointSettings.from_env(os.environ)
@@ -506,6 +524,7 @@ class Runtime:
             on_rooms_changed=lifecycle.rooms_changed if lifecycle is not None else None,
             tables=ConfigTables(),
         )
+        battle.kill_switch = switch
         if control is not None:
             control.bind(battle)
         battle.admitting = False

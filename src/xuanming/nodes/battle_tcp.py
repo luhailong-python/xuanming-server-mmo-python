@@ -219,6 +219,9 @@ class BattleClients:
         if len(timestamps) >= count:
             return self.protocol.content(message_id, call_id, error=1008)
         timestamps.append(now)
+        switch = getattr(self.battle, "kill_switch", None)
+        if switch is not None and switch.check_id(message_id):
+            return self.protocol.content(message_id, call_id, error=1003)
         try:
             message = self.protocol.parse(kind, request.body)
             response = self.battle.dispatch(ticket, message_id, message)

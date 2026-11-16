@@ -211,7 +211,9 @@ class GateLinks:
                              for method in GATE_BROADCAST_METHODS})
         async with asyncio.timeout(_HANDSHAKE_TIMEOUT):
             reader, writer = await asyncio.open_connection(remote.endpoint.ip, remote.endpoint.port)
-        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT)
+        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT,
+                             deny=lambda mid: bool(getattr(self, "kill_switch", None)
+                                                   and self.kill_switch.check_id(mid)))
         self._channels.add(channel)
         try:
             if self._closing:
@@ -320,7 +322,10 @@ class SceneLinks:
                 ids["SceneSceneGmGracefulShutdown"]: partial(administrative, self._admin.shutdown),
                 ids["SceneSceneGmDescribeEntity"]: partial(administrative, self._admin.describe),
             })
-        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT)
+        channel = RpcChannel(reader, writer, self._envelope, handlers, heartbeat=_HEARTBEAT,
+                             deny=lambda mid: bool(mid != ids["SceneProcessClientPlayerMessage"]
+                                                   and getattr(self._scene, "kill_switch", None)
+                                                   and self._scene.kill_switch.check_id(mid)))
         peer = _GatePeer(channel)
         self._channels.add(channel)
 
