@@ -14,9 +14,9 @@ from xuanming.nodes.scene_aoi import (
 
 
 def test_native_weights_capacity_and_flat_hex():
-    assert [priority_weight(p) for p in Priority] == [0, 1, 2, 3, 4, 255]
-    assert [priority_weight(p, Policy.DUNGEON) for p in Priority] == [0, 2, 3, 1, 4, 255]
-    assert [priority_weight(p, Policy.PVP_ARENA) for p in Priority] == [0, 2, 4, 1, 3, 255]
+    assert [priority_weight(p) for p in Priority] == [0, 1, 2, 3, 4, 255, 5]
+    assert [priority_weight(p, Policy.DUNGEON) for p in Priority] == [0, 2, 3, 1, 4, 255, 5]
+    assert [priority_weight(p, Policy.PVP_ARENA) for p in Priority] == [0, 2, 4, 1, 3, 255, 5]
     assert effective_capacity() == 100
     assert effective_capacity(0) == 20 and effective_capacity(201) == 200
     assert effective_capacity(180, .5) == 110 and effective_capacity(200, 1.) == 20

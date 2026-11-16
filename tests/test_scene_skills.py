@@ -100,6 +100,8 @@ def test_realtime_release_resolves_opaque_target_and_commits_guarded_damage(race
     pushes = []
     writes = []
     pending = []
+    engagements = []
+    dirty = []
     locations = {1: world, 2: world}
 
     def complete(player, data, on_committed):
@@ -119,6 +121,10 @@ def test_realtime_release_resolves_opaque_target_and_commits_guarded_damage(race
 
     scene = SimpleNamespace(protocol=p, rows=codec, mutable=lambda _: True, battle=None, worlds={1: world},
                             locations=locations, _lock=lambda _: asyncio.Lock(),
+                            combat_engagement=SimpleNamespace(
+                                record_damage=lambda caster, target: engagements.append((caster.entity, target.entity)),
+                                on_death=lambda target: engagements.append(("death", target.entity)),
+                            ), actor_sync=SimpleNamespace(mark=lambda actor, *fields: dirty.append((actor.entity, fields))),
                             _push=lambda player, name, message: pushes.append((player.player_id, name, message)),
                             flush_player_rows=flush, commit_player_data=commit)
     service = SceneSkills(scene, tables)
@@ -143,7 +149,12 @@ def test_realtime_release_resolves_opaque_target_and_commits_guarded_damage(race
         assert buffs == ([] if race in ("caster_relocates", "target_relocates") else [15])
         assert pushes[0][0:2] == (2, "SceneSkillClientPlayerNotifySkillUsed")
         assert list(pushes[0][2].target_entity) == [101]
-        assert players[1].transform.rotation[2] > 1.5
+        assert players[1].transform.rotation == (0.0, 0.0, 90.0)
+        assert (100, ("transform",)) in dirty
+        if race in ("caster_relocates", "target_relocates"):
+            assert not engagements
+        else:
+            assert engagements == [(100, 101)] + ([("death", 101)] if writes[0][1] == 0 else [])
         await service.close()
 
     asyncio.run(exercise())
