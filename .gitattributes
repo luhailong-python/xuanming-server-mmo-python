@@ -3,3 +3,5 @@
 /src/xuanming/data/tables/*.json text eol=lf
 /src/xuanming/data/nav/current_maps/village/yuexi-bay-20261115/scene.bin.mask -text
 /src/xuanming/data/nav/current_maps/village/yuexi-bay-20261115/scene.bin.sha256 text eol=lf
+/src/xuanming/data/nav/authored_maps/*/scene.bin.authored -text
+/src/xuanming/data/nav/authored_maps/*/scene.bin.sha256 text eol=lf

@@ -50,6 +50,37 @@ class _GroundTile:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthoredNavBounds:
+    min_x: float
+    min_z: float
+    width: float
+    height: float
+    ground_y: float
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> AuthoredNavBounds:
+        if not 0 < len(data) <= 4096:
+            raise ValueError("invalid authored navigation bounds size")
+        try:
+            fields = data.decode("ascii").split()
+            if len(fields) != 7 or fields[:2] != ["ANAV", "1"]:
+                raise ValueError("invalid authored navigation bounds header")
+            values = tuple(map(float, fields[2:]))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("invalid authored navigation bounds") from exc
+        x, z, width, height, ground = values
+        if (not all(map(math.isfinite, values)) or width <= 0 or height <= 0 or ground != 0
+                or not math.isfinite(x + width) or not math.isfinite(z + height)
+                or x + width <= x or z + height <= z):
+            raise ValueError("invalid authored navigation geometry")
+        return cls(*values)
+
+    def contains(self, x: float, z: float) -> bool:
+        return (math.isfinite(x) and math.isfinite(z) and self.min_x <= x < self.min_x + self.width
+                and self.min_z <= z < self.min_z + self.height)
+
+
+@dataclass(frozen=True, slots=True)
 class NavMask:
     """Exact half-open walkability bitmap paired with a versioned nav mesh."""
 
@@ -256,7 +287,7 @@ def _portal_overlap(a, b, c, d, side):
 
 class NavigationMesh:
     def __init__(self, polygons, portals, tiles, parameters, *, mask: NavMask | None = None,
-                 versioned_mask: bool = False) -> None:
+                 versioned_mask: bool = False, authored_bounds: AuthoredNavBounds | None = None) -> None:
         self._polygons = tuple(polygons)
         self._portals = tuple(tuple(links) for links in portals)
         self._height = polygons[0].center[2]
@@ -266,9 +297,11 @@ class NavigationMesh:
         self._tile_width, self._tile_height = parameters[7:9]
         self.mask = mask
         self.versioned_mask = versioned_mask
+        self.authored_bounds = authored_bounds
 
     @classmethod
-    def from_bytes(cls, data: bytes, *, mask: NavMask | None = None, versioned_mask: bool = False):
+    def from_bytes(cls, data: bytes, *, mask: NavMask | None = None, versioned_mask: bool = False,
+                   authored_bounds: AuthoredNavBounds | None = None):
         if len(data) < _MSET.size:
             raise ValueError("truncated MSET header")
         magic, version, count, *parameters = _MSET.unpack_from(data)
@@ -351,7 +384,10 @@ class NavigationMesh:
                     overlap = _portal_overlap(a, b, c, d, side) if polygons[end].flags else None
                     if overlap is not None:
                         portals[start].insert(0, (end, edge, *overlap))
-        return cls(polygons, portals, tiles, parameters, mask=mask, versioned_mask=versioned_mask)
+        if authored_bounds is not None and abs(height - authored_bounds.ground_y) > 1e-6:
+            raise ValueError("authored navigation ground mismatch")
+        return cls(polygons, portals, tiles, parameters, mask=mask, versioned_mask=versioned_mask,
+                   authored_bounds=authored_bounds)
 
     def _candidates(self, position):
         x, y, z = position
@@ -404,6 +440,10 @@ class NavigationMesh:
             not self.mask.contains(position[1], position[0]) or abs(position[2]) > 0.2
         ):
             return None
+        bounds = self.authored_bounds
+        if bounds is not None and (not bounds.contains(position[1], position[0])
+                                   or abs(position[2] - bounds.ground_y) > 0.02):
+            return None
         nearest = self._nearest_raw(position)
         if nearest is None:
             return None
@@ -414,6 +454,10 @@ class NavigationMesh:
                     or abs(snapped[0] - position[0]) > 0.02 or abs(snapped[2]) > 0.02):
                 return None
             snapped = snapped[0], snapped[1], 0.0
+        if bounds is not None and (not bounds.contains(snapped[1], snapped[0])
+                                   or any(abs(a - b) > 0.02 for a, b in zip(snapped, position))
+                                   or abs(snapped[2] - bounds.ground_y) > 0.02):
+            return None
         return key, snapped
 
     def _nearest_raw(self, position):
@@ -481,6 +525,11 @@ class NavigationMesh:
         return 0.0
 
     def validate_move(self, start: Point, target: Point) -> tuple[bool, Point | None]:
+        bounds = self.authored_bounds
+        if bounds is not None and (len(target) != 3 or not all(map(math.isfinite, target))
+                                   or abs(target[2] - bounds.ground_y) > 0.02
+                                   or not bounds.contains(target[1], target[0])):
+            return False, start
         nearest = self._nearest(start)
         if nearest is None:
             return False, None
@@ -535,7 +584,7 @@ class NavigationMesh:
                         previous[neighbor] = current, _lerp(a, b, 0.5)
                         heapq.heappush(queue, (cost + distance(neighbor), neighbor))
 
-            if self.mask is not None and closest != last:
+            if (self.mask is not None or self.authored_bounds is not None) and closest != last:
                 return None
             point = target if closest == last else _closest(self._polygons[closest], target)
             raw_path = [point]
@@ -550,6 +599,11 @@ class NavigationMesh:
             raw_path.reverse()
             path = self._straighten(raw_path)
 
+        if self.authored_bounds is not None and (not path or path[-1] != target or any(
+            not self.authored_bounds.contains(point[1], point[0])
+            or abs(point[2] - self.authored_bounds.ground_y) > 0.02 for point in path
+        )):
+            return None
         if self.mask is not None:
             valid_path = (path and path[0] == start and path[-1] == target
                           and all(self.mask.segment(a[1], a[0], b[1], b[0])
@@ -658,27 +712,34 @@ def load_navigation(tables) -> dict[int, NavigationMesh]:
         if contract == "legacy" and len(path.parts) != 3:
             logger.warning("旧导航文件路径必须位于导航根目录 scene_config_id=%s", row.id)
             continue
-        if contract == "authored_flat":
-            logger.warning("当前 Python 导航读取器尚不支持手绘导航契约 scene_config_id=%s", row.id)
-            continue
         relative = path.parts[2:]
         cache_key = "/".join(relative)
         if cache_key not in cache:
             try:
                 payload = root.joinpath(*relative).read_bytes()
                 mask = None
+                bounds = None
                 versioned = contract == "versioned_mask"
-                if contract in {"exact_mask", "versioned_mask"}:
+                if contract in {"exact_mask", "versioned_mask", "authored_flat"}:
                     parent = root.joinpath(*relative[:-1])
-                    mask_payload = parent.joinpath(path.name + ".mask").read_bytes()
+                    if contract == "authored_flat" and parent.joinpath(path.name + ".mask").is_file():
+                        raise ValueError("authored navigation has a residual mask")
+                    companion = parent.joinpath(path.name + (".authored" if contract == "authored_flat" else ".mask"))
+                    companion_payload = companion.read_bytes()
                     checksum_fields = parent.joinpath(path.name + ".sha256").read_text("ascii").split()
                     if (len(checksum_fields) != 2
                             or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in checksum_fields)
+                            or not 0 < len(payload) <= 64 * 1024 * 1024
+                            or not 0 < len(companion_payload) <= 64 * 1024 * 1024
                             or hashlib.sha256(payload).hexdigest() != checksum_fields[0]
-                            or hashlib.sha256(mask_payload).hexdigest() != checksum_fields[1]):
+                            or hashlib.sha256(companion_payload).hexdigest() != checksum_fields[1]):
                         raise ValueError("navigation checksums do not match")
-                    mask = NavMask.from_bytes(mask_payload)
-                mesh = NavigationMesh.from_bytes(payload, mask=mask, versioned_mask=versioned)
+                    if contract == "authored_flat":
+                        bounds = AuthoredNavBounds.from_bytes(companion_payload)
+                    else:
+                        mask = NavMask.from_bytes(companion_payload)
+                mesh = NavigationMesh.from_bytes(payload, mask=mask, versioned_mask=versioned,
+                                                 authored_bounds=bounds)
                 mesh.verify_mask_geometry()
                 cache[cache_key] = mesh
             except (OSError, ValueError):

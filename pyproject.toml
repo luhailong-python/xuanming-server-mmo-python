@@ -24,6 +24,8 @@ xuanming = ["contracts/*"]
   "nav/current_maps/village/yuexi-bay-20261115/scene.bin",
   "nav/current_maps/village/yuexi-bay-20261115/scene.bin.mask",
   "nav/current_maps/village/yuexi-bay-20261115/scene.bin.sha256",
+  "nav/authored_maps/*/scene.bin", "nav/authored_maps/*/scene.bin.authored",
+  "nav/authored_maps/*/scene.bin.sha256",
 ]
 
 [tool.pytest.ini_options]

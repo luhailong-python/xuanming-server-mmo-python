@@ -1,10 +1,12 @@
 from importlib.resources import files
 from dataclasses import replace
+import hashlib
+from types import SimpleNamespace
 
 import pytest
 
 from xuanming.data import ConfigTables
-from xuanming.data.navigation import NavigationMesh, load_navigation
+from xuanming.data.navigation import AuthoredNavBounds, NavigationMesh, load_navigation
 
 
 def test_original_maps_snap_spawns_and_share_identical_config_paths():
@@ -64,3 +66,38 @@ def test_yuexi_bay_routes_and_mask_geometry():
     mesh.mask = replace(mask, packed=bytes(bitmap))
     with pytest.raises(ValueError, match="does not match"):
         mesh.verify_mask_geometry()
+
+
+def test_authored_navigation_contract_load_and_limits(tmp_path, monkeypatch):
+    from xuanming.data import navigation
+
+    root = tmp_path / "nav" / "authored_maps" / "sample"
+    root.mkdir(parents=True)
+    mesh_data = files("xuanming.data").joinpath("nav", "main_scene.bin").read_bytes()
+    bounds_data = b"ANAV 1\n0 0 300 300 0\n"
+    (root / "scene.bin").write_bytes(mesh_data)
+    (root / "scene.bin.authored").write_bytes(bounds_data)
+    (root / "scene.bin.sha256").write_text(
+        hashlib.sha256(mesh_data).hexdigest() + "\n" + hashlib.sha256(bounds_data).hexdigest() + "\n"
+    )
+    monkeypatch.setattr(navigation, "files", lambda name: tmp_path)
+    row = SimpleNamespace(id=1, nav_bin_file="data/scene_nav_bin/authored_maps/sample/scene.bin",
+                          spawn_x=133., spawn_y=199., spawn_z=0.)
+    tables = {"BaseScene": SimpleNamespace(rows=lambda: [row])}
+    mesh = load_navigation(tables)[1]
+    spawn = (133., 199., 0.)
+    assert mesh.snap(spawn) == spawn
+    assert mesh.snap((133., 300., 0.)) is None
+    assert mesh.validate_move(spawn, (133., 300., 0.)) == (False, spawn)
+    assert mesh.snap((133., 199., 0.1)) is None
+    assert mesh.find_path(spawn, (133., 300., 0.)) is None
+
+    (root / "scene.bin.mask").write_bytes(b"old mask")
+    assert not load_navigation(tables)
+    (root / "scene.bin.mask").unlink()
+    (root / "scene.bin.authored").write_bytes(b"ANAV 1\n0 0 300 300 1\n")
+    assert not load_navigation(tables)
+
+    for invalid in (b"ANAV 1\n0 0 0 300 0\n", b"ANAV 1\n0 0 300 300 1\n"):
+        with pytest.raises(ValueError):
+            AuthoredNavBounds.from_bytes(invalid)
