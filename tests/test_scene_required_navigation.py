@@ -74,3 +74,58 @@ def test_missing_required_navigation_fences_movement_and_team_follow(tmp_path):
             await scene.close()
 
     asyncio.run(exercise())
+
+
+def test_strict_navigation_guards_teleport_and_team_follow(tmp_path):
+    class StrictNavigation:
+        mask = object()
+        reachable = True
+        walkable = True
+
+        def snap(self, position):
+            return None if position[0] < 0 else (position[0], position[1], 0.)
+
+        def find_path(self, start, target):
+            return (start, target) if self.reachable else None
+
+        def validate_move(self, start, target):
+            return (True, target) if self.walkable else (False, start)
+
+    async def exercise():
+        p = Protocol()
+        scene = SceneNode(p, p.message("NodeInfo", node_id=5, zone_id=1, node_uuid="nav-test"),
+                          SqlitePlayerStore(tmp_path / "strict.sqlite"), PlayerRowCodec(p), lambda *args: None)
+        scene.create(p.message("CreateSceneRequest", scene_id=1, config_id=1))
+        for player_id in (1, 2):
+            await scene.enter(p.message("PlayerEnterGameNodeRequest", scene_id=1, session_id=player_id,
+                                        player_id=player_id, owner_revision=1, login_generation=1), "gate")
+        world = scene.worlds[1]
+        leader, follower = world.players[1], world.players[2]
+        nav = world.nav = StrictNavigation()
+        team = scene.team = SceneTeam(scene, None)
+        try:
+            origin = leader.transform.position
+            assert not scene.teleport(world, leader, (-1., 1., 0.), ZERO, reason=5)
+            nav.reachable = False
+            assert not scene.teleport(world, leader, (origin[0] + 2., origin[1], 0.), ZERO, reason=5)
+            assert leader.transform.position == origin
+            nav.reachable = True
+            assert scene.teleport(world, leader, (origin[0] + 2., origin[1], 0.1), ZERO, reason=5)
+            assert leader.transform.position == (origin[0] + 2., origin[1], 0.)
+
+            scene._move_position(world, follower, leader.transform.position)
+            team._attach(world, follower, leader, _Membership(20, (1, 1), 1, 2), True)
+            assert team.driven(2)
+            scene._move_position(world, leader, (origin[0] + 4., origin[1], 0.))
+            team.tick(.2)
+            moved = follower.transform.position
+            assert moved[0] > origin[0] + 2.
+            nav.walkable = False
+            scene._move_position(world, leader, (origin[0] + 6., origin[1], 0.))
+            team.tick(.2)
+            assert not team.driven(2) and follower.transform.position == moved
+        finally:
+            await team.close()
+            await scene.close()
+
+    asyncio.run(exercise())

@@ -404,16 +404,10 @@ class NavigationMesh:
             not self.mask.contains(position[1], position[0]) or abs(position[2]) > 0.2
         ):
             return None
-        best = None
-        for key in self._candidates(position):
-            polygon = self._polygons[key]
-            snapped = _closest(polygon, position)
-            distance = math.dist(snapped, position)
-            if best is None or distance < best[0]:
-                best = distance, key, snapped
-        if best is None:
+        nearest = self._nearest_raw(position)
+        if nearest is None:
             return None
-        _, key, snapped = best
+        key, snapped = nearest
         if self.mask is not None:
             if (not self.mask.contains(snapped[1], snapped[0])
                     or abs(snapped[1] - position[1]) > 0.02
@@ -421,6 +415,40 @@ class NavigationMesh:
                 return None
             snapped = snapped[0], snapped[1], 0.0
         return key, snapped
+
+    def _nearest_raw(self, position):
+        best = None
+        for key in self._candidates(position):
+            polygon = self._polygons[key]
+            snapped = _closest(polygon, position)
+            distance = math.dist(snapped, position)
+            if best is None or distance < best[0]:
+                best = distance, key, snapped
+        return best[1:] if best is not None else None
+
+    def verify_mask_geometry(self) -> None:
+        """Reject a mask whose cells disagree with the loaded navigation geometry."""
+        mask = self.mask
+        if mask is None:
+            return
+        for row in range(mask.rows):
+            for col in range(mask.columns):
+                bounds = mask.cell_bounds(col, row)
+                if bounds is None:
+                    x = mask.min_x + (col + 0.5) * mask.cell_size
+                    z = mask.min_z + (mask.rows - row - 0.5) * mask.cell_size
+                else:
+                    x0, x1, z0, z1 = bounds
+                    x, z = (x0 + x1) / 2, (z0 + z1) / 2
+                nearest = self._nearest_raw((z, x, 0.0))
+                if nearest is None:
+                    found = False
+                else:
+                    point = nearest[1]
+                    found = (abs(point[0] - z) <= 0.02 and abs(point[1] - x) <= 0.02
+                             and abs(point[2]) <= 0.02)
+                if found != mask.cell(col, row):
+                    raise ValueError("navigation geometry does not match walkability mask")
 
     def snap(self, position: Point) -> Point | None:
         nearest = self._nearest(position)
@@ -462,7 +490,7 @@ class NavigationMesh:
         if self.mask is not None and (
             abs(target[2]) > 0.2 or not self.mask.segment(start[1], start[0], target[1], target[0])
         ):
-            return False, snapped
+            return False, start
         fraction = self._ray(key, snapped, target)
         if fraction == 1.0 and (accepted := self.snap(target)) is not None:
             return True, accepted
@@ -598,7 +626,10 @@ class NavigationMesh:
         result = [path[0]]
         index = 0
         while index + 1 < len(path):
-            key, start = self._nearest(path[index])
+            nearest = self._nearest(path[index])
+            if nearest is None:
+                break
+            key, start = nearest
             farthest = index
             while farthest + 1 < len(path) and self._ray(key, start, path[farthest + 1]) == 1.0:
                 farthest += 1
@@ -647,7 +678,9 @@ def load_navigation(tables) -> dict[int, NavigationMesh]:
                             or hashlib.sha256(mask_payload).hexdigest() != checksum_fields[1]):
                         raise ValueError("navigation checksums do not match")
                     mask = NavMask.from_bytes(mask_payload)
-                cache[cache_key] = NavigationMesh.from_bytes(payload, mask=mask, versioned_mask=versioned)
+                mesh = NavigationMesh.from_bytes(payload, mask=mask, versioned_mask=versioned)
+                mesh.verify_mask_geometry()
+                cache[cache_key] = mesh
             except (OSError, ValueError):
                 logger.warning("场景导航文件加载失败 file=%s", path.as_posix(), exc_info=True)
                 cache[cache_key] = None

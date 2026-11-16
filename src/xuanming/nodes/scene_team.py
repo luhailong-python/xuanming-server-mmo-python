@@ -350,8 +350,14 @@ class SceneTeam:
                         self._detach(step.player_id, _LEFT)
                         continue
                     previous = player.transform.position
-                    self.scene._move_position(world, player, step.position)
-                    self._motion(world, player, follower, tuple((b - a) / delta for a, b in zip(previous, step.position)))
+                    position = step.position
+                    if world.nav is not None and world.nav.mask is not None:
+                        walkable, position = world.nav.validate_move(previous, position)
+                        if not walkable or position is None:
+                            self._detach(step.player_id, _LEFT)
+                            continue
+                    self.scene._move_position(world, player, position)
+                    self._motion(world, player, follower, tuple((b - a) / delta for a, b in zip(previous, position)))
                 else:
                     self._motion(world, player, follower, ZERO)
 

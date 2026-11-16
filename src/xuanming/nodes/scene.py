@@ -990,6 +990,11 @@ class SceneNode:
     def teleport(self, world, player, position, rotation, *, reason) -> bool:
         if self._missing_required_navigation(world):
             return False
+        if world.nav is not None and world.nav.mask is not None:
+            destination = world.nav.snap(position)
+            if destination is None or not world.nav.find_path(player.transform.position, destination):
+                return False
+            position = destination
         player.transform.rotation = rotation
         self.set_velocity(player, ZERO)
         self.actor_sync.mark(player, "transform", "velocity")

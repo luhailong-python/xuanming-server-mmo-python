@@ -1,4 +1,5 @@
 from importlib.resources import files
+from dataclasses import replace
 
 import pytest
 
@@ -46,3 +47,20 @@ def test_mset_loader_rejects_truncation_and_unsupported_tile_layout():
     layered[114] = 1  # MSET header + first tile header + Detour version.
     with pytest.raises(ValueError, match="flat ground"):
         NavigationMesh.from_bytes(layered)
+
+
+def test_yuexi_bay_routes_and_mask_geometry():
+    mesh = load_navigation(ConfigTables())[3]
+    spawn = (36.73125, 20.19375, 0.0)
+    for dock in ((44.4375, 59.34375, 0.0), (21.88125, 48.15, 0.0)):
+        path = mesh.find_path(spawn, dock)
+        assert path and path[0] == spawn and path[-1] == dock
+        assert all(mesh.validate_move(a, b)[0] for a, b in zip(path, path[1:]))
+    assert mesh.snap((spawn[0], 75.0, 0.0)) is None
+
+    mask = mesh.mask
+    bitmap = bytearray(mask.packed)
+    bitmap[0] ^= 0x80
+    mesh.mask = replace(mask, packed=bytes(bitmap))
+    with pytest.raises(ValueError, match="does not match"):
+        mesh.verify_mask_geometry()
