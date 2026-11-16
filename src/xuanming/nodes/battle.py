@@ -838,12 +838,15 @@ class BattleNode:
                 or not 0 < request.admit_before_ms <= now + 30_000):
             return response
         key = request.battle_id, player, operation
-        if key not in self.observer_receipts and len(self.observer_receipts) >= _MAX_SPECTATOR_OPERATIONS:
-            return response
         previous = self.observer_receipts.get(key)
         if previous is not None and previous.expires_ms != request.admit_before_ms:
             return response
-        self.observer_receipts[key] = _ObserverReceipt(request.admit_before_ms)
+        if request.admit_before_ms > now:
+            if previous is None and len(self.observer_receipts) >= _MAX_SPECTATOR_OPERATIONS:
+                return response
+            self.observer_receipts[key] = _ObserverReceipt(request.admit_before_ms)
+        elif previous is not None:
+            del self.observer_receipts[key]
         room = self.rooms.get(request.battle_id)
         if room is not None:
             observer = room.observers.get(player)

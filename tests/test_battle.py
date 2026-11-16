@@ -205,6 +205,59 @@ def test_admission_tombstones_block_late_create_and_old_observer_ticket(runtime)
         node.authorize(assigned.token_payload, assigned.token_signature)
 
 
+def test_expired_observer_removal_succeeds_when_receipts_are_full(runtime, monkeypatch):
+    protocol, node, clock, _, _ = runtime
+    monkeypatch.setattr("xuanming.nodes.battle._MAX_SPECTATOR_OPERATIONS", 1)
+    assert not node.create(create_request(protocol)).error_message.id
+    operation = "01900000-0000-7000-8000-000000000001"
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id=operation, target_instance_id=node.instance_id,
+                           admit_before_ms=1100)
+    add.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(add).error_message.id
+    assignment = issue(protocol, node, 303, operation)
+    ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+    socket = Socket()
+    node.attach(ticket, socket.emit, socket.close)
+
+    clock.now = 1100
+    node.tick()
+    other = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=304,
+                             spectator_operation_id="01900000-0000-7000-8000-000000000002",
+                             target_instance_id=node.instance_id, admit_before_ms=2000)
+    other.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(other).error_message.id
+    remove = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
+                              spectator_operation_id=operation, admit_before_ms=1100,
+                              target_instance_id=node.instance_id)
+    assert node.remove_observer(remove).cancelled
+    assert 303 not in node.rooms[10].observers
+    assert socket.closed == 1
+    assert [(message_id, message.reason) for message_id, message in socket.messages] == [(166, 3)]
+    assert len(node.observer_receipts) == 1
+
+
+def test_expired_observer_removal_clears_existing_matching_receipt(runtime):
+    protocol, node, clock, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    operation = "01900000-0000-7000-8000-000000000001"
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id=operation, target_instance_id=node.instance_id,
+                           admit_before_ms=1100)
+    add.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(add).error_message.id
+    clock.now = 1100
+    remove = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
+                              spectator_operation_id=operation, admit_before_ms=1099,
+                              target_instance_id=node.instance_id)
+    assert not node.remove_observer(remove).cancelled
+    assert 303 in node.rooms[10].observers
+    remove.admit_before_ms = 1100
+    assert node.remove_observer(remove).cancelled
+    assert not node.observer_receipts
+    assert 303 not in node.rooms[10].observers
+
+
 def test_direct_spectator_node_quota_counts_seats_and_snapshot_counts_live_connections(runtime):
     protocol, original, clock, _, _ = runtime
     node = BattleNode(protocol, node_id=original.node_id, instance_id=original.instance_id,
