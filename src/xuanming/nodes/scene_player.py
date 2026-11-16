@@ -1,6 +1,7 @@
 """从当前玩家的持久组件构造 Scene 只读响应。"""
 
 from ..data import ConfigTables, PlayerRowKind
+from ..data.asset_inventory import AssetInventory, held_item_count
 
 _INVALID_TABLE_DATA = 1002
 _INVALID_PARAMETER = 1005
@@ -56,6 +57,7 @@ def _bag(scene, tables: ConfigTables, player, bag_type: int):
     capacity = saved.capacities[bag_type] if bag_type < len(saved.capacities) else _BAG_CAPACITY[bag_type]
     slots = {}
     items = {}
+    countable = {}
     for entry in saved.items:
         if entry.bag_type != bag_type:
             continue
@@ -73,6 +75,10 @@ def _bag(scene, tables: ConfigTables, player, bag_type: int):
             return response
         slots[entry.pos] = item_id
         items[item_id] = (config_id, count, item.equip if item.HasField("equip") else None)
+        if bag_type == 0:
+            countable.setdefault(config_id, 0)
+            if not entry.HasField("instance") or AssetInventory.countable(item):
+                countable[config_id] += count
 
     for item_id, (config_id, count, equip) in sorted(items.items()):
         info = response.bag.items.add(item_id=item_id, config_id=config_id, count=count)
@@ -92,6 +98,12 @@ def _bag(scene, tables: ConfigTables, player, bag_type: int):
                 layout.equip_slots.add(slot=slot, equip_kind=row.equip_kind, name=row.name)
     wallet = _read_row(scene, player, PlayerRowKind.WALLET)
     response.bag.currency.CopyFrom(wallet.currency)
+    if bag_type == 0:
+        profile = _read_row(scene, player, PlayerRowKind.PROFILE)
+        for config_id, total in sorted(countable.items()):
+            held = held_item_count(profile, config_id)
+            if held:
+                response.bag.held_items.add(config_id=config_id, count=min(held, total))
     return response
 
 

@@ -101,10 +101,17 @@ message BagLayoutInfo {
   repeated EquipSlotInfo equip_slots = 5;
 }
 
+// 人物背包中被未结算战斗占用的物品数量，按配置号汇总。
+message BagHeldItemInfo {
+  uint32 config_id = 1;
+  uint64 count = 2;
+}
+
 message BagInfo {
   repeated BagItemInfo items = 1; // 顺序无语义，布局通过 item_id 关联。
   BagLayoutInfo layout = 2;
   CurrencyComp currency = 3;
+  repeated BagHeldItemInfo held_items = 4;
 }
 
 message GetBagRequest { uint32 bag_type = 1; }
