@@ -12,6 +12,7 @@ from google.protobuf.message import DecodeError
 
 from ..grpc_runtime import GrpcClient, session_metadata
 from ..protocol import RpcKind
+from .gate_login_renewal import RENEW_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,19 @@ class DirectForwarder:
 
     def validate_request(self, route, request):
         return self.protocol.parse(route.request_type, request.body)
+
+    async def renew_login(self, gate, session):
+        peer = await self._select(gate.info, _LOGIN)
+        if peer is None:
+            raise RuntimeError("Login 节点不可用")
+        try:
+            details = gate.details(session, 0).SerializeToString()
+            metadata = session_metadata(details, RENEW_PATH, self.secret)
+            return await peer.client.call(RENEW_PATH, b"", metadata=metadata)
+        finally:
+            peer.in_flight -= 1
+            if peer.retired and not peer.in_flight:
+                await self._close_peer(peer)
 
     async def __call__(self, gate, session, route, request, seq):
         def error(code):

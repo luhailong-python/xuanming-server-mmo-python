@@ -24,6 +24,7 @@ from ..transport.client_limits import illegal_packet_threshold as _illegal_packe
 from ..transport.client_output import ClientOutputQueue
 from .gate_chat import WorldChatFanout
 from .gate_entry import FORCE_CLOSE_DELAY, PendingSceneEntry, retry_entry
+from .gate_login_renewal import LoginRenewal, RENEW_ID, RENEW_PATH
 
 logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 10
@@ -135,6 +136,21 @@ class RouterForwarder:
             raise PermissionError("RPC 路由响应会话校验失败")
         return self.protocol.parse("MessageContent", data)
 
+    async def renew_login(self, gate, session):
+        request = self.protocol.message("ClientRequest", message_id=RENEW_ID)
+        forward = self.protocol.message("client_rpc_router.ForwardRequest", request=request,
+                                        zone_id=gate.info.zone_id, release_track=gate.info.release_track)
+        subject = gate.details(session, 0).SerializeToString()
+        metadata = session_metadata(subject, RENEW_PATH, self.secret)
+        call = self.client.request(ROUTER_PATH, forward.SerializeToString(), metadata=metadata)
+        data = await call
+        if dict(await call.initial_metadata()).get("x-session-detail-bin") != metadata[0][1]:
+            raise ValueError("RPC 路由响应会话校验失败")
+        result = self.protocol.parse("MessageContent", data)
+        if result.error_message.id:
+            raise ValueError("Login 续租失败")
+        return result.serialized_message
+
 
 class GateNode:
     def __init__(self, protocol, info, ticket_secret: bytes, forward, *, max_connections: int = 1024):
@@ -159,6 +175,8 @@ class GateNode:
         self._generation = count(1)
         self._calls = count(1)
         self._handlers: set[asyncio.Task] = set()
+        sender = getattr(forward, "renew_login", None)
+        self.login_renewal = LoginRenewal(self, sender) if sender is not None else None
 
     def issue_ticket(self, *, ttl: int = 600, player_id: int = 0):
         return issue_gate_ticket(
@@ -209,6 +227,8 @@ class GateNode:
             if io_tasks:
                 await asyncio.gather(*io_tasks, return_exceptions=True)
             self.sessions.pop(session_id, None)
+            if self.login_renewal is not None:
+                self.login_renewal.forget(session)
             if self.spectate:
                 self.spectate.close_session(session_id)
             try:
@@ -398,6 +418,8 @@ class GateNode:
                 if (result is not None and not result.error_message.id
                         and not self.protocol.parse(route.response_type, result.serialized_message).error_message.id):
                     session.logged_in = True
+                    if self.login_renewal is not None:
+                        self.login_renewal.login_succeeded(session)
             return result
         except (OSError, ValueError, RpcError, DecodeError, grpc.RpcError, RuntimeError):
             logger.debug("客户端请求失败 message_id=%s", request.message_id, exc_info=True)
@@ -747,6 +769,8 @@ class GateNode:
                 session.emit(content)
 
     async def close(self) -> None:
+        if self.login_renewal is not None:
+            await self.login_renewal.close()
         for session in tuple(self.sessions.values()):
             session.close()
         if self._handlers:
