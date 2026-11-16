@@ -1,10 +1,14 @@
-"""Read the original flat Detour MSET maps in server Z-up coordinates."""
+"""Read flat Detour MSET maps and strict walkability masks in server Z-up coordinates."""
+
+from __future__ import annotations
 
 import heapq
+import hashlib
 import logging
 import math
+import re
 import struct
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import PurePosixPath
@@ -43,6 +47,134 @@ class _GroundTile:
     lower: Point
     upper: Point
     nodes: tuple
+
+
+@dataclass(frozen=True, slots=True)
+class NavMask:
+    """Exact half-open walkability bitmap paired with a versioned nav mesh."""
+
+    columns: int
+    rows: int
+    cell_size: float
+    min_x: float
+    min_z: float
+    width: float
+    height: float
+    effective_x: float
+    effective_z: float
+    effective_width: float
+    effective_height: float
+    packed: bytes
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> NavMask:
+        try:
+            fields = payload.decode("ascii").split()
+        except UnicodeDecodeError as exc:
+            raise ValueError("walkability mask is not ASCII") from exc
+        if len(fields) != 14 or fields[:2] != ["FMASK", "1"]:
+            raise ValueError("unsupported walkability mask header")
+        try:
+            columns, rows = int(fields[2]), int(fields[3])
+            cell_size, min_x, min_z, width, height = map(float, fields[4:9])
+            effective_x, effective_z, effective_width, effective_height = map(float, fields[9:13])
+        except ValueError as exc:
+            raise ValueError("invalid walkability mask geometry") from exc
+        if (not 0 < columns <= 4096 or not 0 < rows <= 4096
+                or not all(math.isfinite(value) for value in (
+                    cell_size, min_x, min_z, width, height,
+                    effective_x, effective_z, effective_width, effective_height,
+                ))
+                or cell_size <= 0 or width <= 0 or height <= 0
+                or effective_width <= 0 or effective_height <= 0
+                or columns != math.ceil(width / cell_size) or rows != math.ceil(height / cell_size)
+                or effective_x < min_x or effective_z < min_z
+                or effective_x + effective_width > min_x + width + 1e-9
+                or effective_z + effective_height > min_z + height + 1e-9):
+            raise ValueError("invalid walkability mask bounds")
+        encoded = fields[13]
+        cell_count = columns * rows
+        if len(encoded) != ((cell_count + 7) // 8) * 2 or re.fullmatch(r"[0-9a-fA-F]+", encoded) is None:
+            raise ValueError("invalid walkability mask bitmap")
+        packed = bytes.fromhex(encoded)
+        tail = (8 - cell_count % 8) % 8
+        if packed[-1] & ((1 << tail) - 1):
+            raise ValueError("nonzero padding in walkability mask")
+        return cls(columns, rows, cell_size, min_x, min_z, width, height,
+                   effective_x, effective_z, effective_width, effective_height, packed)
+
+    def cell(self, col: int, row: int) -> bool:
+        if not (0 <= col < self.columns and 0 <= row < self.rows):
+            return False
+        index = row * self.columns + col
+        return bool(self.packed[index // 8] & (0x80 >> (index % 8)))
+
+    def contains(self, x: float, z: float) -> bool:
+        if (not math.isfinite(x) or not math.isfinite(z)
+                or x < self.effective_x or z < self.effective_z
+                or x >= self.effective_x + self.effective_width
+                or z >= self.effective_z + self.effective_height):
+            return False
+        col = math.floor((x - self.min_x) / self.cell_size)
+        row = self.rows - 1 - math.floor((z - self.min_z) / self.cell_size)
+        return self.cell(col, row)
+
+    def cell_bounds(self, col: int, row: int) -> tuple[float, float, float, float] | None:
+        x0 = max(self.min_x + col * self.cell_size, self.effective_x)
+        x1 = min(self.min_x + (col + 1) * self.cell_size, self.effective_x + self.effective_width)
+        z0 = max(self.min_z + (self.rows - 1 - row) * self.cell_size, self.effective_z)
+        z1 = min(self.min_z + (self.rows - row) * self.cell_size, self.effective_z + self.effective_height)
+        return (x0, x1, z0, z1) if x0 < x1 and z0 < z1 else None
+
+    def segment(self, x0: float, z0: float, x1: float, z1: float) -> bool:
+        if not self.contains(x0, z0) or not self.contains(x1, z1):
+            return False
+        cuts = [0.0, 1.0]
+        for first, last, origin in ((x0, x1, self.min_x), (z0, z1, self.min_z)):
+            if first == last:
+                continue
+            low, high = sorted((first, last))
+            for index in range(math.floor((low - origin) / self.cell_size) + 1,
+                               math.floor((high - origin) / self.cell_size) + 1):
+                fraction = (origin + index * self.cell_size - first) / (last - first)
+                if 0 < fraction < 1:
+                    cuts.append(fraction)
+        cuts.sort()
+        unique = [cuts[0]]
+        for fraction in cuts[1:]:
+            if abs(fraction - unique[-1]) > 1e-12:
+                unique.append(fraction)
+        previous_col = math.floor((x0 - self.min_x) / self.cell_size)
+        previous_row = self.rows - 1 - math.floor((z0 - self.min_z) / self.cell_size)
+        for first, last in zip(unique, unique[1:]):
+            fraction = (first + last) * 0.5
+            x = x0 + (x1 - x0) * fraction
+            z = z0 + (z1 - z0) * fraction
+            if not self.contains(x, z):
+                return False
+            col = math.floor((x - self.min_x) / self.cell_size)
+            row = self.rows - 1 - math.floor((z - self.min_z) / self.cell_size)
+            if col != previous_col and row != previous_row and not (
+                self.cell(col, previous_row) and self.cell(previous_col, row)
+            ):
+                return False
+            previous_col, previous_row = col, row
+        end_col = math.floor((x1 - self.min_x) / self.cell_size)
+        end_row = self.rows - 1 - math.floor((z1 - self.min_z) / self.cell_size)
+        return (end_col == previous_col or end_row == previous_row
+                or self.cell(end_col, previous_row) and self.cell(previous_col, end_row))
+
+
+def navigation_contract(nav_bin_file: str) -> str:
+    """Return the safety contract declared by a scene navigation path."""
+    path = str(nav_bin_file).replace("\\", "/")
+    if path.startswith("data/scene_nav_bin/festival_maps/"):
+        return "exact_mask"
+    if path.startswith("data/scene_nav_bin/current_maps/"):
+        return "versioned_mask"
+    if path.startswith("data/scene_nav_bin/authored_maps/"):
+        return "authored_flat"
+    return "legacy"
 
 
 def _polygon(vertices, flags):
@@ -123,7 +255,8 @@ def _portal_overlap(a, b, c, d, side):
 
 
 class NavigationMesh:
-    def __init__(self, polygons, portals, tiles, parameters) -> None:
+    def __init__(self, polygons, portals, tiles, parameters, *, mask: NavMask | None = None,
+                 versioned_mask: bool = False) -> None:
         self._polygons = tuple(polygons)
         self._portals = tuple(tuple(links) for links in portals)
         self._height = polygons[0].center[2]
@@ -131,9 +264,11 @@ class NavigationMesh:
         self._quantization = parameters[3]
         self._origin = parameters[4:7]
         self._tile_width, self._tile_height = parameters[7:9]
+        self.mask = mask
+        self.versioned_mask = versioned_mask
 
     @classmethod
-    def from_bytes(cls, data: bytes):
+    def from_bytes(cls, data: bytes, *, mask: NavMask | None = None, versioned_mask: bool = False):
         if len(data) < _MSET.size:
             raise ValueError("truncated MSET header")
         magic, version, count, *parameters = _MSET.unpack_from(data)
@@ -216,7 +351,7 @@ class NavigationMesh:
                     overlap = _portal_overlap(a, b, c, d, side) if polygons[end].flags else None
                     if overlap is not None:
                         portals[start].insert(0, (end, edge, *overlap))
-        return cls(polygons, portals, tiles, parameters)
+        return cls(polygons, portals, tiles, parameters, mask=mask, versioned_mask=versioned_mask)
 
     def _candidates(self, position):
         x, y, z = position
@@ -265,6 +400,10 @@ class NavigationMesh:
             return None
         if abs(position[2] - self._height) >= 4:
             return None
+        if self.mask is not None and (
+            not self.mask.contains(position[1], position[0]) or abs(position[2]) > 0.2
+        ):
+            return None
         best = None
         for key in self._candidates(position):
             polygon = self._polygons[key]
@@ -272,7 +411,16 @@ class NavigationMesh:
             distance = math.dist(snapped, position)
             if best is None or distance < best[0]:
                 best = distance, key, snapped
-        return best[1:] if best is not None else None
+        if best is None:
+            return None
+        _, key, snapped = best
+        if self.mask is not None:
+            if (not self.mask.contains(snapped[1], snapped[0])
+                    or abs(snapped[1] - position[1]) > 0.02
+                    or abs(snapped[0] - position[0]) > 0.02 or abs(snapped[2]) > 0.02):
+                return None
+            snapped = snapped[0], snapped[1], 0.0
+        return key, snapped
 
     def snap(self, position: Point) -> Point | None:
         nearest = self._nearest(position)
@@ -311,6 +459,10 @@ class NavigationMesh:
         key, snapped = nearest
         if len(target) != 3 or not all(math.isfinite(v) for v in target):
             return False, snapped
+        if self.mask is not None and (
+            abs(target[2]) > 0.2 or not self.mask.segment(start[1], start[0], target[1], target[0])
+        ):
+            return False, snapped
         fraction = self._ray(key, snapped, target)
         if fraction == 1.0 and (accepted := self.snap(target)) is not None:
             return True, accepted
@@ -325,48 +477,122 @@ class NavigationMesh:
         first, start = origin
         last, target = destination
         if self._ray(first, start, target) == 1.0:
-            return (start, target) if start != target else (start,)
+            path = (start, target) if start != target else (start,)
+        else:
+            def distance(key):
+                return math.dist(self._polygons[key].center, target)
 
-        def distance(key):
-            return math.dist(self._polygons[key].center, target)
-
-        costs, previous, closed = {first: 0.0}, {}, set()
-        queue = [(distance(first), first)]
-        closest = first
-        best_distance = math.dist(_closest(self._polygons[first], target), target)
-        while queue and len(closed) < _MAX_PATH_POLYS:
-            _, current = heapq.heappop(queue)
-            if current in closed:
-                continue
-            if current == last:
-                closest = last
-                break
-            closed.add(current)
-            candidate_distance = math.dist(_closest(self._polygons[current], target), target)
-            if candidate_distance < best_distance:
-                closest, best_distance = current, candidate_distance
-            center = self._polygons[current].center
-            for neighbor, _, a, b in self._portals[current]:
-                if neighbor in closed:
+            costs, previous, closed = {first: 0.0}, {}, set()
+            queue = [(distance(first), first)]
+            closest = first
+            best_distance = math.dist(_closest(self._polygons[first], target), target)
+            while queue and len(closed) < _MAX_PATH_POLYS:
+                _, current = heapq.heappop(queue)
+                if current in closed:
                     continue
-                cost = costs[current] + math.dist(center, self._polygons[neighbor].center)
-                if cost < costs.get(neighbor, math.inf):
-                    costs[neighbor] = cost
-                    previous[neighbor] = current, _lerp(a, b, 0.5)
-                    heapq.heappush(queue, (cost + distance(neighbor), neighbor))
+                if current == last:
+                    closest = last
+                    break
+                closed.add(current)
+                candidate_distance = math.dist(_closest(self._polygons[current], target), target)
+                if candidate_distance < best_distance:
+                    closest, best_distance = current, candidate_distance
+                center = self._polygons[current].center
+                for neighbor, _, a, b in self._portals[current]:
+                    if neighbor in closed:
+                        continue
+                    cost = costs[current] + math.dist(center, self._polygons[neighbor].center)
+                    if cost < costs.get(neighbor, math.inf):
+                        costs[neighbor] = cost
+                        previous[neighbor] = current, _lerp(a, b, 0.5)
+                        heapq.heappush(queue, (cost + distance(neighbor), neighbor))
 
-        point = target if closest == last else _closest(self._polygons[closest], target)
-        path = [point]
-        while closest != first:
-            parent, portal = previous[closest]
-            # Avoid starting a smoothed segment exactly on a portal. Detour can
-            # choose either incident polygon when snapping a boundary point.
-            path.append(_lerp(portal, self._polygons[closest].center, 0.01))
-            path.append(_lerp(portal, self._polygons[parent].center, 0.01))
-            closest = parent
+            if self.mask is not None and closest != last:
+                return None
+            point = target if closest == last else _closest(self._polygons[closest], target)
+            raw_path = [point]
+            while closest != first:
+                parent, portal = previous[closest]
+                # Avoid starting a smoothed segment exactly on a portal. Detour can
+                # choose either incident polygon when snapping a boundary point.
+                raw_path.append(_lerp(portal, self._polygons[closest].center, 0.01))
+                raw_path.append(_lerp(portal, self._polygons[parent].center, 0.01))
+                closest = parent
+            raw_path.append(start)
+            raw_path.reverse()
+            path = self._straighten(raw_path)
+
+        if self.mask is not None:
+            valid_path = (path and path[0] == start and path[-1] == target
+                          and all(self.mask.segment(a[1], a[0], b[1], b[0])
+                                  for a, b in zip(path, path[1:])))
+            if not valid_path:
+                return self._versioned_mask_path(start, target) if self.versioned_mask else None
+        return path
+
+    def _versioned_mask_path(self, start: Point, target: Point) -> tuple[Point, ...] | None:
+        mask = self.mask
+        if mask is None:
+            return None
+        total = mask.columns * mask.rows
+        if total > 262144:
+            return None
+
+        def index(point):
+            col = math.floor((point[1] - mask.min_x) / mask.cell_size)
+            row = mask.rows - 1 - math.floor((point[0] - mask.min_z) / mask.cell_size)
+            return row * mask.columns + col
+
+        first, goal = index(start), index(target)
+        if first == goal:
+            return (start, target) if self.validate_move(start, target)[0] else None
+
+        def location(cell):
+            if cell == first:
+                return start
+            if cell == goal:
+                return target
+            bounds = mask.cell_bounds(cell % mask.columns, cell // mask.columns)
+            if bounds is None:
+                return None
+            x0, x1, z0, z1 = bounds
+            return ((z0 + z1) / 2, (x0 + x1) / 2, 0.0)
+
+        parent = [-1] * total
+        parent[first] = first
+        pending = deque((first,))
+        steps = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        while pending and parent[goal] == -1:
+            current = pending.popleft()
+            point = location(current)
+            if point is None:
+                continue
+            row, col = divmod(current, mask.columns)
+            for dx, dy in steps:
+                next_col, next_row = col + dx, row + dy
+                if not mask.cell(next_col, next_row):
+                    continue
+                neighbor = next_row * mask.columns + next_col
+                if parent[neighbor] != -1:
+                    continue
+                target_point = location(neighbor)
+                if target_point is None or not self.validate_move(point, target_point)[0]:
+                    continue
+                parent[neighbor] = current
+                pending.append(neighbor)
+        if parent[goal] == -1:
+            return None
+        path = []
+        cell = goal
+        while cell != first:
+            point = location(cell)
+            if point is None:
+                return None
+            path.append(point)
+            cell = parent[cell]
         path.append(start)
         path.reverse()
-        return self._straighten(path)
+        return tuple(path)
 
     def _straighten(self, path):
         result = [path[0]]
@@ -385,24 +611,47 @@ class NavigationMesh:
 
 
 def load_navigation(tables) -> dict[int, NavigationMesh]:
-    """Share each packaged original mesh and probe each configured scene spawn."""
+    """Share packaged meshes, verify versioned contracts, and probe scene spawns."""
     root = files("xuanming.data").joinpath("nav")
     cache = {}
     result = {}
     for row in tables["BaseScene"].rows():
         if not row.nav_bin_file:
             continue
-        path = PurePosixPath(row.nav_bin_file)
-        if path.parts != ("data", "scene_nav_bin", path.name) or path.suffix != ".bin":
+        path = PurePosixPath(row.nav_bin_file.replace("\\", "/"))
+        contract = navigation_contract(row.nav_bin_file)
+        if (len(path.parts) < 3 or path.parts[:2] != ("data", "scene_nav_bin")
+                or path.suffix != ".bin" or any(part in (".", "..") for part in path.parts)):
             logger.warning("跳过不支持的导航文件位置 scene_config_id=%s", row.id)
             continue
-        if path.name not in cache:
+        if contract == "legacy" and len(path.parts) != 3:
+            logger.warning("旧导航文件路径必须位于导航根目录 scene_config_id=%s", row.id)
+            continue
+        if contract == "authored_flat":
+            logger.warning("当前 Python 导航读取器尚不支持手绘导航契约 scene_config_id=%s", row.id)
+            continue
+        relative = path.parts[2:]
+        cache_key = "/".join(relative)
+        if cache_key not in cache:
             try:
-                cache[path.name] = NavigationMesh.from_bytes(root.joinpath(path.name).read_bytes())
+                payload = root.joinpath(*relative).read_bytes()
+                mask = None
+                versioned = contract == "versioned_mask"
+                if contract in {"exact_mask", "versioned_mask"}:
+                    parent = root.joinpath(*relative[:-1])
+                    mask_payload = parent.joinpath(path.name + ".mask").read_bytes()
+                    checksum_fields = parent.joinpath(path.name + ".sha256").read_text("ascii").split()
+                    if (len(checksum_fields) != 2
+                            or any(re.fullmatch(r"[0-9a-f]{64}", item) is None for item in checksum_fields)
+                            or hashlib.sha256(payload).hexdigest() != checksum_fields[0]
+                            or hashlib.sha256(mask_payload).hexdigest() != checksum_fields[1]):
+                        raise ValueError("navigation checksums do not match")
+                    mask = NavMask.from_bytes(mask_payload)
+                cache[cache_key] = NavigationMesh.from_bytes(payload, mask=mask, versioned_mask=versioned)
             except (OSError, ValueError):
-                logger.warning("场景导航文件加载失败 file=%s", path.name, exc_info=True)
-                cache[path.name] = None
-        mesh = cache[path.name]
+                logger.warning("场景导航文件加载失败 file=%s", path.as_posix(), exc_info=True)
+                cache[cache_key] = None
+        mesh = cache[cache_key]
         spawn = row.spawn_x, row.spawn_y, row.spawn_z
         if not any(spawn) or not all(math.isfinite(v) for v in spawn):
             spawn = DEFAULT_SPAWN

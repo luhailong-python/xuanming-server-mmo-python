@@ -12,6 +12,7 @@ from itertools import count
 from google.protobuf.message import DecodeError
 
 from ..data import PlayerRowKind, PlayerSnapshot, StoreRejected, StoreUnavailable
+from ..data.navigation import navigation_contract
 from ..protocol import RouteNode, RpcKind
 from .scene_afk import FRAME_MASK, FrameActivity
 from .scene_actor_sync import SceneActorSync
@@ -488,7 +489,7 @@ class SceneNode:
         if world.nav is not None or self.tables is None:
             return False
         row = self.tables["BaseScene"].get(world.info.scene_config_id)
-        return bool(row and row.nav_bin_file.startswith("data/scene_nav_bin/festival_maps/"))
+        return bool(row and navigation_contract(row.nav_bin_file) != "legacy")
 
     def _resolve_entry_position(self, world, position, *, force_spawn=False) -> Position:
         if force_spawn or position == ZERO or not all(map(math.isfinite, position)):

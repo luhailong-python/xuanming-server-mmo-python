@@ -19,7 +19,12 @@ xuanming-server = "xuanming.__main__:main"
 
 [tool.setuptools.package-data]
 xuanming = ["contracts/*"]
-"xuanming.data" = ["_table_descriptors.pb", "tables/*.json", "tables/*.pb", "nav/*.bin"]
+"xuanming.data" = [
+  "_table_descriptors.pb", "tables/*.json", "tables/*.pb", "nav/*.bin",
+  "nav/current_maps/village/yuexi-bay-20261115/scene.bin",
+  "nav/current_maps/village/yuexi-bay-20261115/scene.bin.mask",
+  "nav/current_maps/village/yuexi-bay-20261115/scene.bin.sha256",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
