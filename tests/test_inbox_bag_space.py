@@ -102,7 +102,7 @@ def test_free_space_does_not_wake_other_executor_failures_or_former_player(tmp_p
         try:
             invalid = protocol.message(
                 "BattleSettlementData", player_id=1, battle_id=42, outcome=1,
-                currency_gains=[{"currency_type": 999, "amount": 1}],
+                currency_gains=[{"currency_type": 0, "amount": 1}, {"currency_type": 0, "amount": 1}],
             )
             item = protocol.message("player_inbox.PlayerInboxItem", seq=1, request_id=42, msg_type=4,
                                     payload=invalid.SerializeToString())

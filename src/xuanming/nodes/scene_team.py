@@ -53,6 +53,7 @@ class SceneTeam:
         self._followers: dict[int, _Follower] = {}
         self._formations: dict[int, _Formation] = {}
         self._await_leader: dict[int, tuple[int, int]] = {}
+        self._last_hosted_recheck_second: int | None = None
         self._pending: dict[int, bool] = {}
         self._tasks: dict[int, asyncio.Task] = {}
         self._closing = False
@@ -310,6 +311,16 @@ class SceneTeam:
     def tick(self, delta: float) -> None:
         if delta <= 0:
             return
+        now_unix = int(self.scene.connection_holds.unix_clock())
+        if now_unix != self._last_hosted_recheck_second:
+            self._last_hosted_recheck_second = now_unix
+            for player_id in tuple(self.intents):
+                view = self.membership.get(player_id)
+                player = self._player(player_id)
+                if (player is not None and view is not None and view.team_id and not self.driven(player_id)
+                        and (player_id + now_unix) % 15 == 0
+                        and self.scene.connection_holds.placement_eligible(player)):
+                    self.refresh(player)
         for leader_id, group in tuple(self._formations.items()):
             world = group.world
             leader = world.players.get(leader_id)

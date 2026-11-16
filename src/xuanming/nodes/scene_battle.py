@@ -10,7 +10,7 @@ import grpc
 from google.protobuf.message import DecodeError
 
 from ..data import StoreRejected, StoreUnavailable
-from ..data.asset_inventory import AssetInventory
+from ..data.asset_inventory import AssetInventory, release_item_hold
 from .battle_control import service_digest, sign_service_call, verify_service_call
 from .battle_tables import battle_table_fingerprint
 from .scene_mission import effective_level
@@ -82,6 +82,9 @@ class SceneBattle:
         self._match_call = match_call
         self._terminal_secret = terminal_secret
         self._reaping: dict[int, asyncio.Task] = {}
+        self._hold_reviews: dict[int, asyncio.Task] = {}
+        self._hold_review_at: dict[int, int] = {}
+        self._inventory = AssetInventory(self.protocol, tables)
 
     def current(self, player_id: int) -> int:
         entry = self._freezes.get(player_id)
@@ -112,6 +115,43 @@ class SceneBattle:
             if past_cap or (entry.retry_at <= now and len(self._reaping) < 16):
                 entry.cap_scheduled = past_cap
                 self._reaping[player_id] = asyncio.create_task(self._expire(player_id, entry))
+        for world in tuple(getattr(self.scene, "worlds", {}).values()):
+            for player in tuple(world.players.values()):
+                player_id = player.player_id
+                if (player_id in self._hold_reviews or self._hold_review_at.get(player_id, 0) > now
+                        or len(self._hold_reviews) >= 16 or not self.scene.mutable(player)):
+                    continue
+                data = self.scene.rows.assemble(player.snapshot)
+                if any(hold.kind == 1 and hold.hold_id and hold.review_after_ms <= now
+                       and hold.hold_id != self.current(player_id) for hold in data.item_holds.holds):
+                    self._hold_review_at[player_id] = now + _REAPER_INTERVAL_MS
+                    self._hold_reviews[player_id] = asyncio.create_task(self._review_holds(player_id))
+
+    async def _review_holds(self, player_id: int) -> None:
+        try:
+            player = self._player(player_id)
+            if player is None:
+                return
+            data = self.scene.rows.assemble(player.snapshot)
+            candidates = [hold.hold_id for hold in data.item_holds.holds
+                          if hold.kind == 1 and hold.hold_id and hold.review_after_ms <= self._clock()
+                          and hold.hold_id != self.current(player_id)]
+            for hold_id in candidates:
+                verdict = (2, False) if self._applied(player, hold_id) else await self._decision(hold_id)
+                if verdict not in ((2, False), (0, False)):
+                    continue
+                async with self.scene._lock(player_id):
+                    if self._player(player_id) is not player or not self.scene.mutable(player) or self.current(player_id) == hold_id:
+                        continue
+                    await self.scene.flush_player_rows(player)
+                    current = self.scene.rows.assemble(player.snapshot)
+                    if release_item_hold(current, hold_id):
+                        await self.scene.commit_player_data(player, current)
+        except (StoreRejected, StoreUnavailable, OSError, ValueError):
+            logger.warning("战斗道具预留复核待重试 player_id=%s", player_id, exc_info=True)
+        finally:
+            if self._hold_reviews.get(player_id) is asyncio.current_task():
+                self._hold_reviews.pop(player_id, None)
 
     async def _expire(self, player_id, entry) -> None:
         try:
@@ -256,6 +296,9 @@ class SceneBattle:
         self._freezes.pop(player.player_id, None)
         if (task := self._reaping.pop(player.player_id, None)) is not None:
             task.cancel()
+        if (task := self._hold_reviews.pop(player.player_id, None)) is not None:
+            task.cancel()
+        self._hold_review_at.pop(player.player_id, None)
 
     def notify_reconnect(self, player) -> None:
         entry = self._freezes.get(player.player_id)
@@ -288,6 +331,33 @@ class SceneBattle:
                     error = 1003
                 if not error and deadline <= self._clock():
                     error = 1005
+                if not error and response.snapshot.items:
+                    data = self.scene.rows.assemble(player.snapshot)
+                    counts = {item.item_table_id: item.count for item in response.snapshot.items}
+                    error = self._inventory.place_item_hold(
+                        data, request.battle_id, counts, created_at_ms=self._clock(),
+                        review_after_ms=min(_UINT64_MAX, request.deadline_ms + _SETTLEMENT_GRACE_MS),
+                    )
+                    if error:
+                        error = 1006
+                    if not error:
+                        try:
+                            await self.scene.commit_player_data(player, data)
+                        except (StoreRejected, StoreUnavailable):
+                            error = 1003
+                        else:
+                            # The commit yields to the event loop. A deadline that was
+                            # valid before the write may have passed while it was in flight.
+                            if deadline <= self._clock():
+                                error = 1005
+                                try:
+                                    data = self.scene.rows.assemble(player.snapshot)
+                                    if release_item_hold(data, request.battle_id):
+                                        await self.scene.commit_player_data(player, data)
+                                except (StoreRejected, StoreUnavailable):
+                                    # Keep an uncertain hold for the regular terminal review.
+                                    logger.warning("过期备战预留释放待复核 player_id=%s battle_id=%s",
+                                                   player_id, request.battle_id, exc_info=True)
                 if not error:
                     context = self.protocol.message(
                         "InBattleComp", battle_id=request.battle_id, battle_node_id=request.battle_node_id,
@@ -351,7 +421,9 @@ class SceneBattle:
             if rule is not None and rule.battle_usable and guid and amount and AssetInventory.countable(item):
                 items[config] += amount
         for config, amount in sorted(items.items()):
-            snapshot.items.add(item_table_id=config, count=min((1 << 32) - 1, amount))
+            available = min(amount, self._inventory.removable_count(data, config))
+            if available:
+                snapshot.items.add(item_table_id=config, count=min((1 << 32) - 1, available))
         if data.pet_component.active_pet_id:
             pet = next((item for item in data.pet_component.pets if item.pet_id == data.pet_component.active_pet_id), None)
             row = self.tables["Pet"].get(pet.pet_table_id) if pet is not None else None
@@ -378,6 +450,11 @@ class SceneBattle:
             if entry and entry.context.battle_id == request.battle_id and entry.context.state == 1:
                 await self._eval(_REMOVE, player_id, str(request.battle_id), entry.context.SerializeToString(deterministic=True))
                 self._thaw(player_id)
+                if (player := self._player(player_id)) is not None and self.scene.mutable(player):
+                    await self.scene.flush_player_rows(player)
+                    data = self.scene.rows.assemble(player.snapshot)
+                    if release_item_hold(data, request.battle_id):
+                        await self.scene.commit_player_data(player, data)
         return self.protocol.message("Empty")
 
     async def confirm(self, event) -> None:
@@ -416,6 +493,7 @@ class SceneBattle:
         return True
 
     async def close(self) -> None:
-        for task in tuple(self._reaping.values()):
+        tasks = tuple(self._reaping.values()) + tuple(self._hold_reviews.values())
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*tuple(self._reaping.values()), return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)

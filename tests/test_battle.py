@@ -883,9 +883,12 @@ def test_scene_prepare_confirm_cannot_be_cancelled_by_late_compensation(runtime)
         async def flush(_):
             return None
 
+        async def commit(player, saved):
+            player.snapshot = saved
+
         scene = SimpleNamespace(protocol=protocol, rows=SimpleNamespace(assemble=lambda snapshot: snapshot),
                                 _lock=lambda _: lock, locations={101: SimpleNamespace(players={101: player})},
-                                mutable=lambda _: True, flush_player_rows=flush,
+                                mutable=lambda _: True, flush_player_rows=flush, commit_player_data=commit,
                                 info=SimpleNamespace(node_id=10, node_uuid="scene-instance", zone_id=1))
         tables = ConfigTables()
         medicine = next(row.id for row in tables["Item"].rows() if row.battle_usable)
@@ -901,6 +904,9 @@ def test_scene_prepare_confirm_cannot_be_cancelled_by_late_compensation(runtime)
         assert result.table_fingerprint == result.snapshot.table_fingerprint == "19ee31807f2393e449dcebebb5cca233"
         assert result.snapshot.routing.gate_node_id == 7 and result.snapshot.routing.scene_node_id == 10
         assert [(item.item_table_id, item.count) for item in result.snapshot.items] == [(medicine, 2)]
+        assert [(h.hold_id, [(line.config_id, line.count) for line in h.lines]) for h in data.item_holds.holds] == [
+            (40, [(medicine, 2)])
+        ]
         assert battle.frozen(101) and player.motion.velocity == (0.0, 0.0, 0.0)
         assert (await battle.prepare(prepare)).error_message.id == 1006
         cancel = protocol.message("CancelBattlePrepareRequest", player_id=101, battle_id=41)

@@ -117,6 +117,8 @@ message EnterSceneRequest {
   uint64 login_generation = 12;
   // 账号目录放行的所有权修订；完整参与幂等指纹，不能用新买家的修订替旧路由补权。0拒绝。
   uint64 owner_revision = 13;
+  // 服务端代表断线托管角色请求落点；不绑定 Gate 会话。
+  bool hosted_placement = 14;
 }
 
 message EnterSceneResponse {

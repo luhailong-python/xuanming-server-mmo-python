@@ -177,6 +177,7 @@ class SceneNode:
         self.travel = None
         self.combat_engagement = SceneCombatEngagement(self)
         self.inbox = None
+        self.mail_outbox = None
         self.landing = None
         self.team = None
         self.connection_holds = SceneConnectionHolds(on_hosting=self._hosting_started, hold_seconds=disconnect_grace)
@@ -279,7 +280,7 @@ class SceneNode:
         if self.buffs is not None:
             self.buffs.discard(npc)
 
-    async def enter(self, request, gate_uuid: str):
+    async def enter(self, request, gate_uuid: str, *, hosted: bool = False):
         player_id = request.player_id
         if self._closing or not all((player_id, request.owner_revision)) or not session_bound(request.session_id):
             raise ValueError("入场身份不完整")
@@ -300,9 +301,15 @@ class SceneNode:
                 published = old is not None and self.travel and self.travel.published(player_id)
                 replacement_admission = None
                 if old is not None:
-                    same_session = (old.gate_uuid, old.session_id) == key
+                    if hosted and old.disconnect_at is None:
+                        raise ValueError("在线角色不能接收托管落点")
+                    if hosted and (self._releasing(old) or not self.connection_holds.held(old)):
+                        raise ValueError("退出中的角色不能接收托管落点")
+                    same_session = (old.session_id == request.session_id if hosted
+                                    else (old.gate_uuid, old.session_id) == key)
                     # 原版 enter_fence：同一绑定会话允许迟到请求，先校验再处理交接。
-                    if not same_session and request.login_generation <= old.generation:
+                    if (hosted and (not same_session or request.login_generation != old.generation)
+                            or not hosted and not same_session and request.login_generation <= old.generation):
                         raise ValueError("过期的场景入场请求")
                 if published and request.owner_epoch > old.snapshot.owner_epoch:
                     # 原版 RoleAdmission 在废黜旧实体前完成；新账号修订由权威服务验证。
@@ -331,7 +338,7 @@ class SceneNode:
                     rebound = not same_session or old.generation < request.login_generation
                     if published and (rebound or not same_epoch):
                         raise ValueError("玩家原入场世代正在交接")
-                    if self.connection_holds.held(old) and not self.connection_holds.resumable(
+                    if not hosted and self.connection_holds.held(old) and not self.connection_holds.resumable(
                         old, request.session_id, request.login_generation,
                     ):
                         raise ValueError("已断开的会话不能接回角色")
@@ -347,7 +354,40 @@ class SceneNode:
                                     await self.travel.retire(admitted)
                                     raise
                             except BaseException:
-                                self._evict(previous, old)
+                                # A failed registration can revoke the old fence as
+                                # well. Hosted players have no client to re-enter, so
+                                # restore their old admission before keeping them in
+                                # the original scene. If that cannot be confirmed,
+                                # evict rather than retain an unfenced writer.
+                                restored = False
+                                if hosted and not asyncio.current_task().cancelling():
+                                    try:
+                                        restore = type(request)()
+                                        restore.CopyFrom(request)
+                                        restore.scene_id = previous.info.scene_id
+                                        restore.owner_epoch = old.snapshot.owner_epoch
+                                        restore.session_id = old.session_id
+                                        restore.login_generation = old.generation
+                                        admitted = await self.travel.admit(restore)
+                                        try:
+                                            await self.travel.confirm(admitted)
+                                        except BaseException:
+                                            await self.travel.retire(admitted)
+                                            raise
+                                        old.admission = admitted
+                                        restored = True
+                                        if former:
+                                            try:
+                                                await self.travel.retire(former, transferred=True)
+                                            except Exception:
+                                                logger.exception("关闭恢复前的托管入场世代失败 player_id=%s", player_id)
+                                    except Exception:
+                                        logger.exception("恢复托管角色原场景入场资格失败 player_id=%s", player_id)
+                                    except BaseException:
+                                        self._evict(previous, old)
+                                        raise
+                                if not restored:
+                                    self._evict(previous, old)
                                 raise
                             old.admission = admitted
                             if former:
@@ -355,7 +395,7 @@ class SceneNode:
                                     await self.travel.retire(former, transferred=True)
                                 except Exception:
                                     logger.exception("关闭旧角色入场世代待重试 player_id=%s", player_id)
-                        if rebound or old.disconnect_at is not None:
+                        if not hosted and (rebound or old.disconnect_at is not None):
                             self.connection_holds.forget(old)
                             old_key = old.gate_uuid, old.session_id
                             if self.sessions.get(old_key) is old:
@@ -382,12 +422,19 @@ class SceneNode:
                         return self.protocol.message("Empty")
                     await self._remove(previous, old, release_credential=False)
                 player = await self._load_player(request, gate_uuid, world, admission=replacement_admission)
+                if hosted:
+                    player.disconnect_at = time.monotonic() + self.disconnect_grace
+                    if not self.connection_holds.start(player):
+                        if self.travel and player.admission:
+                            await self.travel.retire(player.admission)
+                        raise ValueError("无法建立托管断线保留")
                 world.add(player)
                 self.locations[player_id] = world
-                self.sessions[key] = player
+                if not hosted:
+                    self.sessions[key] = player
                 self._announce(world, player)
                 self._enter_aoi(world, player)
-                if self.battle:
+                if self.battle and not hosted:
                     self.battle.notify_reconnect(player)
                 if self.inbox:
                     self.inbox.landed(player)
@@ -754,6 +801,8 @@ class SceneNode:
 
     def _evict(self, world: World, player: Player) -> None:
         self.connection_holds.forget(player)
+        if self.travel and hasattr(self.travel, "forget_hosted_presence"):
+            self.travel.forget_hosted_presence(player.player_id)
         if self.team:
             self.team.departed(player)
         self.actor_sync.discard(player)
@@ -768,6 +817,8 @@ class SceneNode:
             self.battle.departed(player)
         if self.inbox:
             self.inbox.departed(player)
+        if self.mail_outbox:
+            self.mail_outbox.departed(player)
         if self.buffs is not None:
             self.buffs.discard(player)
 
@@ -786,6 +837,8 @@ class SceneNode:
             self.battle.reap()
         if self.inbox:
             self.inbox.tick()
+        if self.mail_outbox:
+            self.mail_outbox.tick()
         if self.skill_casts is not None:
             await self.skill_casts.tick(delta)
         self.combat_engagement.update(delta)
@@ -796,6 +849,8 @@ class SceneNode:
                 if world.players.get(player.player_id) is not player:
                     continue
                 held = self.connection_holds.held(player)
+                if held and self.travel and hasattr(self.travel, "refresh_hosted_presence"):
+                    self.travel.refresh_hosted_presence(player)
                 if held:
                     due = world.draining or self.connection_holds.expired(player, now) or now >= player.save_at
                 else:
@@ -892,6 +947,8 @@ class SceneNode:
             await self.travel.stop()
         if self.inbox:
             await self.inbox.close()
+        if self.mail_outbox:
+            await self.mail_outbox.close()
         if self.battle:
             await self.battle.close()
         await self._entries_drained.wait()

@@ -31,6 +31,13 @@ _LATE_DISPATCH = 35.0
 _REPLY_WATCHDOG = 30.0
 _FREEZE_CAP = 70.0
 _RECOVERY_TICK = 5.0
+_HOSTED_RETRY_DELAYS = (5.0, 20.0, 60.0)
+_HOSTED_WATCH_BUDGET = 480.0
+_HOSTED_READ_RETRY = 1.0
+_HOSTED_READ = "#!lua\nreturn redis.call('MGET', KEYS[1], KEYS[2], KEYS[3])"
+_HOSTED_WATCH_PRESENCE = ("#!lua\nif redis.call('GET', KEYS[1]) ~= ARGV[1] or "
+                          "redis.call('GET', KEYS[2]) ~= ARGV[2] then return 0 end "
+                          "redis.call('SET', KEYS[3], ARGV[3], 'EX', 60) return 1")
 
 
 def _keys(player_id: int) -> tuple[str, str, str, str]:
@@ -73,6 +80,7 @@ class _Travel:
     owner_revision: int
     mirror_config: int = 0
     silent: bool = False
+    hosted: bool = False
     source_scene: int = 0
     client_pick: bool = False
     frozen: bool = False
@@ -114,6 +122,11 @@ class SceneTravel:
         self._last_stamp = 0
         self._trips: dict[int, _Travel] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._presence_tasks: dict[int, asyncio.Task] = {}
+        self._presence_seconds: dict[int, int] = {}
+        self._hosted_watches: dict[int, asyncio.Task] = {}
+        self._hosted_watch_requests: dict[int, bytes] = {}
+        self._hosted_candidates: dict[tuple[int, bytes], asyncio.Task] = {}
         self._trade_tasks: set[asyncio.Task] = set()
         self._trade_drains: dict[int, _TradeDrain] = {}
         self._trade_completed: OrderedDict[tuple[int, int], bytes] = OrderedDict()
@@ -404,8 +417,9 @@ class SceneTravel:
         return self.protocol.parse("storage.PlayerLocation", raw) if raw else None
 
     def follow_scene(self, player, scene_id: int) -> None:
-        if self._ready(player) and player.player_id not in self._trips:
-            self._start(player, self.scene.info.zone_id, scene_id, 0, silent=True)
+        hosted = player.disconnect_at is not None and self.scene.connection_holds.placement_eligible(player)
+        if (self._ready(player) or hosted and self._hosted_ready(player)) and player.player_id not in self._trips:
+            self._start(player, self.scene.info.zone_id, scene_id, 0, silent=True, hosted=hosted)
 
     async def travel_to_zone(self, world, player, route, request) -> Message:
         zone = request.target_zone_id
@@ -471,6 +485,191 @@ class SceneTravel:
                     and player.session_id >> 17 and player.owner_revision and player.disconnect_at is None
                     and player.snapshot.owner_epoch and not player.snapshot.released and not self.sealed(player.player_id))
 
+    def _hosted_ready(self, player) -> bool:
+        return bool(not self._stopping and player.admission is not None and player.session_id >> 17
+                    and player.generation and player.owner_revision and player.disconnect_at is not None
+                    and self.scene.connection_holds.placement_eligible(player) and player.snapshot.owner_epoch
+                    and not self.scene._releasing(player) and not self.sealed(player.player_id))
+
+    def _trip_ready(self, trip: _Travel) -> bool:
+        return self._hosted_ready(trip.player) if trip.hosted else self._ready(trip.player)
+
+    def refresh_hosted_presence(self, player) -> None:
+        now = int(self.scene.connection_holds.unix_clock())
+        player_id = player.player_id
+        if ((player_id + now) % 20 or self._presence_seconds.get(player_id) == now
+                or player_id in self._presence_tasks or not self._hosted_ready(player)):
+            return
+        self._presence_seconds[player_id] = now
+        task = asyncio.create_task(self._write_hosted_presence(player, now), name=f"hosted-presence-{player_id}")
+        self._presence_tasks[player_id] = task
+        def finished(done):
+            if self._presence_tasks.get(player_id) is done:
+                self._presence_tasks.pop(player_id, None)
+        task.add_done_callback(finished)
+
+    def forget_hosted_presence(self, player_id: int) -> None:
+        self._presence_seconds.pop(player_id, None)
+        if (task := self._presence_tasks.pop(player_id, None)) is not None:
+            task.cancel()
+
+    async def _write_hosted_presence(self, player, now: int) -> None:
+        try:
+            if not self._hosted_ready(player):
+                return
+            ttl = self.scene.connection_holds.placement_expiry(player) - now
+            if ttl <= 0:
+                return
+            prefix = f"player:{{{player.player_id}}}:"
+            identity = f"v1:{self.scene.info.zone_id}:{player.owner_revision}:{player.session_id}:{player.generation}"
+            await self._redis.set(prefix + "hosted_presence", self.scene.info.node_uuid, ex=60)
+            await self._redis.set(prefix + "hosted_return", identity, ex=ttl)
+        except Exception:
+            _LOG.warning("托管在场心跳写入失败 player=%s", player.player_id, exc_info=True)
+
+    async def hosted_placement(self, request) -> None:
+        """Land a committed hosted route, watching failed loads while it remains authoritative."""
+        player_id = request.player_id
+        raw = request.SerializeToString(deterministic=True)
+        if player_id in self._hosted_watches:
+            if self._hosted_watch_requests.get(player_id) == raw:
+                return
+            key = player_id, raw
+            if key not in self._hosted_candidates and len(self._hosted_candidates) < 4096:
+                task = asyncio.create_task(self._adopt_hosted_candidate(request, raw),
+                                           name=f"hosted-candidate-{player_id}")
+                self._hosted_candidates[key] = task
+                def finished(done):
+                    if self._hosted_candidates.get(key) is done:
+                        del self._hosted_candidates[key]
+                task.add_done_callback(finished)
+            return
+        if player_id in self.scene.locations or len(self._hosted_watches) >= 4096:
+            if (await self._hosted_placement_authoritative(request))[0] is True:
+                await self.scene.enter(request, "", hosted=True)
+            return
+        self._start_hosted_watch(request, raw)
+
+    def _start_hosted_watch(self, request, raw: bytes) -> None:
+        player_id = request.player_id
+        task = asyncio.create_task(self._watch_hosted_placement(request), name=f"hosted-placement-{player_id}")
+        self._hosted_watches[player_id] = task
+        self._hosted_watch_requests[player_id] = raw
+        def finished(done):
+            if self._hosted_watches.get(player_id) is done:
+                del self._hosted_watches[player_id]
+                self._hosted_watch_requests.pop(player_id, None)
+        task.add_done_callback(finished)
+
+    async def _adopt_hosted_candidate(self, request, raw: bytes) -> None:
+        player_id = request.player_id
+        try:
+            async with asyncio.timeout(_HOSTED_WATCH_BUDGET):
+                while not self._stopping and not self.scene._closing:
+                    previous = self._hosted_watches.get(player_id)
+                    matches, _ = await self._hosted_placement_authoritative(request)
+                    if matches is None:
+                        await asyncio.sleep(_HOSTED_READ_RETRY)
+                        continue
+                    if not matches:
+                        return
+                    # A newer event may have replaced the watch while Redis was in flight.
+                    if self._hosted_watches.get(player_id) is not previous:
+                        continue
+                    if self._hosted_watch_requests.get(player_id) == raw:
+                        return
+                    if player_id in self.scene.locations:
+                        await self.scene.enter(request, "", hosted=True)
+                        return
+                    if previous is None and len(self._hosted_watches) >= 4096:
+                        return
+                    if previous is not None:
+                        previous.cancel()
+                    self._start_hosted_watch(request, raw)
+                    return
+        except TimeoutError:
+            _LOG.warning("托管落点候选核验超时 player=%s", player_id)
+        except Exception:
+            _LOG.warning("托管落点候选处理失败 player=%s", player_id, exc_info=True)
+
+    async def _watch_hosted_placement(self, request) -> None:
+        player_id = request.player_id
+        heartbeat = None
+        try:
+            async with asyncio.timeout(_HOSTED_WATCH_BUDGET):
+                for delay in (0.0, *_HOSTED_RETRY_DELAYS):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    while not self._stopping and not self.scene._closing:
+                        if player_id in self.scene.locations:
+                            return
+                        world = self.scene.worlds.get(request.scene_id)
+                        if world is None or world.draining:
+                            return
+                        matches, _ = await self._hosted_placement_authoritative(request)
+                        if matches is None:
+                            await asyncio.sleep(_HOSTED_READ_RETRY)
+                            continue
+                        if not matches:
+                            return
+                        break
+                    else:
+                        return
+                    if heartbeat is None:
+                        heartbeat = asyncio.create_task(self._hosted_watch_presence(request))
+                    try:
+                        await self.scene.enter(request, "", hosted=True)
+                    except Exception:
+                        _LOG.warning("托管落点载入失败 player=%s", player_id, exc_info=True)
+                        continue
+                    return
+        except TimeoutError:
+            _LOG.warning("托管落点看护超时 player=%s", player_id)
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _hosted_placement_authoritative(self, request) -> tuple[bool | None, bytes | None]:
+        player_id = request.player_id
+        try:
+            epoch, raw, _ = await self._redis.eval(
+                _HOSTED_READ, 3, _keys(player_id)[0], _keys(player_id)[3], _keys(player_id)[2],
+            )
+        except Exception:
+            return None, None
+        if not raw:
+            return False, None
+        try:
+            location = self.protocol.parse("storage.PlayerLocation", raw)
+            matches = (int(epoch or 0) == request.owner_epoch and location.zone_id == self.scene.info.zone_id
+                       and location.node_id == str(self.scene.info.node_id) and location.scene_id == request.scene_id
+                       and location.session_id == request.session_id and location.login_generation == request.login_generation)
+            return matches, raw
+        except (ValueError, TypeError, DecodeError):
+            return False, None
+
+    async def _hosted_watch_presence(self, request) -> None:
+        player_id = request.player_id
+        while not self._stopping and not self.scene._closing and player_id not in self.scene.locations:
+            matches, raw = await self._hosted_placement_authoritative(request)
+            if matches is False:
+                return
+            if matches is None:
+                await asyncio.sleep(_HOSTED_READ_RETRY)
+                continue
+            try:
+                written = await self._redis.eval(
+                    _HOSTED_WATCH_PRESENCE, 3, _keys(player_id)[0], _keys(player_id)[3],
+                    f"player:{{{player_id}}}:hosted_presence", str(request.owner_epoch), raw,
+                    self.scene.info.node_uuid,
+                )
+                if written != 1:
+                    return
+            except Exception:
+                _LOG.warning("托管落点看护心跳写入失败 player=%s", player_id, exc_info=True)
+            await asyncio.sleep(20)
+
     def _start(self, player, zone: int, scene_id: int, config: int, **options) -> None:
         trip = _Travel(player, zone, scene_id, config, player.gate_uuid, player.session_id,
                        player.generation, player.owner_revision, **options)
@@ -515,7 +714,8 @@ class SceneTravel:
         correlation = next(self._correlations)
         reply = await self._call_manager(
             "EnterScene", player_id=player.player_id, scene_id=trip.scene_id, scene_conf_id=trip.scene_config,
-            session_id=trip.session_id, gate_id=str(trip.session_id >> 17), gate_instance_id=trip.gate_uuid,
+            session_id=trip.session_id, gate_id="" if trip.hosted else str(trip.session_id >> 17),
+            gate_instance_id="" if trip.hosted else trip.gate_uuid, hosted_placement=trip.hosted,
             gate_zone_id=self.scene.info.zone_id, zone_id=trip.zone, correlation_id=correlation,
             login_generation=trip.generation, owner_revision=trip.owner_revision, client_channel_pick=client_pick,
         )
@@ -550,7 +750,7 @@ class SceneTravel:
                         self._tip(trip, failure)
                     return
                 async with self.scene._lock(player.player_id):
-                    if (self._world(trip) is None or not self._ready(player)
+                    if (self._world(trip) is None or not self._trip_ready(trip)
                             or self.scene.battle and self.scene.battle.frozen(player.player_id)):
                         self._tip(trip, failure)
                         return
@@ -583,7 +783,7 @@ class SceneTravel:
         player = trip.player
         async with asyncio.timeout_at(trip.started_at + _LATE_DISPATCH):
             async with self.scene._lock(player.player_id):
-                if self._world(trip) is None or not self._ready(player):
+                if self._world(trip) is None or not self._trip_ready(trip):
                     return
                 await self.scene.flush_player_rows(player)
                 snapshot = await self.scene.commit_player_rows(player, self.scene._position_rows(player), force=True)
@@ -600,7 +800,7 @@ class SceneTravel:
         if result != 1:
             await self._depose(trip, failure)
             return
-        if self._world(trip) is None or not self._ready(player) or self._clock >= trip.started_at + _LATE_DISPATCH:
+        if self._world(trip) is None or not self._trip_ready(trip) or self._clock >= trip.started_at + _LATE_DISPATCH:
             await self._settle(trip, failure, "mark_unknown")
             return
         trip.enter_sent_at = self._clock
@@ -702,6 +902,9 @@ class SceneTravel:
     async def stop(self) -> None:
         self._stopping = True
         tasks = tuple(self._tasks)
+        tasks += tuple(self._presence_tasks.values())
+        tasks += tuple(self._hosted_watches.values())
+        tasks += tuple(self._hosted_candidates.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

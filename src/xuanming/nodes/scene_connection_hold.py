@@ -123,6 +123,17 @@ class SceneConnectionHolds:
         hold = self._get(player)
         return hold is not None and hold.hosting_started
 
+    def placement_eligible(self, player: Player) -> bool:
+        hold = self._get(player)
+        return bool(hold is not None and hold.hosting_started and hold.pass_expires_at
+                    and int(self.unix_clock()) + HOSTING_EXIT_LEAD < hold.pass_expires_at
+                    and session_bound(hold.session_id) and hold.generation
+                    and (player.session_id, player.generation) == (hold.session_id, hold.generation))
+
+    def placement_expiry(self, player: Player) -> int:
+        hold = self._get(player)
+        return int(hold.pass_expires_at) if hold is not None and self.placement_eligible(player) else 0
+
     def start(self, player: Player) -> bool:
         if self._closed or not player.player_id or not session_bound(player.session_id):
             return False

@@ -44,6 +44,7 @@ message PlayerBattleResult {
   bool seen = 14;             // 客户端已确认展示过(AckBattleResults)
   uint32 match_mode = 15;     // MatchMode 数值;0 = 结算原件没带
   uint32 battle_config_id = 16; // 战斗配置号;0 = 结算原件没带
+  bool items_mailed = 17; // 背包和临时格满时整批掉落改由邮件发放
 }
 
 message PlayerBattleResultComp {

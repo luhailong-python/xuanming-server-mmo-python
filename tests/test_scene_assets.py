@@ -8,13 +8,30 @@ from types import SimpleNamespace
 from xuanming.data import ConfigTables, PlayerRowCodec, SqlitePlayerStore, StoreUnavailable
 from xuanming.data.asset_anomaly import AnomalyThreshold, AssetGain
 from xuanming.data.asset_audit import AssetAudit
-from xuanming.data.asset_inventory import BAG_FULL, FEATURE_UNAVAILABLE, AssetInventory
+from xuanming.data.asset_inventory import BAG_FULL, BAG_INSUFFICIENT, FEATURE_UNAVAILABLE, AssetInventory, release_item_hold
 from xuanming.data.asset_ledger import Outcome, canonical, classify, find_stream, record, valid
 from xuanming.nodes.scene import SceneNode
 from xuanming.nodes.scene_assets import SceneAssets
 from xuanming.protocol import Protocol
 
 _SECRETS = {name: (name * 32).encode() for name in ("guild", "trade", "mail", "data_service")}
+
+
+def test_item_holds_protect_consumption_and_allow_own_battle():
+    protocol, tables = Protocol(), ConfigTables()
+    inventory = AssetInventory(protocol, tables)
+    config = next(row.id for row in tables["Item"].rows() if row.battle_usable)
+    data = protocol.message("player_database")
+    data.bag_component.items.add(item_uuid=1, config_id=config, stack_size=10)
+    assert not inventory.place_item_hold(data, 40, {config: 6}, created_at_ms=1, review_after_ms=2)
+    assert not inventory.place_item_hold(data, 41, {config: 2}, created_at_ms=1, review_after_ms=2)
+    assert inventory.removable_count(data, config) == 2
+    assert inventory.removable_count(data, config, except_hold_id=40) == 8
+    assert inventory.consume_items(data, {config: 3}) == BAG_INSUFFICIENT
+    assert not inventory.consume_items(data, {config: 7}, except_hold_id=40)
+    assert release_item_hold(data, 40)
+    assert inventory.removable_count(data, config) == 1
+    assert not release_item_hold(data, 40)
 
 
 def _sign(rpc, request, caller):

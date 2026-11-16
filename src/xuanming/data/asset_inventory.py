@@ -58,6 +58,22 @@ def bag_capacity(bag, kind: int) -> int:
     return bag.capacities[kind] if kind < len(bag.capacities) else BAG_CAPACITY[kind]
 
 
+def held_item_count(data, config: int, *, except_hold_id: int = 0) -> int:
+    return min(UINT64_MAX, sum(line.count for hold in data.item_holds.holds
+                               if not except_hold_id or hold.hold_id != except_hold_id
+                               for line in hold.lines if line.config_id == config))
+
+
+def release_item_hold(data, hold_id: int) -> bool:
+    holds = data.item_holds.holds
+    removed = False
+    for index in range(len(holds) - 1, -1, -1):
+        if holds[index].hold_id == hold_id:
+            del holds[index]
+            removed = True
+    return removed
+
+
 class AssetInventory:
     def __init__(
         self,
@@ -223,7 +239,26 @@ class AssetInventory:
                 self.write_entry(entry, item)
         return known, known < amount <= total
 
-    def consume_items(self, data, counts: Mapping[int, int], *, bag_type: int = 0) -> int:
+    def removable_count(self, data, config: int, *, except_hold_id: int = 0) -> int:
+        total = sum(item.size for _, item in self.entries(data.bag_component, 0)
+                    if item.config_id == config and self.countable(item))
+        return max(0, total - held_item_count(data, config, except_hold_id=except_hold_id))
+
+    def place_item_hold(self, data, hold_id: int, counts: Mapping[int, int], *,
+                        created_at_ms: int, review_after_ms: int) -> int:
+        holds = data.item_holds.holds
+        if (not hold_id or not counts or len(counts) > 256 or len(holds) >= 8
+                or any(hold.hold_id == hold_id for hold in holds)
+                or any(not config or not 0 < count <= UINT64_MAX for config, count in counts.items())):
+            return INVALID
+        if any(count > self.removable_count(data, config) for config, count in counts.items()):
+            return BAG_INSUFFICIENT
+        hold = holds.add(hold_id=hold_id, kind=1, created_at_ms=created_at_ms, review_after_ms=review_after_ms)
+        for config, count in sorted(counts.items()):
+            hold.lines.add(config_id=config, count=count)
+        return 0
+
+    def consume_items(self, data, counts: Mapping[int, int], *, bag_type: int = 0, except_hold_id: int = 0) -> int:
         if not 0 <= bag_type < len(BAG_CAPACITY):
             return INVALID
         bag = clone(data.bag_component)
@@ -234,6 +269,10 @@ class AssetInventory:
         for config, amount in sorted(counts.items()):
             if not 0 < amount <= 0xFFFFFFFF or self.tables["Item"].get(config) is None:
                 return INVALID
+            held = held_item_count(data, config, except_hold_id=except_hold_id) if bag_type == 0 else 0
+            known = sum(item.size for _, item in entries if item.config_id == config and self.countable(item))
+            if held and known >= amount and amount > max(0, known - held):
+                return BAG_INSUFFICIENT
             taken, version_skew = self._drain(entries, config, amount)
             if taken != amount and not version_skew:
                 return BAG_INSUFFICIENT
@@ -522,6 +561,8 @@ class AssetInventory:
         if item_pair is None:
             return 28000 if wear else 28005
         entry, item = item_pair
+        if wear and self.countable(item) and item.size > self.removable_count(data, item.config_id):
+            return FEATURE_UNAVAILABLE
         row = self.tables["Item"].get(item.config_id)
         if not wear:
             if row is None or row.max_stack_size != 1 or item.size != 1:

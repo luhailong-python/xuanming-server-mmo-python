@@ -57,6 +57,7 @@ message BattleEndS2C {
   uint64 battle_id = 1;
   eBattleOutcome outcome = 2;
   BattleSettlementData settlement = 3;    // 收信玩家本人视角
+  bool items_mailed = 4; // 本局掉落改由邮件发放
 }
 
 // 重连提示:scene 在换会话(RECONNECT / REPLACE)或登录重建出 FIGHTING 冻结时经大厅推送;

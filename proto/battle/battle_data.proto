@@ -207,6 +207,7 @@ enum eBattleOutcome {
   BATTLE_OUTCOME_SIDE_A_WIN = 1; // team_index 0 胜
   BATTLE_OUTCOME_SIDE_B_WIN = 2;
   BATTLE_OUTCOME_DRAW = 3;       // 回合打满等平局情形(PVE 中进攻方判负走 SIDE_B_WIN)
+  BATTLE_OUTCOME_VOID = 4;       // Match 作废结算，不能携带任何战斗效果
 }
 
 // ---- 单个玩家的结算数据(battle -> scene,scene 是唯一应用者) ----

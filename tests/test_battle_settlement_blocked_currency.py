@@ -9,7 +9,7 @@ from xuanming.nodes.scene_mission import Missions
 
 
 @pytest.mark.parametrize("block", ("player", "global", "none"))
-def test_blocked_battle_currency_skips_unknown_debt_without_blocking_other_rewards(tmp_path, block):
+def test_battle_currency_unknown_debt_halts_even_if_gain_blocked(tmp_path, block):
     async def exercise():
         protocol, scene, assets, _ = await _scene(tmp_path)
         player = scene.locations[1].players[1]
@@ -35,15 +35,10 @@ def test_blocked_battle_currency_skips_unknown_debt_without_blocking_other_rewar
             saved = scene.rows.assemble(player.snapshot)
             assert saved.currency.debts[0].SerializeToString(deterministic=True) == original_debt
             assert saved.currency.values[0] == 100
-            if block == "none":
-                assert saved.currency.values[1] == 0
-                assert not saved.battle_results.entries
-                assert await asyncio.to_thread(peer._fetch, 1)
-            else:
-                assert saved.currency.values[1] == 20
-                assert [entry.battle_id for entry in saved.battle_results.entries] == [42]
-                assert [(line.currency_type, line.amount) for line in saved.battle_results.entries[0].currencies] == [(1, 20)]
-                assert not await asyncio.to_thread(peer._fetch, 1)
+            assert saved.currency.values[1] == 0
+            assert not saved.battle_results.entries
+            assert (1, BATTLE) in inbox._halted
+            assert await asyncio.to_thread(peer._fetch, 1)
         finally:
             await scene.close()
 

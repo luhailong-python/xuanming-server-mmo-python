@@ -373,17 +373,22 @@ class SceneAssets(AssetInventory):
                 return Outcome.REJECTED, _INVALID_BUNDLE, False
         if ids:
             entries = {item.item_id: item for _, item in self.entries(data.bag_component, 0)}
+            removing = {}
             for guid in bundle.item_uuids:
                 item = entries.get(guid)
                 row = None if item is None else self.tables["Item"].get(item.config_id)
                 if row is None or row.max_stack_size != 1 or item.size != 1:
                     return Outcome.REJECTED, _INVALID_BUNDLE, False
+                if self.countable(item):
+                    removing[item.config_id] = removing.get(item.config_id, 0) + item.size
                 payload = item.SerializeToString(deterministic=True)
                 if len(payload) > INSTANCE_LIMIT:
                     return Outcome.REJECTED, _INVALID_BUNDLE, False
                 snapshot.items.add(
                     item_uuid=guid, config_id=item.config_id, stack_size=item.size, instance_proto=payload,
                 )
+            if any(count > self.removable_count(data, config) for config, count in removing.items()):
+                return Outcome.RETRY, BAG_INSUFFICIENT, False
         pet_index = None
         if bundle.pet_id:
             if data.pet_component.active_pet_id == bundle.pet_id:
@@ -409,6 +414,8 @@ class SceneAssets(AssetInventory):
             if result:
                 return Outcome.RETRY, result, False
         if ids:
+            if any(count > self.removable_count(data, config) for config, count in removing.items()):
+                return Outcome.RETRY, BAG_INSUFFICIENT, False
             for index in range(len(data.bag_component.items) - 1, -1, -1):
                 entry = data.bag_component.items[index]
                 if entry.bag_type == 0 and self.item(entry).item_id in ids:
@@ -488,6 +495,10 @@ class SceneAssets(AssetInventory):
     def _recall_items(self, data, request, snapshot):
         item = request.bundle.items[0]
         config, requested = item.config_id, item.count
+        # 召回跨多个背包和实例进行，预留期间保守重试，避免越过人物背包预留。
+        from ..data.asset_inventory import held_item_count
+        if held_item_count(data, config):
+            return Outcome.RETRY, BAG_INSUFFICIENT, False
         bag = data.bag_component
         groups = [[entry for entry in bag.items if entry.bag_type == kind] for kind in (0, 1, 3)]
         groups.extend(box.items for box in sorted(bag.dynamic_bags, key=lambda box: box.bag_id))

@@ -23,6 +23,7 @@ from ..transport import (
 from ..transport.client_limits import illegal_packet_threshold as _illegal_packet_threshold
 from ..transport.client_output import ClientOutputQueue
 from .gate_chat import WorldChatFanout
+from .gate_drain_migration import GateDrainMigration
 from .gate_entry import FORCE_CLOSE_DELAY, PendingSceneEntry, retry_entry
 from .gate_login_renewal import LoginRenewal, RENEW_ID, RENEW_PATH
 
@@ -98,6 +99,8 @@ class Session:
     enter_player_id: int = 0
     redirected: bool = False
     lease_expired: bool = False
+    lane_busy: bool = False
+    last_enter_at: float | None = None
 
     def close(self) -> None:
         self.writer.close()
@@ -151,6 +154,21 @@ class RouterForwarder:
             raise ValueError("Login 续租失败")
         return result.serialized_message
 
+    async def request_migration(self, gate, session):
+        route = self.protocol.routes[self.protocol.message_ids["ClientPlayerLoginRequestGateMigration"]]
+        request = self.protocol.message("ClientRequest", message_id=route.message_id)
+        forward = self.protocol.message("client_rpc_router.ForwardRequest", request=request,
+                                        zone_id=gate.info.zone_id, release_track=gate.info.release_track)
+        metadata = session_metadata(gate.details(session, 0).SerializeToString(), route.path, self.secret)
+        call = self.client.request(ROUTER_PATH, forward.SerializeToString(), metadata=metadata)
+        data = await call
+        if dict(await call.initial_metadata()).get("x-session-detail-bin") != metadata[0][1]:
+            raise ValueError("RPC 路由响应会话校验失败")
+        result = self.protocol.parse("MessageContent", data)
+        if result.error_message.id or result.message_id != route.message_id:
+            raise ValueError("Gate 迁移请求失败")
+        return result.serialized_message
+
 
 class GateNode:
     def __init__(self, protocol, info, ticket_secret: bytes, forward, *, max_connections: int = 1024):
@@ -177,6 +195,7 @@ class GateNode:
         self._handlers: set[asyncio.Task] = set()
         sender = getattr(forward, "renew_login", None)
         self.login_renewal = LoginRenewal(self, sender) if sender is not None else None
+        self.drain_migration = GateDrainMigration(self, getattr(forward, "request_migration", None))
 
     def issue_ticket(self, *, ttl: int = 600, player_id: int = 0):
         return issue_gate_ticket(
@@ -229,6 +248,7 @@ class GateNode:
             self.sessions.pop(session_id, None)
             if self.login_renewal is not None:
                 self.login_renewal.forget(session)
+            self.drain_migration.forget(session)
             if self.spectate:
                 self.spectate.close_session(session_id)
             try:
@@ -350,6 +370,7 @@ class GateNode:
     async def _lane(self, session: Session) -> None:
         while True:
             seq, request, admitted = await session.requests.get()
+            session.lane_busy = True
             try:
                 identity = session.player_id, session.account, session.owner_revision
                 if session.redirected or session.entry_failed or admitted is not None and admitted != identity:
@@ -359,6 +380,7 @@ class GateNode:
                 if reply is not None:
                     session.emit(reply)
             finally:
+                session.lane_busy = False
                 session.requests.task_done()
 
     async def _dispatch(self, session: Session, seq: int, request):
@@ -395,6 +417,7 @@ class GateNode:
                         return self._error(request, 2006)
                     session.enter_requested = True
                     session.enter_player_id = target
+                    session.last_enter_at = time.monotonic()
                 elif route.method == "LeaveGame":
                     async with session.routing:
                         await self.exit_scene(session, 1)
@@ -644,11 +667,13 @@ class GateNode:
     async def command(self, payload: bytes) -> None:
         try:
             command = self.protocol.parse("contracts.kafka.GateCommand", payload)
-            if (command.target_gate_id != self.info.node_id or not command.payload
+            if (command.target_gate_id != self.info.node_id
                     or command.target_instance_id != self.info.node_uuid):
                 return
             ids = self.protocol.event_ids
             event_id = command.event_id
+            if not command.payload and event_id != ids.get("ContractsKafkaGateDrainMigrationEvent"):
+                return
             if event_id == ids["ContractsKafkaBindSessionEvent"]:
                 await self.bind(self.protocol.parse("contracts.kafka.BindSessionEvent", command.payload))
             elif event_id == ids["ContractsKafkaRoutePlayerEvent"]:
@@ -662,6 +687,8 @@ class GateNode:
                     session.writer.transport.abort()
             elif event_id == ids["ContractsKafkaRedirectToGateEvent"]:
                 self._redirect(self.protocol.parse("contracts.kafka.RedirectToGateEvent", command.payload))
+            elif event_id == ids.get("ContractsKafkaGateDrainMigrationEvent"):
+                self.drain_migration.lease(self.protocol.parse("contracts.kafka.GateDrainMigrationEvent", command.payload))
             elif event_id == ids["ContractsKafkaPushToPlayerEvent"]:
                 event = self.protocol.parse("contracts.kafka.PushToPlayerEvent", command.payload)
                 if event.HasField("message_content"):
@@ -710,6 +737,7 @@ class GateNode:
         if token.player_id not in (0, event.player_id) or not token.gate_node_id:
             return
         session.redirected = True
+        self.drain_migration.redirected(session)
         self._clear_scene_entry(session)
         session.last_scene_route = None
         while not session.requests.empty():
@@ -722,6 +750,30 @@ class GateNode:
         session.emit(self.protocol.content(
             self.protocol.message_ids["SceneClientPlayerCommonRedirectToGate"], body=notify.SerializeToString(),
         ))
+
+    def _drain_redirect(self, session, response, expected_player: int) -> bool:
+        if (not response.target_gate_ip or not 0 < response.target_gate_port < 65536
+                or not response.token_payload or not response.token_signature
+                or response.token_deadline <= int(time.time()) or session.writer.is_closing()):
+            return False
+        try:
+            token = self.protocol.parse("GateTokenPayload", response.token_payload)
+        except DecodeError:
+            return False
+        if (not token.gate_node_id or token.gate_node_id == self.info.node_id
+                or token.player_id != expected_player or token.target_zone_id != 0
+                or token.zone_id != self.info.zone_id or token.expire_timestamp <= int(time.time())):
+            return False
+        notify = self.protocol.message("RedirectToGateNotify", target_ip=response.target_gate_ip,
+                                       target_port=response.target_gate_port, token_payload=response.token_payload,
+                                       token_signature=response.token_signature, token_deadline=response.token_deadline)
+        session.emit(self.protocol.content(self.protocol.message_ids["SceneClientPlayerCommonRedirectToGate"],
+                                           body=notify.SerializeToString()))
+        if session.writer.is_closing():
+            return False
+        session.redirected = True
+        self.drain_migration.redirected(session)
+        return True
 
     def _broadcast(self, event_id, payload) -> None:
         for method in GATE_BROADCAST_METHODS:
@@ -769,6 +821,7 @@ class GateNode:
                 session.emit(content)
 
     async def close(self) -> None:
+        await self.drain_migration.close()
         if self.login_renewal is not None:
             await self.login_renewal.close()
         for session in tuple(self.sessions.values()):

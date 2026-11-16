@@ -50,3 +50,5 @@
 49=PlayerInboxNotifyEvent
 50=reserved:ContractsKafkaPlayerRatingSnapshotEvent
 51=ContractsKafkaSpectateFrameEvent
+52=ContractsKafkaGateDrainMigrationEvent
+53=PlayerHostedPlacementEvent

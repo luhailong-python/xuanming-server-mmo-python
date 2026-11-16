@@ -28,6 +28,7 @@ from .nodes.scene_attributes import SceneAttributes, initialize_attribute_scheme
 from .nodes.scene_battle import SceneBattle
 from .nodes.scene_connection_hold import afk_pass_key
 from .nodes.scene_landing import SceneLanding
+from .nodes.scene_mail_outbox import MailSender, SceneMailOutbox
 from .nodes.scene_merchant import SceneMerchant, redis_key
 from .nodes.scene_mission import Missions
 from .nodes.scene_pets import ScenePets
@@ -362,6 +363,8 @@ class Runtime:
         Activities(missions).register()
         settlement = BattleSettlement(scene, tables, scene.assets, missions)
         settlement.register()
+        mail_ids = IdSegments.local(self.settings.database, "txlog") if self.local else allocate_tx_id
+        scene.mail_outbox = SceneMailOutbox(scene, mail_ids, MailSender(self.protocol, self.directory))
         scene.inbox = SceneInbox(scene, peer, settlement, scene.assets, poll_seconds=5 if self.local else 60)
         skills = SceneSkills(scene, tables)
         skills.register()
@@ -418,6 +421,19 @@ class Runtime:
                 event = self.protocol.parse("PlayerTeamRefreshEvent", command.payload)
                 if event.player_id == command.player_id:
                     self.scene.team.hint(event.player_id)
+            elif command.event_id == self.protocol.event_ids.get("PlayerHostedPlacementEvent"):
+                event = self.protocol.parse("PlayerHostedPlacementEvent", command.payload)
+                if (event.player_id == command.player_id and event.player_id and event.scene_id
+                        and event.owner_epoch and event.session_id and event.login_generation and event.owner_revision):
+                    request = self.protocol.message(
+                        "PlayerEnterGameNodeRequest", player_id=event.player_id, scene_id=event.scene_id,
+                        home_zone_id=event.home_zone_id, owner_epoch=event.owner_epoch, session_id=event.session_id,
+                        login_generation=event.login_generation, owner_revision=event.owner_revision,
+                    )
+                    if self.scene.travel:
+                        await self.scene.travel.hosted_placement(request)
+                    else:
+                        await self.scene.enter(request, "", hosted=True)
         except Exception:
             logger.warning("Scene 命令执行失败", exc_info=True)
 

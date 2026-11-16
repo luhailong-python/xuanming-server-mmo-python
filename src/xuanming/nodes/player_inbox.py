@@ -295,7 +295,7 @@ class SceneInbox:
         if domain == BATTLE:
             settlement = self._payload("BattleSettlementData", item, 16 << 10)
             if (settlement.battle_id != item.request_id or settlement.player_id != player.player_id
-                    or settlement.outcome not in (1, 2, 3)):
+                    or settlement.outcome not in (1, 2, 3, 4)):
                 raise VersionSkew("战斗结算原件与收件箱身份不符")
         if cursor is not None and item.seq <= cursor.decided_through_seq:
             saved = next((entry for entry in cursor.recent if entry.seq == item.seq), None)
@@ -315,6 +315,8 @@ class SceneInbox:
                 for entry in cursor.recent
             )
             if not duplicate:
+                if settlement.outcome != 4 and self.settlement.currency_version_skew(settlement, data):
+                    raise VersionSkew("战斗结算包含未知币种或欠款字段")
                 deferred = []
                 if not await self.settlement.apply(player, data, settlement, audits=audits, defer_reasons=deferred):
                     if BAG_SPACE_DEFERRED in deferred:

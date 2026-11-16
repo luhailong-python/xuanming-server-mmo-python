@@ -80,6 +80,31 @@ def test_player_rows_use_wire_groups_and_reject_unknown_new_fields():
         )
 
 
+def test_battle_hold_and_mail_outbox_round_trip_in_native_persist_groups():
+    protocol = Protocol()
+    codec = PlayerRowCodec(protocol)
+    player = protocol.message("player_database", player_id=42, persist_schema_gen=1)
+    hold = player.item_holds.holds.add(hold_id=77, kind=1, created_at_ms=100, review_after_ms=200)
+    hold.lines.add(config_id=1001, count=3)
+    entry = player.mail_outbox.entries.add(request_id=123, source=1, source_id=77,
+                                           title="战斗奖励", body="补发", created_at_ms=100)
+    entry.items.add(config_id=1002, count=5)
+    player.battle_results.entries.add(battle_id=77, items_mailed=True)
+    rows = codec.project(player)
+    profile = protocol.parse("player_database", rows[PlayerRowKind.PROFILE])
+    wallet = protocol.parse("player_database", rows[PlayerRowKind.WALLET])
+    assert profile.item_holds == player.item_holds and profile.battle_results == player.battle_results
+    assert not profile.HasField("mail_outbox")
+    assert wallet.mail_outbox == player.mail_outbox and not wallet.HasField("item_holds")
+    assert codec.assemble(PlayerSnapshot(42, b"scene-1", 1, 0, rows)) == player
+
+    placement = protocol.message("PlayerHostedPlacementEvent", player_id=42, scene_id=55,
+                                 session_id=12, login_generation=3, owner_revision=4)
+    assert protocol.event_ids["PlayerHostedPlacementEvent"] == 53
+    assert protocol.parse("PlayerHostedPlacementEvent", placement.SerializeToString()) == placement
+    assert protocol.message("scene_manager.EnterSceneRequest", hosted_placement=True).hosted_placement
+
+
 def test_sqlite_snapshot_is_durable_and_old_writer_cannot_save(tmp_path):
     async def exercise():
         db = tmp_path / "data" / "player.sqlite3"

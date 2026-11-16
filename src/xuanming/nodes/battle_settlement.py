@@ -3,9 +3,9 @@
 import logging
 from collections import Counter
 
-from ..data.asset_inventory import BAG_FULL
+from ..data.asset_inventory import BAG_FULL, release_item_hold
 from .scene_mission import now_ms
-from .scene_stats import pet_stats, player_stats
+from .scene_stats import pet_pool, pet_stats, player_stats
 
 logger = logging.getLogger(__name__)
 MAX_HISTORY = 10
@@ -55,11 +55,19 @@ class BattleSettlement:
     ) -> bool:
         if (
             not settlement.battle_id or settlement.player_id != player.player_id
-            or settlement.outcome not in (1, 2, 3) or not known_message(settlement)
+            or settlement.outcome not in (1, 2, 3, 4) or not known_message(settlement)
             or not self.scene.mutable(player)
             or sum(item.count for item in settlement.defeated_monsters) > 4096
         ):
             return False
+        if settlement.outcome == 4:
+            allowed = {1, 2, 3, 4, 17, 18, 19}
+            if any(field.number not in allowed for field, _ in settlement.ListFields()):
+                return False
+            release_item_hold(data, settlement.battle_id)
+            if not any(entry.battle_id == settlement.battle_id for entry in data.battle_results.entries):
+                self._record(data.battle_results, settlement, {}, {}, {}, self.clock())
+            return True
         if self.scene.battle:
             current = self.scene.battle.current(player.player_id)
             if current and current != settlement.battle_id:
@@ -74,7 +82,9 @@ class BattleSettlement:
         owned = self._owned(data, consumed)
         if owned is None:
             return False
-        consumed = {item: min(count, owned[item]) for item, count in consumed.items() if owned[item]}
+        consumed = {item: amount for item, count in consumed.items()
+                    if (amount := min(count, self.assets.removable_count(
+                        data, item, except_hold_id=settlement.battle_id)))}
         gained = {key: count for key, count in gained.items() if not self.assets.item_gain_blocked(data, key)}
         checkpoint = self._checkpoint(data, audits)
         gains = []
@@ -93,18 +103,24 @@ class BattleSettlement:
                 return False
         self._audit(player, checkpoint, data, 8, audits, correlation=settlement.battle_id, credit=True, gains=gains)
         checkpoint = self._checkpoint(data, audits)
-        if consumed and self.assets.consume_items(data, consumed):
+        if consumed and self.assets.consume_items(data, consumed, except_hold_id=settlement.battle_id):
             return False
+        release_item_hold(data, settlement.battle_id)
         details = {"source": "battle-inbox"}
         self._audit(player, checkpoint, data, 13, audits, correlation=settlement.battle_id, item_extra=details)
         checkpoint = self._checkpoint(data, audits)
         gains = []
+        items_mailed = False
         if gained:
             error = await self.assets.add_items(data, gained, overflow=True, gains=gains)
             if error:
-                if error == BAG_FULL and defer_reasons is not None:
-                    defer_reasons.append(BAG_SPACE_DEFERRED)
-                return False
+                outbox = getattr(self.scene, "mail_outbox", None)
+                if error == BAG_FULL and outbox is not None and await outbox.prepare(data, settlement.battle_id, gained):
+                    items_mailed = True
+                else:
+                    if error == BAG_FULL and defer_reasons is not None:
+                        defer_reasons.append(BAG_SPACE_DEFERRED)
+                    return False
         self._audit(player, checkpoint, data, 20, audits, correlation=settlement.battle_id, item_extra=details, gains=gains)
         stats = player_stats(self.protocol, self.tables, data)
         base = data.derived_attributes_component
@@ -120,7 +136,7 @@ class BattleSettlement:
             gains = []
             await self.missions.battle_defeats(data, settlement.defeated_monsters, stamp, gains=gains)
             self._audit(player, checkpoint, data, 7, audits, gains=gains)
-        self._record(data.battle_results, settlement, currencies, gained, consumed, stamp)
+        self._record(data.battle_results, settlement, currencies, gained, consumed, stamp, items_mailed=items_mailed)
         return True
 
     def _checkpoint(self, data, audits):
@@ -133,6 +149,20 @@ class BattleSettlement:
             callback = self.assets.make_audit_callback(player, before, data, kind, **options)
             if callback is not None:
                 audits.append(callback)
+
+    def currency_version_skew(self, settlement, data) -> bool:
+        """Distinguish newer currency/debt fields from malformed reward lines."""
+        entries = ([(line.currency_type, line.amount) for line in settlement.currency_gains]
+                   if settlement.currency_gains else [(0, settlement.gold_gain)])
+        seen = set()
+        for currency, amount in entries:
+            if currency in seen or amount > MAX_CURRENCY_AMOUNT:
+                return False
+            seen.add(currency)
+        if any(currency not in self.currency_types for currency, _ in entries):
+            return True
+        return any(amount and debt.currency_type == currency and not known_message(debt)
+                   for currency, amount in entries for debt in data.currency.debts)
 
     def _currencies(self, settlement):
         entries = ([(line.currency_type, line.amount) for line in settlement.currency_gains]
@@ -156,8 +186,8 @@ class BattleSettlement:
         for item in list(result):
             row = self.tables["Item"].get(item)
             if row is None:
-                logger.warning("战斗原件中的物品配表已删除，跳过 config_id=%s", item)
-                del result[item]
+                logger.warning("战斗物品配表尚不可用，延后结算 config_id=%s", item)
+                return None
             elif not known_message(row):
                 return None
         return result
@@ -198,6 +228,14 @@ class BattleSettlement:
             pet = owned.get(effect.pet_id)
             if pet is None:
                 continue
+            row = self.tables["Pet"].get(pet.pet_table_id)
+            if row is None or not known_message(row):
+                return False
+            pool = pet_pool(self.tables)
+            if pool is None:
+                continue
+            if not known_message(pool):
+                return False
             stats = pet_stats(self.tables, pet)
             if stats is None:
                 continue
@@ -208,7 +246,7 @@ class BattleSettlement:
         return True
 
     @staticmethod
-    def _record(history, settlement, currencies, gained, consumed, stamp):
+    def _record(history, settlement, currencies, gained, consumed, stamp, *, items_mailed=False):
         seq = max(history.last_result_seq, max((entry.result_seq for entry in history.entries), default=0)) + 1
         history.last_result_seq = seq
         entry = history.entries.add(
@@ -216,7 +254,7 @@ class BattleSettlement:
             team_index=settlement.player_team_index, is_dead=settlement.is_dead, fled=settlement.fled,
             total_rounds=settlement.total_rounds, finished_at_ms=settlement.finished_at_ms, settled_at_ms=stamp,
             lines_truncated=len(gained) > MAX_LINES or len(consumed) > MAX_LINES,
-            match_mode=settlement.match_mode, battle_config_id=settlement.battle_config_id,
+            match_mode=settlement.match_mode, battle_config_id=settlement.battle_config_id, items_mailed=items_mailed,
         )
         for kind, amount in sorted(currencies.items()):
             entry.currencies.add(currency_type=kind, amount=amount)
@@ -233,6 +271,10 @@ class BattleSettlement:
         pets = getattr(self.scene, "pets", None)
         if settlement.pets and pets is not None:
             pets.notify(player)
+        data = self.scene.rows.assemble(player.snapshot)
+        result = next((entry for entry in data.battle_results.entries
+                       if entry.battle_id == settlement.battle_id), None)
         self.scene._push(player, "BattleClientPlayerNotifyBattleEnd", self.protocol.message(
             "BattleEndS2C", battle_id=settlement.battle_id, outcome=settlement.outcome, settlement=settlement,
+            items_mailed=bool(result and result.items_mailed),
         ))

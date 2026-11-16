@@ -77,6 +77,19 @@ class DirectForwarder:
             if peer.retired and not peer.in_flight:
                 await self._close_peer(peer)
 
+    async def request_migration(self, gate, session):
+        route = self.protocol.routes[self.protocol.message_ids["ClientPlayerLoginRequestGateMigration"]]
+        peer = await self._select(gate.info, _LOGIN)
+        if peer is None:
+            raise RuntimeError("Login 节点不可用")
+        try:
+            details = gate.details(session, 0).SerializeToString()
+            return await peer.client.call(route.path, b"", metadata=session_metadata(details, route.path, self.secret))
+        finally:
+            peer.in_flight -= 1
+            if peer.retired and not peer.in_flight:
+                await self._close_peer(peer)
+
     async def __call__(self, gate, session, route, request, seq):
         def error(code):
             return self.protocol.content(request.message_id, request.id, error=code) if request.id else None

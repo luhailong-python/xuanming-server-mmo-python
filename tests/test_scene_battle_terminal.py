@@ -156,3 +156,38 @@ def test_applied_ledger_releases_without_match_query():
         assert not battle.frozen(101) and redis.value is None
 
     asyncio.run(exercise())
+
+
+def test_expired_item_hold_released_only_on_definitive_terminal_answer():
+    async def exercise():
+        protocol, clock, player, _, _, scene, _, _ = _setup(2)
+        player.snapshot.item_holds.holds.add(hold_id=40, kind=1, review_after_ms=10).lines.add(
+            config_id=3, count=2,
+        )
+        world = scene.locations[101]
+        scene.worlds = {1: world}
+        scene.mutable = lambda _: True
+        scene.flush_player_rows = lambda _: asyncio.sleep(0)
+
+        async def commit(target, data):
+            target.snapshot = data
+
+        scene.commit_player_data = commit
+        battle = SceneBattle(scene, None, now_ms=lambda: clock.now)
+        answer = [(1, False)]
+
+        async def decision(_):
+            return answer[0]
+
+        battle._decision = decision
+        battle.reap()
+        await battle._hold_reviews[101]
+        assert len(player.snapshot.item_holds.holds) == 1
+        answer[0] = (0, False)
+        clock.now += 30_000
+        battle.reap()
+        await battle._hold_reviews[101]
+        assert not player.snapshot.item_holds.holds
+        await battle.close()
+
+    asyncio.run(exercise())

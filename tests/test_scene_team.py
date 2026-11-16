@@ -184,3 +184,43 @@ def test_follow_rechecks_after_leader_handoff_settles(tmp_path):
             await scene.close()
 
     asyncio.run(exercise())
+
+
+def test_offline_hosted_follower_periodically_rechecks_team(tmp_path):
+    async def exercise():
+        protocol = Protocol()
+        scene = SceneNode(protocol, protocol.message("NodeInfo", node_id=5, zone_id=1, node_uuid="test"),
+                          SqlitePlayerStore(tmp_path / "hosted-team.sqlite"), PlayerRowCodec(protocol), lambda *_: None)
+        scene.create(protocol.message("CreateSceneRequest", scene_id=1, config_id=1))
+        await scene.enter(protocol.message("PlayerEnterGameNodeRequest", scene_id=1, session_id=1 << 17 | 2,
+                                           player_id=2, owner_revision=1, login_generation=1), "gate")
+        player = scene.worlds[1].players[2]
+        clock = [103]
+        scene.connection_holds.unix_clock = lambda: clock[0]
+
+        async def read_pass(_):
+            return b"200"
+
+        scene.connection_holds.read_pass = read_pass
+        team = scene.team = SceneTeam(scene, None)
+        refreshed = []
+        team.refresh = lambda actor, **kwargs: refreshed.append(actor.player_id)
+        try:
+            await scene._connection_lost(scene.worlds[1], player)
+            await asyncio.gather(*tuple(scene.connection_holds._probes))
+            team.intents.add(2)
+            team.membership[2] = _Membership(20, (1, 1), 1, 2)
+            team.tick(.05)
+            team.tick(.05)
+            assert refreshed == [2]
+            clock[0] = 118
+            team.tick(.05)
+            assert refreshed == [2, 2]
+            clock[0] = 208
+            team.tick(.05)
+            assert refreshed == [2, 2]
+        finally:
+            await team.close()
+            await scene.close()
+
+    asyncio.run(exercise())
