@@ -119,6 +119,9 @@ message EnterSceneRequest {
   uint64 owner_revision = 13;
   // 服务端代表断线托管角色请求落点；不绑定 Gate 会话。
   bool hosted_placement = 14;
+  // 服务端疏散：scene_id / scene_conf_id 是原频道和地图提示；
+  // SceneManager 按疏散规则排除源节点并回落到可用的大世界。
+  bool evacuation = 15;
 }
 
 message EnterSceneResponse {

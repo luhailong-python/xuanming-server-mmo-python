@@ -685,7 +685,7 @@ class GateNode:
         return None
 
     async def _scene_request(self, session, request, *, one_way=False, previous_route=False,
-                             on_sent=None, can_send=None, lane_response=False):
+                             on_sent=None, can_send=None, lane_response=False, empty_exit_response=False):
         target = self._scene_identity(session)
         payload = self.protocol.message(
             "ProcessClientPlayerMessageRequest", session_id=session.session_id, player_id=session.player_id,
@@ -707,10 +707,21 @@ class GateNode:
                 if result.session_id not in (0, session.session_id):
                     raise ValueError("场景响应会话不匹配")
                 return result
+            # ExitGame has an Empty inner response. C++ Scene consequently sends
+            # an empty outer response, even when this RPC0 call expects a reply.
+            # Keep this exception local to logout; ordinary client responses
+            # still require the full echoed identity below.
+            if empty_exit_response and not result.HasField("message_content"):
+                if (target != self._scene_identity(session)
+                        or result.session_id not in (0, session.session_id)
+                        or result.dispatch_verdict):
+                    raise ValueError("场景退出响应身份不匹配")
+                return None
             if (target != self._scene_identity(session)
                     or result.session_id != session.session_id
                     or result.message_content.message_id != request.message_id
-                    or result.message_content.id != request.id):
+                    or result.message_content.id != request.id
+                    or empty_exit_response and (result.dispatch_verdict or result.message_content.error_message.id)):
                 raise ValueError("场景响应身份不匹配")
             return result.message_content
         return None
@@ -735,7 +746,7 @@ class GateNode:
             "ClientRequest", message_id=self.protocol.message_ids["ScenePlayerExitGame"],
             body=self.protocol.message("GameNodeExitGameRequest", reason=reason).SerializeToString(),
         )
-        await self._scene_request(session, request, one_way=reason != 1)
+        await self._scene_request(session, request, one_way=reason != 1, empty_exit_response=reason == 1)
 
     async def _disconnect(self, session: Session) -> None:
         self._clear_scene_entry(session)

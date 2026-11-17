@@ -55,14 +55,14 @@ def verify_service_call(path: str, message: Message, caller: str, timestamp: int
 class BattleControl:
     def __init__(
         self, protocol: Protocol, *, match_endpoint: str, outcome_secret: bytes | str,
-        publish: Callable[[str, int, int, Message], Awaitable[None]] | None = None,
+        publish: Callable[[str, int, int, Message], Awaitable[None]] | None = None, match_client=None,
     ):
         secret = outcome_secret.encode() if isinstance(outcome_secret, str) else outcome_secret
         self.secret = secret.strip()
         if not match_endpoint or len(self.secret) < 32:
             raise ValueError("Battle Match endpoint and a 32-byte outcome signing key are required")
         self.protocol = protocol
-        self.match = GrpcClient(match_endpoint)
+        self.match = match_client or GrpcClient(match_endpoint)
         self.publish = publish
         self.node: BattleNode | None = None
         self._pending: dict[int, asyncio.Task] = {}

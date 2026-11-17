@@ -121,7 +121,8 @@ async def cross_zone(session, source, gates, scenes, authenticate, enter_game, r
 
 
 async def main(probe, ingress, skip_cross, monopoly, monopoly_landmarks=False, monopoly_board=False,
-               monopoly_dice_recovery=False, scene_landing=False, scene_team=False, direct_gate=False):
+               monopoly_dice_recovery=False, scene_landing=False, scene_team=False, direct_gate=False,
+               scene_drain=False):
     configure()
     if not probe:
         import battle_full
@@ -219,6 +220,13 @@ async def main(probe, ingress, skip_cross, monopoly, monopoly_landmarks=False, m
 
                         report["stage"] = "scene_team"
                         report["scene_team"] = await verify_team(session, source, gates[1], scenes[1], ingress)
+                    if scene_drain:
+                        from drain_full import verify_drain
+
+                        report["stage"] = "scene_planned_shutdown"
+                        scenes[1], source, report["scene_planned_shutdown"] = await verify_drain(
+                            stack, session, gates[1], scenes[1],
+                        )
                     if monopoly_dice_recovery:
                         import dice_recovery_full
 
@@ -343,6 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--scene-landing", action="store_true")
     parser.add_argument("--scene-team", action="store_true")
     parser.add_argument("--direct-gate", action="store_true")
+    parser.add_argument("--scene-drain", action="store_true")
     args = parser.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
@@ -350,4 +359,4 @@ if __name__ == "__main__":
         logging.getLogger("xuanming.nodes.gate_direct").setLevel(logging.DEBUG)
     asyncio.run(main(args.probe_scenes, args.ingress, args.skip_cross, args.monopoly, args.monopoly_landmarks,
                      args.monopoly_board, args.monopoly_dice_recovery, args.scene_landing, args.scene_team,
-                     args.direct_gate))
+                     args.direct_gate, args.scene_drain))

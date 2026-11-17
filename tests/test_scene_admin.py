@@ -205,3 +205,54 @@ def test_scene_admin_shutdown_replies_then_persists_held_actor(tmp_path, monkeyp
             await asyncio.gather(serving, return_exceptions=True)
 
     asyncio.run(exercise())
+
+
+def test_shutdown_retries_failed_player_save_before_releasing(tmp_path, monkeypatch):
+    async def exercise():
+        async with Runtime(_settings(tmp_path), "local", dev_token=_TOKEN) as runtime:
+            scene = runtime.scene
+            async with connect(runtime.protocol, runtime.gate.info.endpoint) as client:
+                player = await _enter(runtime, client)
+                scene._move_position(scene.locations[1], player, (183., 200., 0.))
+                commit = scene.store.commit
+                attempts = 0
+
+                async def transient_failure(*args, **kwargs):
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        raise ConnectionError("temporary player store outage")
+                    return await commit(*args, **kwargs)
+
+                monkeypatch.setattr(scene.store, "commit", transient_failure)
+            # Leave the actor held until Runtime tears down Scene.
+        assert attempts >= 2
+        assert player.snapshot.released and not scene.locations
+        snapshot = await scene.store.load_and_claim(1, b"retry-verifier")
+        assert scene.rows.assemble(snapshot).transform.location.x == 183.
+        await scene.store.release(snapshot)
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_bounds_store_failure_without_releasing_unsaved_player(tmp_path, monkeypatch):
+    import xuanming.nodes.scene as scene_module
+
+    monkeypatch.setattr(scene_module, "SHUTDOWN_SAVE_BUDGET", .1)
+    monkeypatch.setattr(scene_module, "SHUTDOWN_SAVE_RETRY", .01)
+
+    async def exercise():
+        async with Runtime(_settings(tmp_path), "local", dev_token=_TOKEN) as runtime:
+            scene = runtime.scene
+            async with connect(runtime.protocol, runtime.gate.info.endpoint) as client:
+                player = await _enter(runtime, client)
+                scene._move_position(scene.locations[1], player, (184., 200., 0.))
+
+                async def unavailable(*_args, **_kwargs):
+                    raise ConnectionError("player store unavailable")
+
+                monkeypatch.setattr(scene.store, "commit", unavailable)
+        assert not player.snapshot.released
+        assert player.pending_save is not None and scene.locations[1].players[1] is player
+
+    asyncio.run(exercise())

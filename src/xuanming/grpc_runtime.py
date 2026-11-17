@@ -65,11 +65,11 @@ class GrpcClient:
         self.channel = grpc.aio.insecure_channel(endpoint, options=options)
         self.timeout = timeout
 
-    def request(self, path: str, data: bytes, *, metadata: tuple = ()):
-        return self.channel.unary_unary(path)(data, metadata=metadata, timeout=self.timeout)
+    def request(self, path: str, data: bytes, *, metadata: tuple = (), timeout: float | None = None):
+        return self.channel.unary_unary(path)(data, metadata=metadata, timeout=self.timeout if timeout is None else timeout)
 
-    async def call(self, path: str, data: bytes, *, metadata: tuple = ()) -> bytes:
-        return await self.request(path, data, metadata=metadata)
+    async def call(self, path: str, data: bytes, *, metadata: tuple = (), timeout: float | None = None) -> bytes:
+        return await self.request(path, data, metadata=metadata, timeout=timeout)
 
     async def close(self) -> None:
         await self.channel.close()

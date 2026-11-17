@@ -25,6 +25,65 @@ from xuanming.settings import Settings
 from xuanming.smoke import connect
 
 
+def test_draining_world_preserves_eligible_hosted_player_for_handoff(tmp_path):
+    async def exercise():
+        p = Protocol()
+        store = SqlitePlayerStore(tmp_path / "draining-hosted.sqlite3")
+        scene = SceneNode(p, p.message("NodeInfo", node_id=3, node_uuid="scene", zone_id=1),
+                          store, PlayerRowCodec(p), lambda *_: None)
+        scene.create(p.message("CreateSceneRequest", scene_id=1, config_id=1))
+        await scene.enter(p.message("PlayerEnterGameNodeRequest", player_id=1, session_id=11, scene_id=1,
+                                    owner_revision=1, login_generation=1), "gate")
+        world = scene.locations[1]
+        actor = world.players[1]
+        assert scene.connection_holds.start(actor)
+        actor.disconnect_at = time.monotonic() + 10
+        scene.connection_holds.placement_eligible = lambda player: player is actor
+        scene.connection_holds.expired = lambda *_: False
+        world.draining = True
+        calls = []
+        scene.travel = SimpleNamespace(drain=lambda value: calls.append(value), frozen=lambda _: False,
+                                       published=lambda _: False, sealed=lambda _: False)
+        try:
+            await scene.tick(.05)
+            await scene._maintain(world, actor)
+            assert calls == [world]
+            assert world.players[1] is actor and scene.connection_holds.held(actor)
+        finally:
+            scene.travel = None
+            await scene.close()
+
+    asyncio.run(exercise())
+
+
+def test_shutdown_preserves_hosted_hold_until_handoff_settles(tmp_path):
+    async def exercise():
+        p = Protocol()
+        scene = SceneNode(p, p.message("NodeInfo", node_id=3, node_uuid="scene", zone_id=1),
+                          SqlitePlayerStore(tmp_path / "handoff.sqlite3"), PlayerRowCodec(p), lambda *_: None)
+        scene.create(p.message("CreateSceneRequest", scene_id=1, config_id=1))
+        await scene.enter(p.message("PlayerEnterGameNodeRequest", player_id=1, session_id=11, scene_id=1,
+                                    owner_revision=1, login_generation=1), "gate")
+        actor = scene.locations[1].players[1]
+        assert scene.connection_holds.start(actor)
+        actor.disconnect_at = time.monotonic() + 10
+        pending = True
+
+        async def stop():
+            pass
+
+        scene.travel = SimpleNamespace(frozen=lambda _: pending, published=lambda _: False,
+                                       sealed=lambda _: False, stop=stop)
+        closing = asyncio.create_task(scene.close())
+        await asyncio.sleep(.05)
+        assert scene.connection_holds.held(actor) and not actor.snapshot.released
+        pending = False
+        await asyncio.wait_for(closing, 1)
+        assert actor.snapshot.released and not scene.locations
+
+    asyncio.run(exercise())
+
+
 def test_native_hold_and_monthly_pass_boundaries():
     facts = dict(exiting=False, handoff_in_flight=False, evacuating=False, bound=True, already_held=False)
     assert HOLD_WINDOW == 25

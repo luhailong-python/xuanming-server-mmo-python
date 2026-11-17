@@ -12,6 +12,7 @@ from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
 from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc
 from .kill_switch import EtcdKillSwitch, KillSwitch
+from .match_client import MatchClient
 from .node_link import GateLinks, SceneLinks
 from .nodes.battle import BattleNode
 from .nodes.battle_agones import BattleAgones
@@ -22,6 +23,7 @@ from .nodes.gate_spectate import GateSpectate
 from .nodes.monopoly import Monopoly
 from .nodes.player_inbox import BATTLE as INBOX_BATTLE, InboxPeer, LocalInbox, SceneInbox
 from .nodes.scene import SceneNode
+from .nodes.scene_agones import SceneAgones
 from .nodes.scene_admin import SceneAdmin
 from .nodes.scene_activity import Activities
 from .nodes.scene_assets import SceneAssets
@@ -33,6 +35,7 @@ from .nodes.scene_mail_outbox import MailSender, SceneMailOutbox
 from .nodes.scene_merchant import SceneMerchant, redis_key
 from .nodes.scene_mission import Missions
 from .nodes.scene_pets import ScenePets
+from .nodes.scene_planned_drain import budget_from_env, planned_drain
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_stats import initialize_base
 from .nodes.scene_team import SceneTeam
@@ -68,6 +71,7 @@ class Runtime:
         self._battle_control = None
         self._battle_clients = None
         self._battle_agones = None
+        self._scene_agones = None
         self.battle_info = None
         self._local_outcomes: dict[int, asyncio.Task] = {}
         self._local_notices: set[asyncio.Task] = set()
@@ -75,6 +79,8 @@ class Runtime:
 
     async def __aenter__(self):
         self.settings.validate(self.role)
+        if self.role == "scene":
+            self._scene_drain_budget = budget_from_env()
         try:
             if self.local:
                 self.directory = LocalDirectory()
@@ -98,29 +104,41 @@ class Runtime:
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
-        if self.battle is not None:
-            self.battle.begin_shutdown()
-        for server in self._servers:
-            server.close()
-        for server in self._websocket_servers:
-            server.close()
-        for task in self._background:
-            task.cancel()
-        await asyncio.gather(*self._background, return_exceptions=True)
         try:
-            if self._battle_agones is not None:
-                await self._battle_agones.close()
-            closers = [edge.close() for edge in (self._battle_control, self._battle_clients) if edge is not None]
-            if self.battle_info is not None and not self.local and self.directory.lease:
-                closers.append(self._close_battle_registration())
-            if closers:
-                await asyncio.gather(*closers)
+            if (exc_type is None and self.role == "scene" and self.scene is not None
+                    and self._shutdown_requested.is_set() and getattr(self.directory, "lease", 0)):
+                await planned_drain(self.scene, self.directory, self._scene_drain_budget)
         finally:
             try:
-                await self._stack.aclose()
+                if self.battle is not None:
+                    self.battle.begin_shutdown()
+                for server in self._servers:
+                    server.close()
+                for server in self._websocket_servers:
+                    server.close()
+                # Preserve the lease and transports through the save barrier.
+                if self.scene is not None:
+                    await self.scene.close()
+                if self._scene_agones is not None:
+                    await self._scene_agones.close()
             finally:
-                await asyncio.gather(*(server.wait_closed() for server in self._servers))
-                await asyncio.gather(*(server.wait_closed() for server in self._websocket_servers))
+                for task in self._background:
+                    task.cancel()
+                await asyncio.gather(*self._background, return_exceptions=True)
+                try:
+                    if self._battle_agones is not None:
+                        await self._battle_agones.close()
+                    closers = [edge.close() for edge in (self._battle_control, self._battle_clients) if edge is not None]
+                    if self.battle_info is not None and not self.local and self.directory.lease:
+                        closers.append(self._close_battle_registration())
+                    if closers:
+                        await asyncio.gather(*closers)
+                finally:
+                    try:
+                        await self._stack.aclose()
+                    finally:
+                        await asyncio.gather(*(server.wait_closed() for server in self._servers))
+                        await asyncio.gather(*(server.wait_closed() for server in self._websocket_servers))
 
     async def _close_battle_registration(self) -> None:
         self.battle_info.admission = _ADMISSION_CLOSED
@@ -318,7 +336,7 @@ class Runtime:
             scene.register("SceneSceneClientPlayer", "TravelToZone", scene.local_zone_travel)
         else:
             account_secret = secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE")
-            scene.travel = await create_scene_travel(scene, tables, self.settings)
+            scene.travel = await create_scene_travel(scene, tables, self.settings, self.directory)
             methods["SealAccountRoleTrade"] = scene.travel.seal
             self._stack.push_async_callback(scene.travel.close)
             redis = scene.travel.redis
@@ -327,7 +345,7 @@ class Runtime:
                 return await redis.get(afk_pass_key(player_id))
 
             scene.connection_holds.read_pass = read_afk_pass
-            match = GrpcClient(self.settings.match, timeout=6)
+            match = MatchClient(self.directory, self.settings.match, timeout=6)
             self._stack.push_async_callback(match.close)
             match_call = match.call
             inbox_client = GrpcClient(self.settings.player_inbox)
@@ -407,6 +425,12 @@ class Runtime:
             self._spawn(self.kafka.consume(self._scene_command), "scene-commands")
         self._spawn(self._scene_loop(), "scene-tick")
         await self._publish(info)
+        if not self.local:
+            self._scene_agones = SceneAgones.from_env()
+            if self._scene_agones is not None:
+                self._stack.push_async_callback(self._scene_agones.close)
+                self._scene_agones.start()
+                self._spawn(self._scene_agones.watch_drain(self.request_shutdown), "scene-agones-drain")
 
     async def _scene_loop(self) -> None:
         previous = time.monotonic()
@@ -414,6 +438,8 @@ class Runtime:
             await asyncio.sleep(self.settings.scene_tick_seconds)
             now = time.monotonic()
             await self.scene.tick(min(now - previous, 0.25))
+            if self._scene_agones is not None:
+                self._scene_agones.touch_heartbeat()
             previous = now
 
     async def _scene_command(self, data: bytes) -> None:
@@ -482,6 +508,7 @@ class Runtime:
             control = BattleControl(
                 self.protocol, match_endpoint=self.settings.match,
                 outcome_secret=secret("MMORPG_MATCH_OUTCOME_SECRET_BATTLE"), publish=publish,
+                match_client=MatchClient(self.directory, self.settings.match),
             )
             self._battle_control = control
             self._stack.push_async_callback(control.close)

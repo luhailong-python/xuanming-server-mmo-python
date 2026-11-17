@@ -11,7 +11,7 @@ from xuanming.data import ConfigTables, PlayerSnapshot
 from xuanming.nodes import _handoff_lua as lua
 from xuanming.nodes.battle_control import service_digest, sign_service_call, verify_service_call
 from xuanming.nodes.gate import GateNode, Session, issue_gate_ticket
-from xuanming.nodes.scene_travel import SceneTravel, _keys
+from xuanming.nodes.scene_travel import SceneTravel, _Travel, _keys
 from xuanming.protocol import Protocol
 
 
@@ -79,6 +79,105 @@ class _Data:
 
     async def close(self):
         pass
+
+
+@pytest.mark.parametrize("dungeon,mirror,expected", [
+    (0, 0, (23, 17)),
+    (0, 1, (0, 17)),
+    (1, 0, (0, 0)),
+])
+@pytest.mark.parametrize("hosted", [False, True])
+def test_world_drain_sends_evacuation_with_scene_hints_and_hosted_identity(dungeon, mirror, expected, hosted):
+    async def exercise():
+        protocol = Protocol()
+        player = SimpleNamespace(player_id=42, session_id=(1 << 17) | 1, generation=3,
+                                 owner_revision=7, gate_uuid="gate-a", admission=object(),
+                                 disconnect_at=1 if hosted else None,
+                                 snapshot=SimpleNamespace(owner_epoch=9, released=False),
+                                 motion=SimpleNamespace(velocity=(0., 0., 0.)))
+
+        class World:
+            info = protocol.message("SceneInfoComp", scene_id=23, scene_config_id=17,
+                                    dungeon_config_id=dungeon, mirror_config_id=mirror)
+            players = {42: player}
+
+        class Manager:
+            def __init__(self): self.requests = []
+            async def call(self, path, payload):
+                assert path.endswith("/EnterScene")
+                request = protocol.parse("scene_manager.EnterSceneRequest", payload)
+                self.requests.append(request)
+                return protocol.message("scene_manager.EnterSceneResponse", player_id=42,
+                                        correlation_id=request.correlation_id).SerializeToString()
+
+        scene = SimpleNamespace(protocol=protocol, info=protocol.message("NodeInfo", zone_id=1),
+                                battle=None, register=lambda *_: None,
+                                connection_holds=SimpleNamespace(placement_eligible=lambda _: hosted),
+                                _releasing=lambda _: False)
+        manager = Manager()
+        travel = SceneTravel(scene, ConfigTables(), manager, None, None, b"x" * 32)
+        starts = []
+
+        def start(player, zone, scene_id, config, **options):
+            starts.append(_Travel(player, zone, scene_id, config, player.gate_uuid, player.session_id,
+                                  player.generation, player.owner_revision, **options))
+
+        travel._start = start
+        travel.drain(World())
+        assert len(starts) == 1
+        await travel._enter(starts[0])
+        result = manager.requests[0]
+        assert (result.scene_id, result.scene_conf_id) == expected
+        assert result.evacuation and result.hosted_placement == hosted
+        assert (result.gate_id, result.gate_instance_id) == (("", "") if hosted else ("1", "gate-a"))
+        assert (result.player_id, result.session_id, result.login_generation, result.owner_revision) == (
+            42, player.session_id, 3, 7)
+
+    asyncio.run(exercise())
+
+
+def test_planned_drain_shares_one_relocation_budget_across_worlds(monkeypatch):
+    from xuanming.nodes.scene_planned_drain import RelocationPacer
+
+    async def exercise():
+        protocol = Protocol()
+        clock = [10.0]
+        monkeypatch.setattr(SceneTravel, "_clock", property(lambda _: clock[0]))
+        scene = SimpleNamespace(protocol=protocol, info=protocol.message("NodeInfo", zone_id=1), battle=None,
+                                register=lambda *_: None, _planned_drain_pacer=RelocationPacer(2))
+        travel = SceneTravel(scene, ConfigTables(), None, None, None, b"x" * 32)
+        starts = []
+
+        def start(player, *_args, **_options):
+            starts.append(player.player_id)
+            travel._trips[player.player_id] = True
+
+        travel._start = start
+
+        def player(player_id):
+            return SimpleNamespace(player_id=player_id, admission=object(), gate_uuid="gate",
+                                   session_id=(1 << 17) | player_id, owner_revision=1, disconnect_at=None,
+                                   snapshot=SimpleNamespace(owner_epoch=1, released=False))
+
+        class World:
+            def __init__(self, first):
+                self.info = protocol.message("SceneInfoComp", scene_id=first, scene_config_id=1)
+                self.players = {n: player(n) for n in (first, first + 1)}
+
+        first, second = World(1), World(3)
+        travel.drain(first)
+        travel.drain(second)
+        assert starts == []  # First observation initializes the bucket.
+        clock[0] += 1
+        travel.drain(first)
+        travel.drain(second)
+        assert starts == [1, 2]  # Two tokens for the whole node, not per world.
+        clock[0] += 0.5
+        travel.drain(first)
+        travel.drain(second)
+        assert starts == [1, 2, 3]
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.parametrize("outcome", ("granted", "rejected", "rolled_back", "sealed", "credential", "grouped", "team_retry"))

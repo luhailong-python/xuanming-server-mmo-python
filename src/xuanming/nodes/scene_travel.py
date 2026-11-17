@@ -83,6 +83,7 @@ class _Travel:
     hosted: bool = False
     source_scene: int = 0
     client_pick: bool = False
+    evacuation: bool = False
     frozen: bool = False
     marked: bool = False
     started_at: float = 0
@@ -377,17 +378,28 @@ class SceneTravel:
     def drain(self, world) -> None:
         """疏散目标由 SceneManager 选择。每拍限量，仍在战斗的玩家等下一拍。"""
         now = self._clock
-        if now < self._drain_after.get(world, 0):
-            return
-        self._drain_after[world] = now + 1
+        pacer = getattr(self.scene, "_planned_drain_pacer", None)
+        if pacer is None:
+            if now < self._drain_after.get(world, 0):
+                return
+            self._drain_after[world] = now + 1
         started = 0
         for player in tuple(world.players.values()):
-            if (player.player_id in self._trips or not self._ready(player)
+            hosted = player.disconnect_at is not None and self._hosted_ready(player)
+            if (player.player_id in self._trips or not (self._ready(player) or hosted)
                     or self.scene.battle and self.scene.battle.frozen(player.player_id)):
                 continue
-            self._start(player, self.scene.info.zone_id, 0, 0, frozen=True)
+            if pacer is not None and not pacer.allow(self._clock):
+                break
+            info = world.info
+            # A dungeon cannot move; a mirror falls back to another channel of
+            # its map; a world channel can retain both its ID and map hint.
+            config = 0 if info.dungeon_config_id else info.scene_config_id
+            scene_id = 0 if info.dungeon_config_id or info.mirror_config_id else info.scene_id
+            self._start(player, self.scene.info.zone_id, scene_id, config,
+                        frozen=True, hosted=hosted, evacuation=True)
             started += 1
-            if started == 32:
+            if pacer is None and started == 32:
                 break
 
     async def read_team_membership(self, player) -> Message:
@@ -722,6 +734,7 @@ class SceneTravel:
             gate_instance_id="" if trip.hosted else trip.gate_uuid, hosted_placement=trip.hosted,
             gate_zone_id=self.scene.info.zone_id, zone_id=trip.zone, correlation_id=correlation,
             login_generation=trip.generation, owner_revision=trip.owner_revision, client_channel_pick=client_pick,
+            evacuation=trip.evacuation,
         )
         if reply.player_id != player.player_id or reply.correlation_id not in (0, correlation):
             raise ValueError("SceneManager 应答与本次入场不匹配")
@@ -922,15 +935,16 @@ class SceneTravel:
         await asyncio.gather(*closers)
 
 
-async def create_scene_travel(scene, tables, settings) -> SceneTravel:
+async def create_scene_travel(scene, tables, settings, directory=None) -> SceneTravel:
     from redis.asyncio import Redis, RedisCluster
+    from xuanming.match_client import MatchClient
 
     admission_secret = secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE")
     redis_type = RedisCluster if settings.redis_cluster else Redis
     redis = redis_type.from_url(settings.redis, decode_responses=False, socket_connect_timeout=3, socket_timeout=3)
     coordinator = GrpcClient(settings.scene_manager, timeout=12)
     data = GrpcClient(settings.data_service, timeout=5)
-    team = GrpcClient(settings.match, timeout=4)
+    team = MatchClient(directory, settings.match, timeout=4) if directory else GrpcClient(settings.match, timeout=4)
     try:
         await redis.ping()
         return SceneTravel(scene, tables, coordinator, redis, data, admission_secret,

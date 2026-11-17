@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import os
 import time
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from redis.asyncio import Redis
 
@@ -97,7 +97,11 @@ async def start_python(stack, *, landing=False, direct_gate=False):
     battle = await stack.enter_async_context(Runtime(settings(1), "battle"))
     gates, scenes = {}, {}
     for zone in (1, 2):
-        scenes[zone] = await stack.enter_async_context(Runtime(settings(zone), "scene"))
+        # Keep each scene's lifecycle separate so a drain test can shut down
+        # one node without closing its live peers or tearing it down twice.
+        scene_lifecycle = await stack.enter_async_context(AsyncExitStack())
+        scenes[zone] = await scene_lifecycle.enter_async_context(Runtime(settings(zone), "scene"))
+        scenes[zone]._interop_lifecycle = scene_lifecycle
         gates[zone] = await stack.enter_async_context(Runtime(settings(zone), "gate"))
     return gates, scenes, battle
 

@@ -28,6 +28,7 @@ def main():
     for name in ("prepared", "etcd", "redis", "mysql", "kafka-java", "kafka-libs", "go", "private-helper"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--direct-gate", action="store_true", help="use direct Gate routing (Team requires Router)")
+    parser.add_argument("--scene-drain", action="store_true", help="exercise planned shutdown with a second Scene")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("the native middleware harness currently supports Windows only")
@@ -56,6 +57,8 @@ def main():
     command = [sys.executable, str(Path(__file__).with_name("smoke_full.py")),
                "--ingress", "python", "--scene-landing", "--monopoly-board"]
     command += ["--direct-gate"] if args.direct_gate else ["--scene-team"]
+    if args.scene_drain:
+        command.append("--scene-drain")
     result = subprocess.run(command, env=env)
     raise SystemExit(result.returncode)
 

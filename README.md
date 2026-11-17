@@ -34,6 +34,10 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 
 安装 `.[cluster]` 后可用 `xuanming-server run gate|scene|battle --config <配置文件>` 单独起节点。用 `config/cluster.example.toml` 配置实例地址、原有 Kafka topic 代号和固定分区。设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连原版 Go Login 和 Match。保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Router 转发，组队和其他 Go 客户端服务走此模式。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做原有控制面操作。神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。集群的 Login、Match 和其他业务服务仍使用 Go 实现。
 
+Scene 和 Battle 的内部 Match 终局调用会发现 etcd 中的 stable Match 副本；终局提交和只读查询可在通信失败时切换副本。无登记或首次发现失败时使用配置中的 `match` 地址，因此该地址必须指向可信的 stable Match 服务；已有登记但没有合格 stable 副本时不会绕过轨道限制。
+
+集群 Scene 接收停机请求后先关闭新建和入场准入、向注册中心发布关闭状态，在预算内等待场景迁移并疏散剩余玩家，再进行有界存档退出。`MMORPG_PLANNED_DRAIN_BUDGET_SECONDS` 默认 35 秒，`SCENE_PLANNED_DRAIN_SELF_EVACUATE_AFTER_SECONDS` 可调整自疏散启动时间；部署的终止宽限期还应为后续最多 15 秒的存档阶段留出时间。存储持续不可用或迁移预算耗尽时，停机会记录未完成的工作，不能将其当作成功迁移。
+
 ## HTTP 门户
 
 Python 门户提供登录、Gate 分票、排队查询和令牌刷新，以及区服列表、公告、CDN 签名、热更检查和管理接口。安装 `.[cluster]`，按 [门户配置示例](config/portal.example.toml) 配置 MySQL、Redis、etcd 和 Login，设置密钥后启动：

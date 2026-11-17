@@ -3,6 +3,7 @@ import base64
 import socket
 
 import grpc
+import pytest
 
 from xuanming.grpc_runtime import GrpcClient
 from xuanming.nodes import gate as gate_module
@@ -128,6 +129,123 @@ def test_leave_barrier_remains_during_scene_exit_and_clears_on_send(monkeypatch)
             release.set()
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_router_leave_accepts_cpp_scene_empty_response_and_forwards_to_login():
+    async def run():
+        calls = []
+
+        async def forward(_gate, _session, route, frame, _seq):
+            calls.append(route.method)
+            return protocol.content(frame.message_id, frame.id)
+
+        protocol, gate, session = setup(forward, player_id=42, account="acct", owner_revision=1,
+                                         logged_in=True, scene_node_id=6, scene_instance_id="scene-a")
+
+        class CppScene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid):
+                assert (node, expected_uuid, one_way, payload.player_id) == (6, "scene-a", False, 42)
+                assert message_id == protocol.message_ids["SceneProcessClientPlayerMessage"]
+                assert protocol.parse("GameNodeExitGameRequest", payload.message_content.serialized_message).reason == 1
+                calls.append("SceneExit")
+                return b""  # C++ sends no content for the Empty inner response.
+
+        gate.scene = CppScene()
+        leave = request(protocol, "ClientPlayerLoginLeaveGame", 1)
+        response = await gate._dispatch(session, 1, leave)
+        assert calls == ["SceneExit", "LeaveGame"]
+        assert (response.message_id, response.id, response.error_message.id) == (leave.message_id, 1, 0)
+        assert (session.player_id, session.scene_node_id, session.account) == (0, 0, "")
+
+    asyncio.run(run())
+
+
+def test_router_leave_with_cpp_empty_response_over_rpc0_and_grpc(tmp_path):
+    from test_scene_enter_fence import _edge
+
+    async def run():
+        async with _edge(tmp_path) as (protocol, scene, links, enter):
+            sid = (5 << 17) | 1
+            await enter(sid, 8)
+            original_process = scene.process
+
+            async def cpp_response(request, gate_uuid):
+                response = await original_process(request, gate_uuid)
+                if request.message_content.message_id == protocol.message_ids["ScenePlayerExitGame"]:
+                    return protocol.message("ProcessClientPlayerMessageResponse")
+                return response
+
+            scene.process = cpp_response
+            seen = []
+
+            async def router(raw, context):
+                incoming = protocol.parse("client_rpc_router.ForwardRequest", raw).request
+                seen.append(incoming.message_id)
+                await context.send_initial_metadata((("x-session-detail-bin", dict(context.invocation_metadata())["x-session-detail-bin"]),))
+                return protocol.content(incoming.message_id, incoming.id).SerializeToString()
+
+            server = grpc.aio.server()
+            server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler("client_rpc_router.ClientRpcRouter", {
+                "Forward": grpc.unary_unary_rpc_method_handler(router),
+            }),))
+            port = server.add_insecure_port("127.0.0.1:0")
+            await server.start()
+            client = GrpcClient(f"127.0.0.1:{port}", timeout=2, enable_retries=False)
+            info = protocol.message("NodeInfo", node_id=5, zone_id=1, node_uuid="enter-gate")
+            gate = GateNode(protocol, info, b"x" * 32, RouterForwarder(protocol, client, b"y" * 32))
+            gate.scene = links
+            session = Session(sid, 1, Writer(), verified=True, logged_in=True, player_id=1,
+                              account="alice", owner_revision=1, login_generation=8,
+                              scene_node_id=6, scene_id=1, scene_instance_id="enter-scene")
+            try:
+                leave = request(protocol, "ClientPlayerLoginLeaveGame", 1)
+                response = await gate._dispatch(session, 1, leave)
+                assert not response.error_message.id
+                assert seen == [leave.message_id] and not scene.sessions and 1 not in scene.locations
+                assert (session.player_id, session.scene_node_id) == (0, 0)
+            finally:
+                await client.close()
+                await server.stop(0)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["wrong_session", "retry_later", "wrong_content", "error", "route_changed"])
+def test_router_leave_rejects_invalid_scene_response(failure):
+    async def run():
+        calls = []
+
+        async def forward(*_args):
+            calls.append("Login")
+
+        protocol, gate, session = setup(forward, player_id=42, account="acct", owner_revision=1,
+                                         logged_in=True, scene_node_id=6, scene_instance_id="scene-a")
+
+        class Scene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid):
+                reply = protocol.message("ProcessClientPlayerMessageResponse")
+                if failure == "wrong_session":
+                    reply.session_id = session.session_id + 1
+                elif failure == "retry_later":
+                    reply.dispatch_verdict = 1
+                elif failure == "wrong_content":
+                    reply.session_id = session.session_id
+                    reply.message_content.CopyFrom(protocol.content(123, 0))
+                elif failure == "error":
+                    reply.session_id = session.session_id
+                    reply.message_content.CopyFrom(protocol.content(payload.message_content.message_id, 0, error=1003))
+                else:
+                    session.scene_instance_id = "replacement"
+                return reply.SerializeToString()
+
+        gate.scene = Scene()
+        leave = request(protocol, "ClientPlayerLoginLeaveGame", 1)
+        response = await gate._dispatch(session, 1, leave)
+        assert response.error_message.id == 1003
+        assert not calls
+        assert session.player_id == 42
 
     asyncio.run(run())
 

@@ -24,6 +24,7 @@ from .scene_connection_hold import (
     HOLD_WINDOW, SWEEP_INTERVAL, HoldDecision, SceneConnectionHolds, decide_hold, session_bound,
 )
 from .scene_player import actor_profile_fields, register_player_handlers
+from .scene_planned_drain import RelocationPacer
 
 logger = logging.getLogger(__name__)
 Position = tuple[float, float, float]
@@ -34,6 +35,8 @@ TELEPORT_SETTLE_SECONDS = 3.0
 TELEPORT_SETTLE_RADIUS = 3.0
 DEFAULT_SPAWN: Position = (180., 200., 0.)
 SAVE_INTERVAL = 30
+SHUTDOWN_SAVE_BUDGET = 15.0
+SHUTDOWN_SAVE_RETRY = 0.25
 STALE_SAVE_RESULTS = {"SAVE_PLAYER_STALE_OWNER", "SAVE_PLAYER_NOT_HOLDER", "SAVE_PLAYER_UNCLAIMED"}
 
 # 与 C++ player_handoff_gate 一致：默认不允许跨场景重放。
@@ -185,12 +188,16 @@ class SceneNode:
         self.locations: dict[int, World] = {}
         self.sessions: dict[tuple[str, int], Player] = {}
         self._pending_sessions: set[tuple[str, int]] = set()
+        self._entry_tasks: set[asyncio.Task] = set()
         self._entries_drained = asyncio.Event()
         self._entries_drained.set()
         self._maintenance: dict[int, asyncio.Task] = {}
         self._ids = count(1)
         self._locks = [asyncio.Lock() for _ in range(64)]
         self._closing = False
+        self._closed = False
+        self._admission_closed = False
+        self._planned_drain_pacer = None
         self.current_frame = 0
         self.battle = None
         self.travel = None
@@ -234,7 +241,7 @@ class SceneNode:
             self._mutating.add((service, method))
 
     def create(self, request):
-        if self._closing:
+        if self._closing or self._admission_closed:
             raise ValueError("场景或配表 ID 无效")
         scene_id = request.scene_id
         generation = request.placement_generation
@@ -301,12 +308,12 @@ class SceneNode:
 
     async def enter(self, request, gate_uuid: str, *, hosted: bool = False):
         player_id = request.player_id
-        if self._closing or not all((player_id, request.owner_revision)) or not session_bound(request.session_id):
+        if self._closing or self._admission_closed or not all((player_id, request.owner_revision)) or not session_bound(request.session_id):
             raise ValueError("入场身份不完整")
         if self.travel and not all((request.owner_epoch, request.login_generation)):
             raise ValueError("入场身份不完整")
         async with self._lock(player_id):
-            if self._closing:
+            if self._closing or self._admission_closed:
                 raise ValueError("场景正在关闭")
             if self.travel and self.travel.sealed(player_id):
                 raise ValueError("角色原入场世代正在封存")
@@ -441,6 +448,18 @@ class SceneNode:
                         return self.protocol.message("Empty")
                     await self._remove(previous, old, release_credential=False)
                 player = await self._load_player(request, gate_uuid, world, admission=replacement_admission)
+                if self._closing or self._admission_closed:
+                    # Shutdown can start while load/claim is awaiting I/O. Do
+                    # not publish a late actor after the shutdown snapshot.
+                    try:
+                        await self.flush_player_rows(player)
+                        if not player.snapshot.released:
+                            player.snapshot = await self.store.release(player.snapshot)
+                        if self.travel and player.admission:
+                            await self.travel.retire(player.admission, player.snapshot)
+                    except Exception:
+                        logger.exception("停机期间撤销入场失败 player_id=%s", player_id)
+                    raise ValueError("场景正在关闭")
                 if hosted:
                     player.disconnect_at = time.monotonic() + self.disconnect_grace
                     if not self.connection_holds.start(player):
@@ -507,6 +526,8 @@ class SceneNode:
         if key in self._pending_sessions or bound is not None and bound.player_id != player_id:
             raise ValueError("会话已绑定其他角色或正在入场")
         self._pending_sessions.add(key)
+        task = asyncio.current_task()
+        self._entry_tasks.add(task)
         self._entries_drained.clear()
         world.pending_entrants += 1
         try:
@@ -514,6 +535,7 @@ class SceneNode:
         finally:
             world.pending_entrants -= 1
             self._pending_sessions.remove(key)
+            self._entry_tasks.discard(task)
             if not self._pending_sessions:
                 self._entries_drained.set()
 
@@ -886,6 +908,8 @@ class SceneNode:
             self.buffs.discard(player)
 
     async def tick(self, delta: float) -> None:
+        if self._closing:
+            return
         step_started = time.monotonic()
         for world in self.worlds.values():
             for player in world.players.values():
@@ -917,7 +941,10 @@ class SceneNode:
                 if held and self.travel and hasattr(self.travel, "refresh_hosted_presence"):
                     self.travel.refresh_hosted_presence(player)
                 if held:
-                    due = world.draining or self.connection_holds.expired(player, now) or now >= player.save_at
+                    evacuating_hosted = bool(world.draining and self.travel
+                                             and self.connection_holds.placement_eligible(player))
+                    due = ((world.draining and not evacuating_hosted)
+                           or self.connection_holds.expired(player, now) or now >= player.save_at)
                 else:
                     due = now >= (player.disconnect_at if player.disconnect_at is not None else player.save_at)
                 can_save = (self.mutable(player) if player.disconnect_at is None else not (
@@ -977,7 +1004,9 @@ class SceneNode:
                     return
                 now = time.monotonic()
                 held = self.connection_holds.held(player)
-                if held and (world.draining or self.connection_holds.expired(player, now)):
+                evacuating_hosted = bool(held and world.draining and self.travel
+                                         and self.connection_holds.placement_eligible(player))
+                if held and ((world.draining and not evacuating_hosted) or self.connection_holds.expired(player, now)):
                     await self._remove(world, player)
                 elif player.disconnect_at is not None and not held:
                     if now >= player.disconnect_at:
@@ -1004,28 +1033,90 @@ class SceneNode:
         finally:
             self._maintenance.pop(player.player_id, None)
 
-    async def close(self) -> None:
-        self._closing = True
-        await self.channels.close()
-        await self.connection_holds.close()
-        if self.travel:
-            await self.travel.stop()
-        if self.inbox:
-            await self.inbox.close()
-        if self.mail_outbox:
-            await self.mail_outbox.close()
-        if self.battle:
-            await self.battle.close()
-        await self._entries_drained.wait()
-        await asyncio.gather(*tuple(self._maintenance.values()), return_exceptions=True)
+    def begin_planned_drain(self) -> None:
+        """Stop admitting new work while existing worlds and handoffs continue running."""
+        if self._planned_drain_pacer is None:
+            self._planned_drain_pacer = RelocationPacer.from_env()
+        self._admission_closed = True
+
+    def evacuate_remaining(self) -> None:
+        """Fall back to the normal, fenced SceneManager handoff for each world."""
         for world in tuple(self.worlds.values()):
-            for player in tuple(world.players.values()):
+            world.draining = True
+            if self.travel:
+                self.travel.drain(world)
+
+    async def _shutdown_player(self, world: World, player: Player) -> None:
+        while world.players.get(player.player_id) is player:
+            try:
                 async with self._lock(player.player_id):
-                    if world.players.get(player.player_id) is player:
-                        try:
-                            await self._remove(world, player)
-                        except Exception:
-                            logger.exception("停机角色存盘失败，player_id=%s", player.player_id)
+                    if world.players.get(player.player_id) is not player:
+                        return
+                    # Keep hosted/session state intact while a fenced handoff
+                    # or trade seal is still resolving.
+                    if not (self.travel and (self.travel.frozen(player.player_id)
+                                              or self.travel.published(player.player_id))):
+                        await self._remove(world, player)
+            except Exception:
+                logger.warning("停机角色存盘失败，将重试 player_id=%s", player.player_id, exc_info=True)
+            if world.players.get(player.player_id) is player:
+                await asyncio.sleep(SHUTDOWN_SAVE_RETRY)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        deadline = asyncio.get_running_loop().time() + SHUTDOWN_SAVE_BUDGET
+        saves = {}
+        try:
+            async with asyncio.timeout_at(deadline):
+                if self.skill_casts is not None:
+                    await self.skill_casts.close()
+                await self.channels.close()
+                if self.inbox:
+                    await self.inbox.close()
+                if self.mail_outbox:
+                    await self.mail_outbox.close()
+                if self.battle:
+                    await self.battle.close()
+                while True:
+                    for world in tuple(self.worlds.values()):
+                        for player in tuple(world.players.values()):
+                            key = id(player)
+                            if key not in saves or saves[key].done():
+                                saves[key] = asyncio.create_task(self._shutdown_player(world, player))
+                    if (self._entries_drained.is_set() and not self.locations
+                            and all(task.done() for task in saves.values())
+                            and not self._maintenance):
+                        break
+                    await asyncio.sleep(.01)
+        except TimeoutError:
+            logger.error("Scene 停机任务超过总预算")
+        finally:
+            for world in tuple(self.worlds.values()):
+                for player in tuple(world.players.values()):
+                    logger.error("停机角色尚未释放 player_id=%s", player.player_id)
+            pending = tuple(self._entry_tasks) + tuple(saves.values())
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            try:
+                async with asyncio.timeout(0.1):
+                    await asyncio.gather(*pending, return_exceptions=True)
+            except TimeoutError:
+                logger.error("停机等待入场任务取消超时")
+            if self.travel:
+                try:
+                    async with asyncio.timeout(0.1):
+                        await self.travel.stop()
+                except TimeoutError:
+                    logger.error("停机等待交接任务取消超时")
+            try:
+                async with asyncio.timeout(0.1):
+                    await self.connection_holds.close()
+            except TimeoutError:
+                logger.error("停机等待断线保留清理超时")
+            self._closed = True
 
     def _scene_info(self, world, player, route, request):
         self.channels.query(world, player, request)
