@@ -11,7 +11,7 @@ MAX_PENDING = 1024
 
 
 def directory_key(zone_id: int, scene_config_id: int) -> str:
-    return f"world_channel_directory:zone:{zone_id}:{scene_config_id}"
+    return f"world_channel_directory:{{ctl:{zone_id}}}:{scene_config_id}"
 
 
 class SceneChannels:

@@ -87,7 +87,7 @@ def test_real_tcp_scene_info_forwards_original_directory_only_when_requested(tmp
                 assert response.scene_info[0].scene_id == 1
                 assert not response.HasField("channel_directory") and not redis.calls
                 response = await _query(client)
-                assert redis.calls == ["world_channel_directory:zone:1:1"]
+                assert redis.calls == ["world_channel_directory:{ctl:1}:1"]
                 assert response.channel_directory.SerializeToString() == redis.value
                 assert scene.locations[1].players[1].snapshot is before
 
@@ -161,6 +161,6 @@ def test_directory_timeout_still_pushes_base_scene_info(tmp_path, monkeypatch):
                 await _enter(runtime, client)
                 response = await _query(client)
                 assert response.scene_info[0].scene_id == 1 and not response.HasField("channel_directory")
-                assert redis.calls == ["world_channel_directory:zone:1:1"]
+                assert redis.calls == ["world_channel_directory:{ctl:1}:1"]
 
     asyncio.run(exercise())
