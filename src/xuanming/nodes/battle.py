@@ -798,7 +798,7 @@ class BattleNode:
         player, operation = request.observer_player_id, request.spectator_operation_id
         now = self.now_ms()
         if (not player or not request.battle_id or not _uuid(operation) or request.target_instance_id != self.instance_id
-                or not request.routing.gate_instance_id or not now < request.admit_before_ms <= now + 30_000):
+                or not now < request.admit_before_ms <= now + 30_000):
             return self._error(response, _INVALID)
         self._prune_observer_receipts(now)
         key = request.battle_id, player, operation
@@ -818,6 +818,8 @@ class BattleNode:
             heapq.heappush(self._observer_deadlines, (receipt.expires_ms, key))
             if room is None:
                 receipt.error = _MISSING
+            elif not request.routing.gate_instance_id:
+                receipt.error = _INVALID
             elif not self.admitting or room.proposed_outcome or room.deadline_ms <= now:
                 receipt.error = _UNAVAILABLE
             elif room.original.spectate_visibility != 2 or player in room.routing or player in room.observers:
@@ -889,7 +891,14 @@ class BattleNode:
         return response
 
     def _drop_observer(self, room: _Room, player: int, *, notify: bool = True) -> None:
-        del room.observers[player]
+        observer = room.observers.pop(player)
+        key = room.engine.battle_id, player, observer.operation_id
+        receipt = self.observer_receipts.get(key)
+        if receipt is not None:
+            if receipt.expires_ms <= self.now_ms():
+                del self.observer_receipts[key]
+            else:
+                receipt.error = _INVALID
         if notify:
             self._emit(room, player, 166, self.protocol.message("SpectateEndS2C", battle_id=room.engine.battle_id, reason=3))
         connection = room.connections.pop(player, None)
@@ -900,7 +909,7 @@ class BattleNode:
         while self._observer_deadlines and self._observer_deadlines[0][0] <= now:
             expires, key = heapq.heappop(self._observer_deadlines)
             receipt = self.observer_receipts.get(key)
-            if receipt is not None and receipt.expires_ms == expires:
+            if receipt is not None and receipt.expires_ms == expires and receipt.error:
                 del self.observer_receipts[key]
 
     def _prune_creation_receipts(self, now: int) -> None:
@@ -1140,6 +1149,9 @@ class BattleNode:
             if player in room.observers:
                 self._emit(room, player, 166, end)
             self._publish(connection.close)
+        room.connections.clear()
+        for player in tuple(room.observers):
+            self._drop_observer(room, player, notify=False)
         del self.rooms[battle_id]
         if self.on_rooms_changed:
             self._publish(self.on_rooms_changed, len(self.rooms))
@@ -1160,6 +1172,9 @@ class BattleNode:
                 if steady - room.outcome_since_ms >= 30 * 3_600_000:
                     for connection in room.connections.values():
                         self._publish(connection.close)
+                    room.connections.clear()
+                    for player in tuple(room.observers):
+                        self._drop_observer(room, player, notify=False)
                     del self.rooms[room.engine.battle_id]
                     if self.on_rooms_changed:
                         self._publish(self.on_rooms_changed, len(self.rooms))
@@ -1207,6 +1222,9 @@ class BattleNode:
                     self._emit(room, player, 166, end)
                 self._publish(connection.close)
             room.connections.clear()
+            if not room.proposed_outcome:
+                for player in tuple(room.observers):
+                    self._drop_observer(room, player, notify=False)
 
     def close(self) -> None:
         self.begin_shutdown()

@@ -422,7 +422,7 @@ def test_expired_observer_removal_succeeds_when_receipts_are_full(runtime, monke
                              spectator_operation_id="01900000-0000-7000-8000-000000000002",
                              target_instance_id=node.instance_id, admit_before_ms=2000)
     other.routing.gate_instance_id = "gate-process"
-    assert not node.add_observer(other).error_message.id
+    assert node.add_observer(other).error_message.id == 1008
     remove = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
                               spectator_operation_id=operation, admit_before_ms=1100,
                               target_instance_id=node.instance_id)
@@ -430,6 +430,7 @@ def test_expired_observer_removal_succeeds_when_receipts_are_full(runtime, monke
     assert 303 not in node.rooms[10].observers
     assert socket.closed == 1
     assert [(message_id, message.reason) for message_id, message in socket.messages] == [(166, 3)]
+    assert not node.add_observer(other).error_message.id
     assert len(node.observer_receipts) == 1
 
 
@@ -446,8 +447,11 @@ def test_expired_observer_removal_clears_existing_matching_receipt(runtime):
     remove = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
                               spectator_operation_id=operation, admit_before_ms=1099,
                               target_instance_id=node.instance_id)
-    # C++ first prunes the expired original operation, then permits removal
-    # of the seat even when the late request carries an earlier deadline.
+    # The active admission retains its original deadline even after expiry;
+    # a late cancellation with a different deadline cannot retire its seat.
+    assert not node.remove_observer(remove).cancelled
+    assert 303 in node.rooms[10].observers
+    remove.admit_before_ms = 1100
     assert node.remove_observer(remove).cancelled
     assert not node.observer_receipts
     assert 303 not in node.rooms[10].observers
@@ -462,6 +466,10 @@ def test_expired_observer_tombstones_are_pruned_before_new_operations(runtime, m
                              target_instance_id=node.instance_id, admit_before_ms=1100)
     first.routing.gate_instance_id = "gate-process"
     assert not node.add_observer(first).error_message.id
+    cancel = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
+                              spectator_operation_id=first.spectator_operation_id,
+                              target_instance_id=node.instance_id, admit_before_ms=first.admit_before_ms)
+    assert node.remove_observer(cancel).cancelled
     clock.now = 1100
     second = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=304,
                               spectator_operation_id="01900000-0000-7000-8000-000000000002",
@@ -469,6 +477,10 @@ def test_expired_observer_tombstones_are_pruned_before_new_operations(runtime, m
     second.routing.gate_instance_id = "gate-process"
     # No tick occurs: admission itself must reclaim the expired operation.
     assert not node.add_observer(second).error_message.id
+    cancel.observer_player_id = 304
+    cancel.spectator_operation_id = second.spectator_operation_id
+    cancel.admit_before_ms = second.admit_before_ms
+    assert node.remove_observer(cancel).cancelled
     clock.now = 1200
     third = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=305,
                              spectator_operation_id="01900000-0000-7000-8000-000000000003",
@@ -479,6 +491,51 @@ def test_expired_observer_tombstones_are_pruned_before_new_operations(runtime, m
                             target_instance_id=node.instance_id, admit_before_ms=third.admit_before_ms)
     late.routing.gate_instance_id = "gate-process"
     assert node.add_observer(late).error_message.id == 1005
+
+
+def test_invalid_observer_routing_seals_operation(runtime):
+    protocol, node, _, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id="01900000-0000-7000-8000-000000000001",
+                           target_instance_id=node.instance_id, admit_before_ms=15_000)
+    assert node.add_observer(add).error_message.id == 1005
+    add.routing.gate_instance_id = "gate-process"
+    assert node.add_observer(add).error_message.id == 1005
+    assert 303 not in node.rooms[10].observers
+
+
+def test_retiring_observer_retains_or_removes_tombstone_by_deadline(runtime):
+    protocol, node, clock, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id="01900000-0000-7000-8000-000000000001",
+                           target_instance_id=node.instance_id, admit_before_ms=15_000)
+    add.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(add).error_message.id
+    room = node.rooms[10]
+    node._drop_observer(room, 303, notify=False)
+    assert node.add_observer(add).error_message.id == 1005
+    clock.now = 15_000
+    node.tick()
+    assert not node.observer_receipts
+
+
+def test_battle_end_retires_active_observer_operations(runtime):
+    protocol, node, clock, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id="01900000-0000-7000-8000-000000000001",
+                           target_instance_id=node.instance_id, admit_before_ms=15_000)
+    add.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(add).error_message.id
+    room = node.rooms[10]
+    node._propose_outcome(room, 3, clock.now)
+    assert node.decide_outcome(10, committed=True)
+    assert node.add_observer(add).error_message.id == 1005
+    clock.now = 15_000
+    node.tick()
+    assert not node.observer_receipts
 
 
 def test_observer_query_and_remove_reject_zero_identifiers(runtime):
