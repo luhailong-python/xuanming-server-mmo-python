@@ -328,7 +328,7 @@ class GateNode:
                         if reply is not None:
                             session.emit(reply)
                     else:
-                        session.scene_lane.admit(request, route.kind == RpcKind.ONE_WAY)
+                        await session.scene_lane.admit_wait(request, route.kind == RpcKind.ONE_WAY)
                     continue
                 try:
                     identity = (session.player_id, session.account, session.owner_revision) if session.account else None

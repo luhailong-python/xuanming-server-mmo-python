@@ -319,6 +319,58 @@ def test_full_holding_lane_still_sends_one_way():
     asyncio.run(run())
 
 
+def test_congested_bypass_backpressures_without_losing_one_way_messages():
+    async def run():
+        protocol, gate, session = setup()
+        started, release = asyncio.Event(), asyncio.Event()
+        sent = []
+
+        class Scene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid, can_send, on_sent=None):
+                assert one_way and can_send()
+                sent.append(payload.message_content.serialized_message)
+                if len(sent) == 1:
+                    started.set()
+                    await release.wait()
+                return b""
+
+        gate.scene = Scene()
+        lane = session.scene_lane
+        for call_id in range(1, 65):
+            lane.admit(request(protocol, "SceneBagClientPlayerGetBag", call_id), False)
+        lane.queue[0].retry_at = time.monotonic() + 1
+        message_id = protocol.message_ids["SceneMovementClientPlayerMoveStart"]
+        for index in range(lane_module.MAX_BYPASS):
+            assert lane.admit(protocol.message("ClientRequest", message_id=message_id, body=bytes([index])), True)
+        extra = asyncio.create_task(lane.admit_wait(
+            protocol.message("ClientRequest", message_id=message_id, body=b"extra"), True,
+        ))
+        worker = None
+        try:
+            await asyncio.sleep(0)
+            assert not extra.done()
+            session.scene_node_id, session.scene_id, session.scene_instance_id = 7, 5, "scene-b"
+            worker = asyncio.create_task(lane.run())
+            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(extra, 1)
+            assert lane.bypass[-1].route == (6, 4, "scene-a")
+            release.set()
+            async with asyncio.timeout(1):
+                while len(sent) < lane_module.MAX_BYPASS + 1:
+                    await asyncio.sleep(0)
+            assert sent == [bytes([index]) for index in range(lane_module.MAX_BYPASS)] + [b"extra"]
+        finally:
+            release.set()
+            if worker is not None:
+                await stop(worker)
+            if not extra.done():
+                extra.cancel()
+                with suppress(asyncio.CancelledError):
+                    await extra
+
+    asyncio.run(run())
+
+
 def test_route_change_after_send_does_not_retry_even_on_unsent_exception():
     async def run():
         protocol, gate, session = setup()

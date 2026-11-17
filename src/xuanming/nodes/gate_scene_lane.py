@@ -33,6 +33,8 @@ class SceneLane:
         # Async writes can block, so bound the fast-path backlog separately.
         self.bypass = deque()
         self.changed = asyncio.Event()
+        self.bypass_space = asyncio.Event()
+        self.bypass_space.set()
         self.inflight = None
         self.sent = False
 
@@ -41,24 +43,40 @@ class SceneLane:
         return not self.queue and not self.bypass and self.inflight is None
 
     def admit(self, request, one_way):
-        if one_way and self.queue and self.queue[0].retry_at:
-            if len(self.bypass) < MAX_BYPASS:
-                session = self.session
-                self.bypass.append(Item(request, True, time.monotonic(), self.gate._scene_route(session),
-                                        self.gate._client_identity(session)))
-                self.changed.set()
-            return
-        if len(self.queue) + (self.inflight is not None) >= MAX_DEPTH:
-            if not one_way:
-                self.session.emit(self.gate._error(request, 1008))
-            return
         session = self.session
-        self.queue.append(Item(request, one_way, time.monotonic(), self.gate._scene_route(session),
-                               self.gate._client_identity(session)))
+        item = Item(request, one_way, time.monotonic(), self.gate._scene_route(session),
+                    self.gate._client_identity(session))
+        return self._admit(item)
+
+    def _admit(self, item):
+        if item.one_way and self.queue and self.queue[0].retry_at:
+            if len(self.bypass) >= MAX_BYPASS:
+                return False
+            self.bypass.append(item)
+            self.changed.set()
+            return True
+        if len(self.queue) + (self.inflight is not None) >= MAX_DEPTH:
+            if not item.one_way:
+                self.session.emit(self.gate._error(item.request, 1008))
+            return True
+        self.queue.append(item)
         self.changed.set()
+        return True
+
+    async def admit_wait(self, request, one_way):
+        """Backpressure the client when direct one-way writes are congested."""
+        session = self.session
+        item = Item(request, one_way, time.monotonic(), self.gate._scene_route(session),
+                    self.gate._client_identity(session))
+        while not self._admit(item):
+            self.bypass_space.clear()
+            if len(self.bypass) < MAX_BYPASS or not self.queue or not self.queue[0].retry_at:
+                continue
+            await self.bypass_space.wait()
 
     def redirect(self):
         self.bypass.clear()
+        self.bypass_space.set()
         while self.queue:
             item = self.queue.popleft()
             self._reply_error(item, 1003)
@@ -162,6 +180,7 @@ class SceneLane:
                             self.queue.remove(item)
                         elif self.bypass:
                             item = self.bypass.popleft()
+                            self.bypass_space.set()
                         elif head.retry_at > now:
                             timeout = min(head.retry_at, head.admitted_at + MAX_WAIT) - now
                         elif self.inflight is None:
@@ -170,6 +189,7 @@ class SceneLane:
                         item = self.queue.popleft()
                 elif self.bypass and (self.inflight is None or self.sent):
                     item = self.bypass.popleft()
+                    self.bypass_space.set()
                 if item is not None:
                     if time.monotonic() - item.admitted_at >= MAX_WAIT:
                         self._reply_error(item, 1003)
