@@ -11,14 +11,14 @@ requires-python = ">=3.11"
 dependencies = ["protobuf>=6.31,<8", "grpcio>=1.75,<2", "websockets>=15,<18", "filelock>=3.15,<4", "cryptography>=44,<47"]
 
 [project.optional-dependencies]
-cluster = ["aiokafka>=0.12,<1", "redis>=6.2,<9", "aiohttp>=3.11,<4"]
-dev = ["pytest>=8,<10", "grpcio-tools>=1.75,<2"]
+cluster = ["aiokafka>=0.12,<1", "redis>=6.2,<9", "aiohttp>=3.11,<4", "aiomysql>=0.2,<1"]
+dev = ["pytest>=8,<10", "grpcio-tools>=1.75,<2", "aiohttp>=3.11,<4", "aiomysql>=0.2,<1", "redis>=6.2,<9"]
 
 [project.scripts]
 xuanming-server = "xuanming.__main__:main"
 
 [tool.setuptools.package-data]
-xuanming = ["contracts/*"]
+xuanming = ["contracts/*", "mall_admin/*"]
 "xuanming.data" = [
   "_table_descriptors.pb", "tables/*.json", "tables/*.pb", "nav/*.bin",
   "nav/current_maps/village/yuexi-bay-20261115/scene.bin",

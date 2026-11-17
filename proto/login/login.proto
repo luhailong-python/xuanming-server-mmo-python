@@ -164,11 +164,11 @@ message AssignGateRequest {
   // skips capacity check, and returns the current rank (or admit token if
   // dispatcher already promoted this entry). Empty on first call.
   string queue_token = 2;
-  // Optional account/device for reconnect-exemption. When server sees an
-  // existing PlayerSession for this account on a live gate, it bypasses
-  // the queue and returns a fresh gate token bound to that gate.
-  string account = 3;
+  // Account must come from the verified access token, never client input.
+  reserved 3;
+  reserved "account";
   string device_id = 4;
+  string access_token = 5;
 }
 
 // AssignGateStatus mirrors AssignGateResponse.status / QueryQueueStatusResponse.status.
@@ -229,6 +229,15 @@ service LoginPreGate {
   // QueryQueueStatus until it receives a gate token.
   rpc AssignGate (AssignGateRequest) returns (AssignGateResponse);
   rpc QueryQueueStatus (QueryQueueStatusRequest) returns (QueryQueueStatusResponse);
+  rpc GetZoneRoleCount (ZoneRoleCountRequest) returns (ZoneRoleCountResponse);
+}
+
+message ZoneRoleCountRequest {
+  uint32 zone_id = 1;
+}
+
+message ZoneRoleCountResponse {
+  uint64 roles = 1;
 }
 
 // ── Admin-only RPCs (internal, not client-facing) ──────────────

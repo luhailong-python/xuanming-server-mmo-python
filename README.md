@@ -32,7 +32,22 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 
 ## 单角色启动
 
-安装 `.[cluster]` 后可用 `xuanming-server run gate|scene|battle --config <配置文件>` 单独起节点。用 `config/cluster.example.toml` 配置实例地址、原有 Kafka topic 代号和固定分区。设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连原版 Go Login 和 Match。保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Router 转发，组队和其他 Go 客户端服务走此模式。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做原有控制面操作。神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。Java 门户和 Go 业务服继续提供各自的集群服务。
+安装 `.[cluster]` 后可用 `xuanming-server run gate|scene|battle --config <配置文件>` 单独起节点。用 `config/cluster.example.toml` 配置实例地址、原有 Kafka topic 代号和固定分区。设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连原版 Go Login 和 Match。保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Router 转发，组队和其他 Go 客户端服务走此模式。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做原有控制面操作。神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。集群的 Login、Match 和其他业务服务仍使用 Go 实现。
+
+## HTTP 门户
+
+Python 门户提供登录、Gate 分票、排队查询和令牌刷新，以及区服列表、公告、CDN 签名、热更检查和管理接口。安装 `.[cluster]`，按 [门户配置示例](config/portal.example.toml) 配置 MySQL、Redis、etcd 和 Login，设置密钥后启动：
+
+```powershell
+$env:XUANMING_PORTAL_MYSQL_PASSWORD = '数据库密码'
+$env:XUANMING_PORTAL_CDN_SIGNING_SECRET = 'CDN 签名密钥'
+$env:XUANMING_PORTAL_ADMIN_API_KEY = '管理接口密钥'
+.venv/Scripts/xuanming-server.exe portal --config config/portal.example.toml
+```
+
+门户通过 HTTP 监听，应由可信反向代理提供 TLS；`trusted_proxies` 只填写可信代理网段。`home_zone_ids` 指定本实例负责发布策略、健康状态和检查角色容量的区服。管理接口使用 `X-Admin-Key`，未配置密钥时拒绝访问；商城代理另需配置目标服务及 `COMMERCE_ADMIN_SECRET`。CDN 密钥须与资源校验方一致。门户和游戏节点不需要 Java 运行环境，生产集群仍需要配置中的 Go 服务和中间件。
+
+新数据库需要先在与 Go Login 共用的数据库中执行 [门户建表脚本](config/portal_schema.sql)，并通过管理接口配置区服。脚本不会迁移已存在的旧表；已有部署应先核对 `zone_config`、`zone_whitelist` 和 `announcement` 的结构。
 
 集群密钥沿用当前 C++ 配置名。Gate 使用 `MMORPG_GATE_TOKEN_SECRET`、`MMORPG_INTERNAL_AUTH_SIGNING_KEY` 和 `MMORPG_INTERNAL_AUTH_PUBLIC_KEYS`。内部鉴权私钥是 32 字节 Ed25519 种子的 64 位十六进制编码；公钥配置是逗号分隔的 64 位十六进制公钥列表，必须包含该私钥对应的公钥，轮换期间可配置多把公钥。Battle 使用 `MMORPG_BATTLE_TOKEN_SECRET` 和 `MMORPG_MATCH_OUTCOME_SECRET_BATTLE`。Scene 使用 `MMORPG_PLAYER_STORE_SECRET_SCENE` 和 `MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE`。资产调用方按需配置 `MMORPG_ASSET_OP_SECRET_GUILD`、`MMORPG_ASSET_OP_SECRET_TRADE`、`MMORPG_ASSET_OP_SECRET_MAIL`、`MMORPG_ASSET_OP_SECRET_DATA_SERVICE`。角色封存另用 `MMORPG_ACCOUNT_DIRECTORY_SECRET_TRADE`，大厅观战另用 `MMORPG_SPECTATE_TOKEN_SECRET`。本地客户端 GM 同时要求 `GATE_RUN_MODE=dev` 和 `SCENE_RUN_MODE=dev`。Gate 和 Scene 的内部停机 RPC 与 Scene 实体诊断 RPC 使用独立的 `GATE_GM_ADMIN_SECRET`。Scene 诊断列出 Python 运行时的组件和值，实体编号和组件描述使用 Python 实现的格式。
 
@@ -56,13 +71,11 @@ Agones 部署设置 `AGONES_SDK_HTTP_PORT`，可同时设置 `CLIENT_ENDPOINT_SO
 
 已用本地真实 TCP/gRPC 验证登录、副本、任务、资产、终局存档和实时技能选取 NPC，用隔离的 etcd、Kafka 和 Redis 验证基础设施协议，并和原生 C++ 对拍了指定回合、配表指纹及回放字节。
 
-隔离整栈验收使用本地 MySQL、Redis、Kafka 和 etcd。原版 Java 网关通过 `/api/login` 和 `/api/assign-gate` 调用 Go Login，完成 Argon2id 密码验证和分票。同一角色通过 Python Gate 和原版 Router 进入 1 区，再由原版 SceneManager 重定向至 2 区并返回 1 区。验收直查 MySQL 核对三次写权代次和两区资产写入，往返后余额从 0 增至 18。
+隔离整栈验收使用本地 MySQL、Redis、Kafka 和 etcd。Python 门户通过 `/api/login` 和 `/api/assign-gate` 调用 Go Login，完成 Argon2id 密码验证和分票。同一角色通过 Python Gate 和原版 Router 进入 1 区，再由原版 SceneManager 重定向至 2 区并返回 1 区，并直查 MySQL 核对写权代次和资产写入。
 
 同一角色通过 Python Battle 的 TCP 端口完成三次延迟探测，提交回执并经原版 Go Match 正常入队。Match 创建单人 PvE 成局记录和 Python Battle 房间，客户端收到战斗票据和开战通知，进入战斗后以撤退结束。原版 Go Match 签名确认 `COMPLETE`，把终局原件写入 MySQL 并发布 Kafka。原版 PlayerInbox 投递并确认 `APPLIED`，原版 Go DB 可回读战报和对应的消费记录。
 
-本机 Router 验收记录见 `build/interop-native-20261106/run-e064fc92/acceptance.json`。有对应原版服务和中间件的联调环境可运行 `python build/interop-native-20261106/smoke_full.py --ingress java --scene-landing --scene-team --monopoly-dice-recovery`。两个真实账号组队时，原版 Go `ApplyJoinTeam` 返回 4030。验收在隔离 MySQL 写入一条待审申请，由原版 Go `HandleApplication` 审批并提交成员关系，Python 通过原版签名读取和真实 TCP 验证了同场景跟随、同节点换场景跟随与移动纠正。
-
-Gate 直连验收记录见 `build/interop-native-20261106/run-ee0f1772/acceptance.json`。使用 `--ingress java --direct-gate --monopoly-board` 复验真实登录、棋盘通关与重登、跨区和战斗落库。
+本机 Router 验收记录见 `build/interop-native-20261106/run-2eaf66f4/acceptance.json`（本地构建产物，不随仓库分发）。两个真实账号经修复后的 Go Match 完成申请、审批、离队、邀请和接受，无需注入申请记录；场景跟随、棋盘通关与重登、跨区和战斗落库也已验证。部署时 Go Match 需要包含对应的组队鉴权修复。
 
 ## WebSocket 客户端承载
 

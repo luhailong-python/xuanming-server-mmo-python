@@ -5,12 +5,17 @@ import os
 import socket
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from xuanming.grpc_runtime import GrpcClient
 from xuanming.kill_switch import EtcdKillSwitch, KillSwitch
 from xuanming.protocol import Protocol
+from xuanming.portal_admin_killswitch import register_routes
+from xuanming.portal_health import HealthPublisher
 
 
 def _free_port():
@@ -70,6 +75,55 @@ async def _exercise(process, port):
         delete = protocol.message("etcdserverpb.DeleteRangeRequest", key=key)
         await client.call("/etcdserverpb.KV/DeleteRange", delete.SerializeToString())
         await eventually(lambda: switch.check("SceneBagClientPlayer", "GetBag") is None)
+        app = web.Application()
+        register_routes(app, SimpleNamespace(protocol=protocol, directory=SimpleNamespace(client=client),
+                                             settings=SimpleNamespace(admin_api_key="admin-secret")))
+        async with TestClient(TestServer(app)) as http:
+            headers = {"X-Admin-Key": "admin-secret"}
+            assert (await http.put("/admin/killswitch", json={"target": "SceneBagClientPlayer/GetBag", "deny": True})).status == 401
+            response = await http.put("/admin/killswitch", headers=headers,
+                                      json={"target": "SceneBagClientPlayer/GetBag", "deny": True, "reason": "test"})
+            assert response.status == 200 and (await response.json())["deny"]
+            await eventually(lambda: switch.check("SceneBagClientPlayer", "GetBag") is not None)
+            response = await http.get("/admin/killswitch", headers=headers)
+            assert (await response.json())[0]["reason"] == "test"
+            response = await http.delete("/admin/killswitch", headers=headers,
+                                         params={"key": "SceneBagClientPlayer/GetBag"})
+            assert (await response.json())["deleted"] == 1
+            await eventually(lambda: switch.check("SceneBagClientPlayer", "GetBag") is None)
+
+        class Directory:
+            async def _rpc(self, service, method, **fields):
+                request = protocol.message(f"etcdserverpb.{method}Request", **fields)
+                raw = await client.call(f"/etcdserverpb.{service}/{method}", request.SerializeToString())
+                return protocol.parse(f"etcdserverpb.{method}Response", raw)
+
+            async def candidates(self, kind, zone):
+                assert zone == 5
+                return [SimpleNamespace(player_count=20, max_connections=100)] if kind == 4 else [object()]
+
+        class DB:
+            def acquire(self): return self
+            def cursor(self): return self
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): pass
+            async def execute(self, *args): pass
+            async def fetchone(self): return (100,)
+            async def rollback(self): pass
+
+        directory = Directory()
+        directory.client = client
+        publisher = HealthPublisher(SimpleNamespace(directory=directory, db=DB(), protocol=protocol,
+                                                     settings=SimpleNamespace(home_zone_ids=[5])))
+        await publisher.publish()
+        lease = publisher.lease
+        await publisher.publish()
+        assert publisher.lease == lease
+        health_key = next(iter(publisher.current_keys))
+        found = await publisher.deps.directory._rpc("KV", "Range", key=health_key)
+        assert len(found.kvs) == 1 and b'"status":"HEALTHY"' in found.kvs[0].value
+        await publisher.close()
+        assert not (await publisher.deps.directory._rpc("KV", "Range", key=health_key)).kvs
     finally:
         await sync.close()
         await client.close()

@@ -50,6 +50,8 @@ def main() -> None:
     commands.add_parser("smoke", help="用真实 TCP 与 gRPC 运行本地端到端验证")
     ticket = commands.add_parser("gate-ticket", help="使用本机设置的密钥签发开发 Gate 票据")
     ticket.add_argument("--config", type=Path)
+    portal = commands.add_parser("portal", help="启动 HTTP 门户")
+    portal.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -70,6 +72,10 @@ def main() -> None:
                 "payload_b64": base64.b64encode(request.payload).decode(),
                 "signature_hex": request.signature.decode(),
             }))
+        elif args.command == "portal":
+            from .portal import load_settings, run_portal
+
+            asyncio.run(run_portal(load_settings(args.config)))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

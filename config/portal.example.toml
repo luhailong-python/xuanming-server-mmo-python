@@ -1,0 +1,28 @@
+[portal]
+# Reverse proxy supplies TLS. Without trusted_proxies, forwarded headers are ignored.
+host = "0.0.0.0"
+port = 8080
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "gateway"
+mysql_database = "gateway"
+redis_url = "redis://redis:6379/0"
+etcd = "etcd:2379"
+home_zone_ids = [1]
+cdn_base_url = "https://cdn.example.com"
+cdn_sign_ttl_seconds = 3600
+rate_limit_enabled = true
+trusted_proxies = []
+ip_rps = 2
+ip_burst = 10
+zone_rps = 500
+zone_burst = 1000
+account_cooldown_ms = 5000
+
+# Zone-aware fallbacks are used until etcd discovers Login registrations.
+[portal.login_endpoints]
+"1" = "login-zone-1:50000"
+
+# Secrets are provided only through environment variables:
+# XUANMING_PORTAL_MYSQL_PASSWORD, XUANMING_PORTAL_CDN_SIGNING_SECRET,
+# XUANMING_PORTAL_ADMIN_API_KEY, COMMERCE_ADMIN_SECRET.
