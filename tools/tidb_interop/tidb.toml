@@ -1,0 +1,6 @@
+[performance]
+txn-entry-size-limit = 33554432
+
+[pessimistic-txn]
+deadlock-history-capacity = 128
+deadlock-history-collect-retryable = true

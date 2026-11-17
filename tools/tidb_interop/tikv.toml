@@ -1,0 +1,25 @@
+memory-usage-limit = "2304MiB"
+
+[raftstore]
+raft-entry-max-size = "32MB"
+
+[storage.block-cache]
+capacity = "256MiB"
+
+[raft-engine]
+memory-limit = "64MiB"
+
+[server]
+grpc-memory-pool-quota = "256MiB"
+
+[rocksdb.defaultcf]
+write-buffer-size = "32MiB"
+
+[rocksdb.writecf]
+write-buffer-size = "32MiB"
+
+[rocksdb.lockcf]
+write-buffer-size = "16MiB"
+
+[rocksdb.raftcf]
+write-buffer-size = "32MiB"
