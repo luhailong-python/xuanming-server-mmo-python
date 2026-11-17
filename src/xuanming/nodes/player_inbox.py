@@ -18,6 +18,7 @@ _SERVICE = "/player_inbox.PlayerInbox"
 GM, BATTLE = 1, 2
 APPLIED, REJECTED, SKIPPED, UNKNOWN = 1, 2, 3, 4
 MAX_RECENT = 32
+PAYLOAD_INVALID = 29003
 
 
 class InboxPeer:
@@ -138,6 +139,14 @@ class VersionSkew(ValueError):
     pass
 
 
+class ReplayMismatch(VersionSkew):
+    """A sequence maps to another original; native drops the entire ACK batch."""
+
+
+class StaleOwner(RuntimeError):
+    """A newer owner can re-acknowledge the durable ledger."""
+
+
 class SceneInbox:
     def __init__(self, scene, peer, settlement, assets, *, poll_seconds=60, clock=time.monotonic):
         self.scene, self.protocol, self.peer = scene, scene.protocol, peer
@@ -146,6 +155,7 @@ class SceneInbox:
         self._due = {}
         self._jobs = {}
         self._halted = set()
+        self._pending_ack = {}
         self._bag_deferred = {}
         self._published = {}
         self._serial = count(1)
@@ -160,6 +170,7 @@ class SceneInbox:
             key = player.player_id, domain
             self._due.pop(key, None)
             self._halted.discard(key)
+            self._pending_ack.pop(key, None)
             self._bag_deferred.pop(key, None)
         self._published.pop(player.entity, None)
 
@@ -182,7 +193,7 @@ class SceneInbox:
         for key, due in tuple(self._due.items()):
             if len(self._jobs) >= 16:
                 return
-            if due <= now and key not in self._jobs and key not in self._halted:
+            if due <= now and key not in self._jobs and (key not in self._halted or key in self._pending_ack):
                 self._due[key] = now + self._poll_seconds
                 self._jobs[key] = asyncio.create_task(self._poll(*key))
 
@@ -194,6 +205,10 @@ class SceneInbox:
     def _identity(player):
         return player.entity, player.session_id, player.generation, player.snapshot.owner_epoch
 
+    def _current(self, player, identity):
+        return (player is not None and identity is not None
+                and self._player(player.player_id) is player and self._identity(player) == identity)
+
     def _available(self, player, domain):
         return player and self.scene.mutable(player) and not (
             domain == GM and self.scene.battle and self.scene.battle.frozen(player.player_id)
@@ -202,8 +217,12 @@ class SceneInbox:
     async def _poll(self, player_id, domain) -> None:
         key = player_id, domain
         self._bag_deferred.pop(key, None)
-        identity = None
+        player = identity = None
         try:
+            if key in self._pending_ack:
+                player, identity, _ = self._pending_ack[key]
+                await self._ack_halted_prefix(key)
+                return
             async with self.scene._lock(player_id):
                 player = self._player(player_id)
                 if player is None:
@@ -212,16 +231,16 @@ class SceneInbox:
                 if not self._available(player, domain):
                     self._due[key] = self._clock() + 2
                     return
+                identity = self._identity(player)
                 await self.scene.flush_player_rows(player)
                 cursor = self._cursor(self.scene.rows.assemble(player.snapshot), domain)
                 through = cursor.decided_through_seq if cursor is not None else 0
-                identity = self._identity(player)
             correlation = next(self._serial)
             fetched = await self.peer.fetch(player, domain, correlation, through)
             self._check_reply(fetched, player_id, domain, correlation)
-            if not fetched.items:
+            if fetched.fence == 1 or not fetched.items:
                 return
-            if fetched.fence == 1 or len(fetched.items) > (1 if domain == BATTLE else 16) or any(
+            if len(fetched.items) > (1 if domain == BATTLE else 16) or any(
                 a.seq >= b.seq for a, b in zip(fetched.items, fetched.items[1:])
             ):
                 raise VersionSkew("收件箱回包序号无序")
@@ -231,37 +250,83 @@ class SceneInbox:
                     return
                 await self.scene.flush_player_rows(player)
                 for item in fetched.items:
-                    report = await self._consume(player, domain, item)
+                    try:
+                        report = await self._consume(player, domain, item)
+                    except ReplayMismatch:
+                        raise
+                    except VersionSkew as error:
+                        self._halted.add(key)
+                        logger.error("收件箱域停用 player_id=%s domain=%s reason=%s", player_id, domain, error)
+                        break
                     if report is None:
                         self._due[key] = self._clock() + 2
                         break
                     reports.append(report)
-            if reports and self._player(player_id) is player and self._identity(player) == identity:
-                correlation = next(self._serial)
-                ack = await self.peer.ack(player, domain, correlation, reports)
-                self._check_reply(ack, player_id, domain, correlation)
-                if len(ack.results) != len(reports) or any(
-                    result.seq != report.seq or result.result not in (1, 2) or result.state != report.outcome + 1
-                    for result, report in zip(ack.results, reports)
-                ):
-                    raise VersionSkew("收件箱确认回包与持久账本不一致")
-                if fetched.has_more:
+            if reports and self._current(player, identity):
+                if key in self._halted:
+                    self._pending_ack[key] = (player, identity, tuple(reports))
+                    await self._ack_halted_prefix(key)
+                else:
+                    await self._ack_reports(player, domain, reports)
+                if fetched.has_more and self._current(player, identity) and key not in self._halted:
                     self._due[key] = self._clock() + 1
+        except StaleOwner:
+            if self._current(player, identity) and key not in self._halted:
+                self._due[key] = self._clock() + 60
         except VersionSkew as error:
-            current = self._player(player_id)
-            if current is not None and (identity is None or self._identity(current) == identity):
+            if self._current(player, identity):
                 self._halted.add(key)
                 logger.error("收件箱域停用 player_id=%s domain=%s reason=%s", player_id, domain, error)
         except Exception:
-            if player_id in self.scene.locations:
+            if self._current(player, identity):
                 self._due[key] = self._clock() + 5
             logger.warning("收件箱处理待重试 player_id=%s domain=%s", player_id, domain, exc_info=True)
         finally:
             self._jobs.pop(key, None)
 
-    def _check_reply(self, reply, player_id, domain, correlation):
-        if (reply.player_id, reply.domain, reply.correlation_id) != (player_id, domain, correlation):
-            raise VersionSkew("收件箱回包身份不一致")
+    async def _ack_reports(self, player, domain, reports):
+        correlation = next(self._serial)
+        ack = await self.peer.ack(player, domain, correlation, reports)
+        self._check_reply(ack, player.player_id, domain, correlation, ack=True)
+        if len(ack.results) != len(reports) or any(
+            result.seq != report.seq or result.result not in (1, 2) or result.state != report.outcome + 1
+            for result, report in zip(ack.results, reports)
+        ):
+            raise VersionSkew("收件箱确认回包与持久账本不一致")
+
+    async def _ack_halted_prefix(self, key):
+        pending = self._pending_ack[key]
+        player, identity, reports = pending
+        if not self._current(player, identity):
+            if self._pending_ack.get(key) is pending:
+                self._pending_ack.pop(key, None)
+            return
+        try:
+            await self._ack_reports(player, key[1], reports)
+        except StaleOwner:
+            if self._current(player, identity) and self._pending_ack.get(key) is pending:
+                self._pending_ack.pop(key, None)
+                self._due.pop(key, None)
+            return
+        except VersionSkew:
+            if self._current(player, identity) and self._pending_ack.get(key) is pending:
+                self._pending_ack.pop(key, None)
+            raise
+        if self._current(player, identity) and self._pending_ack.get(key) is pending:
+            self._pending_ack.pop(key, None)
+            self._due.pop(key, None)
+
+    def _check_reply(self, reply, player_id, domain, correlation, *, ack=False):
+        if any(actual not in (0, expected) for actual, expected in zip(
+            (reply.player_id, reply.domain, reply.correlation_id), (player_id, domain, correlation)
+        )):
+            raise RuntimeError("收件箱回包身份不一致")
+        if reply.fence == 5:
+            raise StaleOwner("收件箱写权已由新 owner 接管")
+        if reply.fence in (6, 7):
+            raise VersionSkew("收件箱写权代次无效")
+        if ack and reply.error_message.id == 1005:
+            raise VersionSkew("收件箱确认报告被判为非法参数")
         if reply.error_message.id not in (0, 1000) or reply.fence not in (1, 2, 3, 4):
             raise RuntimeError("收件箱拒绝当前写权")
 
@@ -305,7 +370,7 @@ class SceneInbox:
                 return self._report(item, UNKNOWN, 0)
             if ((saved.request_id, saved.msg_type) != (item.request_id, item.msg_type)
                     or domain == BATTLE and saved.outcome != APPLIED):
-                raise VersionSkew("同一序号对应不同原件")
+                raise ReplayMismatch("同一序号对应不同原件")
             if settlement is not None:
                 await self._publish(player, settlement)
             return self._report(item, saved.outcome, saved.reason)
@@ -360,19 +425,33 @@ class SceneInbox:
         raise VersionSkew(f"收件箱无法解析 {name}")
 
     def _sanction(self, data, item):
+        def payload_or_none(name, limit):
+            try:
+                return self._payload(name, item, limit)
+            except VersionSkew:
+                # A malformed protobuf is a deterministic executor rejection;
+                # parsed messages carrying new fields remain version skew.
+                try:
+                    if len(item.payload) <= limit:
+                        self.protocol.parse(name, item.payload)
+                except DecodeError:
+                    return None
+                raise
+
         if item.msg_type in (1, 2):
-            payload = self._payload("player_inbox.GmCurrencyGainPayload", item, 64)
+            payload = payload_or_none("player_inbox.GmCurrencyGainPayload", 64)
+            if payload is None:
+                return REJECTED, PAYLOAD_INVALID
             if payload.currency_type not in self.assets.currency_types:
                 raise VersionSkew("无法识别收件箱币种")
             values, key = data.currency.blocked_types, payload.currency_type
             active = item.msg_type == 1
         elif item.msg_type == 3:
-            payload = self._payload("player_inbox.GmCurrencyDebtPayload", item, 1024)
+            payload = payload_or_none("player_inbox.GmCurrencyDebtPayload", 1024)
+            if payload is None or not 0 < payload.owe_amount < (1 << 63):
+                return REJECTED, PAYLOAD_INVALID
             if payload.currency_type not in self.assets.currency_types:
                 raise VersionSkew("无法识别欠款币种")
-            if (len(payload.reason.encode()) > 256 or len(payload.gm_operator.encode()) > 64
-                    or not 0 < payload.owe_amount < (1 << 63)):
-                return REJECTED, 1005
             code = self.assets.attach_debt(data, payload.currency_type, payload.owe_amount,
                                            reason=payload.reason, operator=payload.gm_operator,
                                            expires_at=payload.expires_at)
@@ -380,10 +459,12 @@ class SceneInbox:
                 raise VersionSkew("欠款带未知字段")
             return (REJECTED, code) if code else (APPLIED, 0)
         elif item.msg_type in (5, 6):
-            payload = self._payload("player_inbox.GmItemGainPayload", item, 64)
+            payload = payload_or_none("player_inbox.GmItemGainPayload", 64)
+            if payload is None:
+                return REJECTED, PAYLOAD_INVALID
             values, key = data.item_gain_block.item_config_ids, payload.item_config_id
             if not key:
-                return REJECTED, 1005
+                return REJECTED, PAYLOAD_INVALID
             active = item.msg_type == 5
         else:
             raise VersionSkew("收件箱处置类型未注册")
