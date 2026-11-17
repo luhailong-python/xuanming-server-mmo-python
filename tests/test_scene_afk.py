@@ -88,15 +88,18 @@ def test_real_client_activity_heartbeat_filters_and_afk_movement(tmp_path):
                 start_frame = scene.current_frame
                 await client.rpc(p.message_ids["SceneMovementClientPlayerMoveStart"], 0, p.message(
                     "MoveStartC2S", input_seq=1, velocity={"x": .1},
+                    start_location=dict(zip(("x", "y", "z"), actor.transform.position)),
                 ))
-                await client.content(p.message_ids["SceneMovementClientPlayerNotifyMoveAck"])
+                async with asyncio.timeout(5):
+                    while actor.motion.velocity != (.1, 0., 0.):
+                        await asyncio.sleep(.01)
                 assert actor.activity.last_active_frame == start_frame
                 await _advance(scene, INACTIVITY_FRAMES)
                 assert scene.current_frame == start_frame + INACTIVITY_FRAMES and not actor.activity.afk
                 before = actor.transform.position
                 await scene.tick(.05)
                 assert actor.activity.afk and actor.transform.position == before
-                assert actor.motion.velocity == (.1, 0., 0.)
+                assert actor.motion.velocity == (0., 0., 0.)
                 await client.send(p.message("ClientHeartbeatRequest", seq=77))
                 assert (await client.receive("ClientHeartbeatResponse")).seq == 77
                 assert actor.activity.last_active_frame == start_frame
@@ -111,7 +114,16 @@ def test_real_client_activity_heartbeat_filters_and_afk_movement(tmp_path):
                 assert actor.activity.last_active_frame == scene.current_frame
                 assert actor.activity.afk
                 await scene.tick(.05)
-                assert not actor.activity.afk and actor.transform.position[0] > before[0]
+                assert not actor.activity.afk and actor.transform.position == before
+                await client.rpc(p.message_ids["SceneMovementClientPlayerMoveStart"], 0, p.message(
+                    "MoveStartC2S", input_seq=2, velocity={"x": .1},
+                    start_location=dict(zip(("x", "y", "z"), before)),
+                ))
+                async with asyncio.timeout(5):
+                    while actor.motion.velocity != (.1, 0., 0.):
+                        await asyncio.sleep(.01)
+                await scene.tick(.05)
+                assert actor.transform.position[0] > before[0]
 
                 accepted_frame = actor.activity.last_active_frame
                 await scene.tick(.05)
@@ -161,6 +173,36 @@ def test_replacement_login_preserves_activity_and_fresh_load_seeds_current_frame
                     loaded = await _enter(runtime, fresh)
                     assert loaded is not actor and loaded.activity is not remembered
                     assert loaded.activity.last_active_frame == scene.current_frame and not loaded.activity.afk
+
+    asyncio.run(exercise())
+
+
+def test_afk_transition_broadcasts_a_stop_to_visible_observers(tmp_path):
+    async def exercise():
+        p, sent = Protocol(), []
+        scene = SceneNode(p, p.message("NodeInfo", node_id=5, zone_id=1, node_uuid="afk-stop"),
+                          SqlitePlayerStore(tmp_path / "afk-stop.sqlite"), PlayerRowCodec(p),
+                          lambda player, content: sent.append((player.player_id, content)))
+        scene.create(p.message("CreateSceneRequest", scene_id=1, config_id=1))
+        for player_id in (1, 2):
+            await scene.enter(p.message("PlayerEnterGameNodeRequest", player_id=player_id, session_id=player_id,
+                                        owner_revision=1, login_generation=1, scene_id=1), "gate")
+        world = scene.worlds[1]
+        moving, observer = world.players[1], world.players[2]
+        try:
+            assert observer in scene.watchers(world, moving)
+            scene.set_velocity(moving, (2., 0., 0.))
+            scene.current_frame = INACTIVITY_FRAMES
+            observer.activity.record(scene.current_frame)
+            sent.clear()
+            await scene.tick(.05)
+            assert moving.activity.afk and moving.motion.velocity == (0., 0., 0.)
+            moves = [p.parse("ActorMoveS2C", content.serialized_message) for recipient, content in sent
+                     if recipient == 2 and content.message_id == p.message_ids["SceneMovementClientPlayerNotifyActorMove"]]
+            assert len(moves) == 1 and moves[0].entity == moving.entity and moves[0].move_state == 0
+            assert (moves[0].velocity.x, moves[0].velocity.y, moves[0].velocity.z) == (0., 0., 0.)
+        finally:
+            await scene.close()
 
     asyncio.run(exercise())
 

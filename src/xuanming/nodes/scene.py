@@ -80,7 +80,6 @@ class Transform:
 @dataclass(slots=True)
 class Motion:
     velocity: Position = ZERO
-    sequence: int | None = None
     teleport_target: Position | None = None
     teleport_until: float = 0.
 
@@ -877,6 +876,8 @@ class SceneNode:
             for player in world.players.values():
                 was_afk = player.activity.afk
                 player.activity.update(self.current_frame, frozen=bool(self.travel and self.travel.frozen(player.player_id)))
+                if player.activity.afk and not was_afk and not (self.team and self.team.driven(player.player_id)):
+                    self._stop_motion(world, player)
                 if player.activity.afk != was_afk:
                     logger.info("Scene player activity changed player_id=%d afk=%s frame=%d",
                                 player.player_id, player.activity.afk, self.current_frame)
@@ -1027,13 +1028,10 @@ class SceneNode:
                 self._stop_motion(world, player)
             return
         seq = request.input_seq
-        if motion.sequence is not None and not 0 < (seq - motion.sequence) % (1 << 32) < (1 << 31):
-            return
         rotation = xyz(request.rotation)
         velocity = xyz(request.velocity) if route.method != "MoveStop" else ZERO
         field = {"MoveStart": "start_location", "MoveStop": "end_location", "MoveSync": "location"}[route.method]
-        has_position = request.HasField(field)
-        reported = xyz(getattr(request, field)) if has_position else player.transform.position
+        reported = xyz(getattr(request, field))
         if not all(map(math.isfinite, rotation + velocity + reported)):
             raise ValueError("移动参数无效")
         if motion.teleport_target is not None:
@@ -1044,28 +1042,26 @@ class SceneNode:
         if speed > MOVE_SPEED:
             velocity = tuple(v * (MOVE_SPEED / speed) for v in velocity)
         position = reported
-        if has_position and world.nav:
+        if world.nav:
             _, position = world.nav.validate_move(player.transform.position, reported)
             if position is None:
-                position = world.nav.snap(reported) or self._spawn_position(world)
+                guided = world.nav.snap(reported) if world.nav.mask is None else None
+                position = guided or self._spawn_position(world)
         missing_navigation = self._missing_required_navigation(world)
         if missing_navigation:
             position, velocity = player.transform.position, ZERO
         previous_velocity = ZERO if missing_navigation else motion.velocity
-        changed = (velocity != previous_velocity or rotation != player.transform.rotation
-                   or position != player.transform.position)
-        motion.sequence, player.transform.rotation = seq, rotation
+        player.transform.rotation = rotation
         self.set_velocity(player, velocity)
         self._move_position(world, player, position)
         self.actor_sync.mark(player, "transform", "velocity")
-        if not has_position or math.dist(position[:2], reported[:2]) > MOVE_CORRECTION_EPSILON:
+        if math.dist(position[:2], reported[:2]) > MOVE_CORRECTION_EPSILON:
             self._push(player, "SceneMovementClientPlayerNotifyMoveAck", self.protocol.message(
                 "MoveAckS2C", input_seq=seq, server_location=vector(position),
-                server_velocity=vector(previous_velocity if has_position else velocity),
+                server_velocity=vector(previous_velocity),
                 server_time_ms=time.time_ns() // 1_000_000,
             ))
-        if has_position or changed:
-            self._broadcast_move(world, player)
+        self._broadcast_move(world, player)
 
     def _move_position(self, world, player, position, *, teleport=False) -> None:
         if position == player.transform.position and not teleport:
@@ -1083,12 +1079,15 @@ class SceneNode:
             player.motion.velocity = velocity
             self.actor_sync.mark(player, "velocity")
 
-    def _broadcast_move(self, world, player, *, include_self=False) -> None:
+    def _actor_move(self, player, server_time_ms):
         velocity = player.motion.velocity
-        message = self.protocol.message(
+        return self.protocol.message(
             "ActorMoveS2C", entity=player.entity, transform=player.transform.wire(),
-            velocity=vector(velocity), server_time_ms=time.time_ns() // 1_000_000, move_state=int(velocity != ZERO),
+            velocity=vector(velocity), server_time_ms=server_time_ms, move_state=int(velocity != ZERO),
         )
+
+    def _broadcast_move(self, world, player, *, include_self=False) -> None:
+        message = self._actor_move(player, time.time_ns() // 1_000_000)
         if include_self and player.disconnect_at is None:
             self._push(player, "SceneMovementClientPlayerNotifyActorMove", message)
         self._push_many(self.watchers(world, player), "SceneMovementClientPlayerNotifyActorMove", message)
@@ -1161,6 +1160,19 @@ class SceneNode:
         if shown:
             message = self.protocol.message("ActorListCreateS2C", actor_list=[self._actor(world.actors[n]) for n in targets])
             self._push_many(watchers, "SceneSceneClientPlayerNotifyActorListCreate", message)
+            advancing = [actor for target in targets if isinstance((actor := world.actors[target]), Player)
+                         and actor.motion.velocity != ZERO
+                         and ((self.team and self.team.driven(actor.player_id)) or
+                              (not actor.activity.afk and not (self.travel and self.travel.frozen(actor.player_id))
+                               and not (self.battle and self.battle.frozen(actor.player_id))))]
+            if advancing:
+                now = time.time_ns() // 1_000_000
+                moves = [self._actor_move(actor, now) for actor in advancing]
+                if len(moves) == 1:
+                    self._push_many(watchers, "SceneMovementClientPlayerNotifyActorMove", moves[0])
+                else:
+                    self._push_many(watchers, "SceneMovementClientPlayerNotifyActorMoveList",
+                                    self.protocol.message("ActorMoveListS2C", moves=moves))
         else:
             message = self.protocol.message("ActorListDestroyS2C", entity=targets)
             self._push_many(watchers, "SceneSceneClientPlayerNotifyActorListDestroy", message)
