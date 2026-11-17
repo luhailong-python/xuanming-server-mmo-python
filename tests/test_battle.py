@@ -109,6 +109,141 @@ def test_create_idempotency_and_wire_ticket_fence(runtime):
         node.authorize(assigned.token_payload, assigned.token_signature)
 
 
+def test_battle_timers_start_after_engine_initialization(runtime):
+    protocol, node, clock, _, _ = runtime
+    request = create_request(protocol, match_mode=4)
+    request.deadline_ms = 0
+    node.max_rounds = 2
+
+    def slow_monsters(_request):
+        clock.now = 5_000
+        return ()
+
+    node.monster_factory = slow_monsters
+    assert not node.create(request).error_message.id
+    room = node.rooms[request.battle_id]
+    assert room.action_deadline_ms == 30_000
+    assert room.deadline_ms == 5_000 + 302 * 6_000
+    assert room.confirm_retry_steady_ms == 15_000 and room.confirm_until_ms == 185_000
+
+
+def test_creation_expiring_while_signing_never_commits(runtime, monkeypatch):
+    protocol, node, clock, _, pushes = runtime
+    request = create_request(protocol)
+    request.admit_before_ms = 2_000
+    changes, confirms = [], []
+    node.on_rooms_changed = changes.append
+    node.on_confirm = lambda *args: confirms.append(args)
+    original = node._assignment
+
+    def slow_assignment(*args, **kwargs):
+        assignment = original(*args, **kwargs)
+        clock.now = request.admit_before_ms
+        return assignment
+
+    monkeypatch.setattr(node, "_assignment", slow_assignment)
+    assert node.create(request).error_message.id == 1005
+    assert not node.rooms and not node.receipts
+    assert not changes and not confirms and not pushes
+
+
+def test_first_action_deadline_starts_after_ticket_signing(runtime, monkeypatch):
+    protocol, node, clock, _, pushes = runtime
+    request = create_request(protocol)
+    original = node._assignment
+
+    def slow_assignment(*args, **kwargs):
+        assignment = original(*args, **kwargs)
+        clock.now = 5_000
+        return assignment
+
+    monkeypatch.setattr(node, "_assignment", slow_assignment)
+    assert not node.create(request).error_message.id
+    room = node.rooms[request.battle_id]
+    assert room.action_deadline_ms == 30_000
+    starts = [message for _, _, message_id, message in pushes if message_id == 143]
+    assert all(start.state.action_deadline_ms == 30_000 for start in starts)
+
+
+def test_round_and_battle_timers_use_elapsed_time_across_wall_clock_jumps():
+    protocol, wall, steady = Protocol(), Clock(), Clock(5_000)
+    outcomes = []
+    node = BattleNode(protocol, node_id=4, instance_id="battle-process", host="127.0.0.1", port=8000,
+                      ticket_secret=b"battle-ticket-keys-for-test-only", physical_region=2,
+                      now_ms=wall, steady_ms=steady, on_outcome=lambda *values: outcomes.append(values))
+    request = create_request(protocol, health=10_000)
+    assert not node.create(request).error_message.id
+    assignment = issue(protocol, node, 101)
+    ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+    room = node.rooms[request.battle_id]
+
+    # A wall-clock jump must not resolve a round or terminate a live room.
+    wall.now = 500_000
+    node.tick()
+    assert room.engine.round_index == 1 and not room.proposed_outcome
+    action = protocol.message("SubmitBattleActionRequest", battle_id=10)
+    action.action.action_type = 3
+    assert not node.dispatch(ticket, 149, action).error_message.id
+
+    # Elapsed time still expires the round when UTC moves backwards.
+    wall.now = 500
+    steady.now += 25_000
+    node.tick()
+    assert room.engine.round_index == 2 and room.action_deadline_ms == 25_500
+    assert not room.proposed_outcome
+
+    # The whole-battle timer was armed for 99 seconds, independent of UTC.
+    steady.now = 5_000 + 99_000
+    node.tick()
+    assert room.proposed_outcome == 3 and outcomes == [(10, 3)]
+
+
+def test_new_round_window_starts_after_turn_resolution(runtime, monkeypatch):
+    protocol, node, clock, _, _ = runtime
+    assert not node.create(create_request(protocol, health=10_000)).error_message.id
+    room = node.rooms[10]
+    original = room.engine.resolve
+
+    def slow_resolution():
+        result = original()
+        clock.now = 5_000
+        return result
+
+    monkeypatch.setattr(room.engine, "resolve", slow_resolution)
+    node._resolve(room)
+    assert room.engine.round_index == 2
+    assert room.action_deadline_ms == 30_000
+    assert room.action_due_steady_ms == 30_000
+
+
+def test_confirmation_retry_uses_monotonic_timer_and_stops_at_utc_window():
+    protocol, wall, steady = Protocol(), Clock(), Clock(5_000)
+    confirms = []
+    node = BattleNode(protocol, node_id=4, instance_id="battle-process", host="127.0.0.1", port=8000,
+                      ticket_secret=b"battle-ticket-keys-for-test-only", physical_region=2,
+                      now_ms=wall, steady_ms=steady, on_outcome=lambda *_: None,
+                      on_confirm=lambda *args: confirms.append(args))
+    assert not node.create(create_request(protocol, health=10_000)).error_message.id
+    assert len(confirms) == 2
+    confirms.clear()
+    wall.now = 500
+    steady.now += 9_999
+    node.tick()
+    assert not confirms
+    steady.now += 1
+    node.tick()
+    assert len(confirms) == 2
+    confirms.clear()
+    wall.now = 400_000
+    steady.now += 10_000
+    node.tick()
+    assert not confirms and node.rooms[10].confirm_retry_steady_ms == 0
+    wall.now = 500
+    steady.now += 10_000
+    node.tick()
+    assert not confirms
+
+
 def test_battle_websocket_carries_the_existing_battle_ticket_frame(runtime):
     async def exercise():
         from websockets.asyncio.client import connect
@@ -205,6 +340,67 @@ def test_admission_tombstones_block_late_create_and_old_observer_ticket(runtime)
         node.authorize(assigned.token_payload, assigned.token_signature)
 
 
+def test_new_creation_prunes_expired_tombstone_without_waiting_for_tick(runtime):
+    protocol, node, clock, _, _ = runtime
+    request = create_request(protocol)
+    node.destroy(protocol.message("DestroyBattleRequest", battle_id=request.battle_id,
+                                  placement_operation_id=request.placement_operation_id,
+                                  target_instance_id=node.instance_id))
+    assert node.create(request).error_message.id == 1005
+    clock.now += 360_000
+    request.placement_operation_id = "new-placement"
+    request.admit_before_ms = clock.now + 30_000
+    request.deadline_ms = clock.now + 100_000
+    assert node.create(request).error_message.id == 1005
+    clock.now += 1
+    assert not node.create(request).error_message.id
+    assert request.battle_id in node.rooms
+
+
+@pytest.mark.parametrize("requested_deadline", [0, 500])
+def test_creation_receipt_uses_original_deadline_but_preserves_live_room(runtime, requested_deadline):
+    protocol, node, clock, _, _ = runtime
+    original = create_request(protocol)
+    original.deadline_ms = requested_deadline
+    assert not node.create(original).error_message.id
+    room = node.rooms[original.battle_id]
+    assert room.deadline_ms > requested_deadline + 60_000
+    assert node.receipts[original.battle_id].expires_ms == requested_deadline + 60_000
+
+    clock.now = requested_deadline + 60_001
+    replacement = create_request(protocol)
+    replacement.placement_operation_id = "new-placement"
+    replacement.admit_before_ms = clock.now + 30_000
+    replacement.deadline_ms = clock.now + 100_000
+    assert node.create(replacement).error_message.id == 1005
+    assert not node.create(original).error_message.id
+    assert node.rooms[original.battle_id] is room
+
+    node._propose_outcome(room, 3, clock.now)
+    assert node.decide_outcome(original.battle_id, committed=True)
+    assert not node.create(replacement).error_message.id
+    assert node.rooms[original.battle_id] is not room
+
+
+def test_completed_creation_receipt_expires_strictly_after_deadline(runtime):
+    protocol, node, clock, _, _ = runtime
+    original = create_request(protocol)
+    original.deadline_ms = 0
+    assert not node.create(original).error_message.id
+    room = node.rooms[original.battle_id]
+    node._propose_outcome(room, 3, clock.now)
+    assert node.decide_outcome(original.battle_id, committed=True)
+
+    clock.now = 60_000
+    replacement = create_request(protocol)
+    replacement.placement_operation_id = "new-placement"
+    replacement.admit_before_ms = clock.now + 30_000
+    replacement.deadline_ms = clock.now + 100_000
+    assert node.create(replacement).error_message.id == 1005
+    clock.now += 1
+    assert not node.create(replacement).error_message.id
+
+
 def test_expired_observer_removal_succeeds_when_receipts_are_full(runtime, monkeypatch):
     protocol, node, clock, _, _ = runtime
     monkeypatch.setattr("xuanming.nodes.battle._MAX_SPECTATOR_OPERATIONS", 1)
@@ -250,12 +446,73 @@ def test_expired_observer_removal_clears_existing_matching_receipt(runtime):
     remove = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=303,
                               spectator_operation_id=operation, admit_before_ms=1099,
                               target_instance_id=node.instance_id)
-    assert not node.remove_observer(remove).cancelled
-    assert 303 in node.rooms[10].observers
-    remove.admit_before_ms = 1100
+    # C++ first prunes the expired original operation, then permits removal
+    # of the seat even when the late request carries an earlier deadline.
     assert node.remove_observer(remove).cancelled
     assert not node.observer_receipts
     assert 303 not in node.rooms[10].observers
+
+
+def test_expired_observer_tombstones_are_pruned_before_new_operations(runtime, monkeypatch):
+    protocol, node, clock, _, _ = runtime
+    monkeypatch.setattr("xuanming.nodes.battle._MAX_SPECTATOR_OPERATIONS", 1)
+    assert not node.create(create_request(protocol)).error_message.id
+    first = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                             spectator_operation_id="01900000-0000-7000-8000-000000000001",
+                             target_instance_id=node.instance_id, admit_before_ms=1100)
+    first.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(first).error_message.id
+    clock.now = 1100
+    second = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=304,
+                              spectator_operation_id="01900000-0000-7000-8000-000000000002",
+                              target_instance_id=node.instance_id, admit_before_ms=1200)
+    second.routing.gate_instance_id = "gate-process"
+    # No tick occurs: admission itself must reclaim the expired operation.
+    assert not node.add_observer(second).error_message.id
+    clock.now = 1200
+    third = protocol.message("RemoveObserverRequest", battle_id=10, observer_player_id=305,
+                             spectator_operation_id="01900000-0000-7000-8000-000000000003",
+                             target_instance_id=node.instance_id, admit_before_ms=2000)
+    assert node.remove_observer(third).cancelled
+    late = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=305,
+                            spectator_operation_id=third.spectator_operation_id,
+                            target_instance_id=node.instance_id, admit_before_ms=third.admit_before_ms)
+    late.routing.gate_instance_id = "gate-process"
+    assert node.add_observer(late).error_message.id == 1005
+
+
+def test_observer_query_and_remove_reject_zero_identifiers(runtime):
+    protocol, node, _, _, _ = runtime
+    operation = "01900000-0000-7000-8000-000000000001"
+    query = protocol.message("QueryObserverRequest", battle_id=0, observer_player_id=303,
+                             spectator_operation_id=operation, target_instance_id=node.instance_id)
+    assert not node.query_observer(query).SerializeToString()
+    remove = protocol.message("RemoveObserverRequest", battle_id=0, observer_player_id=303,
+                              spectator_operation_id=operation, target_instance_id=node.instance_id,
+                              admit_before_ms=2000)
+    assert not node.remove_observer(remove).SerializeToString()
+    assert not node.observer_receipts
+
+
+def test_observer_replay_without_signing_key_retires_existing_seat(runtime):
+    protocol, node, _, _, _ = runtime
+    assert not node.create(create_request(protocol)).error_message.id
+    operation = "01900000-0000-7000-8000-000000000001"
+    add = protocol.message("AddObserverRequest", battle_id=10, observer_player_id=303,
+                           spectator_operation_id=operation, target_instance_id=node.instance_id,
+                           admit_before_ms=15_000)
+    add.routing.gate_instance_id = "gate-process"
+    assert not node.add_observer(add).error_message.id
+    assignment = issue(protocol, node, 303, operation)
+    ticket = node.authorize(assignment.token_payload, assignment.token_signature)
+    socket = Socket()
+    node.attach(ticket, socket.emit, socket.close)
+    node.ticket_secret = b""
+    assert node.add_observer(add).error_message.id == 1003
+    assert 303 not in node.rooms[10].observers and socket.closed == 1
+    assert not socket.messages
+    node.ticket_secret = b"battle-ticket-keys-for-test-only"
+    assert node.add_observer(add).error_message.id == 1003
 
 
 def test_direct_spectator_node_quota_counts_seats_and_snapshot_counts_live_connections(runtime):
@@ -878,6 +1135,9 @@ def test_spectate_keepalive_uses_elapsed_time_and_retires_expired_channels(runti
     node._steady_ms = steady
     node.on_spectate_frame = lambda *record: frames.append(record)
     assert not node.create(create_request(p)).error_message.id
+    # This test isolates spectator heartbeats while advancing the monotonic
+    # clock beyond a normal round; the round timer is covered separately.
+    node.rooms[10].action_due_steady_ms = steady.now + 1_000_000
 
     def attach(gate_id):
         request = p.message("AttachRelayGateRequest", battle_id=10, gate_node_id=gate_id,

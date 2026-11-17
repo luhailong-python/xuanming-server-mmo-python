@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import heapq
 import logging
 import os
 import re
@@ -466,6 +467,8 @@ class _Room:
     deadline_ms: int
     action_deadline_ms: int
     routing: dict[int, Message]
+    action_due_steady_ms: int = 0
+    battle_due_steady_ms: int = 0
     reward_profile: Message | None = None
     observers: dict[int, _Observer] = field(default_factory=dict)
     connections: dict[int, _Connection] = field(default_factory=dict)
@@ -476,7 +479,7 @@ class _Room:
     outcome_finished_ms: int = 0
     outcome_since_ms: int = 0
     outcome_payload: bytes = b""
-    confirm_retry_ms: int = 0
+    confirm_retry_steady_ms: int = 0
     confirm_until_ms: int = 0
     replay: BattleReplayRecorder | None = None
     outcome_replay: Message | None = None
@@ -537,6 +540,7 @@ class BattleNode:
         self.rooms: dict[int, _Room] = {}
         self.receipts: dict[int, _Receipt] = {}
         self.observer_receipts: dict[tuple[int, int, str], _ObserverReceipt] = {}
+        self._observer_deadlines: list[tuple[int, tuple[int, int, str]]] = []
         self.admitting = True
         self._draining = False
 
@@ -555,6 +559,7 @@ class BattleNode:
                 or request.target_instance_id != self.instance_id
                 or request.required_physical_region != self.physical_region):
             return self._error(response, _INVALID)
+        self._prune_creation_receipts(now)
         canonical = request.SerializeToString(deterministic=True)
         receipt = self.receipts.get(request.battle_id)
         if receipt is not None:
@@ -592,23 +597,35 @@ class BattleNode:
                                 monster_ids={row.id for row in self.tables.tables["Monster"].rows()} if self.tables else None)
         except (BattleError, ValueError):
             return self._error(response, _INVALID_TABLE)
-        if request.admit_before_ms <= self.now_ms():
+        now = self.now_ms()
+        if request.admit_before_ms <= now:
             return self._error(response, _INVALID)
-        deadline = request.deadline_ms if request.deadline_ms > now else now + (self.max_rounds + 2) * _ROUND_MS
+        deadline = request.deadline_ms if request.deadline_ms > now else now + (_MAX_ROUNDS + 2) * _ROUND_MS
         original = self.protocol.message("CreateBattleRequest")
         original.CopyFrom(request)
         routing = {player.player_id: player.routing for player in original.players}
         room = _Room(engine, original, deadline, now + _ACTION_MS, routing,
                      reward_profile=reward_profile,
-                     confirm_retry_ms=now + 10_000, confirm_until_ms=now + 180_000)
+                     confirm_until_ms=now + 180_000)
         if request.record_replay:
             fingerprint = self.tables.fingerprint if self.tables else ""
             room.replay = BattleReplayRecorder(self.protocol, original, fingerprint, engine.snapshot(0))
         assignments = {player: self._assignment(room, player, _PARTICIPANT) for player in routing}
+        # Preparing the engine, replay and every ticket can exhaust the
+        # placement window; do not commit a room after it has expired.
+        admitted_at = self.now_ms()
+        if request.admit_before_ms <= admitted_at:
+            return self._error(response, _INVALID)
+        room.action_deadline_ms = admitted_at + _ACTION_MS
+        armed_at = self._steady_ms()
+        room.action_due_steady_ms = armed_at + _ACTION_MS
+        room.battle_due_steady_ms = armed_at + deadline - now
         self.rooms[request.battle_id] = room
         if self.on_rooms_changed:
             self._publish(self.on_rooms_changed, len(self.rooms))
-        self.receipts[request.battle_id] = _Receipt(request.placement_operation_id, deadline + 60_000, canonical)
+        self.receipts[request.battle_id] = _Receipt(
+            request.placement_operation_id, request.deadline_ms + 60_000, canonical,
+        )
         for player, route in routing.items():
             if self.on_lobby_push:
                 self._publish(self.on_lobby_push, route, player, 177, assignments[player])
@@ -617,6 +634,7 @@ class BattleNode:
                 self._publish(self.on_lobby_push, route, player, 143, start)
             if self.on_confirm:
                 self._publish(self.on_confirm, route, player, request.battle_id, deadline)
+        room.confirm_retry_steady_ms = self._steady_ms() + 10_000
         return self._create_success(response)
 
     def _fingerprint_mismatches(self, request: Message) -> list[str]:
@@ -782,6 +800,7 @@ class BattleNode:
         if (not player or not request.battle_id or not _uuid(operation) or request.target_instance_id != self.instance_id
                 or not request.routing.gate_instance_id or not now < request.admit_before_ms <= now + 30_000):
             return self._error(response, _INVALID)
+        self._prune_observer_receipts(now)
         key = request.battle_id, player, operation
         canonical = request.SerializeToString(deterministic=True)
         receipt = self.observer_receipts.get(key)
@@ -796,6 +815,7 @@ class BattleNode:
                 return self._error(response, _AT_CAPACITY)
             receipt = _ObserverReceipt(request.admit_before_ms, canonical)
             self.observer_receipts[key] = receipt
+            heapq.heappush(self._observer_deadlines, (receipt.expires_ms, key))
             if room is None:
                 receipt.error = _MISSING
             elif not self.admitting or room.proposed_outcome or room.deadline_ms <= now:
@@ -813,6 +833,13 @@ class BattleNode:
                 receipt.error = 0
             if receipt.error:
                 return self._error(response, receipt.error)
+        # A replay must be signed again, just like a new admission.  If the
+        # signing endpoint becomes unavailable, Match rolls back its marker;
+        # retire the local seat as well and retain the original rejection.
+        if not self.ticket_secret or not self.port:
+            self._drop_observer(room, player, notify=False)
+            receipt.error = _UNAVAILABLE
+            return self._error(response, _UNAVAILABLE)
         assignment = self._assignment(room, player, _OBSERVER, operation)
         if self.on_lobby_push:
             self._publish(self.on_lobby_push, request.routing, player, 177, assignment)
@@ -821,7 +848,8 @@ class BattleNode:
 
     def query_observer(self, request: Message) -> Message:
         response = self.protocol.message("QueryObserverResponse")
-        if request.target_instance_id != self.instance_id or not _uuid(request.spectator_operation_id):
+        if (request.target_instance_id != self.instance_id or not request.battle_id or not request.observer_player_id
+                or not _uuid(request.spectator_operation_id)):
             return response
         response.target_instance_id = self.instance_id
         response.spectator_operation_id = request.spectator_operation_id
@@ -834,9 +862,10 @@ class BattleNode:
         response = self.protocol.message("RemoveObserverResponse")
         now = self.now_ms()
         player, operation = request.observer_player_id, request.spectator_operation_id
-        if (not player or not _uuid(operation) or request.target_instance_id != self.instance_id
+        if (not player or not request.battle_id or not _uuid(operation) or request.target_instance_id != self.instance_id
                 or not 0 < request.admit_before_ms <= now + 30_000):
             return response
+        self._prune_observer_receipts(now)
         key = request.battle_id, player, operation
         previous = self.observer_receipts.get(key)
         if previous is not None and previous.expires_ms != request.admit_before_ms:
@@ -845,6 +874,8 @@ class BattleNode:
             if previous is None and len(self.observer_receipts) >= _MAX_SPECTATOR_OPERATIONS:
                 return response
             self.observer_receipts[key] = _ObserverReceipt(request.admit_before_ms)
+            if previous is None:
+                heapq.heappush(self._observer_deadlines, (request.admit_before_ms, key))
         elif previous is not None:
             del self.observer_receipts[key]
         room = self.rooms.get(request.battle_id)
@@ -864,6 +895,18 @@ class BattleNode:
         connection = room.connections.pop(player, None)
         if connection is not None:
             self._publish(connection.close)
+
+    def _prune_observer_receipts(self, now: int) -> None:
+        while self._observer_deadlines and self._observer_deadlines[0][0] <= now:
+            expires, key = heapq.heappop(self._observer_deadlines)
+            receipt = self.observer_receipts.get(key)
+            if receipt is not None and receipt.expires_ms == expires:
+                del self.observer_receipts[key]
+
+    def _prune_creation_receipts(self, now: int) -> None:
+        for battle_id, receipt in tuple(self.receipts.items()):
+            if receipt.expires_ms < now and battle_id not in self.rooms:
+                del self.receipts[battle_id]
 
     def _spectate_room(self, request):
         if request.target_instance_id != self.instance_id:
@@ -925,7 +968,7 @@ class BattleNode:
             self._publish(self.on_spectate_frame, channel, gate_id, event.battle_id, event)
 
     def dispatch(self, ticket: Ticket, message_id: int, request: Message) -> Message:
-        now = self.now_ms()
+        steady = self._steady_ms()
         room = self._member(ticket) if request.battle_id == ticket.battle_id else None
         if message_id == 140:
             return self._snapshot(room, ticket.player_id if ticket.role == _PARTICIPANT else 0) if room is not None else self.protocol.message("BattleStateS2C")
@@ -941,11 +984,11 @@ class BattleNode:
             return self._error(response, _INVALID)
         if ticket.role != _PARTICIPANT:
             return self._error(response, _INVALID)
-        if room.proposed_outcome or room.deadline_ms <= now:
+        if room.proposed_outcome or room.battle_due_steady_ms <= steady:
             return self._error(response, _UNAVAILABLE)
         engine = room.engine
-        if now >= room.action_deadline_ms:
-            self._resolve(room, now)
+        if steady >= room.action_due_steady_ms:
+            self._resolve(room)
             return self._error(response, _INVALID)
         actor = engine.actors[ticket.player_id]
         if not _active(actor):
@@ -954,7 +997,7 @@ class BattleNode:
             was_ready = not engine.pending_players()
             actor.is_auto = request.enabled
             if request.enabled and not was_ready and not engine.pending_players():
-                self._resolve(room, now)
+                self._resolve(room)
         else:
             error = engine.validate(actor, request.action)
             if error:
@@ -962,7 +1005,7 @@ class BattleNode:
             engine.pending[ticket.player_id] = self.protocol.message("BattleAction")
             engine.pending[ticket.player_id].CopyFrom(request.action)
             if not engine.pending_players():
-                self._resolve(room, now)
+                self._resolve(room)
         return response
 
     @staticmethod
@@ -971,7 +1014,7 @@ class BattleNode:
             return room.visible_before_terminal.get(viewer, room.visible_before_terminal[0])
         return room.engine.snapshot(room.action_deadline_ms, viewer)
 
-    def _resolve(self, room: _Room, now: int) -> None:
+    def _resolve(self, room: _Room) -> None:
         visible = self._terminal_visibility(room)
         turn = room.engine.resolve()
         if room.replay is not None:
@@ -979,10 +1022,11 @@ class BattleNode:
         if room.engine.outcome:
             room.visible_before_terminal = visible
             room.final_turn = turn
-            self._propose_outcome(room, room.engine.outcome, now)
+            self._propose_outcome(room, room.engine.outcome, self.now_ms())
             return
         interval = _ACTION_MS if room.engine.pending_players() else max(2000, 250 * len(turn.action_order))
-        room.action_deadline_ms = now + interval
+        room.action_deadline_ms = self.now_ms() + interval
+        room.action_due_steady_ms = self._steady_ms() + interval
         self._broadcast_turn(room, turn)
 
     @staticmethod
@@ -1106,12 +1150,8 @@ class BattleNode:
             return
         now = self.now_ms()
         steady = self._steady_ms()
-        for battle_id, receipt in tuple(self.receipts.items()):
-            if receipt.expires_ms <= now and battle_id not in self.rooms:
-                del self.receipts[battle_id]
-        for key, receipt in tuple(self.observer_receipts.items()):
-            if receipt.expires_ms <= now:
-                del self.observer_receipts[key]
+        self._prune_creation_receipts(now)
+        self._prune_observer_receipts(now)
         for room in tuple(self.rooms.values()):
             for player, observer in tuple(room.observers.items()):
                 if 0 < observer.expires_ms <= steady:
@@ -1126,17 +1166,21 @@ class BattleNode:
                     _LOG.error("battle outcome still unconfirmed after replay window: %s", room.engine.battle_id)
                 elif room.outcome_retry_ms <= steady:
                     self._propose_outcome(room, room.proposed_outcome, now)
-            elif room.deadline_ms <= now:
+            elif room.battle_due_steady_ms <= steady:
                 room.visible_before_terminal = self._terminal_visibility(room)
                 if room.replay is not None:
                     room.replay.mark_deadline_draw(room.visible_before_terminal[0])
                 self._propose_outcome(room, 3, now)
-            elif room.action_deadline_ms <= now:
-                self._resolve(room, now)
-            elif self.on_confirm and room.confirm_retry_ms <= now < room.confirm_until_ms:
-                room.confirm_retry_ms = now + 10_000
-                for player, route in room.routing.items():
-                    self._publish(self.on_confirm, route, player, room.engine.battle_id, room.deadline_ms)
+            elif room.action_due_steady_ms <= steady:
+                self._resolve(room)
+            elif (self.on_confirm and room.confirm_retry_steady_ms
+                  and room.confirm_retry_steady_ms <= steady):
+                if now >= room.confirm_until_ms:
+                    room.confirm_retry_steady_ms = 0
+                else:
+                    room.confirm_retry_steady_ms = steady + 10_000
+                    for player, route in room.routing.items():
+                        self._publish(self.on_confirm, route, player, room.engine.battle_id, room.deadline_ms)
         self.pump_spectate_keepalive()
 
     def pump_spectate_keepalive(self) -> None:
