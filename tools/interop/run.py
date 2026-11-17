@@ -27,6 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("prepared", "etcd", "redis", "mysql", "kafka-java", "kafka-libs", "go", "private-helper"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--direct-gate", action="store_true", help="use direct Gate routing (Team requires Router)")
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("the native middleware harness currently supports Windows only")
@@ -52,8 +53,10 @@ def main():
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "src")
     env["PYTHONNOUSERSITE"] = "1"
     print(f"Testing C++/Go commit {manifest['revision']} in {prepared}", flush=True)
-    result = subprocess.run([sys.executable, str(Path(__file__).with_name("smoke_full.py")),
-                             "--ingress", "python", "--scene-landing", "--scene-team", "--monopoly-board"], env=env)
+    command = [sys.executable, str(Path(__file__).with_name("smoke_full.py")),
+               "--ingress", "python", "--scene-landing", "--monopoly-board"]
+    command += ["--direct-gate"] if args.direct_gate else ["--scene-team"]
+    result = subprocess.run(command, env=env)
     raise SystemExit(result.returncode)
 
 

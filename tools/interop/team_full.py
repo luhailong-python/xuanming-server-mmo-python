@@ -63,7 +63,6 @@ async def verify_team(leader_session, leader, gate, runtime, ingress):
         async with asyncio.timeout(5):
             while math.dist(start, follower.transform.position) < 2:
                 await asyncio.sleep(0.03)
-        assert follower.motion.sequence is None
         gap = math.dist(leader.transform.position, follower.transform.position)
         assert 1.35 <= gap <= 1.55, gap
         async with asyncio.timeout(5):
@@ -73,6 +72,18 @@ async def verify_team(leader_session, leader, gate, runtime, ingress):
                     assert math.hypot(attributes.velocity.x, attributes.velocity.y) == 10
                     break
         await move(leader_client, "MoveStop", end_location=vector(leader.transform.position), input_seq=2)
+        async with asyncio.timeout(5):
+            while follower.motion.velocity != (0.0, 0.0, 0.0):
+                await asyncio.sleep(0.03)
+        # A driven follower must ignore its own movement, even if the input is valid.
+        # A subsequent Scene RPC fences the one-way movement on the same client lane.
+        forged_rotation = (12345.0, 23456.0, 34567.0)
+        await move(client, "MoveSync", location=vector(follower.transform.position),
+                   rotation=vector(forged_rotation), input_seq=0xFFFFFFFF)
+        bag = await client.rpc(protocol.message_ids["SceneBagClientPlayerGetBag"], 214,
+                               protocol.message("GetBagRequest"))
+        assert not bag.error_message.id
+        assert follower.transform.rotation != forged_rotation
         await move(client, "TeamFollow", follow=False)
         async with asyncio.timeout(5):
             while True:

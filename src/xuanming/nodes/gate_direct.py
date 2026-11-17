@@ -46,6 +46,8 @@ class _Scope:
 
 
 class DirectForwarder:
+    direct_mode = True
+
     def __init__(self, protocol, directory, secret, *, client_factory=GrpcClient,
                  discovery_ttl: float = 1) -> None:
         self.protocol = protocol
@@ -62,12 +64,21 @@ class DirectForwarder:
     def validate_request(self, route, request):
         return self.protocol.parse(route.request_type, request.body)
 
+    @staticmethod
+    def _details(gate, session):
+        details = gate.details(session, 0)
+        # C++ retains playerId while a LeaveGame route reset is pending.
+        # Python tracks it separately to reject stale scene events.
+        if not details.player_id and session.left_player_id:
+            details.player_id = session.left_player_id
+        return details
+
     async def renew_login(self, gate, session):
         peer = await self._select(gate.info, _LOGIN)
         if peer is None:
             raise RuntimeError("Login 节点不可用")
         try:
-            details = gate.details(session, 0).SerializeToString()
+            details = self._details(gate, session).SerializeToString()
             metadata = session_metadata(details, RENEW_PATH, self.secret)
             return await peer.client.call(RENEW_PATH, b"", metadata=metadata)
         finally:
@@ -81,14 +92,14 @@ class DirectForwarder:
         if peer is None:
             raise RuntimeError("Login 节点不可用")
         try:
-            details = gate.details(session, 0).SerializeToString()
+            details = self._details(gate, session).SerializeToString()
             return await peer.client.call(route.path, b"", metadata=session_metadata(details, route.path, self.secret))
         finally:
             peer.in_flight -= 1
             if peer.retired and not peer.in_flight:
                 await self._close_peer(peer)
 
-    async def __call__(self, gate, session, route, request, seq):
+    async def __call__(self, gate, session, route, request, seq, *, details=None, on_send=None):
         def error(code):
             return self.protocol.content(request.message_id, request.id, error=code) if request.id else None
 
@@ -104,16 +115,20 @@ class DirectForwarder:
         if service not in self._target_types:
             return error(_UNAVAILABLE)
 
+        # Discovery can yield; the direct sender signs the identity as it was
+        # when this client frame was accepted, not a later role binding.
+        subject = (details if details is not None else self._details(gate, session)).SerializeToString()
         peer = None
         try:
             peer = await self._select(gate.info, service)
             if peer is None:
                 return error(_UNAVAILABLE)
             # The native direct path correlates replies on the call itself.
-            details = gate.details(session, 0).SerializeToString()
-            metadata = session_metadata(details, route.path, self.secret)
+            metadata = session_metadata(subject, route.path, self.secret)
             if service == _LOGIN and route.method == "Login":
                 session.login_started = True
+            if on_send is not None:
+                on_send()
             data = await peer.client.call(route.path, typed.SerializeToString(), metadata=metadata)
             response = self.protocol.parse(route.response_type, data)
             if disconnect:
