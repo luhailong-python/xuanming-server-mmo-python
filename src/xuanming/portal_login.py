@@ -11,6 +11,7 @@ import grpc
 from aiohttp import web
 
 from .grpc_runtime import GrpcClient
+from .portal_observability import trace_metadata
 
 _LOG = logging.getLogger(__name__)
 _FAULTS = frozenset((1002, 1003, 1004, 1007, 1009, 1011, 1012, 1016, 1018, 2015, 2018, 2019,
@@ -69,8 +70,9 @@ def client_ip(request, networks):
 
 
 class Limiter:
-    def __init__(self, redis, settings):
+    def __init__(self, redis, settings, *, metrics=None):
         self.redis, self.settings = redis, settings
+        self.metrics = metrics
         self.networks = tuple(ipaddress.ip_network(item, strict=False) for item in settings.trusted_proxies)
         self.cooldown = {}
         self.bypass_until = 0.0
@@ -101,6 +103,7 @@ class Limiter:
             return None
         wait = self.wave_wait(zone)
         if wait is not None:
+            self._count("wave_queue")
             return ("wave", wait)
         now = time.monotonic()
         probe_generation = None
@@ -116,6 +119,8 @@ class Limiter:
                 result = await self._admit(zone, ip)
             except Exception:
                 _LOG.warning("portal rate limiter unavailable, temporarily bypassing Redis buckets", exc_info=True)
+                if self.metrics:
+                    self.metrics.rate_fail_open["store_error"] += 1
                 self.bypass_generation += 1
                 self.bypass_until = now + 5
             else:
@@ -124,16 +129,25 @@ class Limiter:
                 if probe_generation is not None and probe_generation == self.bypass_generation:
                     self.bypass_until = 0.0
                 if result:
+                    self._count("ip_deny" if result[0] == "deny" else "zone_queue")
                     return result
+        elif self.metrics:
+            self.metrics.rate_fail_open["bypass"] += 1
         if account:
             key = (scope, account, ip)
             if now - self.cooldown.get(key, float('-inf')) < s.account_cooldown_ms / 1000:
+                self._count("cooldown_deny")
                 return ("deny", "ACCOUNT_COOLDOWN")
             self.cooldown[key] = now
             if len(self.cooldown) >= 1024:
                 self.cooldown = {k: t for k, t in self.cooldown.items()
                                  if now - t < s.account_cooldown_ms / 1000}
+        self._count("pass")
         return None
+
+    def _count(self, outcome):
+        if self.metrics:
+            self.metrics.rate_decisions[outcome] += 1
 
     async def _admit(self, zone, ip):
         s = self.settings
@@ -197,7 +211,7 @@ class LoginRpc:
         client = self.clients.get(endpoint)
         if client is None:
             client = self.clients[endpoint] = GrpcClient(endpoint, timeout=3, enable_retries=False)
-        raw = await client.call(f"/loginpb.{service}/{method}", request.SerializeToString())
+        raw = await client.call(f"/loginpb.{service}/{method}", request.SerializeToString(), metadata=trace_metadata())
         return self.protocol.parse("loginpb." + response, raw)
 
     async def close(self):

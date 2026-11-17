@@ -2,6 +2,9 @@
 # Reverse proxy supplies TLS. Without trusted_proxies, forwarded headers are ignored.
 host = "0.0.0.0"
 port = 8080
+# Bind management separately; restrict this port to monitoring and operators.
+management_host = "127.0.0.1"
+management_port = 8082
 mysql_host = "mysql"
 mysql_port = 3306
 mysql_user = "gateway"

@@ -47,6 +47,8 @@ $env:XUANMING_PORTAL_ADMIN_API_KEY = '管理接口密钥'
 
 门户通过 HTTP 监听，应由可信反向代理提供 TLS；`trusted_proxies` 只填写可信代理网段。`home_zone_ids` 指定本实例负责发布策略、健康状态和检查角色容量的区服。管理接口使用 `X-Admin-Key`，未配置密钥时拒绝访问；商城代理另需配置目标服务及 `COMMERCE_ADMIN_SECRET`。CDN 密钥须与资源校验方一致。门户和游戏节点不需要 Java 运行环境，生产集群仍需要配置中的 Go 服务和中间件。
 
+健康探针及 Prometheus 指标在独立的管理监听端口提供，默认绑定 `127.0.0.1:8082`；管理端口与业务端口共享同一 asyncio 事件循环。公开 HTTP 请求会生成新的追踪标识，传入的外部追踪头不作为内部调用链的来源。
+
 新数据库需要先在与 Go Login 共用的数据库中执行 [门户建表脚本](config/portal_schema.sql)，并通过管理接口配置区服。脚本不会迁移已存在的旧表；已有部署应先核对 `zone_config`、`zone_whitelist` 和 `announcement` 的结构。
 
 集群密钥沿用当前 C++ 配置名。Gate 使用 `MMORPG_GATE_TOKEN_SECRET`、`MMORPG_INTERNAL_AUTH_SIGNING_KEY` 和 `MMORPG_INTERNAL_AUTH_PUBLIC_KEYS`。内部鉴权私钥是 32 字节 Ed25519 种子的 64 位十六进制编码；公钥配置是逗号分隔的 64 位十六进制公钥列表，必须包含该私钥对应的公钥，轮换期间可配置多把公钥。Battle 使用 `MMORPG_BATTLE_TOKEN_SECRET` 和 `MMORPG_MATCH_OUTCOME_SECRET_BATTLE`。Scene 使用 `MMORPG_PLAYER_STORE_SECRET_SCENE` 和 `MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE`。资产调用方按需配置 `MMORPG_ASSET_OP_SECRET_GUILD`、`MMORPG_ASSET_OP_SECRET_TRADE`、`MMORPG_ASSET_OP_SECRET_MAIL`、`MMORPG_ASSET_OP_SECRET_DATA_SERVICE`。角色封存另用 `MMORPG_ACCOUNT_DIRECTORY_SECRET_TRADE`，大厅观战另用 `MMORPG_SPECTATE_TOKEN_SECRET`。本地客户端 GM 同时要求 `GATE_RUN_MODE=dev` 和 `SCENE_RUN_MODE=dev`。Gate 和 Scene 的内部停机 RPC 与 Scene 实体诊断 RPC 使用独立的 `GATE_GM_ADMIN_SECRET`。Scene 诊断列出 Python 运行时的组件和值，实体编号和组件描述使用 Python 实现的格式。

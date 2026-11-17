@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 
 from .cluster import EtcdDirectory
 from .portal_login import Limiter, LoginRpc, register_login_routes
+from .portal_observability import Metrics, create_management_app
 from .protocol import Protocol
 
 
@@ -20,7 +21,8 @@ def load_settings(path: Path):
     with path.open("rb") as file:
         values = tomllib.load(file).get("portal", {})
     defaults = {
-        "host": "127.0.0.1", "port": 8080, "mysql_host": "127.0.0.1", "mysql_port": 3306,
+        "host": "127.0.0.1", "port": 8080, "management_host": "127.0.0.1", "management_port": 8082,
+        "mysql_host": "127.0.0.1", "mysql_port": 3306,
         "mysql_user": "", "mysql_database": "", "redis_url": "redis://127.0.0.1:6379/0",
         "etcd": "", "login_endpoints": {}, "rate_limit_enabled": False, "trusted_proxies": [],
         "ip_rps": 2, "ip_burst": 10, "zone_rps": 500, "zone_burst": 1000,
@@ -39,7 +41,8 @@ def load_settings(path: Path):
     settings.admin_api_key = os.getenv("XUANMING_PORTAL_ADMIN_API_KEY", "")
     settings.mall_admin_secret = os.getenv("COMMERCE_ADMIN_SECRET", "")
     if (not settings.mysql_host or not settings.mysql_user or not settings.mysql_database
-            or not 0 <= settings.port <= 65535 or not 0 < settings.mysql_port <= 65535
+            or not 0 <= settings.port <= 65535 or not 0 <= settings.management_port <= 65535
+            or not settings.management_host or not 0 < settings.mysql_port <= 65535
             or not all(isinstance(x, int) and x > 0 for x in
                        (settings.ip_rps, settings.ip_burst, settings.zone_rps, settings.zone_burst))
             or not isinstance(settings.login_endpoints, dict)):
@@ -81,8 +84,10 @@ async def open_deps(settings):
             stack.push_async_callback(directory.close)
         rpc = LoginRpc(protocol, settings.login_endpoints, directory)
         stack.push_async_callback(rpc.close)
+        metrics = Metrics()
         deps = SimpleNamespace(settings=settings, protocol=protocol, db=pool, redis=redis,
-                               directory=directory, rpc=rpc, limiter=Limiter(redis, settings))
+                               directory=directory, rpc=rpc, metrics=metrics,
+                               limiter=Limiter(redis, settings, metrics=metrics))
         yield deps
 
 
@@ -96,7 +101,9 @@ def create_app(deps, extra_routes=None):
     from .portal_mall_admin import register_routes as register_mall_admin
     from .portal_zone_policy import register_background as register_zone_policy
 
-    app = web.Application(client_max_size=64 * 1024)
+    if not hasattr(deps, "metrics"):
+        deps.metrics = Metrics()
+    app = web.Application(client_max_size=64 * 1024, middlewares=[deps.metrics.instrument])
     register_login_routes(app, deps)
     register_catalog(app, deps)
     register_server_list(app, deps)
@@ -114,9 +121,15 @@ def create_app(deps, extra_routes=None):
 async def run_portal(settings):
     async with open_deps(settings) as deps:
         runner = web.AppRunner(create_app(deps), access_log=None)
-        await runner.setup()
+        management = web.AppRunner(create_management_app(deps), access_log=None)
         try:
+            await runner.setup()
+            await management.setup()
+            await web.TCPSite(management, settings.management_host, settings.management_port).start()
             await web.TCPSite(runner, settings.host, settings.port).start()
+            deps.metrics.ready = True
             await asyncio.Event().wait()
         finally:
+            deps.metrics.ready = False
             await runner.cleanup()
+            await management.cleanup()
