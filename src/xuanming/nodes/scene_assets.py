@@ -50,11 +50,12 @@ _SOCKET_EMPTY = 28019
 _GEM_TYPE_MISMATCH = 28020
 _GEM_BAG_FULL = 28021
 _TEMPORARY_BUSY = 6017
+_TX_AUCTION_RETURN = 30
 _RULES = {
     1: ("debit", (24,)),
     2: ("credit", (25, 26)),
     3: ("debit", (1, 3, 4)),
-    4: ("credit", (1, 4)),
+    4: ("credit", (1, 4, 30)),
     5: ("credit", (2, 8, 9)),
     6: ("debit", (19,)),
 }
@@ -225,7 +226,13 @@ class SceneAssets(AssetInventory):
 
         if not self._valid_bundle(rpc, request):
             return await self._finish(player, data, request, Outcome.REJECTED, _INVALID_BUNDLE)
-        if any(value.currency_type not in self.currency_types for value in request.bundle.currencies):
+        if carries_unknown(request):
+            return self._answer(Outcome.RETRY, FEATURE_UNAVAILABLE)
+        if (any(value.currency_type not in self.currency_types for value in request.bundle.currencies)
+                or any(self.tables["Item"].get(value.config_id) is None
+                       for value in (*request.bundle.items, *request.bundle.item_instances))
+                or (request.bundle.HasField("pet_instance") and
+                    self.tables["Pet"].get(request.bundle.pet_instance.pet_table_id) is None)):
             return self._answer(Outcome.RETRY, FEATURE_UNAVAILABLE)
         snapshot = self.protocol.message("AssetSnapshot")
         gains = []
@@ -301,7 +308,7 @@ class SceneAssets(AssetInventory):
             return False
         if len({entry.config_id for entry in grants}) != len(grants):
             return False
-        if any(not item.count or self.tables["Item"].get(item.config_id) is None for item in grants):
+        if any(not item.config_id or not item.count for item in grants):
             return False
         if guids and (0 in guids or len(set(guids)) != len(guids)):
             return False
@@ -320,7 +327,7 @@ class SceneAssets(AssetInventory):
             if instances or has_pet or not (currencies or grants or guids or bundle.pet_id):
                 return False
             return all(
-                item.count <= 4096 and row.max_stack_size > 1 and not row.equip_kind
+                item.count <= 4096 and (row is None or row.max_stack_size > 1 and not row.equip_kind)
                 for item in grants for row in (self.tables["Item"].get(item.config_id),)
             )
         if guids or bundle.pet_id or not (currencies or grants or instances or has_pet):
@@ -338,9 +345,9 @@ class SceneAssets(AssetInventory):
                 item = self.protocol.parse("ItemComp", transfer.instance_proto)
                 row = self.tables["Item"].get(item.config_id)
                 if (
-                    not item.item_id or item.item_id in ids or item.item_id != transfer.item_uuid
+                    not item.item_id or not transfer.config_id or item.item_id in ids or item.item_id != transfer.item_uuid
                     or item.config_id != transfer.config_id or item.size != 1 or transfer.stack_size != 1
-                    or row is None or row.max_stack_size != 1
+                    or (row is not None and row.max_stack_size != 1)
                 ):
                     return False
                 ids.add(item.item_id)
@@ -351,8 +358,7 @@ class SceneAssets(AssetInventory):
                 pet = self.protocol.parse("PetInstance", transfer.instance_proto)
                 if (
                     not pet.pet_id or pet.pet_id != transfer.pet_id or pet.pet_table_id != transfer.pet_table_id
-                    or pet.level != transfer.level or pet.name != transfer.name
-                    or self.tables["Pet"].get(pet.pet_table_id) is None
+                    or pet.level != transfer.level or pet.name != transfer.name or not pet.pet_table_id
                 ):
                     return False
         except DecodeError:
@@ -430,10 +436,13 @@ class SceneAssets(AssetInventory):
 
     async def _apply_credit(self, data, request, gains):
         bundle = request.bundle
-        if any(self.currency_blocked(data, value.currency_type) for value in bundle.currencies) or any(
+        counts_as_gain = request.tx_type != _TX_AUCTION_RETURN
+        if counts_as_gain and (any(self.currency_blocked(data, value.currency_type) for value in bundle.currencies) or any(
             self.item_gain_blocked(data, item.config_id) for item in (*bundle.items, *bundle.item_instances)
-        ):
+        )):
             return Outcome.REJECTED, BLOCKED, False
+        if any(self.credit_overflows(data, entry.currency_type, entry.amount) for entry in bundle.currencies):
+            return Outcome.REJECTED, _INVALID_BUNDLE, False
         items = [self.protocol.parse("ItemComp", item.instance_proto) for item in bundle.item_instances]
         stored_ids = self.all_ids(data.bag_component)
         if any(item.item_id in stored_ids for item in items):
@@ -448,17 +457,25 @@ class SceneAssets(AssetInventory):
             if any(existing.pet_id == pet.pet_id for existing in data.pet_component.pets):
                 return Outcome.REJECTED, _INVALID_BUNDLE, False
         counts = {item.config_id: item.count for item in bundle.items}
-        result = await self.add_items(data, counts, instances=items, gains=gains)
+        result = await self.add_items(data, counts, instances=items, gains=gains, counts_as_gain=counts_as_gain)
         if result in (BLOCKED, INVALID):
             return Outcome.REJECTED, BLOCKED, False
         if result:
             tip = _ASSET_BAG_FULL if result == BAG_FULL else 0 if result == UNAVAILABLE else result
             return Outcome.RETRY, tip, False
+        # Item allocation awaits an external source. Re-evaluate debt expiry
+        # after that wait, before committing any of the detached asset changes,
+        # and use one timestamp for both the check and every currency credit.
+        credit_at = int(time.time())
+        if any(self.credit_overflows(data, entry.currency_type, entry.amount, now_seconds=credit_at)
+               for entry in bundle.currencies):
+            return Outcome.REJECTED, _INVALID_BUNDLE, False
         if pet is not None:
             data.pet_component.pets.add().CopyFrom(pet)
         mutated = bool(counts or items or pet is not None)
         for entry in bundle.currencies:
-            result = self.add_currency(data, entry.currency_type, entry.amount, gains=gains)
+            result = self.add_currency(data, entry.currency_type, entry.amount, gains=gains,
+                                       counts_as_gain=counts_as_gain, now_seconds=credit_at)
             if result:
                 return (Outcome.APPLIED, _PARTIAL, True) if mutated else (Outcome.RETRY, result, False)
             mutated = True

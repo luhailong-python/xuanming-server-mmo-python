@@ -239,6 +239,117 @@ def test_trade_preserves_original_instance_and_ack_keeps_identity(tmp_path):
     asyncio.run(exercise())
 
 
+def test_trade_return_restores_escrow_despite_gain_blocks(tmp_path):
+    async def exercise():
+        p, scene, assets, _ = await _scene(tmp_path)
+        try:
+            tx = p.pool.FindEnumTypeByName("TransactionType").values_by_name
+            assert tx["TX_AUCTION_RETURN"].number == 30
+            assert tx["TX_PAYMENT_REVERSAL"].number == 31
+            debit = _request(p, 3, 1, 1, item_uuids=[30])
+            snapshot = await assets.debit(_sign("debit", debit, "trade"))
+            assert snapshot.outcome == Outcome.APPLIED
+            original = snapshot.snapshot.items[0]
+            player = scene.locations[1].players[1]
+            data = scene.rows.assemble(player.snapshot)
+            config = next(row.id for row in assets.tables["Item"].rows()
+                          if row.max_stack_size > 1 and not row.equip_kind)
+            data.currency.blocked_types.append(0)
+            data.item_gain_block.item_config_ids.extend([config, original.config_id])
+            assets.global_blocks["currency"].add(0)
+            assets.global_blocks["item"].update([config, original.config_id])
+            assert await assets._save(player, data)
+
+            bundle = {"currencies": [{"currency_type": 0, "amount": 7}],
+                      "items": [{"config_id": config, "count": 1}], "item_instances": [original]}
+            normal = _request(p, 4, 1, 1, **bundle)
+            rejected = await assets.credit(_sign("credit", normal, "trade"))
+            assert rejected.outcome == Outcome.REJECTED and rejected.reason.id == 27005
+            returned = _request(p, 4, 2, 30, **bundle)
+            result = await assets.credit(_sign("credit", returned, "trade"))
+            assert result.outcome == Outcome.APPLIED and result.durable and not result.partial
+            assert (await assets.credit(returned)).outcome == Outcome.APPLIED
+            data = scene.rows.assemble(player.snapshot)
+            assert data.currency.values[0] == 107
+            assert {assets.item(entry).item_id for entry in data.bag_component.items} == {30, 500}
+        finally:
+            await scene.close()
+            await assets.close()
+
+    asyncio.run(exercise())
+
+
+def test_credit_overflow_rejected_before_items_and_respects_debt(tmp_path):
+    async def exercise():
+        p, scene, assets, _ = await _scene(tmp_path)
+        try:
+            player = scene.locations[1].players[1]
+            data = scene.rows.assemble(player.snapshot)
+            data.currency.values[0] = (1 << 64) - 2
+            assert await assets._save(player, data)
+            config = next(row.id for row in assets.tables["Item"].rows()
+                          if row.max_stack_size > 1 and not row.equip_kind)
+            bundle = {"currencies": [{"currency_type": 0, "amount": 3}],
+                      "items": [{"config_id": config, "count": 1}]}
+            request = _request(p, 4, 1, 1, **bundle)
+            rejected = await assets.credit(_sign("credit", request, "trade"))
+            assert rejected.outcome == Outcome.REJECTED and rejected.reason.id == 27004
+            assert rejected.durable and not rejected.partial
+            current = scene.rows.assemble(player.snapshot)
+            assert current.currency.values[0] == (1 << 64) - 2
+            assert len(current.bag_component.items) == 1
+            assert (await assets.credit(request)).outcome == Outcome.REJECTED
+
+            current.currency.debts.add(currency_type=0, owed=3)
+            assert await assets._save(player, current)
+            request = _request(p, 4, 2, 1, **bundle)
+            applied = await assets.credit(_sign("credit", request, "trade"))
+            assert applied.outcome == Outcome.APPLIED and applied.durable and not applied.partial
+            current = scene.rows.assemble(player.snapshot)
+            assert current.currency.values[0] == (1 << 64) - 2 and not current.currency.debts
+            assert len(current.bag_component.items) == 2
+        finally:
+            await scene.close()
+            await assets.close()
+
+    asyncio.run(exercise())
+
+
+def test_credit_rechecks_expiring_debt_after_async_item_allocation(tmp_path, monkeypatch):
+    async def exercise():
+        p, scene, assets, _ = await _scene(tmp_path)
+        try:
+            player = scene.locations[1].players[1]
+            data = scene.rows.assemble(player.snapshot)
+            data.currency.values[0] = (1 << 64) - 2
+            data.currency.debts.add(currency_type=0, owed=3, expires_at=101)
+            assert await assets._save(player, data)
+            config = next(row.id for row in assets.tables["Item"].rows()
+                          if row.max_stack_size > 1 and not row.equip_kind)
+            clock = [100]
+            monkeypatch.setattr("xuanming.data.asset_inventory.time.time", lambda: clock[0])
+
+            async def allocate():
+                clock[0] = 101
+                return 500
+
+            assets.allocate_item_id = allocate
+            request = _request(p, 4, 1, 1, currencies=[{"currency_type": 0, "amount": 3}],
+                               items=[{"config_id": config, "count": 1}])
+            result = await assets.credit(_sign("credit", request, "trade"))
+            assert result.outcome == Outcome.REJECTED and result.reason.id == 27004
+            assert result.durable and not result.partial
+            current = scene.rows.assemble(player.snapshot)
+            assert len(current.bag_component.items) == 1
+            assert current.currency.values[0] == (1 << 64) - 2
+            assert current.currency.debts[0].owed == 3 and current.currency.debts[0].paid == 0
+        finally:
+            await scene.close()
+            await assets.close()
+
+    asyncio.run(exercise())
+
+
 def test_inventory_plans_are_atomic_and_preserve_unknown_instances():
     async def exercise():
         p = Protocol()

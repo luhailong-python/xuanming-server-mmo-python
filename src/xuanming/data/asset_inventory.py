@@ -108,18 +108,27 @@ class AssetInventory:
             or self.blocked_gain("item", config)
         )
 
-    def add_currency(self, data, kind: int, amount: int, *, gains: list[AssetGain] | None = None) -> int:
-        if kind not in self.currency_types or not 1 <= amount <= INT64_MAX:
-            return INVALID
-        if self.currency_blocked(data, kind):
-            return BLOCKED
-        now = int(time.time())
+    def _credit_plan(self, data, kind: int, amount: int, *, now_seconds: int | None = None):
+        now_seconds = int(time.time()) if now_seconds is None else now_seconds
         debt = next((debt for debt in data.currency.debts if debt.currency_type == kind), None)
         owed = 0
         if debt is not None and not debt.frozen and (
-            not debt.expires_at or now < debt.expires_at
+            not debt.expires_at or now_seconds < debt.expires_at
         ) and not carries_unknown(debt):
             owed = min(amount, max(0, debt.owed - debt.paid))
+        return debt, owed
+
+    def credit_overflows(self, data, kind: int, amount: int, *, now_seconds: int | None = None) -> bool:
+        _, owed = self._credit_plan(data, kind, amount, now_seconds=now_seconds)
+        return balance(data, kind) + amount - owed > UINT64_MAX
+
+    def add_currency(self, data, kind: int, amount: int, *, gains: list[AssetGain] | None = None,
+                     counts_as_gain: bool = True, now_seconds: int | None = None) -> int:
+        if kind not in self.currency_types or not 1 <= amount <= INT64_MAX:
+            return INVALID
+        if counts_as_gain and self.currency_blocked(data, kind):
+            return BLOCKED
+        debt, owed = self._credit_plan(data, kind, amount, now_seconds=now_seconds)
         new_balance = balance(data, kind) + amount - owed
         if new_balance > UINT64_MAX:
             return INVALID
@@ -292,6 +301,7 @@ class AssetInventory:
         overflow: bool = False,
         instances=(),
         gains: list[AssetGain] | None = None,
+        counts_as_gain: bool = True,
     ) -> int:
         if not counts and not instances:
             return 0
@@ -303,10 +313,10 @@ class AssetInventory:
             row = self.tables["Item"].get(config)
             if row is None or row.max_stack_size == 0 or not 0 < amount <= 0xFFFFFFFF:
                 return INVALID
-            if self.item_gain_blocked(data, config):
+            if counts_as_gain and self.item_gain_blocked(data, config):
                 return BLOCKED
             rows.append((row, amount))
-        if any(self.item_gain_blocked(data, item.config_id) for item in instances):
+        if counts_as_gain and any(self.item_gain_blocked(data, item.config_id) for item in instances):
             return BLOCKED
         bag = clone(data.bag_component)
         items = {kind: self.entries(bag, kind) for kind in kinds}
