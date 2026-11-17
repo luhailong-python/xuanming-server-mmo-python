@@ -7,8 +7,21 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prepare import BUILDS, digest, digest_tree, extract_snapshot
+from prepare import BUILDS, check_native_compatibility, digest, digest_tree, extract_snapshot
 from run import verify_prepared
+
+
+def test_scene_manager_redis_pool_conflict_is_rejected_before_start(tmp_path):
+    mint = tmp_path / "go/scene_manager/internal/svc/owner_epoch_mint.go"
+    redis = tmp_path / "go/shared/clusterredis/clusterredis.go"
+    mint.parent.mkdir(parents=True)
+    redis.parent.mkdir(parents=True)
+    mint.write_text("const (\nownerEpochMintPoolSize = 130\n)\nconn.PoolSizePerNode = ownerEpochMintPoolSize\n", encoding="utf-8")
+    redis.write_text("const (\nMaxPoolSizePerNode = 128\n)\nif c.PoolSizePerNode > MaxPoolSizePerNode {\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="ownerEpochMintPoolSize 130 exceeds clusterredis MaxPoolSizePerNode 128"):
+        check_native_compatibility(tmp_path)
+    redis.write_text(redis.read_text(encoding="utf-8").replace("= 128", "= 130"), encoding="utf-8")
+    check_native_compatibility(tmp_path)
 
 
 def test_snapshot_and_binaries_must_match_build_manifest(tmp_path):

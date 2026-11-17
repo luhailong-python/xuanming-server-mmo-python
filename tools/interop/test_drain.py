@@ -17,7 +17,7 @@ def test_drain_harness_verifies_handoff_and_rejects_incomplete_results(monkeypat
     async def exercise():
         player_id = 42
         old_player = SimpleNamespace(snapshot=SimpleNamespace(owner_epoch=4))
-        new_player = SimpleNamespace(snapshot=SimpleNamespace(owner_epoch=5))
+        new_player = SimpleNamespace(admission=object(), snapshot=SimpleNamespace(owner_epoch=5, owner=b"new", released=False))
         old_world = SimpleNamespace(info=SimpleNamespace(scene_config_id=8), players={player_id: old_player})
         old_scene = SimpleNamespace(info=SimpleNamespace(zone_id=1, node_id=201),
                                     locations={player_id: old_world})
@@ -42,14 +42,17 @@ def test_drain_harness_verifies_handoff_and_rejects_incomplete_results(monkeypat
             def __init__(self, settings, role):
                 assert role == "scene" and settings.scene.node_id == 203
                 self.scene = SimpleNamespace(info=SimpleNamespace(zone_id=1, node_id=203, node_uuid="new"),
-                                             locations={player_id: SimpleNamespace(info=SimpleNamespace(scene_config_id=8))})
+                                             locations={player_id: SimpleNamespace(
+                                                 info=SimpleNamespace(scene_id=20, scene_config_id=8),
+                                                 players={player_id: new_player})})
                 state.target = self
             async def __aenter__(self): return self
             async def __aexit__(self, *args): pass
 
-        async def entry(client, target, incoming_player):
-            assert state.closed and (client, target, incoming_player) == (session.client, state.target, player_id)
-            return new_player
+        notices = iter((10, 20))  # An earlier scene-change notification is still buffered.
+        async def read_push(client, name):
+            assert state.closed and client is session.client and name == "SceneSceneClientPlayerNotifyEnterScene"
+            return name, SimpleNamespace(scene_info=SimpleNamespace(scene_id=next(notices)))
         async def wallet(_client, request_id):
             return 8 if incorrect == "lost_wallet" and request_id == 182 else 9
         async def epoch(_player): return 5
@@ -57,7 +60,7 @@ def test_drain_harness_verifies_handoff_and_rejects_incomplete_results(monkeypat
             return SimpleNamespace(owner=b"new", owner_epoch=5, released=False, save_seq=7)
 
         scene_full = ModuleType("scene_full")
-        scene_full.entry, scene_full.redis_epoch, scene_full.wallet = entry, epoch, wallet
+        scene_full._read_push, scene_full.redis_epoch, scene_full.wallet = read_push, epoch, wallet
         data_full = ModuleType("data_full")
         data_full.read_native_player = saved
         smoke_original = ModuleType("smoke_original")

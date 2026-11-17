@@ -5,10 +5,27 @@ from dataclasses import replace
 import os
 
 from data_full import read_native_player
-from scene_full import entry, redis_epoch, wallet
+from scene_full import _read_push, redis_epoch, wallet
 from smoke_original import RUN
 from xuanming.runtime import Runtime
 from xuanming.settings import NodeSettings
+
+
+async def _target_entry(client, target, player_id):
+    # Source teardown may finish before the Gate has consumed the new route.
+    # First wait for the target entity, then ignore any earlier scene-change
+    # notices still buffered by client RPCs performed before the drain.
+    while player_id not in target.scene.locations:
+        await asyncio.sleep(0.05)
+    world = target.scene.locations[player_id]
+    player = world.players[player_id]
+    while True:
+        _, notice = await _read_push(client, "SceneSceneClientPlayerNotifyEnterScene")
+        if notice.scene_info.scene_id == world.info.scene_id:
+            break
+    assert player.snapshot.owner_epoch > 0 and player.admission is not None
+    assert not player.snapshot.released and player.snapshot.owner == target.scene.info.node_uuid.encode()
+    return player
 
 
 async def verify_drain(stack, session, gate, source):
@@ -36,7 +53,7 @@ async def verify_drain(stack, session, gate, source):
         # registered and its network transports stay open through handoff.
         async with asyncio.timeout(70):
             await source._interop_lifecycle.aclose()
-            player = await entry(session.client, target, player_id)
+            player = await _target_entry(session.client, target, player_id)
     finally:
         if previous is None:
             os.environ.pop(key, None)

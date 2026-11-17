@@ -42,7 +42,7 @@ $Prepared = 'D:/path/to/new-disposable-work-directory'
 
 此场景依赖 C++ main 的 Go SceneManager 所实现的 `EnterSceneRequest.evacuation` 语义：要验证当前基线，请通过 `prepare.py --revision <当前 C++ main 提交>` 重新准备快照。也可先对已有的 `--prepared` 快照运行，但早期快照可能缺少该语义；其结果不能证明当前 C++ main 的迁移行为。不同快照保存在各自新建的准备目录，不覆盖已有产物。
 
-轻量验证只检查脚本编译和测试，不启动中间件：`.venv/Scripts/python.exe -m pytest -q tools/interop/test_drain.py tools/interop/test_preflight.py`。实际多节点联调必须运行上面的完整验收，不能用轻量测试结果代替。
+轻量验证不启动外部中间件：`.venv/Scripts/python.exe -m pytest -q tools/interop/test_drain.py tools/interop/test_preflight.py tests/test_scene_drain_network.py`。其中双 Scene 测试使用真实本机 RPC0、gRPC 和 SQLite，但 SceneManager、Redis、Data 是测试替身；实际原生服务联调必须运行上面的完整验收，不能用轻量测试结果代替。
 
 可单独运行准备产物篡改检测的回归测试：`.venv/Scripts/python.exe -m pytest -q tools/interop/test_preflight.py`。
 

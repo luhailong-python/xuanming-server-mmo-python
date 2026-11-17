@@ -28,6 +28,8 @@
 
 完整结果见工作目录下的 `tidb-full-acceptance.json`，它引用更详细的 `run-.../acceptance.json` 和本地锁资格证据。详细记录和底层工具中部分历史字段名仍含 `mysql`；本工具实际数据库类型以总结果中的 `backend: tidb/tikv` 和检测到的 TiDB 版本为准。只有完整业务验证及容器清理都通过，结果才为 `ok: true`。复验预检、进程树与 SQL 监听隔离：`.venv/Scripts/python.exe -m pytest -q tools/tidb_full/test_tidb_full_preflight.py tools/tidb_full/test_windows_job.py tools/tidb_full/test_safety.py`。
 
+需要同时验证同区 Scene 计划停机时，在上述 `run.py` 命令末尾追加 `--scene-drain`。工具会在真实账号进入源 Scene 后，启动第二个 Python Scene，执行源节点停机并核验目标入场、Gate 路由、归属 epoch 和 TiDB 存档。此选项要求准备的原生 Go SceneManager 支持 `EnterSceneRequest.evacuation`；对照当前基线时，请按 [MySQL 整栈工具](../interop/README.md) 使用当前 C++ main 提交重新准备快照。输出的总结果包含 `scene_drain_requested` 和 `scene_planned_shutdown` 证据；如果指定选项后缺少或未通过迁移证据，总结果不会标记成功。历史字段 `native_mysql_verified` / `mysql_save_seq` 在此链路中实际表示通过 TiDB 验证的存档。
+
 在 `tools/tidb_ha` 创建的隔离多副本实例上，先针对其 `ready.json` 生成绑定本轮容器的资格证据，再运行原生 Go 旧 epoch 围栏用例：
 
 ```powershell

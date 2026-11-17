@@ -38,6 +38,8 @@ Scene 和 Battle 的内部 Match 终局调用会发现 etcd 中的 stable Match 
 
 集群 Scene 接收停机请求后先关闭新建和入场准入、向注册中心发布关闭状态，在预算内等待场景迁移并疏散剩余玩家，再进行有界存档退出。`MMORPG_PLANNED_DRAIN_BUDGET_SECONDS` 默认 35 秒，`SCENE_PLANNED_DRAIN_SELF_EVACUATE_AFTER_SECONDS` 可调整自疏散启动时间；部署的终止宽限期还应为后续最多 15 秒的存档阶段留出时间。存储持续不可用或迁移预算耗尽时，停机会记录未完成的工作，不能将其当作成功迁移。
 
+自疏散共用节点级限速，`SCENE_PLANNED_DRAIN_RELOCATIONS_PER_SECOND` 默认为 200，设为 0 表示不限制。
+
 ## HTTP 门户
 
 Python 门户提供登录、Gate 分票、排队查询和令牌刷新，以及区服列表、公告、CDN 签名、热更检查和管理接口。安装 `.[cluster]`，按 [门户配置示例](config/portal.example.toml) 配置 MySQL、Redis、etcd 和 Login，设置密钥后启动：

@@ -46,11 +46,33 @@ def verify_prepared(path):
     return manifest, source, binaries
 
 
+def driver_command(scene_drain):
+    command = [sys.executable, str(Path(__file__).with_name("driver.py"))]
+    if scene_drain:
+        command.append("--scene-drain")
+    return command
+
+
+def valid_scene_drain(report):
+    evidence = report.get("scene_planned_shutdown")
+    if not isinstance(evidence, dict):
+        return False
+    source, target = evidence.get("source_node"), evidence.get("target_node")
+    old, new = evidence.get("source_epoch"), evidence.get("target_epoch")
+    return bool(evidence.get("source_shutdown") is True and evidence.get("gate_routed") is True
+                and evidence.get("native_mysql_verified") is True
+                and type(source) is int and type(target) is int and 0 < source != target > 0
+                and type(old) is int and type(new) is int and 0 < old < new
+                and type(evidence.get("scene_config_id")) is int and evidence["scene_config_id"] > 0
+                and type(evidence.get("mysql_save_seq")) is int and evidence["mysql_save_seq"] > 0)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("prepared", "work-dir", "etcd", "redis", "mysql", "kafka-java", "kafka-libs", "go", "private-helper"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--subnet", help="optional unused private IPv4 Docker subnet")
+    parser.add_argument("--scene-drain", action="store_true", help="exercise same-zone Scene planned shutdown")
     args = parser.parse_args()
     if os.name != "nt" or not __debug__:
         parser.error("Windows and enabled Python assertions are required")
@@ -84,6 +106,7 @@ def main():
     stack = ["docker", "compose", "-p", project, "-f", compose]
     started = False
     result = {"ok": False, "cpp_commit": manifest["revision"], "run_id": run_id,
+              "scene_drain_requested": args.scene_drain,
               "project": project, "mode": "isolated integration; not production I3 certification"}
     try:
         started = True  # Include cleanup when Compose only partially starts.
@@ -115,7 +138,7 @@ def main():
                    PYTHONPATH=str(ROOT / "src"), PYTHONNOUSERSITE="1")
         env.pop("PYTHONOPTIMIZE", None)
         print(f"Testing complete chain with isolated TiDB; artifacts: {work}", flush=True)
-        status = windows_job.run([sys.executable, str(Path(__file__).with_name("driver.py"))],
+        status = windows_job.run(driver_command(args.scene_drain),
                                  cwd=ROOT, env=env, timeout=1200)
         if status:
             raise RuntimeError(f"TiDB full-chain driver failed with status {status}")
@@ -129,11 +152,14 @@ def main():
                 or not report.get("scene_team", {}).get("native_invitation_accepted")
                 or not report.get("cross_zone", {}).get("round_trip")
                 or not report.get("battle", {}).get("native_go_db_battle_result")
-                or proof.get("lockPrimitive") != "SELECT_ONLY" or not proof.get("select_only_blocked_writer")):
+                or proof.get("lockPrimitive") != "SELECT_ONLY" or not proof.get("select_only_blocked_writer")
+                or args.scene_drain and not valid_scene_drain(report)):
             raise RuntimeError("full-chain or TiDB locking evidence is incomplete")
         result.update(ok=True, tidb_version=version.decode(errors="replace").strip(),
                       backend="tidb/tikv", writer_lock="SELECT_ONLY", full_acceptance=str(runs[0] / "acceptance.json"),
                       qualification=str(runs[0] / "tidb-lock-qualification.json"))
+        if args.scene_drain:
+            result["scene_planned_shutdown"] = report["scene_planned_shutdown"]
     except Exception as exc:
         result.update(error=type(exc).__name__, reason=str(exc))
         raise

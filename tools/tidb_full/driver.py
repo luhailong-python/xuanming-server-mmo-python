@@ -1,5 +1,6 @@
 """Adapt the isolated interoperability chain to a verified disposable TiDB."""
 
+import argparse
 import asyncio
 import json
 import logging
@@ -21,7 +22,18 @@ from safety import assert_exclusive_tidb
 from qualify import qualify
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scene-drain", action="store_true", help="exercise same-zone Scene planned shutdown")
+    return parser.parse_args(argv)
+
+
+def smoke_options(args):
+    return dict(monopoly_board=True, scene_landing=True, scene_team=True, scene_drain=args.scene_drain)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     import smoke_original as original
@@ -212,8 +224,7 @@ def main():
         original.PORT["mysql"] = port
     smoke_full.configure = configure
     logging.basicConfig(level=logging.WARNING, stream=sys.stdout)
-    asyncio.run(smoke_full.main(False, "python", False, False, monopoly_board=True,
-                                scene_landing=True, scene_team=True))
+    asyncio.run(smoke_full.main(False, "python", False, False, **smoke_options(args)))
     print(f"TiDB full-chain artifacts: {original.RUN}", flush=True)
 
 

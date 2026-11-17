@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import subprocess
 import tarfile
@@ -32,6 +33,25 @@ def digest_tree(root):
         total.update(b"\0")
         total.update(bytes.fromhex(digest(path)))
     return total.hexdigest()
+
+
+def check_native_compatibility(source):
+    """Fail early for the known native SceneManager Redis pool conflict."""
+    mint = source / "go/scene_manager/internal/svc/owner_epoch_mint.go"
+    redis = source / "go/shared/clusterredis/clusterredis.go"
+    if not mint.is_file() or not redis.is_file():
+        return
+    mint_text, redis_text = mint.read_text(encoding="utf-8"), redis.read_text(encoding="utf-8")
+    fixed = re.search(r"(?m)^\s*ownerEpochMintPoolSize\s*=\s*(\d+)\s*$", mint_text)
+    maximum = re.search(r"(?m)^\s*MaxPoolSizePerNode\s*=\s*(\d+)\s*$", redis_text)
+    if (fixed and maximum and "conn.PoolSizePerNode = ownerEpochMintPoolSize" in mint_text
+            and "c.PoolSizePerNode > MaxPoolSizePerNode" in redis_text
+            and int(fixed.group(1)) > int(maximum.group(1))):
+        raise RuntimeError(
+            "native SceneManager cannot start: ownerEpochMintPoolSize "
+            f"{fixed.group(1)} exceeds clusterredis MaxPoolSizePerNode {maximum.group(1)}; "
+            "select a corrected committed C++/Go revision"
+        )
 
 
 def extract_snapshot(archive, source):
@@ -82,6 +102,7 @@ def main():
                     "go", "generated", "deploy/sql"], check=True)
     extract_snapshot(archive, source)
     archive.unlink()
+    check_native_compatibility(source)
     source_hash = digest_tree(source)
     env = dict(os.environ, GOWORK="off", GOENV="off", GOTOOLCHAIN="local", CGO_ENABLED="0", GOTELEMETRY="off")
     for name, module, package in BUILDS:

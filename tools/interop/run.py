@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from prepare import BUILDS, digest, digest_tree
+from prepare import BUILDS, check_native_compatibility, digest, digest_tree
 
 
 def verify_prepared(prepared):
@@ -15,6 +15,7 @@ def verify_prepared(prepared):
     source, binaries = prepared / "source", prepared / "bin"
     if digest_tree(source) != manifest.get("source_sha256"):
         raise RuntimeError("prepared source snapshot changed after native compilation")
+    check_native_compatibility(source)
     if set(manifest.get("binaries", {})) != {f"{name}.exe" for name, _, _ in BUILDS}:
         raise RuntimeError("native build manifest is incomplete")
     for name, expected in manifest["binaries"].items():
