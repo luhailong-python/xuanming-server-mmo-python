@@ -12,6 +12,7 @@ from aiohttp import web
 
 from .grpc_runtime import GrpcClient
 from .portal_observability import trace_metadata
+from .portal_sql import connection
 
 _LOG = logging.getLogger(__name__)
 _FAULTS = frozenset((1002, 1003, 1004, 1007, 1009, 1011, 1012, 1016, 1018, 2015, 2018, 2019,
@@ -75,6 +76,7 @@ class Limiter:
         self.metrics = metrics
         self.networks = tuple(ipaddress.ip_network(item, strict=False) for item in settings.trusted_proxies)
         self.cooldown = {}
+        self.cooldown_writes = 0
         self.bypass_until = 0.0
         self.bypass_generation = 0
         self.wave_start = getattr(settings, "wave_start_epoch_seconds", 0) or int(time.time())
@@ -139,9 +141,11 @@ class Limiter:
                 self._count("cooldown_deny")
                 return ("deny", "ACCOUNT_COOLDOWN")
             self.cooldown[key] = now
-            if len(self.cooldown) >= 1024:
+            self.cooldown_writes += 1
+            if self.cooldown_writes >= 1024:
                 self.cooldown = {k: t for k, t in self.cooldown.items()
                                  if now - t < s.account_cooldown_ms / 1000}
+                self.cooldown_writes = 0
         self._count("pass")
         return None
 
@@ -182,22 +186,30 @@ class LoginRpc:
         self.static = {int(k): ([v] if isinstance(v, str) else list(v)) for k, v in endpoints.items()}
         self.dynamic = {}
         self.refreshed = 0.0
+        self.discovery_task = None
         self.counter = 0
         self.clients = {}
 
-    async def call(self, zone, service, method, request, response, *, zoned=True):
-        now = time.monotonic()
-        if self.directory and now >= self.refreshed:
-            self.refreshed = now + 5
-            try:
+    async def _refresh(self):
+        try:
+            async with asyncio.timeout(4):
                 nodes = await self.directory.candidates(5, None)
                 found = {}
                 for node in nodes:
                     if node.zone_id and node.endpoint.ip and node.endpoint.port:
                         found.setdefault(node.zone_id, []).append(f"{node.endpoint.ip}:{node.endpoint.port}")
                 self.dynamic = found
-            except Exception:
-                _LOG.warning("Login discovery failed; retaining last known endpoints", exc_info=True)
+        except Exception:
+            _LOG.warning("Login discovery failed; retaining last known endpoints", exc_info=True)
+        finally:
+            self.refreshed = time.monotonic() + 5
+            self.discovery_task = None
+
+    async def call(self, zone, service, method, request, response, *, zoned=True):
+        if self.directory and (self.discovery_task is not None or time.monotonic() >= self.refreshed):
+            if self.discovery_task is None:
+                self.discovery_task = asyncio.create_task(self._refresh())
+            await asyncio.shield(self.discovery_task)
         if zoned:
             if zone <= 0:
                 raise ValueError("zone id required")
@@ -215,27 +227,63 @@ class LoginRpc:
         return self.protocol.parse("loginpb." + response, raw)
 
     async def close(self):
+        if self.discovery_task is not None:
+            self.discovery_task.cancel()
+            await asyncio.gather(self.discovery_task, return_exceptions=True)
         await asyncio.gather(*(client.close() for client in self.clients.values()))
 
 
-async def _zone_admission(db, zone):
-    if zone <= 0:
-        return None
-    try:
-        async with asyncio.timeout(3):
-            async with db.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT manual_status FROM zone_config WHERE zone_id=%s", (zone,))
-                    row = await cur.fetchone()
-                await conn.rollback()
-    except Exception:
-        _LOG.warning("zone admission lookup failed", exc_info=True)
-        return {"code": 500, "error": "zone_admission_unavailable"}
-    if row is None:
-        return {"code": 404, "error": "zone_not_found"}
-    status = row[0] if not isinstance(row, dict) else row["manual_status"]
-    reason = {1: "zone_maintenance", 2: "zone_closed", 3: "zone_not_open"}.get(status)
-    return {"code": 503, "error": reason} if reason else None
+class ZoneAdmission:
+    def __init__(self, db, *, clock=time.monotonic):
+        self.db, self.clock = db, clock
+        self.cached, self.inflight = {}, {}
+
+    async def _load(self, zone):
+        try:
+            async with asyncio.timeout(3):
+                async with connection(self.db) as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("SELECT manual_status FROM zone_config WHERE zone_id=%s", (zone,))
+                        row = await cur.fetchone()
+                    await conn.rollback()
+            if row is None:
+                result = {"code": 404, "error": "zone_not_found"}
+            else:
+                status = row[0] if not isinstance(row, dict) else row["manual_status"]
+                reason = {1: "zone_maintenance", 2: "zone_closed", 3: "zone_not_open"}.get(status)
+                result = {"code": 503, "error": reason} if reason else None
+            now = self.clock()
+            if zone not in self.cached and len(self.cached) >= 4096:
+                self.cached = {key: value for key, value in self.cached.items() if value[0] > now}
+            if zone in self.cached or len(self.cached) < 4096:
+                self.cached[zone] = (now + 1, result)
+            return result
+        except Exception:
+            _LOG.warning("zone admission lookup failed", exc_info=True)
+            return {"code": 500, "error": "zone_admission_unavailable"}
+        finally:
+            self.inflight.pop(zone, None)
+
+    async def check(self, zone):
+        if zone <= 0:
+            return None
+        entry = self.cached.get(zone)
+        if entry is not None and entry[0] > self.clock():
+            return entry[1]
+        task = self.inflight.get(zone)
+        if task is None:
+            task = self.inflight[zone] = asyncio.create_task(self._load(zone))
+        try:
+            async with asyncio.timeout(3):
+                return await asyncio.shield(task)
+        except TimeoutError:
+            return {"code": 500, "error": "zone_admission_unavailable"}
+
+    async def close(self):
+        tasks = tuple(self.inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _body(request):
@@ -266,9 +314,9 @@ def _tokens(response):
 
 def _tip(response):
     tip = response.error_message
-    if tip.id or tip.parameters:
+    if tip.id or tip.parameters and tip.parameters[-1]:
         return {"code": 500 if tip.id in _FAULTS else 401,
-                "message": tip.parameters or f"upstream_err={tip.id}"}
+                "message": tip.parameters[-1] if tip.parameters else f"upstream_err={tip.id}"}
     return None
 
 
@@ -289,8 +337,14 @@ def _gate_response(response, queue_token=""):
             "token_deadline": response.token_deadline}
 
 
-def register_login_routes(app, deps):
+def register_login_routes(app, deps, *, admission=None):
     p, rpc, limiter = deps.protocol, deps.rpc, deps.limiter
+    admission = admission or ZoneAdmission(deps.db)
+
+    async def close_admission(_app):
+        await admission.close()
+
+    app.on_cleanup.append(close_admission)
 
     async def handle(request):
         try:
@@ -339,7 +393,7 @@ def register_login_routes(app, deps):
                 if path == "queue-status" and not token.strip():
                     return web.json_response({"code": 410, "error": "missing_queue_token", "gate_port": 0,
                                               "token_deadline": 0})
-                denied = await _zone_admission(deps.db, zone)
+                denied = await admission.check(zone)
                 if denied:
                     return web.json_response({"gate_port": 0, "token_deadline": 0} | denied)
                 if path == "assign-gate":

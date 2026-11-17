@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from aiohttp import web
 
 from .portal_admin_auth import authorize
+from .portal_sql import connection
 
 
 _last_id = 0
@@ -40,11 +41,11 @@ def _view(row):
 def register_routes(app, deps):
     async def list_all(request):
         authorize(request, deps)
-        async with deps.db.acquire() as connection:
-            async with connection.cursor() as cursor:
+        async with connection(deps.db) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute("SELECT id,title,content,type,start_time,end_time,created_at FROM announcement")
                 rows = await cursor.fetchall()
-            await connection.rollback()
+            await conn.rollback()
         return web.json_response([_view(row) for row in rows])
 
     async def create(request):
@@ -62,13 +63,13 @@ def register_routes(app, deps):
             raise web.HTTPBadRequest(text="invalid announcement")
         identifier = _next_id()
         created = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
-        async with deps.db.acquire() as connection:
-            async with connection.cursor() as cursor:
+        async with connection(deps.db) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute("INSERT INTO announcement "
                                      "(id,title,content,type,start_time,end_time,created_at) "
                                      "VALUES (%s,%s,%s,%s,%s,%s,%s)",
                                      (identifier, title, content, kind, start, end, created))
-            await connection.commit()
+            await conn.commit()
         return web.json_response(_view((identifier, title, content, kind, start, end, created)))
 
     async def delete(request):
@@ -77,10 +78,10 @@ def register_routes(app, deps):
             identifier = int(request.match_info["id"])
         except ValueError:
             raise web.HTTPBadRequest(text="invalid id")
-        async with deps.db.acquire() as connection:
-            async with connection.cursor() as cursor:
+        async with connection(deps.db) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute("DELETE FROM announcement WHERE id = %s", (identifier,))
-            await connection.commit()
+            await conn.commit()
         return web.Response(status=204)
 
     app.router.add_get("/admin/announcements", list_all)

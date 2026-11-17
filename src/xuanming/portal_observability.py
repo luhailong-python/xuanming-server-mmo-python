@@ -10,6 +10,8 @@ from collections import Counter, defaultdict
 
 from aiohttp import web
 
+from .portal_sql import connection
+
 _LOG = logging.getLogger(__name__)
 _trace_id = contextvars.ContextVar("portal_trace_id", default=None)
 
@@ -91,11 +93,11 @@ def _label(value):
 
 async def _mysql_health(db):
     async with asyncio.timeout(2):
-        async with db.acquire() as connection:
-            async with connection.cursor() as cursor:
+        async with connection(db) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute("SELECT 1")
                 row = await cursor.fetchone()
-            await connection.rollback()
+            await conn.rollback()
             if not row or row[0] != 1:
                 raise RuntimeError("unexpected MySQL health response")
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from xuanming.portal_login import Limiter, client_ip, register_login_routes
+from xuanming.portal_login import Limiter, LoginRpc, ZoneAdmission, client_ip, register_login_routes
 from xuanming.protocol import Protocol
 
 
@@ -68,8 +68,11 @@ def test_login_admission_queue_and_rotation():
         rpc = Rpc(protocol)
         db = Database((0,))
         limiter = Limiter(None, settings())
+        now = [0.0]
+        admission = ZoneAdmission(db, clock=lambda: now[0])
         app = web.Application()
-        register_login_routes(app, SimpleNamespace(protocol=protocol, rpc=rpc, db=db, limiter=limiter))
+        register_login_routes(app, SimpleNamespace(protocol=protocol, rpc=rpc, db=db, limiter=limiter),
+                              admission=admission)
         async with TestClient(TestServer(app)) as client:
             response = await client.post("/api/login", json={"zone_id": 1, "account": "alice", "password": "pw"})
             assert (await response.json())["access_token"] == "access"
@@ -86,11 +89,140 @@ def test_login_admission_queue_and_rotation():
             assert rpc.calls[-1][-1] == {"zoned": False}
             count = len(rpc.calls)
             db.status = (1,)
+            now[0] += 1.1
             response = await client.post("/api/assign-gate", json={"zone_id": 1})
             assert (await response.json())["error"] == "zone_maintenance" and len(rpc.calls) == count
             db.status = None
+            now[0] += 1.1
             response = await client.post("/api/queue-status", json={"zone_id": 1, "queue_token": "queue"})
             assert (await response.json())["error"] == "zone_not_found" and len(rpc.calls) == count
+
+    asyncio.run(run())
+
+
+def test_zone_admission_single_flight_cache_and_failure_recovery():
+    class BlockedDB:
+        def __init__(self):
+            self.calls = 0
+            self.release = asyncio.Event()
+            self.fail = False
+
+        def acquire(self):
+            self.calls += 1
+            return self
+
+        async def __aenter__(self):
+            await self.release.wait()
+            if self.fail:
+                raise RuntimeError("database unavailable")
+            return self
+
+        async def __aexit__(self, *_): pass
+        def cursor(self): return self
+        async def execute(self, *_): pass
+        async def fetchone(self): return (0,)
+        async def rollback(self): pass
+
+    async def run():
+        db = BlockedDB()
+        now = [0.0]
+        admission = ZoneAdmission(db, clock=lambda: now[0])
+        requests = [asyncio.create_task(admission.check(1)) for _ in range(20)]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert db.calls == 1
+        requests[0].cancel()
+        db.release.set()
+        result = await asyncio.gather(*requests, return_exceptions=True)
+        assert all(item is None for item in result[1:])
+        assert await admission.check(1) is None and db.calls == 1
+        now[0] = 2.0
+        db.fail = True
+        assert (await admission.check(1))["error"] == "zone_admission_unavailable"
+        db.fail = False
+        assert await admission.check(1) is None and db.calls == 3
+        await admission.close()
+
+    asyncio.run(run())
+
+
+def test_login_discovery_single_flight_on_cold_start(monkeypatch):
+    async def run():
+        class Directory:
+            def __init__(self):
+                self.calls = 0
+                self.release = asyncio.Event()
+
+            async def candidates(self, *_):
+                self.calls += 1
+                await self.release.wait()
+                return [SimpleNamespace(zone_id=1, endpoint=SimpleNamespace(ip="127.0.0.1", port=42))]
+
+        class Client:
+            def __init__(self, *_args, **_kwargs): pass
+            async def call(self, *_args, **_kwargs):
+                return protocol.message("loginpb.LoginResponse").SerializeToString()
+            async def close(self): pass
+
+        protocol, directory = Protocol(), Directory()
+        monkeypatch.setattr("xuanming.portal_login.GrpcClient", Client)
+        rpc = LoginRpc(protocol, {}, directory)
+        request = protocol.message("loginpb.LoginRequest")
+        calls = [asyncio.create_task(rpc.call(1, "ClientPlayerLogin", "Login", request, "LoginResponse"))
+                 for _ in range(20)]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert directory.calls == 1
+        calls[0].cancel()
+        directory.release.set()
+        responses = await asyncio.gather(*calls, return_exceptions=True)
+        assert all(item.DESCRIPTOR.name == "LoginResponse" for item in responses[1:])
+        await rpc.close()
+
+    asyncio.run(run())
+
+
+def test_login_and_refresh_propagate_upstream_error_messages():
+    async def run():
+        protocol = Protocol()
+
+        class ErrorRpc:
+            async def call(self, zone, service, method, request, response, **kwargs):
+                return protocol.message("loginpb." + response, error_message={
+                    "id": 1002 if method == "RefreshToken" else 1234,
+                    "parameters": ["detail", "last message"],
+                })
+
+        app = web.Application()
+        register_login_routes(app, SimpleNamespace(protocol=protocol, rpc=ErrorRpc(), db=Database((0,)),
+                                                    limiter=Limiter(None, settings())))
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post("/api/login", json={"zone_id": 1, "account": "alice"})
+            assert await response.json() == {"code": 401, "message": "last message"}
+            response = await client.post("/api/refresh-token", json={"refresh_token": "expired"})
+            assert await response.json() == {"code": 500, "message": "last message"}
+
+    asyncio.run(run())
+
+
+def test_empty_tip_parameter_is_not_an_error():
+    from xuanming.portal_login import _tip
+    response = Protocol().message("loginpb.LoginResponse", error_message={"parameters": [""]})
+    assert _tip(response) is None
+
+
+def test_cooldown_cleanup_is_batched_at_high_cardinality():
+    class Redis:
+        async def eval(self, *_): return [0, 0]
+
+    async def run():
+        limiter = Limiter(Redis(), settings(rate_limit_enabled=True))
+        for index in range(1024):
+            assert await limiter.check(1, "127.0.0.1", str(index), "login") is None
+        cache = limiter.cooldown
+        for index in range(1024, 1124):
+            assert await limiter.check(1, "127.0.0.1", str(index), "login") is None
+        assert limiter.cooldown is cache and len(cache) == 1124
 
     asyncio.run(run())
 

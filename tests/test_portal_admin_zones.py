@@ -94,6 +94,7 @@ def test_real_mysql_zone_and_whitelist_commands(tmp_path):
             for statement in schema.split(";"):
                 if statement.strip():
                     await cur.execute(statement)
+            await cur.execute("CREATE TABLE rollback_probe (id INT PRIMARY KEY) ENGINE=InnoDB")
         connection.close()
         pool = await aiomysql.create_pool(host="127.0.0.1", port=port, user="root", db="portal_test", autocommit=False, maxsize=5)
         app = web.Application()
@@ -141,6 +142,25 @@ def test_real_mysql_zone_and_whitelist_commands(tmp_path):
                 assert (await call("DELETE", "/admin/whitelist/1/9")).status == 204
                 assert (await call("DELETE", "/admin/zones/1")).status == 204
                 assert (await call("DELETE", "/admin/zones/1")).status == 404
+                # A timeout after a write closes its connection; verify against
+                # real InnoDB that the uncommitted row is rolled back.
+                from xuanming import portal_sql
+                old_timeout = portal_sql.SQL_TIMEOUT
+                portal_sql.SQL_TIMEOUT = .1
+                async def stalled_write(cur):
+                    await cur.execute("INSERT INTO rollback_probe VALUES (1)")
+                    await cur.execute("SELECT SLEEP(1)")
+                try:
+                    with pytest.raises(TimeoutError):
+                        await zones._retry_write(pool, stalled_write)
+                finally:
+                    portal_sql.SQL_TIMEOUT = old_timeout
+                await asyncio.sleep(1.1)
+                async with pool.acquire() as connection:
+                    async with connection.cursor() as cursor:
+                        await cursor.execute("SELECT COUNT(*) FROM rollback_probe")
+                        assert (await cursor.fetchone())[0] == 0
+                    await connection.rollback()
         finally:
             pool.close()
             await pool.wait_closed()

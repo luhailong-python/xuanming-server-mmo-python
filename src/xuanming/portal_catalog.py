@@ -8,6 +8,8 @@ from datetime import timezone
 
 from aiohttp import web
 
+from .portal_sql import connection
+
 
 _VERSION = re.compile(r"[0-9]{1,9}(?:\.[0-9]{1,9}){0,3}\Z")
 
@@ -78,15 +80,15 @@ def register_routes(app, deps):
             raise web.HTTPBadRequest(text="invalid request")
 
     async def announcements(request):
-        async with deps.db.acquire() as connection:
-            async with connection.cursor() as cursor:
+        async with connection(deps.db) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute(
                     "SELECT id,title,content,type,start_time,end_time FROM announcement "
                     "WHERE (start_time IS NULL OR start_time <= UTC_TIMESTAMP()) "
                     "AND (end_time IS NULL OR end_time >= UTC_TIMESTAMP()) ORDER BY created_at DESC"
                 )
                 rows = await cursor.fetchall()
-            await connection.rollback()
+            await conn.rollback()
         items = []
         for row in rows:
             item = dict(zip(("id", "title", "content", "type"), row[:4]))

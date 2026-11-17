@@ -9,6 +9,7 @@ import time
 from aiohttp import web
 
 from .portal_admin_auth import authorize
+from .portal_sql import connection
 
 
 _COLUMNS = ("zone_id", "name", "manual_status", "capacity", "maintenance_msg", "open_time", "recommended",
@@ -136,13 +137,17 @@ def _zone(row):
 async def _retry_write(db, fn, retry=False):
     for attempt in range(3 if retry else 1):
         try:
-            async with db.acquire() as conn:
+            async with connection(db) as conn:
                 await conn.begin()
                 try:
                     async with conn.cursor() as cur:
                         value = await fn(cur)
                     await conn.commit()
                     return value
+                except asyncio.CancelledError:
+                    # The operation deadline cancelled an in-flight SQL call;
+                    # the connection context discards it without a risky retry.
+                    raise
                 except BaseException:
                     await conn.rollback()
                     raise
@@ -153,7 +158,7 @@ async def _retry_write(db, fn, retry=False):
 
 
 async def _query(db, sql, args=(), *, one=False):
-    async with db.acquire() as conn:
+    async with connection(db) as conn:
         try:
             async with conn.cursor() as cur:
                 await cur.execute(sql, args)

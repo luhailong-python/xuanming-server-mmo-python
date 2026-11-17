@@ -8,6 +8,8 @@ import uuid
 
 import grpc
 
+from .portal_sql import connection
+
 _LOG = logging.getLogger(__name__)
 
 
@@ -78,7 +80,7 @@ class HealthPublisher:
                 async with asyncio.timeout(4):
                     gates, scenes = await asyncio.gather(deps.directory.candidates(4, zone),
                                                          deps.directory.candidates(3, zone))
-                    async with deps.db.acquire() as conn:
+                    async with connection(deps.db) as conn:
                         async with conn.cursor() as cursor:
                             await cursor.execute("SELECT capacity FROM zone_config WHERE zone_id=%s", (zone,))
                             row = await cursor.fetchone()

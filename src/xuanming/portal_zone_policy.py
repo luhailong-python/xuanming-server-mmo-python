@@ -7,13 +7,14 @@ import logging
 import grpc
 
 from .portal_db import as_bool
+from .portal_sql import connection
 
 _LOG = logging.getLogger(__name__)
 
 
 async def _row(deps, zone, columns):
     async with asyncio.timeout(3):
-        async with deps.db.acquire() as conn:
+        async with connection(deps.db) as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(f"SELECT {columns} FROM zone_config WHERE zone_id=%s", (zone,))
                 row = await cursor.fetchone()
@@ -59,7 +60,7 @@ async def check_capacity(deps, zone):
     if response.roles < capacity:
         return "below"
     async with asyncio.timeout(3):
-        async with deps.db.acquire() as conn:
+        async with connection(deps.db) as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute("UPDATE zone_config SET create_role_closed=TRUE,version=version+1,"
                                      "updated_at=CURRENT_TIMESTAMP WHERE zone_id=%s AND role_capacity=%s "
