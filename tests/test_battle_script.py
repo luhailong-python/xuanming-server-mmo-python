@@ -1,5 +1,9 @@
+import json
+from pathlib import Path
+
 from xuanming.nodes.battle import TurnEngine
-from xuanming.nodes.battle_tables import BattleSkill
+from xuanming.nodes.battle_script import _ratio_below, _ratio_less
+from xuanming.nodes.battle_tables import BattleBuff, BattleSkill
 from xuanming.protocol import Protocol
 
 
@@ -109,3 +113,101 @@ def test_class_skill_rejects_wrong_target_side():
     role.rules.add(action=2, skill_id=8, target={'side': 2})
     engine = _engine(protocol, request, skills={8: BattleSkill(0, class_id=2, target_team=2)})
     assert not engine.scripts.scripts
+
+
+def test_ratio_boundaries_match_native_battle_script_rules():
+    protocol = Protocol()
+    actor = lambda health, maximum: protocol.message(
+        'BattleActorState', attributes={'health': health}, max_health=maximum)
+    max_uint64 = (1 << 64) - 1
+    for health, maximum, threshold, expected in (
+        (29, 100, 3000, True), (30, 100, 3000, False),
+        (0, 0, 10000, False), (0, 1, 1, True),
+        (max_uint64, max_uint64, 10000, False),
+    ):
+        assert _ratio_below(health, maximum, threshold) is expected
+    for lhs, rhs, expected in (
+        ((1, 3), (1, 2), True), ((1, 2), (1, 3), False),
+        ((2, 4), (1, 2), False), ((99, 100), (0, 0), True),
+        ((5, 0), (99, 100), False),
+    ):
+        assert _ratio_less(actor(*lhs), actor(*rhs)) is expected
+
+
+def test_same_role_spreads_targets_like_native_script():
+    protocol = Protocol()
+    request = _request(protocol)
+    request.players.add(player_id=4, team_index=0, max_health=100).base_attributes.health = 100
+    script = request.team_scripts.add(team_index=0).script
+    script.schema_version = 1
+    role = script.roles.add(role_id=1, actor_type=1)
+    rule = _rule(role, side=2)
+    rule.target.filters.add(kind=7, p1=0, negate=True)
+    engine = _engine(protocol, request)
+    engine._fill_default_actions()
+    assert engine.pending[1].target_id == 2
+    assert engine.pending[4].target_id == 3
+
+
+def test_round_condition_and_fallback_match_native_script():
+    protocol = Protocol()
+    request = _request(protocol)
+    script = request.team_scripts.add(team_index=0).script
+    script.schema_version = 1
+    role = script.roles.add(role_id=1, actor_type=1)
+    defend = _rule(role, priority=10, action=3, side=1)
+    defend.conditions.add(kind=3, p1=2, p2=1)
+    _rule(role, priority=20, action=1, side=2)
+    engine = _engine(protocol, request)
+    for round_index, expected_action in ((1, 3), (2, 1), (3, 3)):
+        engine.round_index = round_index
+        engine.pending.clear()
+        engine._fill_default_actions()
+        assert engine.pending[1].action_type == expected_action
+
+
+def test_cooldown_falls_through_to_next_rule_like_native_script():
+    protocol = Protocol()
+    request = _request(protocol)
+    request.players[0].skill_table_ids.append(77)
+    script = request.team_scripts.add(team_index=0).script
+    script.schema_version = 1
+    role = script.roles.add(role_id=1, actor_type=1)
+    role.rules.add(priority=10, action=2, skill_id=77, target={'side': 2})
+    _rule(role, priority=20, action=3, side=1)
+    engine = _engine(protocol, request, skills={77: BattleSkill(1, requires_target=True)})
+    engine._fill_default_actions()
+    assert engine.pending[1].action_type == 2
+    engine.pending.clear()
+    engine.actors[1].skill_cooldown_rounds[77] = 1
+    engine._fill_default_actions()
+    assert engine.pending[1].action_type == 3
+
+
+def test_combo_matches_native_head_each_round():
+    fixture = json.loads((Path(__file__).parent / 'fixtures' / 'battle_script_combo_head.json').read_text())
+    protocol = Protocol()
+    request = protocol.parse('CreateBattleRequest', bytes.fromhex(fixture['ORACLE_REQUEST']))
+    state = protocol.parse('BattleStateS2C', bytes.fromhex(fixture['ORACLE_STATE']))
+    skills = {9501: BattleSkill(0, requires_target=True, effects=(9930,)),
+              9502: BattleSkill(0, requires_target=True, effects=(9952,)),
+              9503: BattleSkill(0, requires_target=True, effects=(9950,)),
+              9504: BattleSkill(30, requires_target=True)}
+    buffs = {9930: BattleBuff(buff_type=30, duration_rounds=3),
+             9952: BattleBuff(buff_type=52, duration_rounds=3),
+             9950: BattleBuff(buff_type=50, duration_rounds=3)}
+    engine = TurnEngine(protocol, request, skills=skills, buffs=buffs,
+                        monsters=[a for a in state.actors if a.actor_type == 2],
+                        items={}, max_rounds=20, monster_ids={101, 102})
+    for actor in engine.actors.values():
+        if actor.actor_type == 1:
+            actor.is_auto = True
+    expected_order = [8001, 8002, 8003, 8004, 9223372041149743104, 9223372041149743105]
+    for index in range(1, 3):
+        native = protocol.parse('TurnResultS2C', bytes.fromhex(fixture[f'ORACLE_ROUND{index}']))
+        actual = engine.resolve()
+        # Native engine exposes this order separately; its battle node writes it into the response.
+        assert list(actual.action_order) == expected_order
+        assert not native.action_order
+        actual.ClearField('action_order')
+        assert actual == native
