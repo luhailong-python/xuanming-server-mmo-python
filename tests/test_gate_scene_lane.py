@@ -319,8 +319,9 @@ def test_full_holding_lane_still_sends_one_way():
     asyncio.run(run())
 
 
-def test_congested_bypass_backpressures_without_losing_one_way_messages():
+def test_congested_bypass_backpressures_without_losing_one_way_messages(monkeypatch):
     async def run():
+        monkeypatch.setattr(lane_module, "MAX_WAIT", 0.02)
         protocol, gate, session = setup()
         started, release = asyncio.Event(), asyncio.Event()
         sent = []
@@ -354,6 +355,9 @@ def test_congested_bypass_backpressures_without_losing_one_way_messages():
             await asyncio.wait_for(started.wait(), 1)
             await asyncio.wait_for(extra, 1)
             assert lane.bypass[-1].route == (6, 4, "scene-a")
+            # The writes behind the blocked send, including the producer that
+            # waited for space, must survive beyond the ordinary queue limit.
+            await asyncio.sleep(0.05)
             release.set()
             async with asyncio.timeout(1):
                 while len(sent) < lane_module.MAX_BYPASS + 1:
@@ -367,6 +371,96 @@ def test_congested_bypass_backpressures_without_losing_one_way_messages():
                 extra.cancel()
                 with suppress(asyncio.CancelledError):
                     await extra
+
+    asyncio.run(run())
+
+
+def test_direct_one_way_does_not_expire_during_async_write_or_route_change():
+    async def run():
+        protocol, gate, session = setup()
+        attempts = []
+
+        class Scene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid, can_send, on_sent=None):
+                assert one_way
+                attempts.append(node)
+                if len(attempts) == 1:
+                    session.scene_node_id, session.scene_id, session.scene_instance_id = 7, 5, "scene-b"
+                    raise RpcNotSent("route changed before writing")
+                assert can_send()
+                return b""
+
+        gate.scene = Scene()
+        lane = session.scene_lane
+        lane.admit(request(protocol, "SceneMovementClientPlayerMoveStart", 0), True)
+        lane.queue[0].admitted_at -= lane_module.MAX_WAIT + 1
+        worker = asyncio.create_task(lane.run())
+        try:
+            async with asyncio.timeout(1):
+                while len(attempts) < 2:
+                    await asyncio.sleep(0)
+            assert attempts == [6, 7]
+            assert session.outbound.empty()
+        finally:
+            await stop(worker)
+
+    asyncio.run(run())
+
+
+def test_queued_one_way_still_expires_without_direct_bypass():
+    async def run():
+        protocol, gate, session = setup()
+        called = []
+
+        class Scene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid, can_send, on_sent=None):
+                called.append(payload.message_content.id)
+                on_sent()
+                return protocol.message("ProcessClientPlayerMessageResponse", message_content=protocol.content(
+                    payload.message_content.message_id, payload.message_content.id)).SerializeToString()
+
+        gate.scene = Scene()
+        lane = session.scene_lane
+        lane.admit(request(protocol, "SceneBagClientPlayerGetBag", 1), False)
+        lane.admit(request(protocol, "SceneMovementClientPlayerMoveStart", 0), True)
+        assert not lane.queue[1].direct
+        lane.queue[1].admitted_at -= lane_module.MAX_WAIT + 1
+        worker = asyncio.create_task(lane.run())
+        try:
+            assert (await asyncio.wait_for(session.outbound.get(), 1)).id == 1
+            async with asyncio.timeout(1):
+                while not lane.idle:
+                    await asyncio.sleep(0)
+            assert called == [1]
+        finally:
+            await stop(worker)
+
+    asyncio.run(run())
+
+
+def test_retry_hold_releases_queued_one_way_without_expiring_it():
+    async def run():
+        protocol, gate, session = setup()
+        sent = asyncio.Event()
+
+        class Scene:
+            async def call(self, node, message_id, payload, *, one_way, expected_uuid, can_send, on_sent=None):
+                assert one_way and can_send()
+                sent.set()
+                return b""
+
+        gate.scene = Scene()
+        lane = session.scene_lane
+        lane.admit(request(protocol, "SceneBagClientPlayerGetBag", 1), False)
+        lane.admit(request(protocol, "SceneMovementClientPlayerMoveStart", 0), True)
+        lane.queue[1].admitted_at -= lane_module.MAX_WAIT + 1
+        lane.queue[0].retry_at = time.monotonic() + 1
+        worker = asyncio.create_task(lane.run())
+        try:
+            await asyncio.wait_for(sent.wait(), 1)
+            assert len(lane.queue) == 1
+        finally:
+            await stop(worker)
 
     asyncio.run(run())
 

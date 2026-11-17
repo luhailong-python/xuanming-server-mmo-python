@@ -24,6 +24,7 @@ class Item:
     route: tuple
     identity: tuple
     retry_at: float = 0.0
+    direct: bool = False
 
 
 class SceneLane:
@@ -45,7 +46,8 @@ class SceneLane:
     def admit(self, request, one_way):
         session = self.session
         item = Item(request, one_way, time.monotonic(), self.gate._scene_route(session),
-                    self.gate._client_identity(session))
+                    self.gate._client_identity(session), direct=bool(one_way and
+                        (not self.queue or self.queue[0].retry_at)))
         return self._admit(item)
 
     def _admit(self, item):
@@ -67,7 +69,8 @@ class SceneLane:
         """Backpressure the client when direct one-way writes are congested."""
         session = self.session
         item = Item(request, one_way, time.monotonic(), self.gate._scene_route(session),
-                    self.gate._client_identity(session))
+                    self.gate._client_identity(session), direct=bool(one_way and
+                        (not self.queue or self.queue[0].retry_at)))
         while not self._admit(item):
             self.bypass_space.clear()
             if len(self.bypass) < MAX_BYPASS or not self.queue or not self.queue[0].retry_at:
@@ -142,7 +145,7 @@ class SceneLane:
                 # the same live identity, permits another attempt on the new route.
                 if (not sent_this_attempt and self._current(item) and not session.redirected
                         and not session.entry_failed and self.gate._scene_identity(session) != target
-                        and time.monotonic() - item.admitted_at < MAX_WAIT):
+                        and (item.direct or time.monotonic() - item.admitted_at < MAX_WAIT)):
                     continue
                 if self._current(item):
                     self._reply_error(item, 1003)
@@ -178,6 +181,8 @@ class SceneLane:
                         item = next((entry for entry in self.queue if entry.one_way), None)
                         if item is not None:
                             self.queue.remove(item)
+                            # Native HoldForRetry immediately releases these one-ways.
+                            item.direct = True
                         elif self.bypass:
                             item = self.bypass.popleft()
                             self.bypass_space.set()
@@ -191,7 +196,7 @@ class SceneLane:
                     item = self.bypass.popleft()
                     self.bypass_space.set()
                 if item is not None:
-                    if time.monotonic() - item.admitted_at >= MAX_WAIT:
+                    if not item.direct and time.monotonic() - item.admitted_at >= MAX_WAIT:
                         self._reply_error(item, 1003)
                     elif item.one_way:
                         await self._send(item)
