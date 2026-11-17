@@ -589,6 +589,21 @@ class SceneNode:
             response.error_message.id = error
         return response
 
+    def local_zone_travel(self, world, player, route, request):
+        # Standalone mode has no zone coordinator, but still returns the
+        # same validation errors as the clustered entry before declining it.
+        if not request.target_zone_id or request.target_zone_id == self.info.zone_id:
+            code = 3024
+        elif request.scene_config_id and self.tables and not any(
+            row.scene_id == request.scene_config_id for row in self.tables["World"].rows()
+        ):
+            code = 3007
+        elif self.battle and self.battle.frozen(player.player_id):
+            code = 3025
+        else:
+            code = 3027
+        return self.protocol.message("TravelToZoneResponse", error_message={"id": code})
+
     async def process(self, request, gate_uuid: str):
         player = self.sessions.get((gate_uuid, request.session_id))
         content = request.message_content

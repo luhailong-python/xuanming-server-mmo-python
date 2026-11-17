@@ -315,6 +315,7 @@ class Runtime:
             peer = self.local_inbox = LocalInbox(self.protocol, self.settings.database)
             scene.create(self.protocol.message("CreateSceneRequest", config_id=1, scene_id=1))
             scene.register("SceneSceneClientPlayer", "EnterScene", scene.local_scene_entry)
+            scene.register("SceneSceneClientPlayer", "TravelToZone", scene.local_zone_travel)
         else:
             account_secret = secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE")
             scene.travel = await create_scene_travel(scene, tables, self.settings)
