@@ -47,7 +47,6 @@ def main():
     proof = original.RUN / "tidb-lock-qualification.json"
 
     async def bootstrap(_processes):
-        await qualify(port, run_id, proof, assert_owner)
         version = await asyncio.to_thread(sql, "SELECT VERSION(), TIDB_VERSION();")
         if b"tidb" not in version.lower() or b"Store: tikv" not in version:
             raise RuntimeError("SQL endpoint is not isolated TiDB with TiKV storage")
@@ -56,6 +55,8 @@ def main():
                                         "SELECT @@GLOBAL.tidb_enable_check_constraint;")
         if check.decode().splitlines()[-1].strip().upper() not in ("1", "ON"):
             raise RuntimeError("isolated TiDB did not enable CHECK constraint enforcement")
+        await qualify(port, run_id, proof, assert_owner, identity={"run_id": run_id, "project": project,
+                                                                   "container": container, "sql_port": port})
         ddl = (ROOT / "config/portal_schema.sql").read_text(encoding="utf-8")
         await asyncio.to_thread(sql, "CREATE DATABASE interop; USE interop;\n" + ddl +
                                 "\nINSERT INTO zone_config(zone_id,name,recommended) VALUES(1,'zone-1',1);")

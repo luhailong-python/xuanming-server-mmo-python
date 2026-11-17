@@ -79,7 +79,7 @@ Agones 部署设置 `AGONES_SDK_HTTP_PORT`，可同时设置 `CLIENT_ENDPOINT_SO
 
 本机 Router 验收记录见 `build/interop-native-20261106/run-2eaf66f4/acceptance.json`（本地构建产物，不随仓库分发）。两个真实账号经修复后的 Go Match 完成申请、审批、离队、邀请和接受，无需注入申请记录；场景跟随、棋盘通关与重登、跨区和战斗落库也已验证。部署时 Go Match 需要包含对应的组队鉴权修复。
 
-重新构建原生依赖并运行隔离联调的步骤见 [整栈验收工具](tools/interop/README.md)、[TiDB 全链工具](tools/tidb_full/README.md) 和 [TiDB 组件及商城验收工具](tools/tidb_interop/README.md)。这些工具只创建隔离测试资源，不能替代正式生产环境的容量、容灾或写者资格验收。
+重新构建原生依赖并运行隔离联调的步骤见 [整栈验收工具](tools/interop/README.md)、[TiDB 全链工具](tools/tidb_full/README.md)、[TiDB 组件及商城验收工具](tools/tidb_interop/README.md) 和 [本机多副本故障演练](tools/tidb_ha/README.md)。这些工具只创建隔离测试资源，不能替代正式生产环境的容量、容灾或写者资格验收。
 
 ## WebSocket 客户端承载
 
