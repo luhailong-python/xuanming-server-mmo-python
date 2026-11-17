@@ -1,11 +1,14 @@
 import base64
 import hashlib
-import hmac
 import inspect
+import os
+import re
 import secrets
 import time
 
 import grpc
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from .protocol import Protocol
 
@@ -14,11 +17,34 @@ class GrpcUnavailable(RuntimeError):
     """The RPC was rejected before business handling began."""
 
 
-def session_metadata(subject: bytes, method: str, secret: bytes) -> tuple:
+def gate_signing_key(environ=None) -> Ed25519PrivateKey:
+    """Load the native Gate seed and require its public key in the verifier set."""
+    environ = os.environ if environ is None else environ
+    seed = environ.get("MMORPG_INTERNAL_AUTH_SIGNING_KEY", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", seed):
+        raise ValueError("MMORPG_INTERNAL_AUTH_SIGNING_KEY 需要 64 位十六进制种子")
+    public_keys = environ.get("MMORPG_INTERNAL_AUTH_PUBLIC_KEYS", "").split(",")
+    if not public_keys or any(not re.fullmatch(r"[0-9a-fA-F]{64}", item) for item in public_keys):
+        raise ValueError("MMORPG_INTERNAL_AUTH_PUBLIC_KEYS 格式无效")
+    keys = [bytes.fromhex(item) for item in public_keys]
+    if len(keys) != len(set(keys)):
+        raise ValueError("MMORPG_INTERNAL_AUTH_PUBLIC_KEYS 不得包含重复公钥")
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed))
+    public_key = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    if public_key not in keys:
+        raise ValueError("MMORPG_INTERNAL_AUTH_PUBLIC_KEYS 与 Gate 签名私钥不匹配")
+    return key
+
+
+def session_metadata(subject: bytes, method: str, signer: Ed25519PrivateKey | bytes) -> tuple:
+    if not method.startswith("/"):
+        raise ValueError("调用方认证需要完整 gRPC 方法名")
+    if isinstance(signer, bytes):
+        signer = Ed25519PrivateKey.from_private_bytes(signer)
     timestamp = str(time.time_ns() // 1_000_000)
     nonce = secrets.token_hex(16)
     canonical = "\n".join((
-        "mmorpg-login-caller-auth/v1", "gate", method,
+        "mmorpg-gate-identity/v2", "gate", method,
         hashlib.sha256(subject).hexdigest(), timestamp, nonce,
     )).encode()
     return (
@@ -26,7 +52,7 @@ def session_metadata(subject: bytes, method: str, secret: bytes) -> tuple:
         ("x-caller-id", "gate"),
         ("x-caller-ts", timestamp),
         ("x-caller-nonce", nonce),
-        ("x-caller-sig", hmac.new(secret, canonical, "sha256").hexdigest()),
+        ("x-caller-sig", signer.sign(canonical).hex()),
     )
 
 

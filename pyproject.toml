@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Python 版玄冥游戏服务端运行框架"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["protobuf>=6.31,<8", "grpcio>=1.75,<2", "websockets>=15,<18", "filelock>=3.15,<4"]
+dependencies = ["protobuf>=6.31,<8", "grpcio>=1.75,<2", "websockets>=15,<18", "filelock>=3.15,<4", "cryptography>=44,<47"]
 
 [project.optional-dependencies]
 cluster = ["aiokafka>=0.12,<1", "redis>=6.2,<9", "aiohttp>=3.11,<4"]

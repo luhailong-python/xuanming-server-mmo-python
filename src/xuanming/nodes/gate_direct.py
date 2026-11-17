@@ -46,10 +46,8 @@ class _Scope:
 
 
 class DirectForwarder:
-    def __init__(self, protocol, directory, secret: bytes, *, client_factory=GrpcClient,
+    def __init__(self, protocol, directory, secret, *, client_factory=GrpcClient,
                  discovery_ttl: float = 1) -> None:
-        if len(secret) < 32 or secret != secret.strip():
-            raise ValueError("Gate 直连需要至少 32 字节的内部鉴权密钥")
         self.protocol = protocol
         self.directory = directory
         self.secret = secret

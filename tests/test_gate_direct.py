@@ -1,17 +1,17 @@
 import asyncio
 import base64
 import hashlib
-import hmac
 import time
 
 import grpc
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from xuanming.cluster import EtcdDirectory, LocalDirectory
 from xuanming.nodes.gate import GateNode, Session
 from xuanming.nodes.gate_direct import DirectForwarder
 from xuanming.protocol import Protocol
 
-SECRET = b"test-direct-gate-hmac-key..........."
+SECRET = b"x" * 32
 
 
 def node(protocol, *, kind, zone=1, number=5, port=1234, track="", grpc_type=1):
@@ -54,10 +54,14 @@ def test_typed_direct_login_auth_and_reply_without_echo():
             assert metadata["x-caller-id"] == "gate"
             assert abs(int(metadata["x-caller-ts"]) - time.time_ns() // 1_000_000) < 3000
             canonical = "\n".join((
-                "mmorpg-login-caller-auth/v1", "gate", f"/{service}/Login",
+                "mmorpg-gate-identity/v2", "gate", f"/{service}/Login",
                 hashlib.sha256(subject).hexdigest(), metadata["x-caller-ts"], metadata["x-caller-nonce"],
             )).encode()
-            assert metadata["x-caller-sig"] == hmac.new(SECRET, canonical, "sha256").hexdigest()
+            assert len(metadata["x-caller-nonce"]) == 32
+            assert len(metadata["x-caller-sig"]) == 128
+            Ed25519PrivateKey.from_private_bytes(SECRET).public_key().verify(
+                bytes.fromhex(metadata["x-caller-sig"]), canonical
+            )
             if typed.account == "refused":
                 await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "native error")
             assert typed.account == "native"

@@ -10,7 +10,7 @@ from .cluster import BATTLE, GATE, SCENE, EtcdDirectory, KafkaCommands, LocalDir
 from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec, SqlitePlayerStore
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
-from .grpc_runtime import GrpcClient, GrpcUnavailable, serve_grpc
+from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc
 from .kill_switch import EtcdKillSwitch, KillSwitch
 from .node_link import GateLinks, SceneLinks
 from .nodes.battle import BattleNode
@@ -224,11 +224,11 @@ class Runtime:
         elif self.settings.gate_uses_router():
             client = GrpcClient(self.settings.router)
             self._stack.push_async_callback(client.close)
-            forward = RouterForwarder(self.protocol, client, secret("MMORPG_INTERNAL_AUTH_SECRET"))
+            forward = RouterForwarder(self.protocol, client, gate_signing_key())
         else:
             from .nodes.gate_direct import DirectForwarder
 
-            forward = DirectForwarder(self.protocol, self.directory, secret("MMORPG_INTERNAL_AUTH_SECRET"))
+            forward = DirectForwarder(self.protocol, self.directory, gate_signing_key())
             self._stack.push_async_callback(forward.close)
         gate_secret = secret("MMORPG_GATE_TOKEN_SECRET", fallback=secrets.token_bytes(32) if self.local else b"")
         gate = GateNode(self.protocol, info, gate_secret, forward, max_connections=info.max_connections)
