@@ -67,6 +67,25 @@ def test_drain_lease_routes_ticket_and_closes_lingering_connection():
     asyncio.run(exercise())
 
 
+def test_empty_drain_kafka_payload_does_not_cancel_live_lease():
+    async def exercise():
+        protocol = Protocol()
+        info = protocol.message("NodeInfo", node_id=1, zone_id=2, node_uuid="gate-a")
+        gate = GateNode(protocol, info, b"x" * 32, None)
+        gate.drain_migration.clock = lambda: 100.0
+        gate.drain_migration.lease(protocol.message("contracts.kafka.GateDrainMigrationEvent",
+                                                    rate_per_second=2, lease_ms=30000))
+        command = protocol.message("contracts.kafka.GateCommand", target_gate_id=1, target_instance_id="gate-a",
+                                   event_id=protocol.event_ids["ContractsKafkaGateDrainMigrationEvent"])
+        try:
+            await gate.command(command.SerializeToString())
+            assert (gate.drain_migration.rate, gate.drain_migration.deadline) == (2, 130.0)
+        finally:
+            await gate.close()
+
+    asyncio.run(exercise())
+
+
 def test_drain_ignores_stale_reply_and_respects_retries_and_role_selection():
     async def exercise():
         protocol = Protocol()

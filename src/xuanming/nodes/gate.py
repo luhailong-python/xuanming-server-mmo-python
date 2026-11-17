@@ -763,8 +763,7 @@ class GateNode:
         if (session and scene_uuid and session.scene_instance_id and scene_uuid != session.scene_instance_id
                 and request.message_content.message_id == self.protocol.message_ids["SceneClientPlayerCommonKickPlayer"]):
             return
-        if session and session.verified and (not player_id or session.player_id == player_id):
-            session.emit(request.message_content)
+        self._deliver_to_session(request.header.session_id, player_id, request.message_content)
 
     async def bind(self, event) -> None:
         session = self.sessions.get(event.session_id)
@@ -931,7 +930,7 @@ class GateNode:
                 return
             ids = self.protocol.event_ids
             event_id = command.event_id
-            if not command.payload and event_id != ids.get("ContractsKafkaGateDrainMigrationEvent"):
+            if not command.payload:
                 return
             if event_id == ids["ContractsKafkaBindSessionEvent"]:
                 await self.bind(self.protocol.parse("contracts.kafka.BindSessionEvent", command.payload))
@@ -962,6 +961,9 @@ class GateNode:
                         and (not event.login_generation or session.login_generation < event.login_generation)
                     )
                 ):
+                    if session.redirected:
+                        session.close()
+                        return
                     # The native Gate writes the reason before a graceful shutdown.
                     # Write synchronously into the transport so close() can flush it;
                     # enqueuing it would race with cancellation of the writer task.
@@ -1049,10 +1051,11 @@ class GateNode:
 
     def _deliver_to_session(self, session_id: int, player_id: int, content) -> None:
         session = self.sessions.get(session_id)
-        if session and session.verified and (not player_id or session.player_id == player_id):
+        if (session and session.verified and (not player_id or
+                session.player_id not in (0, (1 << 64) - 1) and session.player_id == player_id)):
             session.emit(content)
 
-    def broadcast(self, method: str, event) -> None:
+    def broadcast(self, method: str, event, *, scene_node_id: int = 0, scene_uuid: str = "") -> None:
         if not event.HasField("message_content"):
             return
         if method == "BroadcastToPlayers":
@@ -1077,13 +1080,18 @@ class GateNode:
                     session_id, event.player_list[index] if event.player_list else 0, event.message_content,
                 )
         elif method == "BroadcastToScene" and event.scene_id:
-            self._broadcast_all(event.message_content, scene_id=event.scene_id)
+            self._broadcast_all(event.message_content, scene_id=event.scene_id,
+                                scene_node_id=scene_node_id, scene_uuid=scene_uuid)
         elif method == "BroadcastToAll":
             self._broadcast_all(event.message_content)
 
-    def _broadcast_all(self, content, *, scene_id: int | None = None) -> None:
+    def _broadcast_all(self, content, *, scene_id: int | None = None,
+                       scene_node_id: int = 0, scene_uuid: str = "") -> None:
         for session in self.sessions.values():
-            if session.player_id and session.verified and (scene_id is None or scene_id == session.scene_id):
+            if (session.player_id not in (0, (1 << 64) - 1) and session.verified
+                    and (scene_id is None or scene_id == session.scene_id)
+                    and (not scene_node_id or session.scene_node_id == scene_node_id
+                         and session.scene_instance_id == scene_uuid)):
                 session.emit(content)
 
     async def close(self) -> None:

@@ -144,8 +144,9 @@ class GateRpcService:
             return b""
 
         async def broadcast(method: str, body: bytes) -> bytes:
-            await self._authorize(peer)
-            self.gate.broadcast(method, _parse(self.protocol, method + "Request", body))
+            source = await self._authorize(peer)
+            self.gate.broadcast(method, _parse(self.protocol, method + "Request", body),
+                                scene_node_id=source.node_id, scene_uuid=source.node_uuid)
             return b""
 
         ids = self.protocol.message_ids

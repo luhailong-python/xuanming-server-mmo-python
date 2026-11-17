@@ -61,3 +61,32 @@ def test_kick_identity_fence_and_notification_over_tcp():
         await gate.close()
 
     asyncio.run(exercise())
+
+
+def test_redirected_session_kick_closes_without_another_login_notice():
+    async def exercise():
+        protocol = Protocol()
+        async def forward(*args): pass
+        info = protocol.message("NodeInfo", node_id=1, zone_id=1, node_uuid="gate-kick")
+        gate = GateNode(protocol, info, b"x" * 32, forward)
+        async with await asyncio.start_server(gate.handle_client, "127.0.0.1", 0) as server:
+            reader, writer = await asyncio.open_connection(*server.sockets[0].getsockname()[:2])
+            try:
+                await write_packet(writer, Packet.from_message(gate.issue_ticket()))
+                assert protocol.parse("ClientTokenVerifyResponse", (await read_packet(reader)).payload).success
+                session = next(iter(gate.sessions.values()))
+                session.player_id, session.login_generation, session.redirected = 42, 4, True
+                event = protocol.message("contracts.kafka.KickPlayerEvent", session_id=session.session_id,
+                                         player_id=42, login_generation=5)
+                command = protocol.message("contracts.kafka.GateCommand", target_gate_id=info.node_id,
+                                           target_instance_id=info.node_uuid,
+                                           event_id=protocol.event_ids["ContractsKafkaKickPlayerEvent"],
+                                           payload=event.SerializeToString())
+                await gate.command(command.SerializeToString())
+                assert await asyncio.wait_for(read_packet(reader), 2) is None
+            finally:
+                writer.close()
+                with suppress(ConnectionError): await writer.wait_closed()
+        await gate.close()
+
+    asyncio.run(exercise())

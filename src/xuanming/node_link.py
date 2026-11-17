@@ -207,7 +207,8 @@ class GateLinks:
             async with push_lock:
                 if not ready or channel.closed:
                     raise RpcError(RpcErrorCode.NO_SERVICE)
-                result = self._on_broadcast(method, request)
+                result = (self._on_broadcast(method, request, scene_node_id=remote.node_id, scene_uuid=remote.node_uuid)
+                          if self._source_aware else self._on_broadcast(method, request))
                 if isawaitable(result):
                     await result
             return b""

@@ -88,6 +88,9 @@ def test_gate_rpc0_verifies_scene_and_shares_kafka_broadcast_delivery(monkeypatc
         directory.publish(scene)
         first = _session(gate, 4, 40)
         second = _session(gate, 7, 70, scene_id=20)
+        other_scene = _session(gate, 8, 80, scene_id=20)
+        second.scene_node_id = 3
+        other_scene.scene_node_id, other_scene.scene_instance_id = 4, "other-scene"
         unbound = _session(gate, 10, 0)
         content = p.content(31, 9, body=b"broadcast-content")
         unicast = p.message("NodeRouteMessageRequest", message_content=content,
@@ -147,11 +150,20 @@ def test_gate_rpc0_verifies_scene_and_shares_kafka_broadcast_delivery(monkeypatc
                 await _call(channel, p, "BroadcastToScene", p.message(
                     "BroadcastToSceneRequest", scene_id=20, message_content=content,
                 ))
-                assert second.outbound.get_nowait() == content and first.outbound.empty()
+                assert second.outbound.get_nowait() == content and first.outbound.empty() and other_scene.outbound.empty()
+                kafka_scene = p.message("contracts.kafka.BroadcastToSceneEvent", scene_id=20, message_content=content)
+                await gate.command(p.message(
+                    "contracts.kafka.GateCommand", target_gate_id=gate.info.node_id,
+                    target_instance_id=gate.info.node_uuid,
+                    event_id=p.event_ids["ContractsKafkaBroadcastToSceneEvent"],
+                    payload=kafka_scene.SerializeToString(),
+                ).SerializeToString())
+                assert second.outbound.get_nowait() == other_scene.outbound.get_nowait() == content
                 await _call(channel, p, "BroadcastToAll", p.message("BroadcastToAllRequest"))
                 assert first.outbound.empty() and second.outbound.empty()
                 await _call(channel, p, "BroadcastToAll", p.message("BroadcastToAllRequest", message_content=content))
                 assert first.outbound.get_nowait() == second.outbound.get_nowait() == content
+                assert other_scene.outbound.get_nowait() == content
                 assert unbound.outbound.empty()
                 directory.publish(_node(p, SCENE, 3, "replacement"))
                 with pytest.raises(RpcError) as failure:
@@ -213,6 +225,9 @@ def test_verified_scene_reverse_link_can_broadcast():
         p, directory = Protocol(), LocalDirectory()
         gate = _gate(p)
         client = _session(gate, 3, 88)
+        client.scene_node_id = 6
+        other_scene = _session(gate, 4, 89)
+        other_scene.scene_node_id, other_scene.scene_instance_id = 7, "other-scene"
         scene_info = _node(p, SCENE, 6, "scene")
         scene = SceneLinks(p, scene_info, directory)
         content = p.content(31, 5, body=b"reverse-push")
@@ -220,7 +235,8 @@ def test_verified_scene_reverse_link_can_broadcast():
 
         async def enter(request, gate_uuid):
             peer = scene._peers[gate_uuid]
-            await _call(peer.channel, p, "BroadcastToAll", p.message("BroadcastToAllRequest", message_content=content))
+            await _call(peer.channel, p, "BroadcastToScene", p.message(
+                "BroadcastToSceneRequest", scene_id=client.scene_id, message_content=content))
             return p.message("Empty")
 
         scene.bind(SimpleNamespace(enter=enter))
@@ -232,11 +248,25 @@ def test_verified_scene_reverse_link_can_broadcast():
                 request = p.message("PlayerEnterGameNodeRequest", player_id=88, session_id=client.session_id)
                 await links.call(6, p.message_ids["ScenePlayerEnterGameNode"], request, timeout=2)
                 assert client.outbound.get_nowait() == content
+                assert other_scene.outbound.empty()
             finally:
                 await links.close()
                 await scene.close()
 
     asyncio.run(exercise())
+
+
+def test_unbound_sentinel_is_not_a_targeted_or_broadcast_player():
+    p = Protocol()
+    gate = _gate(p)
+    unbound = _session(gate, 3, (1 << 64) - 1)
+    content = p.content(31, 5, body=b"private")
+    gate._deliver_to_session(unbound.session_id, unbound.player_id, content)
+    gate.broadcast("BroadcastToAll", p.message("BroadcastToAllRequest", message_content=content))
+    assert unbound.outbound.empty()
+    # Legacy zero target is deliberately unfenced, including before binding.
+    gate._deliver_to_session(unbound.session_id, 0, content)
+    assert unbound.outbound.get_nowait() == content
 
 
 def test_runtime_advertises_distinct_gate_ports_and_flushes_admin_reply(tmp_path, monkeypatch):
