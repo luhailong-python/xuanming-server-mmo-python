@@ -1,7 +1,7 @@
 import ipaddress
 import os
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 
@@ -50,6 +50,7 @@ class Settings:
     redis_cluster: bool = False
     scene_control_redis: str = ""
     match: str = ""
+    data_service_node: dict = field(default_factory=dict)  # raw [data_service_node], parsed by data_service.config
 
     @classmethod
     def load(cls, path: Path | None):

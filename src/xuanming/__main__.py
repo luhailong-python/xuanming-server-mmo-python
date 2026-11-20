@@ -51,6 +51,8 @@ def main() -> None:
     ticket.add_argument("--config", type=Path)
     portal = commands.add_parser("portal", help="启动 HTTP 门户")
     portal.add_argument("--config", type=Path, required=True)
+    data_service = commands.add_parser("data-service", help="启动 data_service（账号目录/路由/名字/号段）")
+    data_service.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -75,6 +77,10 @@ def main() -> None:
             from .portal import load_settings, run_portal
 
             asyncio.run(run_portal(load_settings(args.config)))
+        elif args.command == "data-service":
+            from .data_service.node import run as run_data_service
+
+            asyncio.run(run_data_service(Settings.load(args.config)))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

@@ -53,3 +53,17 @@ node_id = 104
 host = "0.0.0.0"
 grpc_port = 53000
 advertise_host = "login-104"
+
+[data_service_node]
+node_id = 105
+host = "0.0.0.0"
+grpc_port = 9000
+advertise_host = "data-service"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_global"
+logical_shards = 1
+max_players_per_account = 5
+storage_ids = [1000000]
+merged_zone_refresh_sec = 5
