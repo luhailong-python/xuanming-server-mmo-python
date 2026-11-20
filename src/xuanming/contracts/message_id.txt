@@ -385,3 +385,10 @@
 10000=MonopolyClientPlayerGetBoard
 10001=MonopolyClientPlayerRollDice
 10002=MonopolyClientPlayerUpgradeLandmark
+394=ClientPlayerLoginRenewSession
+395=LoginPreGateGetZoneRoleCount
+423=LoginPreGateSubmitRealName
+424=LoginPreGateRequestAccountDeletion
+425=LoginPreGateCancelAccountDeletion
+426=LoginAdminScheduleAccountDeletion
+427=LoginAdminResetAccountRealName

@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import AsyncExitStack
 
-from .cluster import BATTLE, GATE, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
+from .cluster import BATTLE, GATE, LOGIN, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
 from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec, SqlitePlayerStore
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
@@ -73,6 +73,7 @@ class Runtime:
         self._battle_agones = None
         self._scene_agones = None
         self.battle_info = None
+        self.login_info = None
         self._local_outcomes: dict[int, asyncio.Task] = {}
         self._local_notices: set[asyncio.Task] = set()
         self._kill_switches: dict[str, KillSwitch] = {}
@@ -96,8 +97,10 @@ class Runtime:
                 )
                 self._stack.push_async_callback(self.kafka.close)
                 node_settings = getattr(self.settings, self.role)
-                await self.kafka.start(self.role if self.role != "battle" else None, node_settings.node_id)
-                await {"gate": self._gate, "scene": self._scene, "battle": self._battle}[self.role]()
+                consumes = self.role in ("gate", "scene")
+                await self.kafka.start(self.role if consumes else None, node_settings.node_id)
+                await {"gate": self._gate, "scene": self._scene, "battle": self._battle,
+                       "login": self._login}[self.role]()
         except BaseException:
             await self.__aexit__(None, None, None)
             raise
@@ -197,13 +200,13 @@ class Runtime:
         )
         self._websocket_servers.append(server)
 
-    async def _listen_grpc(self, role, info, services) -> None:
-        options = getattr(self.settings, role)
-        address = grpc_address(options.host, options.grpc_port)
+    async def _listen_grpc(self, role, info, services, **options) -> None:
+        node = getattr(self.settings, role)
+        address = grpc_address(node.host, node.grpc_port)
         server, port = await serve_grpc(self.protocol, address, services,
-                                        kill_switch=self._kill_switches.get(info.node_uuid))
+                                        kill_switch=self._kill_switches.get(info.node_uuid), **options)
         self._stack.push_async_callback(server.stop, 3)
-        info.grpc_endpoint.ip = options.advertise_host or options.host
+        info.grpc_endpoint.ip = node.advertise_host or node.host
         info.grpc_endpoint.port = port
 
     async def _publish(self, info, load=None) -> None:
@@ -293,6 +296,46 @@ class Runtime:
             info.ClearField("client_endpoint")
         else:
             info.client_endpoint.ip, info.client_endpoint.port = address
+
+    async def _login(self) -> None:
+        from redis.asyncio import Redis, RedisCluster
+
+        from .login.caller_auth import CallerVerifier
+        from .login.config import LoginConfig
+        from .login.directory import DataService
+        from .login.service import LoginService, ServiceContext
+        from .login.sessions import PlayerLocator
+        from .login.tokens import TokenManager
+
+        info = self._info("login", LOGIN)
+        info.protocol_type = 1  # GRPC: gates discover Login by grpc_endpoint
+        config = LoginConfig.from_env(self.settings.zone_id)
+        redis_type = RedisCluster if self.settings.redis_cluster else Redis
+        redis = {}
+        for name, url in (("player", self.settings.redis), ("login", self.settings.login_redis or self.settings.redis)):
+            redis[name] = redis_type.from_url(url, decode_responses=False, socket_connect_timeout=3, socket_timeout=3)
+            self._stack.push_async_callback(redis[name].aclose)
+            await redis[name].ping()
+        clients = {}
+        for name, timeout in (("player_locator", 5), ("scene_manager", 13.5), ("data_service", 3)):
+            clients[name] = GrpcClient(getattr(self.settings, name), timeout=timeout)
+            self._stack.push_async_callback(clients[name].close)
+
+        async def publish(gate_node_id, command, key):
+            await self.kafka.publish("gate", gate_node_id, command, key=key)
+
+        context = ServiceContext(
+            protocol=self.protocol, config=config, login_redis=redis["login"], player_redis=redis["player"],
+            tokens=TokenManager(redis["login"]), locator=PlayerLocator(self.protocol, clients["player_locator"].call),
+            data=DataService(self.protocol, clients["data_service"].call, config.directory_secret),
+            scene_manager_call=clients["scene_manager"].call, publish=publish, directory=self.directory,
+        )
+        self._stack.push_async_callback(context.close)
+        service = LoginService(context, CallerVerifier.from_env())
+        await self._listen_grpc("login", info, service.services(), pass_context=True)
+        info.endpoint.CopyFrom(info.grpc_endpoint)
+        self.login_info = info
+        await self._publish(info)
 
     async def _scene(self) -> None:
         info = self._info("scene", SCENE)

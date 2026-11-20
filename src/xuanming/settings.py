@@ -23,6 +23,7 @@ class Settings:
     gate: NodeSettings = NodeSettings(1, port=8610)
     scene: NodeSettings = NodeSettings(2, port=8611, grpc_port=8612)
     battle: NodeSettings = NodeSettings(3, port=8613, grpc_port=8614)
+    login: NodeSettings = NodeSettings(1, grpc_port=53000)
     zone_id: int = 1
     scene_node_type: int = 0
     physical_region: int = 1
@@ -43,7 +44,9 @@ class Settings:
     player_inbox: str = ""
     data_service: str = ""
     scene_manager: str = ""
+    player_locator: str = ""
     redis: str = ""
+    login_redis: str = ""
     redis_cluster: bool = False
     scene_control_redis: str = ""
     match: str = ""
@@ -55,7 +58,7 @@ class Settings:
         with path.open("rb") as config:
             values = tomllib.load(config)
         defaults = cls()
-        for role in ("gate", "scene", "battle"):
+        for role in ("gate", "scene", "battle", "login"):
             if role in values:
                 settings = getattr(defaults, role)
                 merged = {field.name: getattr(settings, field.name) for field in fields(settings)}
@@ -101,6 +104,8 @@ class Settings:
             raise ValueError("集群 Scene 需要 DataService、SceneManager、PlayerInbox 和玩家域 Redis")
         if role in ("scene", "battle") and not self.match:
             raise ValueError(f"集群 {role} 需要 Match 的 gRPC 地址")
+        if role == "login" and not all((self.data_service, self.scene_manager, self.player_locator, self.redis)):
+            raise ValueError("集群 Login 需要 DataService、SceneManager、PlayerLocator 和玩家域 Redis")
 
 
 def secret(name: str, *, fallback: bytes = b"") -> bytes:

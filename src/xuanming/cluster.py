@@ -9,7 +9,7 @@ from .protocol import Protocol
 
 logger = logging.getLogger(__name__)
 
-GATE, SCENE, BATTLE, ROUTER, PLAYER_STORE = 4, 3, 28, 29, 31
+GATE, SCENE, LOGIN, BATTLE, ROUTER, PLAYER_STORE = 4, 3, 5, 28, 29, 31
 
 
 def command_route(role: str, node_id: int, *, generation: int = 1, partitions: int = 256):

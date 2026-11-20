@@ -13,8 +13,10 @@ player_store = "db:6000"
 player_inbox = "player-inbox:50950"
 data_service = "data-service:9000"
 scene_manager = "scene-manager:60000"
+player_locator = "player-locator:50300"
 redis = "redis://redis-player:6379/0"
 redis_cluster = false
+login_redis = "redis://redis-login:6379/0"
 scene_control_redis = "redis://redis-scene-control:6379/0"
 match = "match:50500"
 anomaly_journal = "/var/lib/xuanming/asset-anomaly.json"
@@ -45,3 +47,9 @@ advertise_host = "battle-103"
 client_host = "battle-103.example.com"
 client_port = 8613
 websocket_port = 8617
+
+[login]
+node_id = 104
+host = "0.0.0.0"
+grpc_port = 53000
+advertise_host = "login-104"

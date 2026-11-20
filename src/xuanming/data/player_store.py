@@ -790,14 +790,14 @@ class DataServicePlayerStore(_SnapshotStore):
             raise StoreUnavailable(f"{path} 超出重试预算") from exc
 
 
-def _sign_request(request: Message, path: str, secret: bytes) -> bytes:
+def _sign_request(request: Message, path: str, secret: bytes, *, caller: str = "scene") -> bytes:
     signed = type(request)()
     signed.CopyFrom(request)
     signed.ClearField("auth")
     digest = hashlib.sha256(signed.SerializeToString(deterministic=True)).hexdigest()
     now_ms = time.time_ns() // 1_000_000
-    content = f"v1\n{path}\nscene\n{now_ms}\n{digest}".encode()
-    signed.auth.caller = "scene"
+    content = f"v1\n{path}\n{caller}\n{now_ms}\n{digest}".encode()
+    signed.auth.caller = caller
     signed.auth.timestamp_ms = now_ms
     signed.auth.signature_hex = hmac.digest(secret, content, "sha256").hex()
     return signed.SerializeToString(deterministic=True)

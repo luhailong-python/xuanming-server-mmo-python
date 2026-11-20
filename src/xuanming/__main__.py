@@ -24,8 +24,7 @@ async def run(args) -> None:
     try:
         async with runtime:
             infos = [node.info for node in (runtime.gate, runtime.scene) if node]
-            if runtime.battle:
-                infos.append(runtime.battle_info)
+            infos.extend(info for info in (runtime.battle_info, runtime.login_info) if info)
             for info in infos:
                 logger.info(
                     "节点就绪 type=%d zone=%d node_id=%d tcp=%s:%d grpc_port=%d",
@@ -45,7 +44,7 @@ def main() -> None:
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser("run", help="启动服务端节点")
-    server.add_argument("role", choices=("local", "gate", "scene", "battle"))
+    server.add_argument("role", choices=("local", "gate", "scene", "battle", "login"))
     server.add_argument("--config", type=Path)
     commands.add_parser("smoke", help="用真实 TCP 与 gRPC 运行本地端到端验证")
     ticket = commands.add_parser("gate-ticket", help="使用本机设置的密钥签发开发 Gate 票据")

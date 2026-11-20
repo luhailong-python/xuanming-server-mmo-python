@@ -75,7 +75,8 @@ class GrpcClient:
         await self.channel.close()
 
 
-async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_switch=None):
+async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_switch=None, pass_context=False):
+    """Serve unary handlers; with ``pass_context`` they are called as ``handler(request, context, path)``."""
     server = grpc.aio.server(options=(("grpc.so_reuseport", 0),))
     for service_name, handlers in services.items():
         descriptor = protocol.pool.FindServiceByName(service_name)
@@ -83,7 +84,8 @@ async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_s
         for name, handler in handlers.items():
             method = descriptor.methods_by_name[name]
             methods[name] = grpc.unary_unary_rpc_method_handler(
-                _grpc_handler(handler, kill_switch=kill_switch, service=service_name, method=name),
+                _grpc_handler(handler, kill_switch=kill_switch, service=service_name, method=name,
+                              pass_context=pass_context),
                 request_deserializer=protocol.message_class(method.input_type.full_name).FromString,
                 response_serializer=lambda message: message.SerializeToString(),
             )
@@ -95,7 +97,7 @@ async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_s
     return server, port
 
 
-def _grpc_handler(handler, *, kill_switch=None, service="", method=""):
+def _grpc_handler(handler, *, kill_switch=None, service="", method="", pass_context=False):
     async def invoke(request, context):
         try:
             rule = kill_switch.check(service, method) if kill_switch is not None else None
@@ -104,7 +106,7 @@ def _grpc_handler(handler, *, kill_switch=None, service="", method=""):
                             grpc.StatusCode.UNAVAILABLE)
                 reason = f", reason: {rule.reason}" if rule.reason else ""
                 await context.abort(code, f"killswitch: method /{service}/{method} is disabled{reason}")
-            response = handler(request)
+            response = handler(request, context, f"/{service}/{method}") if pass_context else handler(request)
             if inspect.isawaitable(response):
                 response = await response
             return response
