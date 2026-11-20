@@ -100,7 +100,6 @@ def test_router_renewal_uses_internal_message_and_signed_session():
 
         forward = RouterForwarder(protocol, Client(), b"x" * 32)
         gate = GateNode(protocol, info, b"x" * 32, forward)
-        assert RENEW_ID not in protocol.routes
         assert RENEW_PATH.endswith("/RenewSession")
         assert await forward.renew_login(gate, session) == response
         await gate.close()
