@@ -1,6 +1,6 @@
 """Announcement administration using the existing portal SQL schema."""
 
-import time
+import secrets
 from datetime import datetime, timezone
 
 from aiohttp import web
@@ -9,16 +9,8 @@ from .portal_admin_auth import authorize
 from .portal_sql import connection
 
 
-_last_id = 0
-_EPOCH = 1767225600
-
-
 def _next_id():
-    global _last_id
-    _last_id = max(_last_id + 1, int(time.time()) - _EPOCH)
-    if not 0 < _last_id < 2**31:
-        raise RuntimeError("announcement identifier exhausted")
-    return _last_id
+    return secrets.randbits(62) | 1
 
 
 def _date(value):

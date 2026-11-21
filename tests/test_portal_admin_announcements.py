@@ -52,7 +52,11 @@ def test_admin_auth_and_announcement_lifecycle():
                                          json={"id": 12, "title": "test", "type": "notice"})
             assert response.status == 200
             created = await response.json()
-            assert created["id"] != 12
+            assert created["id"] != 12 and 0 < created["id"] < 2**62
+            second = await (await client.post("/admin/announcements", headers=headers,
+                                              json={"title": "second", "type": "notice"})).json()
+            assert second["id"] != created["id"] and 0 < second["id"] < 2**62
+            assert (await client.delete(f"/admin/announcements/{second['id']}", headers=headers)).status == 204
             response = await client.get("/admin/announcements", headers=headers)
             assert (await response.json())[0]["id"] == created["id"]
             assert (await client.delete(f"/admin/announcements/{created['id']}", headers=headers)).status == 204

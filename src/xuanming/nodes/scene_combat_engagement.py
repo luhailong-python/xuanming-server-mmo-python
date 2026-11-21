@@ -119,23 +119,6 @@ class SceneCombatEngagement:
         elif attacker_is_npc and not target_is_npc:
             self._share_npc_fight(attacker, target)
 
-    def record_heal(self, healer, target) -> None:
-        """Record a real heal and add its healer to engaged NPCs' aggro rosters."""
-        if not self._can_engage(healer, target):
-            return
-        self._engage(healer, target, hostile=False)
-        if self._is_npc(healer):
-            return
-        state = self._actors.get(target.entity)
-        hostile_npcs = tuple(
-            record.other for record in state.records.values()
-            if record.hostile and self._is_npc(record.other) and record.other is not healer
-        ) if state is not None and state.actor is target else ()
-        for npc in hostile_npcs:
-            if self._can_engage(healer, npc):
-                self._engage(healer, npc, hostile=True)
-                self._share_npc_fight(npc, healer)
-
     def _leave_roster(self, npc, fighter) -> None:
         if not self._is_npc(npc):
             return

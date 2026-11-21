@@ -9,6 +9,7 @@ import time
 import grpc
 
 from ..data import PlayerRowKind
+from ..data.asset_inventory import carries_unknown
 from ..grpc_runtime import GrpcClient
 from .battle_control import sign_service_call
 
@@ -53,16 +54,15 @@ def valid_entry(entry):
         total += item.count
         if total > _MAX_ITEMS:
             return False
-    copy = type(entry)()
-    copy.CopyFrom(entry)
-    copy.DiscardUnknownFields()
-    return copy.SerializeToString(deterministic=True) == entry.SerializeToString(deterministic=True)
+    return not carries_unknown(entry)
 
 
 class MailSender:
     def __init__(self, protocol, directory):
         self.protocol, self.directory = protocol, directory
         self.clients = {}
+        self._inflight = {}
+        self._retired = set()
 
     @staticmethod
     def secret():
@@ -78,8 +78,22 @@ class MailSender:
                  and node.node_uuid and node.grpc_endpoint.ip and 0 < node.grpc_endpoint.port < 65536]
         if not nodes:
             raise RuntimeError("no ready mail node")
-        endpoint = random.choice(nodes).grpc_endpoint
-        address = f"[{endpoint.ip}]:{endpoint.port}" if ":" in endpoint.ip else f"{endpoint.ip}:{endpoint.port}"
+        addresses = [
+            f"[{ep.ip}]:{ep.port}" if ":" in ep.ip and not ep.ip.startswith("[") else f"{ep.ip}:{ep.port}"
+            for ep in (node.grpc_endpoint for node in nodes)
+        ]
+        active = set(addresses)
+        retired = []
+        for ep in tuple(self.clients):
+            if ep not in active:
+                stale = self.clients.pop(ep)
+                if self._inflight.get(stale, 0):
+                    self._retired.add(stale)
+                else:
+                    retired.append(stale)
+        if retired:
+            await asyncio.gather(*(client.close() for client in retired), return_exceptions=True)
+        address = random.choice(addresses)
         client = self.clients.get(address)
         if client is None:
             client = self.clients[address] = GrpcClient(address, timeout=5, enable_retries=False)
@@ -88,12 +102,25 @@ class MailSender:
         for item in entry.items:
             request.attachments.items.add(config_id=item.config_id, count=item.count)
         sign_service_call(_PATH, request, "battle", time.time_ns() // 1_000_000, secret)
-        raw = await client.call(_PATH, request.SerializeToString())
+        self._inflight[client] = self._inflight.get(client, 0) + 1
+        try:
+            raw = await client.call(_PATH, request.SerializeToString())
+        finally:
+            remaining = self._inflight.get(client, 1) - 1
+            if remaining > 0:
+                self._inflight[client] = remaining
+            else:
+                self._inflight.pop(client, None)
+                if client in self._retired:
+                    self._retired.discard(client)
+                    await client.close()
         return self.protocol.parse("mailpb.SendMailResponse", raw)
 
     async def close(self):
-        await asyncio.gather(*(client.close() for client in self.clients.values()), return_exceptions=True)
+        clients = set(self.clients.values()) | self._retired
         self.clients.clear()
+        self._retired.clear()
+        await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
 
 
 class SceneMailOutbox:

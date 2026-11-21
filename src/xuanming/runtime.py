@@ -7,7 +7,7 @@ import uuid
 from contextlib import AsyncExitStack
 
 from .cluster import BATTLE, GATE, LOGIN, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
-from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec, SqlitePlayerStore
+from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
 from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc
@@ -77,6 +77,12 @@ class Runtime:
         self._local_outcomes: dict[int, asyncio.Task] = {}
         self._local_notices: set[asyncio.Task] = set()
         self._kill_switches: dict[str, KillSwitch] = {}
+        self._tables: ConfigTables | None = None
+
+    def _config_tables(self) -> ConfigTables:
+        if self._tables is None:
+            self._tables = ConfigTables()
+        return self._tables
 
     async def __aenter__(self):
         self.settings.validate(self.role)
@@ -340,7 +346,7 @@ class Runtime:
     async def _scene(self) -> None:
         info = self._info("scene", SCENE)
         switch = self._configure_kill_switch(info)
-        tables = ConfigTables()
+        tables = self._config_tables()
         audit = anomaly = allocate_tx_id = None
         if self.local:
             self.settings.database.parent.mkdir(parents=True, exist_ok=True)
@@ -408,7 +414,6 @@ class Runtime:
         )
         await scene.assets.anomaly.start()
         self._stack.push_async_callback(scene.assets.close)
-        self._stack.push_async_callback(scene.close)
         scene.assets.register_client_handlers()
         Monopoly(scene).register()
         methods.update(scene.assets.grpc_methods())
@@ -450,7 +455,6 @@ class Runtime:
         scene.skill_casts = skills.casts
         scene.buffs = skills.casts.buffs
         scene.buffs.visibility_changed = scene.refresh_actor_visibility
-        self._stack.push_async_callback(skills.close)
 
         def initialize(data):
             if self.local:
@@ -471,7 +475,6 @@ class Runtime:
         if not self.local:
             self._scene_agones = SceneAgones.from_env()
             if self._scene_agones is not None:
-                self._stack.push_async_callback(self._scene_agones.close)
                 self._scene_agones.start()
                 self._spawn(self._scene_agones.watch_drain(self.request_shutdown), "scene-agones-drain")
 
@@ -554,7 +557,6 @@ class Runtime:
                 match_client=MatchClient(self.directory, self.settings.match),
             )
             self._battle_control = control
-            self._stack.push_async_callback(control.close)
         battle_secret = secret(
             "MMORPG_BATTLE_TOKEN_SECRET", fallback=secrets.token_bytes(32) if self.local else b"",
         )
@@ -593,7 +595,7 @@ class Runtime:
             on_confirm=local_confirm if self.local else control.confirm,
             on_spectate_frame=None if self.local else control.spectate,
             on_rooms_changed=lifecycle.rooms_changed if lifecycle is not None else None,
-            tables=ConfigTables(),
+            tables=self._config_tables(),
         )
         battle.kill_switch = switch
         if control is not None:
@@ -626,7 +628,6 @@ class Runtime:
         self._stack.callback(battle.close)
         if self.local:
             self._stack.push_async_callback(self._finish_local_outcomes)
-        self._stack.push_async_callback(clients.close)
         await self._listen_tcp("battle", info, clients.serve)
         await self._listen_websocket("battle", clients.serve_websocket)
         agones_endpoint = await lifecycle.client_endpoint() if endpoint.source == "agones" else None

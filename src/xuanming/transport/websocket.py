@@ -6,7 +6,7 @@ import asyncio
 
 from websockets.exceptions import ConnectionClosed
 
-from .framing import DEFAULT_GATE_FRAME_SIZE, FrameError, decode_packet
+from .framing import DEFAULT_GATE_FRAME_SIZE, FrameError, _MIN_PACKET_SIZE, _check_frame
 
 _MAX_OUTGOING_SIZE = (1 << 31) - 1
 
@@ -25,7 +25,7 @@ class WebSocketPacketReader:
                 raise asyncio.IncompleteReadError(b"", size) from exc
             if not isinstance(frame, bytes):
                 raise FrameError("WebSocket 客户端只允许发送二进制消息")
-            decode_packet(frame, max_size=self.max_size)
+            _check_frame(frame, _MIN_PACKET_SIZE, self.max_size)
             self._buffer.extend(frame)
         if len(self._buffer) < size:
             raise FrameError("一个 WebSocket 消息必须只包含一条完整协议帧")
@@ -66,7 +66,7 @@ class WebSocketPacketWriter:
             return
         frame = bytes(self._pending)
         self._pending.clear()
-        decode_packet(frame, max_size=self.max_size)
+        _check_frame(frame, _MIN_PACKET_SIZE, self.max_size)
         self._sending_size = len(frame)
         try:
             await self.websocket.send(frame)

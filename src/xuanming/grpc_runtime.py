@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import inspect
 import os
 import re
@@ -9,8 +10,40 @@ import time
 import grpc
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from google.protobuf.message import Message
 
 from .protocol import Protocol
+
+_SIGNATURE_WINDOW_MS = 300_000
+
+
+def service_digest(message: Message) -> str:
+    canonical = type(message)()
+    canonical.CopyFrom(message)
+    canonical.ClearField("auth")
+    return hashlib.sha256(canonical.SerializeToString(deterministic=True)).hexdigest()
+
+
+def _service_signature(path: str, caller: str, timestamp: int, digest: str, secret: bytes) -> str:
+    canonical = "\n".join(("v1", path, caller, str(timestamp), digest)).encode("ascii")
+    return hmac.digest(secret, canonical, "sha256").hex()
+
+
+def sign_service_call(path: str, message: Message, caller: str, timestamp: int, secret: bytes) -> None:
+    signature = _service_signature(path, caller, timestamp, service_digest(message), secret)
+    message.auth.caller = caller
+    message.auth.timestamp_ms = timestamp
+    message.auth.signature_hex = signature
+
+
+def verify_service_call(path: str, message: Message, caller: str, timestamp: int, secret: bytes) -> bool:
+    auth = message.auth
+    sent = auth.timestamp_ms
+    if (auth.caller != caller or not 0 < sent < (1 << 63) or abs(timestamp - sent) > _SIGNATURE_WINDOW_MS
+            or len(auth.signature_hex) != 64 or not auth.signature_hex.isascii()):
+        return False
+    expected = _service_signature(path, caller, sent, service_digest(message), secret)
+    return hmac.compare_digest(expected, auth.signature_hex)
 
 
 class GrpcUnavailable(RuntimeError):

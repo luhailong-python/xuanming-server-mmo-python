@@ -174,3 +174,42 @@ def test_full_bags_commit_outbox_with_settlement_before_sending(tmp_path):
             await scene.close()
 
     asyncio.run(exercise())
+
+
+def test_mail_sender_closes_retired_clients_on_endpoint_change(monkeypatch):
+    async def exercise():
+        protocol = Protocol()
+        monkeypatch.setenv("MAIL_PRODUCER_SECRET_BATTLE", "battle-secret-01234567890123456789")
+        ports = [10001]
+        closed = []
+
+        class Directory:
+            async def candidates(self, node_type, zone):
+                return [protocol.message("NodeInfo", node_type=8, protocol_type=1, node_uuid=f"mail-{p}",
+                                         grpc_endpoint={"ip": "127.0.0.1", "port": p}) for p in ports]
+
+        class Client:
+            def __init__(self, address, **_kwargs):
+                self.address = address
+
+            async def call(self, _path, _data):
+                return protocol.message("mailpb.SendMailResponse", mail_id=55).SerializeToString()
+
+            async def close(self):
+                closed.append(self.address)
+
+        monkeypatch.setattr("xuanming.nodes.scene_mail_outbox.GrpcClient", Client)
+        sender = MailSender(protocol, Directory())
+        entry = protocol.message("MailOutboxEntry", request_id=13, source=1, source_id=10,
+                                 title="奖励", body="正文", items=[{"config_id": 11, "count": 3}])
+        try:
+            assert (await sender(7, entry)).mail_id == 55
+            assert list(sender.clients) == ["127.0.0.1:10001"]
+            ports[:] = [10002]
+            assert (await sender(7, entry)).mail_id == 55
+            assert list(sender.clients) == ["127.0.0.1:10002"] and closed == ["127.0.0.1:10001"]
+        finally:
+            await sender.close()
+        assert closed == ["127.0.0.1:10001", "127.0.0.1:10002"]
+
+    asyncio.run(exercise())

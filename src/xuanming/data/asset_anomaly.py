@@ -150,14 +150,45 @@ class _AnomalyJournal:
     def claim(self, worker_id: str, now: int) -> tuple[str, bytes] | None:
         with self._locked():
             document = self._read()
+            kept = []
+            claimed = None
+            dirty = False
             for item in document["outbox"]:
-                if int(item.get("lease_until", 0)) > now:
-                    return None
+                if claimed is not None:
+                    kept.append(item)
+                    continue
+                if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                        or not isinstance(item.get("payload"), str)):
+                    logger.error("丢弃损坏的持久资产告警条目: %r", item)
+                    dirty = True
+                    continue
+                try:
+                    lease_until = int(item.get("lease_until", 0))
+                except (TypeError, ValueError):
+                    logger.error("丢弃租约无效的持久资产告警 id=%s", item["id"])
+                    dirty = True
+                    continue
+                if lease_until > now:
+                    kept.append(item)
+                    continue
+                try:
+                    payload = base64.b64decode(item["payload"], validate=True)
+                    parsed = json.loads(payload)
+                    if not isinstance(parsed, dict) or "player_id" not in parsed:
+                        raise ValueError("missing player_id")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    logger.error("丢弃载荷损坏的持久资产告警 id=%s", item["id"])
+                    dirty = True
+                    continue
                 item["lease_owner"] = worker_id
                 item["lease_until"] = now + 30
+                kept.append(item)
+                claimed = (item["id"], payload)
+                dirty = True
+            if dirty:
+                document["outbox"] = kept
                 self._write(document)
-                return item["id"], base64.b64decode(item["payload"], validate=True)
-            return None
+            return claimed
 
     def acknowledge(self, alert_id: str, worker_id: str) -> None:
         with self._locked():
@@ -254,7 +285,7 @@ class AssetAnomaly:
             threshold.count, threshold.amount, threshold.window_seconds,
         )
         if self.emit is not None and payload is not None:
-            self._enqueue(player_id, payload)
+            self._enqueue(player_id, payload, persisted=self._journal is not None)
         return True
 
     def _record_memory(self, player, gain, timestamp, threshold) -> bool:
@@ -297,8 +328,8 @@ class AssetAnomaly:
         if player is not None and self.is_current(player):
             player.asset_anomaly = None
 
-    def _enqueue(self, player_id: int, payload: bytes) -> None:
-        if self._journal is not None:
+    def _enqueue(self, player_id: int, payload: bytes, *, persisted: bool = False) -> None:
+        if persisted:
             if self._started:
                 self._wake.set()
                 self._ensure_worker()
@@ -307,6 +338,7 @@ class AssetAnomaly:
             logger.error("资产告警队列不可用 player_id=%s", player_id)
             return
         self._pending.put_nowait((player_id, payload))
+        self._wake.set()
         self._ensure_worker()
 
     def _ensure_worker(self) -> None:
@@ -319,15 +351,10 @@ class AssetAnomaly:
             self._worker = None
         if self._closed or self.emit is None:
             return
-        if self._journal is None and not self._pending.empty():
-            self._ensure_worker()
-        elif self._journal is not None and self._started and self._wake.is_set():
+        if not self._pending.empty() or (self._journal is not None and self._started and self._wake.is_set()):
             self._ensure_worker()
 
-    async def _publish(self) -> None:
-        if self._journal is not None:
-            await self._publish_journal()
-            return
+    async def _drain_pending(self) -> None:
         while not self._pending.empty():
             player_id, payload = self._pending.get_nowait()
             try:
@@ -338,25 +365,42 @@ class AssetAnomaly:
             except Exception:
                 logger.exception("发布资产收益告警失败 player_id=%s", player_id)
 
+    async def _wait(self, seconds: float) -> None:
+        if self._closed or not self._pending.empty():
+            return
+        self._wake.clear()
+        if self._closed or not self._pending.empty():
+            return
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=seconds)
+        except TimeoutError:
+            pass
+
+    async def _publish(self) -> None:
+        await self._drain_pending()
+        if self._journal is not None and self._started:
+            await self._publish_journal()
+        await self._drain_pending()
+
     async def _publish_journal(self) -> None:
         while not self._closed:
+            await self._drain_pending()
             try:
                 item = await asyncio.to_thread(self._journal.claim, self._worker_id, int(time.time()))
             except Exception:
                 logger.exception("读取持久资产告警失败")
-                await asyncio.sleep(1)
+                await self._drain_pending()
+                await self._wait(1)
                 continue
             if item is None:
+                if not self._pending.empty():
+                    continue
                 try:
                     if not await asyncio.to_thread(self._journal.has_outbox):
                         return
                 except Exception:
                     logger.exception("读取持久资产告警状态失败")
-                self._wake.clear()
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=1)
-                except TimeoutError:
-                    pass
+                await self._wait(1)
                 continue
             alert_id, payload = item
             try:
@@ -368,15 +412,14 @@ class AssetAnomaly:
             except Exception:
                 logger.exception("发布持久资产收益告警失败 id=%s", alert_id)
                 try:
-                    delay = await asyncio.to_thread(self._journal.retry, alert_id, self._worker_id,
-                                                    int(time.time()))
-                    await asyncio.sleep(delay)
+                    await asyncio.to_thread(self._journal.retry, alert_id, self._worker_id, int(time.time()))
                 except Exception:
                     logger.exception("更新持久资产告警重试状态失败 id=%s", alert_id)
-                    await asyncio.sleep(1)
+                    await self._wait(1)
 
     async def close(self) -> None:
         self._closed = True
+        self._wake.set()
         if self._worker is None:
             return
         try:

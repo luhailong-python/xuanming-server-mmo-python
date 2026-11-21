@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import grpc
 from google.protobuf.message import DecodeError
 
-from ..data import StoreRejected, StoreUnavailable
+from ..data import PlayerRowKind, StoreRejected, StoreUnavailable
 from ..data.asset_inventory import AssetInventory, release_item_hold
 from .battle_control import service_digest, sign_service_call, verify_service_call
 from .battle_tables import battle_table_fingerprint
@@ -84,6 +84,7 @@ class SceneBattle:
         self._reaping: dict[int, asyncio.Task] = {}
         self._hold_reviews: dict[int, asyncio.Task] = {}
         self._hold_review_at: dict[int, int] = {}
+        self._hold_checked_seq: dict[int, int] = {}
         self._inventory = AssetInventory(self.protocol, tables)
 
     def current(self, player_id: int) -> int:
@@ -121,9 +122,23 @@ class SceneBattle:
                 if (player_id in self._hold_reviews or self._hold_review_at.get(player_id, 0) > now
                         or len(self._hold_reviews) >= 16 or not self.scene.mutable(player)):
                     continue
-                data = self.scene.rows.assemble(player.snapshot)
-                if any(hold.kind == 1 and hold.hold_id and hold.review_after_ms <= now
-                       and hold.hold_id != self.current(player_id) for hold in data.item_holds.holds):
+                snapshot = player.snapshot
+                save_seq = getattr(snapshot, "save_seq", None)
+                if save_seq is not None and self._hold_checked_seq.get(player_id) == save_seq:
+                    continue
+                if hasattr(snapshot, "rows"):
+                    raw = snapshot.rows.get(PlayerRowKind.PROFILE, b"")
+                    holds = self.protocol.parse("player_database", raw).item_holds.holds if raw else ()
+                else:
+                    holds = self.scene.rows.assemble(snapshot).item_holds.holds
+                battle_holds = [hold for hold in holds if hold.kind == 1 and hold.hold_id]
+                if not battle_holds:
+                    if save_seq is not None:
+                        self._hold_checked_seq[player_id] = save_seq
+                    continue
+                self._hold_checked_seq.pop(player_id, None)
+                if any(hold.review_after_ms <= now and hold.hold_id != self.current(player_id)
+                       for hold in battle_holds):
                     self._hold_review_at[player_id] = now + _REAPER_INTERVAL_MS
                     self._hold_reviews[player_id] = asyncio.create_task(self._review_holds(player_id))
 
@@ -299,6 +314,7 @@ class SceneBattle:
         if (task := self._hold_reviews.pop(player.player_id, None)) is not None:
             task.cancel()
         self._hold_review_at.pop(player.player_id, None)
+        self._hold_checked_seq.pop(player.player_id, None)
 
     def notify_reconnect(self, player) -> None:
         entry = self._freezes.get(player.player_id)
@@ -331,6 +347,7 @@ class SceneBattle:
                     error = 1003
                 if not error and deadline <= self._clock():
                     error = 1005
+                held = False
                 if not error and response.snapshot.items:
                     data = self.scene.rows.assemble(player.snapshot)
                     counts = {item.item_table_id: item.count for item in response.snapshot.items}
@@ -346,18 +363,11 @@ class SceneBattle:
                         except (StoreRejected, StoreUnavailable):
                             error = 1003
                         else:
+                            held = True
                             # The commit yields to the event loop. A deadline that was
                             # valid before the write may have passed while it was in flight.
                             if deadline <= self._clock():
                                 error = 1005
-                                try:
-                                    data = self.scene.rows.assemble(player.snapshot)
-                                    if release_item_hold(data, request.battle_id):
-                                        await self.scene.commit_player_data(player, data)
-                                except (StoreRejected, StoreUnavailable):
-                                    # Keep an uncertain hold for the regular terminal review.
-                                    logger.warning("过期备战预留释放待复核 player_id=%s battle_id=%s",
-                                                   player_id, request.battle_id, exc_info=True)
                 if not error:
                     context = self.protocol.message(
                         "InBattleComp", battle_id=request.battle_id, battle_node_id=request.battle_node_id,
@@ -374,6 +384,15 @@ class SceneBattle:
                     else:
                         self._freezes[player_id] = entry
                         player.motion.velocity = (0., 0., 0.)
+                if error and held:
+                    try:
+                        data = self.scene.rows.assemble(player.snapshot)
+                        if release_item_hold(data, request.battle_id):
+                            await self.scene.commit_player_data(player, data)
+                    except (StoreRejected, StoreUnavailable):
+                        # Keep an uncertain hold for the regular terminal review.
+                        logger.warning("失败备战预留释放待复核 player_id=%s battle_id=%s",
+                                       player_id, request.battle_id, exc_info=True)
             if error:
                 response.ClearField("snapshot")
                 response.error_message.id = error

@@ -42,6 +42,9 @@ def test_gate_websocket_carries_the_existing_ticket_frame(tmp_path):
             battle=replace(settings.battle, port=0, grpc_port=0),
         )
         async with Runtime(settings, "local", dev_token="websocket-test") as runtime:
+            assert runtime.scene.tables is runtime.battle.tables.tables
+            lock1 = runtime.scene._lock(1)
+            assert runtime.scene._lock(1) is lock1 and runtime.scene._lock(65) is not lock1
             port = runtime._websocket_servers[0].sockets[0].getsockname()[1]
             async with connect(f"ws://127.0.0.1:{port}", compression=None) as websocket:
                 await websocket.send(encode_packet(Packet.from_message(runtime.gate.issue_ticket())))

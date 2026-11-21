@@ -76,6 +76,21 @@ async def _body(request):
 
 def register_routes(app, deps):
     config = _config(deps.settings)
+    session = None
+
+    async def client_session(_app):
+        nonlocal session
+        timeout = aiohttp.ClientTimeout(total=8, connect=3)
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as client:
+            session = client
+            try:
+                yield
+            finally:
+                session = None
+
+    if config is not None:
+        app.cleanup_ctx.append(client_session)
+
     assets = files("xuanming").joinpath("mall_admin")
     contents = {name: assets.joinpath(name).read_bytes() for name in
                 ("mall-admin.html", "mall-admin.js", "mall-admin.css")}
@@ -110,20 +125,18 @@ def register_routes(app, deps):
                    "X-Commerce-Timestamp": timestamp, "X-Commerce-Nonce": nonce,
                    "X-Commerce-Signature": _signature(secret, subject, timestamp, nonce, url.raw_path, body)}
         try:
-            timeout = aiohttp.ClientTimeout(total=8, connect=3)
-            async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
-                async with session.post(url, data=body, headers=headers, allow_redirects=False) as response:
-                    if response.status not in _STATUSES:
-                        raise ValueError("unexpected upstream status")
-                    output = bytearray()
-                    async for chunk in response.content.iter_chunked(8192):
-                        output.extend(chunk)
-                        if len(output) > _MAX_RESPONSE:
-                            raise ValueError("upstream response is too large")
-                    if not _is_object(output):
-                        raise ValueError("upstream response is not a JSON object")
-                    return web.Response(body=bytes(output), status=response.status, content_type="application/json",
-                                        headers={"Cache-Control": "no-store"})
+            async with session.post(url, data=body, headers=headers, allow_redirects=False) as response:
+                if response.status not in _STATUSES:
+                    raise ValueError("unexpected upstream status")
+                output = bytearray()
+                async for chunk in response.content.iter_chunked(8192):
+                    output.extend(chunk)
+                    if len(output) > _MAX_RESPONSE:
+                        raise ValueError("upstream response is too large")
+                if not _is_object(output):
+                    raise ValueError("upstream response is not a JSON object")
+                return web.Response(body=bytes(output), status=response.status, content_type="application/json",
+                                    headers={"Cache-Control": "no-store"})
         except (aiohttp.ClientError, TimeoutError, ValueError, OSError):
             raise web.HTTPBadGateway(text="mall management response unavailable; check using the same request id") from None
 

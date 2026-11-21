@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
 import json
 import logging
 import os
@@ -18,12 +16,12 @@ from contextlib import closing
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Protocol
 from weakref import WeakValueDictionary
 
 from filelock import FileLock, Timeout as FileLockTimeout
 from google.protobuf.message import DecodeError, Message
 
+from ..grpc_runtime import sign_service_call
 from .player_rows import PlayerRowKind
 
 logger = logging.getLogger(__name__)
@@ -77,26 +75,6 @@ class PlayerSnapshot:
 class _Revision:
     save_seq: int
     deferred_since: float | None = None
-
-
-class PlayerStore(Protocol):
-    async def load_and_claim(
-        self, player_id: int, owner: bytes, owner_epoch: int = 0
-    ) -> PlayerSnapshot: ...
-
-    async def commit(
-        self,
-        snapshot: PlayerSnapshot,
-        rows: Mapping[int, bytes],
-        *,
-        release: bool = False,
-        force: bool = False,
-        periodic: bool = False,
-    ) -> PlayerSnapshot: ...
-
-    async def release(self, snapshot: PlayerSnapshot) -> PlayerSnapshot: ...
-
-    async def release_detached(self, player_id: int, owner: bytes, owner_epoch: int) -> bool: ...
 
 
 class _SnapshotStore:
@@ -676,7 +654,8 @@ class DataServicePlayerStore(_SnapshotStore):
             try:
                 # 无实体释放由下一次 LeaveScene 重试，本调用只发送一遍。
                 async with asyncio.timeout(min(5.0, self._retry_budget)):
-                    body = await self._call(path, _sign_request(request, path, self._secret))
+                    sign_service_call(path, request, "scene", time.time_ns() // 1_000_000, self._secret)
+                    body = await self._call(path, request.SerializeToString(deterministic=True))
                 result = self._protocol.parse("playerstore.SavePlayerResponse", body)
             except (OSError, DecodeError):
                 return False
@@ -767,8 +746,8 @@ class DataServicePlayerStore(_SnapshotStore):
             async with asyncio.timeout_at(deadline):
                 while True:
                     try:
-                        body = _sign_request(request, path, self._secret)
-                        reply = await self._call(path, body)
+                        sign_service_call(path, request, "scene", time.time_ns() // 1_000_000, self._secret)
+                        reply = await self._call(path, request.SerializeToString(deterministic=True))
                         response = self._protocol.parse(f"playerstore.{method}Response", reply)
                         enum = response.DESCRIPTOR.fields_by_name["result"].enum_type
                         if response.result and response.result in enum.values_by_number:
@@ -788,19 +767,6 @@ class DataServicePlayerStore(_SnapshotStore):
                     delay = min(delay * 2, 5.0)
         except TimeoutError as exc:
             raise StoreUnavailable(f"{path} 超出重试预算") from exc
-
-
-def _sign_request(request: Message, path: str, secret: bytes, *, caller: str = "scene") -> bytes:
-    signed = type(request)()
-    signed.CopyFrom(request)
-    signed.ClearField("auth")
-    digest = hashlib.sha256(signed.SerializeToString(deterministic=True)).hexdigest()
-    now_ms = time.time_ns() // 1_000_000
-    content = f"v1\n{path}\n{caller}\n{now_ms}\n{digest}".encode()
-    signed.auth.caller = caller
-    signed.auth.timestamp_ms = now_ms
-    signed.auth.signature_hex = hmac.digest(secret, content, "sha256").hex()
-    return signed.SerializeToString(deterministic=True)
 
 
 def _validate_rows(rows: Mapping[int, bytes]) -> dict[int, bytes]:

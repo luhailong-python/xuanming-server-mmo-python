@@ -315,6 +315,7 @@ class GateNode:
             valid = (
                 hmac.compare_digest(expected, request.signature)
                 and payload.gate_node_id == self.info.node_id
+                and payload.zone_id in (0, self.info.zone_id)
                 and payload.target_zone_id in (0, self.info.zone_id)
                 and payload.expire_timestamp > int(time.time())
             )
@@ -983,8 +984,14 @@ class GateNode:
                         self.protocol.message_ids["SceneClientPlayerCommonKickPlayer"],
                         body=kick.SerializeToString(),
                     )
+                    frame = encode_packet(Packet.from_message(content))
                     try:
-                        session.writer.write(encode_packet(Packet.from_message(content)))
+                        session.writer.write(frame)
+                        if isinstance(session.writer, WebSocketPacketWriter):
+                            async with asyncio.timeout(2):
+                                await session.writer.drain()
+                    except TimeoutError:
+                        pass
                     finally:
                         session.close()
             elif event_id in (

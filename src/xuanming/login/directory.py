@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import time
 
 from ..data.id_segments import IdSegments
-from ..data.player_store import _sign_request
+from ..grpc_runtime import sign_service_call
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,8 @@ class DataService:
     async def _signed(self, method: str, request, response_type: str, *, create=False):
         path = _PATH + method
         try:
-            raw = await self.call(path, _sign_request(request, path, self.secret, caller="login"),
+            sign_service_call(path, request, "login", time.time_ns() // 1_000_000, self.secret)
+            raw = await self.call(path, request.SerializeToString(deterministic=True),
                                   timeout=_DIRECTORY_TIMEOUT)
         except Exception as error:
             if not status_name(error):
@@ -102,7 +104,8 @@ class DataService:
     async def release_name(self, player_id: int, name: str) -> None:
         path = _PATH + "ReleasePlayerName"
         request = self.protocol.message("data_service.ReleasePlayerNameRequest", player_id=player_id, name=name)
-        await self.call(path, _sign_request(request, path, self.secret, caller="login"), timeout=1.0)
+        sign_service_call(path, request, "login", time.time_ns() // 1_000_000, self.secret)
+        await self.call(path, request.SerializeToString(deterministic=True), timeout=1.0)
 
     async def player_names(self, player_ids) -> dict[int, str]:
         request = self.protocol.message("data_service.BatchGetPlayerNameRequest", player_ids=player_ids)

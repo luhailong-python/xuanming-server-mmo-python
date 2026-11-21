@@ -173,8 +173,12 @@ class DirectForwarder:
         try:
             nodes = await self.directory.candidates(node_type, zone)
         except (grpc.RpcError, OSError, ValueError, RuntimeError):
-            scope.available = False
             scope.expires = time.monotonic() + self._discovery_ttl
+            if scope.available and scope.peers:
+                logger.warning("直连节点发现失败，继续使用上次健康节点 node_type=%s zone=%s",
+                               node_type, zone, exc_info=True)
+                return
+            scope.available = False
             raise
         if self._closed:
             return

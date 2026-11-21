@@ -51,6 +51,81 @@ def test_admin_auth_fails_closed_without_touching_database():
     asyncio.run(run())
 
 
+def test_maintenance_message_length_and_utc_timestamps():
+    import datetime as dt
+
+    class RecordingDB:
+        def __init__(self):
+            self.timestamps = []
+            self.row = None
+
+        def acquire(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def begin(self):
+            pass
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+        def cursor(self):
+            return self
+
+        @property
+        def rowcount(self):
+            return 1
+
+        async def execute(self, sql, args=()):
+            if sql.startswith("INSERT INTO zone_config"):
+                self.timestamps.extend(args[-2:])
+                self.row = (args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                            False, 0, args[8], args[9], args[10])
+            elif sql.startswith("UPDATE zone_config"):
+                stamp = next(item for item in args if isinstance(item, dt.datetime))
+                self.timestamps.append(stamp)
+                self.row = (*self.row[:10], self.row[10] + 1, self.row[11], stamp)
+
+        async def fetchone(self):
+            return self.row
+
+    async def run():
+        db = RecordingDB()
+        app = web.Application()
+        zones.register_routes(app, SimpleNamespace(db=db, settings=SimpleNamespace(admin_api_key="secret")))
+        headers = {"X-Admin-Key": "secret"}
+        async with TestClient(TestServer(app)) as client:
+            too_long = await client.post("/admin/zones/1/maintenance", headers=headers,
+                                         json={"maintenance_msg": "x" * 257})
+            assert too_long.status == 400 and (await too_long.json())["reason"] == "too_long"
+            assert not db.timestamps
+
+            before = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+            assert (await client.post("/admin/zones", headers=headers, json=settings())).status == 200
+            etag = f'"{db.row[10]}"'
+            assert (await client.put("/admin/zones/1", headers=headers | {"If-Match": etag}, json=settings())).status == 200
+            assert (await client.post("/admin/zones/1/maintenance", headers=headers,
+                                      json={"maintenance_msg": "x" * 256})).status == 200
+            after = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+        assert len(db.timestamps) == 4
+        for stamp in db.timestamps:
+            assert stamp.tzinfo is None and before <= stamp <= after
+
+        ids = {zones._row_id() for _ in range(32)}
+        assert len(ids) == 32 and all(0 < identifier < 2**62 for identifier in ids)
+
+    asyncio.run(run())
+
+
 def test_real_mysql_zone_and_whitelist_commands(tmp_path):
     root = os.environ.get("XUANMING_TEST_MYSQL_HOME")
     if not root:

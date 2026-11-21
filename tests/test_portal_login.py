@@ -327,3 +327,40 @@ def test_inflight_failure_does_not_get_erased_by_older_successful_probe():
         assert limiter.bypass_until > time.monotonic()
 
     asyncio.run(run())
+
+
+def test_login_rpc_closes_retired_clients_and_brackets_ipv6(monkeypatch):
+    async def run():
+        protocol = Protocol()
+        endpoints = [("::1", 42)]
+        closed = []
+
+        class Directory:
+            async def candidates(self, *_):
+                return [SimpleNamespace(zone_id=1, endpoint=SimpleNamespace(ip=ip, port=port))
+                        for ip, port in endpoints]
+
+        class Client:
+            def __init__(self, endpoint, **_kwargs):
+                self.endpoint = endpoint
+
+            async def call(self, *_args, **_kwargs):
+                return protocol.message("loginpb.LoginResponse").SerializeToString()
+
+            async def close(self):
+                closed.append(self.endpoint)
+
+        monkeypatch.setattr("xuanming.portal_login.GrpcClient", Client)
+        rpc = LoginRpc(protocol, {}, Directory())
+        request = protocol.message("loginpb.LoginRequest")
+        await rpc.call(1, "ClientPlayerLogin", "Login", request, "LoginResponse")
+        assert list(rpc.clients) == ["[::1]:42"]
+
+        endpoints[:] = [("127.0.0.1", 43)]
+        rpc.refreshed = 0.0
+        await rpc.call(1, "ClientPlayerLogin", "Login", request, "LoginResponse")
+        assert list(rpc.clients) == ["127.0.0.1:43"] and closed == ["[::1]:42"]
+        await rpc.close()
+        assert closed == ["[::1]:42", "127.0.0.1:43"]
+
+    asyncio.run(run())

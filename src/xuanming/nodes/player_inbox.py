@@ -10,8 +10,9 @@ from itertools import count
 
 from google.protobuf.message import DecodeError
 
+from ..data.asset_inventory import carries_unknown
 from .battle_control import sign_service_call
-from .battle_settlement import BAG_SPACE_DEFERRED, known_message
+from .battle_settlement import BAG_SPACE_DEFERRED
 
 logger = logging.getLogger(__name__)
 _SERVICE = "/player_inbox.PlayerInbox"
@@ -344,7 +345,7 @@ class SceneInbox:
                 raise VersionSkew("收件箱持久账本不可解释")
             domains[cursor.domain] = cursor
         cursor = domains.get(domain)
-        if cursor is not None and not known_message(cursor):
+        if cursor is not None and carries_unknown(cursor):
             raise VersionSkew("收件箱当前域包含未知字段")
         return cursor
 
@@ -418,7 +419,7 @@ class SceneInbox:
         try:
             if len(item.payload) <= limit:
                 result = self.protocol.parse(name, item.payload)
-                if known_message(result):
+                if not carries_unknown(result):
                     return result
         except DecodeError:
             pass

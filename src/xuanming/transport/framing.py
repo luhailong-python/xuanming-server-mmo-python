@@ -74,13 +74,17 @@ def _unseal(body: bytes) -> bytes:
     return data
 
 
-def _decode_body(frame: bytes, min_size: int, max_size: int) -> bytes:
+def _check_frame(frame: bytes, min_size: int, max_size: int) -> None:
     if len(frame) < _WORD_SIZE:
         raise FrameError("missing frame size")
     size, = _UINT32.unpack_from(frame)
     _validate_size(size, min_size, max_size)
     if len(frame) != _WORD_SIZE + size:
         raise FrameError("frame size does not match available bytes")
+
+
+def _decode_body(frame: bytes, min_size: int, max_size: int) -> bytes:
+    _check_frame(frame, min_size, max_size)
     return _unseal(frame[_WORD_SIZE:])
 
 

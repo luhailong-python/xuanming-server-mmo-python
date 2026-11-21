@@ -114,6 +114,72 @@ def test_persistent_windows_and_alert_outbox_survive_restart(tmp_path):
             while await asyncio.to_thread(second._journal.has_outbox):
                 await asyncio.sleep(0.01)
         await second.close()
-        assert [row[1]["count"] for row in sent] == [2, 3]
+        assert sorted(row[1]["count"] for row in sent) == [2, 3]
+
+    asyncio.run(exercise())
+
+
+def test_journal_claim_skips_backed_off_and_drops_corrupt_entries(tmp_path):
+    async def exercise():
+        import base64
+        import time
+
+        path = tmp_path / "outbox.json"
+        ready_payload = json.dumps({"player_id": 9, "count": 5}).encode()
+        backed_off_payload = json.dumps({"player_id": 8, "count": 4}).encode()
+        future = int(time.time()) + 300
+        path.write_text(json.dumps({
+            "format_version": 1,
+            "players": {},
+            "outbox": [
+                {"id": "backed-off", "payload": base64.b64encode(backed_off_payload).decode("ascii"),
+                 "attempts": 5, "lease_owner": "", "lease_until": future},
+                {"id": "bad-b64", "payload": "!!!not-base64!!!", "attempts": 0, "lease_owner": "", "lease_until": 0},
+                {"id": "bad-json", "payload": base64.b64encode(b"{not-json").decode("ascii"),
+                 "attempts": 0, "lease_owner": "", "lease_until": 0},
+                {"id": "ready", "payload": base64.b64encode(ready_payload).decode("ascii"),
+                 "attempts": 0, "lease_owner": "", "lease_until": 0},
+            ],
+        }), encoding="utf-8")
+
+        sent = []
+        delivered = asyncio.Event()
+
+        async def emit(player_id, payload):
+            sent.append((player_id, json.loads(payload)))
+            delivered.set()
+
+        detector = AssetAnomaly(lambda _: True, emit, journal_path=path)
+        await detector.start()
+        await asyncio.wait_for(delivered.wait(), 2)
+        started_close = time.monotonic()
+        await detector.close()
+        assert time.monotonic() - started_close < 1.0
+        assert sent == [(9, {"player_id": 9, "count": 5})]
+        remaining = json.loads(path.read_text(encoding="utf-8"))["outbox"]
+        assert [item["id"] for item in remaining] == ["backed-off"]
+
+    asyncio.run(exercise())
+
+
+def test_journal_write_failure_enqueues_memory_fallback_alert(tmp_path):
+    async def exercise():
+        path = tmp_path / "broken.json"
+        path.write_text("{corrupt", encoding="utf-8")
+        player = SimpleNamespace(player_id=11, asset_anomaly=None)
+        sent = []
+        delivered = asyncio.Event()
+
+        async def emit(player_id, payload):
+            sent.append((player_id, json.loads(payload)))
+            delivered.set()
+
+        detector = AssetAnomaly(lambda candidate: candidate is player, emit, clock=lambda: 100, journal_path=path)
+        detector.currency_thresholds[1] = AnomalyThreshold(1, 10, 600)
+        await detector.start()
+        assert await detector.record(player, AssetGain("currency", 1, 20), 100)
+        await asyncio.wait_for(delivered.wait(), 2)
+        await detector.close()
+        assert len(sent) == 1 and sent[0][0] == 11 and sent[0][1]["total_amount"] == 20
 
     asyncio.run(exercise())

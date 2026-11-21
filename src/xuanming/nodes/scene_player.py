@@ -13,15 +13,20 @@ _MAX_UINT64 = (1 << 64) - 1
 
 
 def register_player_handlers(scene) -> None:
-    tables = ConfigTables()
+    fallback: ConfigTables | None = None
+
+    def bag(world, player, route, request):
+        nonlocal fallback
+        tables = scene.tables
+        if tables is None:
+            tables = fallback = fallback or ConfigTables()
+        return _bag(scene, tables, player, request.bag_type)
+
     scene.register(
         "SceneCurrencyClientPlayer", "GetCurrencyList",
         lambda world, player, route, request: _currency(scene, player),
     )
-    scene.register(
-        "SceneBagClientPlayer", "GetBag",
-        lambda world, player, route, request: _bag(scene, tables, player, request.bag_type),
-    )
+    scene.register("SceneBagClientPlayer", "GetBag", bag)
     scene.register(
         "SceneBattleResultClientPlayer", "GetRecentBattleResults",
         lambda world, player, route, request: _recent_battles(scene, player),

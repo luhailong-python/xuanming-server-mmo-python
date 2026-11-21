@@ -4,24 +4,25 @@ import asyncio
 import datetime as dt
 import re
 import secrets
-import time
 
 from aiohttp import web
 
 from .portal_admin_auth import authorize
+from .portal_db import as_bool
 from .portal_sql import connection
 
 
 _COLUMNS = ("zone_id", "name", "manual_status", "capacity", "maintenance_msg", "open_time", "recommended",
             "sort_order", "create_role_closed", "role_capacity", "version", "created_at", "updated_at")
 _SELECT = "SELECT " + ",".join(_COLUMNS) + " FROM zone_config"
-_last_row_id = 0
 
 
 def _row_id():
-    global _last_row_id
-    _last_row_id = max(_last_row_id + 1, (time.time_ns() // 1_000_000) * 1024 + secrets.randbelow(1024))
-    return _last_row_id
+    return secrets.randbits(62) | 1
+
+
+def _utc_now():
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
 
 
 def _problem(request, status, reason, detail, field=None):
@@ -126,8 +127,7 @@ def _zone(row):
     obj = dict(zip(_COLUMNS, row))
     obj.pop("version")
     for field in ("recommended", "create_role_closed"):
-        value = obj[field]
-        obj[field] = bool(int.from_bytes(value, "big")) if isinstance(value, bytes) else bool(value)
+        obj[field] = as_bool(obj[field])
     for field in ("open_time", "created_at", "updated_at"):
         if isinstance(obj[field], dt.datetime):
             obj[field] = obj[field].isoformat()
@@ -212,7 +212,7 @@ def register_routes(app, deps):
 
     async def create_zone(request):
         values = _settings(await _body(request))
-        now = dt.datetime.now()
+        now = _utc_now()
         version = 1 + secrets.randbelow(2**53 - 1)
         async def create(cur):
             await cur.execute("INSERT INTO zone_config (zone_id,name,manual_status,capacity,maintenance_msg,open_time,"
@@ -241,7 +241,7 @@ def register_routes(app, deps):
                 return 412, None
             await cur.execute("UPDATE zone_config SET name=%s,manual_status=%s,capacity=%s,maintenance_msg=%s,"
                               "open_time=%s,recommended=%s,sort_order=%s,version=version+1,updated_at=%s "
-                              "WHERE zone_id=%s AND version=%s", (*values[1:], dt.datetime.now(), zone_id, expected))
+                              "WHERE zone_id=%s AND version=%s", (*values[1:], _utc_now(), zone_id, expected))
             if not cur.rowcount:
                 return 412, None
             await cur.execute(_SELECT + " WHERE zone_id=%s", (zone_id,))
@@ -268,8 +268,11 @@ def register_routes(app, deps):
         if action == "maintenance":
             body = await _body(request, optional=True)
             message = body.get("maintenance_msg")
-            if message is not None and not isinstance(message, str):
-                _bad("maintenance_msg", "maintenance_msg must be a string")
+            if message is not None:
+                if not isinstance(message, str):
+                    _bad("maintenance_msg", "maintenance_msg must be a string")
+                if len(message) > 256:
+                    _bad("maintenance_msg", "maintenance_msg exceeds 256 characters", "too_long")
             sql, args = "manual_status=1,maintenance_msg=COALESCE(%s,maintenance_msg)", (message,)
         elif action == "open":
             sql, args = "manual_status=0,maintenance_msg=%s", ("",)
@@ -290,7 +293,7 @@ def register_routes(app, deps):
             if await cur.fetchone() is None:
                 return None
             await cur.execute("UPDATE zone_config SET " + sql + ",version=version+1,updated_at=%s WHERE zone_id=%s",
-                              (*args, dt.datetime.now(), zone_id))
+                              (*args, _utc_now(), zone_id))
             await cur.execute(_SELECT + " WHERE zone_id=%s", (zone_id,))
             return await cur.fetchone()
         row = await _retry_write(deps.db, update)

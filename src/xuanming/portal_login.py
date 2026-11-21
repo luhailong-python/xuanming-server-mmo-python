@@ -189,21 +189,37 @@ class LoginRpc:
         self.discovery_task = None
         self.counter = 0
         self.clients = {}
+        self._inflight = {}
+        self._retired = set()
 
     async def _refresh(self):
+        retired = []
         try:
             async with asyncio.timeout(4):
                 nodes = await self.directory.candidates(5, None)
                 found = {}
                 for node in nodes:
                     if node.zone_id and node.endpoint.ip and node.endpoint.port:
-                        found.setdefault(node.zone_id, []).append(f"{node.endpoint.ip}:{node.endpoint.port}")
+                        ip = node.endpoint.ip
+                        address = (f"[{ip}]:{node.endpoint.port}"
+                                   if ":" in ip and not ip.startswith("[") else f"{ip}:{node.endpoint.port}")
+                        found.setdefault(node.zone_id, []).append(address)
                 self.dynamic = found
+                active = {ep for eps in (*self.dynamic.values(), *self.static.values()) for ep in eps}
+                for ep in tuple(self.clients):
+                    if ep not in active:
+                        client = self.clients.pop(ep)
+                        if self._inflight.get(client, 0):
+                            self._retired.add(client)
+                        else:
+                            retired.append(client)
         except Exception:
             _LOG.warning("Login discovery failed; retaining last known endpoints", exc_info=True)
         finally:
             self.refreshed = time.monotonic() + 5
             self.discovery_task = None
+        if retired:
+            await asyncio.gather(*(client.close() for client in retired), return_exceptions=True)
 
     async def call(self, zone, service, method, request, response, *, zoned=True):
         if self.directory and (self.discovery_task is not None or time.monotonic() >= self.refreshed):
@@ -223,14 +239,28 @@ class LoginRpc:
         client = self.clients.get(endpoint)
         if client is None:
             client = self.clients[endpoint] = GrpcClient(endpoint, timeout=3, enable_retries=False)
-        raw = await client.call(f"/loginpb.{service}/{method}", request.SerializeToString(), metadata=trace_metadata())
+        self._inflight[client] = self._inflight.get(client, 0) + 1
+        try:
+            raw = await client.call(f"/loginpb.{service}/{method}", request.SerializeToString(), metadata=trace_metadata())
+        finally:
+            remaining = self._inflight.get(client, 1) - 1
+            if remaining > 0:
+                self._inflight[client] = remaining
+            else:
+                self._inflight.pop(client, None)
+                if client in self._retired:
+                    self._retired.discard(client)
+                    await client.close()
         return self.protocol.parse("loginpb." + response, raw)
 
     async def close(self):
         if self.discovery_task is not None:
             self.discovery_task.cancel()
             await asyncio.gather(self.discovery_task, return_exceptions=True)
-        await asyncio.gather(*(client.close() for client in self.clients.values()))
+        clients = set(self.clients.values()) | self._retired
+        self.clients.clear()
+        self._retired.clear()
+        await asyncio.gather(*(client.close() for client in clients), return_exceptions=True)
 
 
 class ZoneAdmission:

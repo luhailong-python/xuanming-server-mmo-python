@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
+from weakref import WeakValueDictionary
 
 from google.protobuf.message import DecodeError
 
@@ -193,7 +194,7 @@ class SceneNode:
         self._entries_drained.set()
         self._maintenance: dict[int, asyncio.Task] = {}
         self._ids = count(1)
-        self._locks = [asyncio.Lock() for _ in range(64)]
+        self._locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
         self._closing = False
         self._closed = False
         self._admission_closed = False
@@ -770,8 +771,12 @@ class SceneNode:
             if player.session_id == session_id and player.gate_uuid == gate_uuid:
                 await self._remove(world, player)
 
-    def _lock(self, player_id: int):
-        return self._locks[player_id % len(self._locks)]
+    def _lock(self, player_id: int) -> asyncio.Lock:
+        lock = self._locks.get(player_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[player_id] = lock
+        return lock
 
     def mutable(self, player: Player) -> bool:
         # 断线会话已解绑，保留中的写权仍可处理结算和资产事务。

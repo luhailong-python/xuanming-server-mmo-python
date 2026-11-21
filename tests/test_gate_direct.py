@@ -758,3 +758,40 @@ def test_direct_tcp_dispatches_real_grpc_calls_without_waiting_for_each_other():
             await grpc_server.stop(0)
 
     asyncio.run(exercise())
+
+
+def test_direct_forwarder_retains_healthy_peers_on_transient_discovery_timeout():
+    async def exercise():
+        protocol = Protocol()
+        fail = False
+        calls = []
+
+        class Directory:
+            async def candidates(self, kind, zone):
+                if fail:
+                    raise TimeoutError("etcd timeout")
+                return [node(protocol, kind=16, port=1111)]
+
+        class Client:
+            def __init__(self, address, **_kwargs):
+                self.address = address
+
+            async def call(self, path, body, *, metadata):
+                calls.append(self.address)
+                return b""
+
+            async def close(self):
+                pass
+
+        forward = DirectForwarder(protocol, Directory(), SECRET, client_factory=Client, discovery_ttl=0)
+        gate, session = gate_session(protocol, forward)
+        queue = request(protocol, "MatchServiceJoinQueue")
+        try:
+            assert not (await gate._dispatch(session, 1, queue)).error_message.id
+            fail = True
+            assert not (await gate._dispatch(session, 2, queue)).error_message.id
+            assert calls == ["127.0.0.1:1111", "127.0.0.1:1111"]
+        finally:
+            await forward.close()
+
+    asyncio.run(exercise())

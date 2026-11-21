@@ -3,7 +3,7 @@
 import logging
 from collections import Counter
 
-from ..data.asset_inventory import BAG_FULL, release_item_hold
+from ..data.asset_inventory import BAG_FULL, carries_unknown, release_item_hold
 from .scene_mission import now_ms
 from .scene_stats import pet_pool, pet_stats, player_stats
 
@@ -14,14 +14,6 @@ MAX_ITEM_COUNT = (1 << 32) - 1
 MAX_CURRENCY_AMOUNT = (1 << 63) - 1
 ASSET_BLOCKED = 27005
 BAG_SPACE_DEFERRED = 6006  # Native kBagItemNotStacked executor defer reason.
-
-
-def known_message(message) -> bool:
-    original = message.SerializeToString(deterministic=True)
-    copy = type(message)()
-    copy.CopyFrom(message)
-    copy.DiscardUnknownFields()
-    return original == copy.SerializeToString(deterministic=True)
 
 
 class BattleSettlement:
@@ -55,7 +47,7 @@ class BattleSettlement:
     ) -> bool:
         if (
             not settlement.battle_id or settlement.player_id != player.player_id
-            or settlement.outcome not in (1, 2, 3, 4) or not known_message(settlement)
+            or settlement.outcome not in (1, 2, 3, 4) or carries_unknown(settlement)
             or not self.scene.mutable(player)
             or sum(item.count for item in settlement.defeated_monsters) > 4096
         ):
@@ -94,7 +86,7 @@ class BattleSettlement:
             if self.assets.currency_blocked(data, kind):
                 del currencies[kind]
                 continue
-            if any(debt.currency_type == kind and not known_message(debt) for debt in data.currency.debts):
+            if any(debt.currency_type == kind and carries_unknown(debt) for debt in data.currency.debts):
                 return False
             error = self.assets.add_currency(data, kind, amount, gains=gains)
             if error == ASSET_BLOCKED:
@@ -161,7 +153,7 @@ class BattleSettlement:
             seen.add(currency)
         if any(currency not in self.currency_types for currency, _ in entries):
             return True
-        return any(amount and debt.currency_type == currency and not known_message(debt)
+        return any(amount and debt.currency_type == currency and carries_unknown(debt)
                    for currency, amount in entries for debt in data.currency.debts)
 
     def _currencies(self, settlement):
@@ -188,7 +180,7 @@ class BattleSettlement:
             if row is None:
                 logger.warning("战斗物品配表尚不可用，延后结算 config_id=%s", item)
                 return None
-            elif not known_message(row):
+            elif carries_unknown(row):
                 return None
         return result
 
@@ -206,7 +198,7 @@ class BattleSettlement:
                     return None
                 owned[config] += entry.stack_size
             else:
-                if (not instance.item_id or not instance.size or not known_message(instance)
+                if (not instance.item_id or not instance.size or carries_unknown(instance)
                         or not self.assets.countable(instance)):
                     return None
                 owned[config] += instance.size
@@ -215,7 +207,7 @@ class BattleSettlement:
     def _pets(self, data, effects) -> bool:
         if not effects:
             return True
-        if not known_message(data.pet_component):
+        if carries_unknown(data.pet_component):
             return False
         owned = {pet.pet_id: pet for pet in data.pet_component.pets}
         if 0 in owned or len(owned) != len(data.pet_component.pets):
@@ -229,12 +221,12 @@ class BattleSettlement:
             if pet is None:
                 continue
             row = self.tables["Pet"].get(pet.pet_table_id)
-            if row is None or not known_message(row):
+            if row is None or carries_unknown(row):
                 return False
             pool = pet_pool(self.tables)
             if pool is None:
                 continue
-            if not known_message(pool):
+            if carries_unknown(pool):
                 return False
             stats = pet_stats(self.tables, pet)
             if stats is None:
