@@ -52,3 +52,11 @@ pytest tests/test_battle.py
 - ❌ 禁止手改由 `tools/build_protocol.py` 自动生成的协议产物与 `src/xuanming/contracts/*`、`src/xuanming/data/*` 下的契约/配置表/导航数据；需先改权威源再重新生成。
 - ❌ 禁止在仓库中写入密钥、口令或未脱敏的运行日志。
 - ❌ 未经用户明确要求，禁止执行 `git push` / `git tag` / `git push --force` 或改写已推送历史。
+
+## 4. 对照 C++ 仓增量移植流程
+
+当用户在本仓库触发「继续移植」等增量同步指令时，固定按以下闭环执行（只读对照 `../xuanming-server-mmo-cpp`，严禁修改 C++ 仓）：
+
+1. 读取 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md) 末尾记录的已校对 C++ 基线 Commit SHA（当前为 `5676d207a6ab960edff7ce7e54bbff6d93a796c1`）；
+2. 在 C++ 仓执行 `git log --oneline <baseline>..HEAD`，仅筛选**非玩法逻辑的底层与框架改动**（传输/协议、存储/锁/围栏、鉴权/安全、停机疏散/故障切换、弹性加固、运维/离线工具及跨服务契约修复）进行纯 Python 移植；默认保留 Python 侧现有战斗与大富翁玩法实现不覆写；
+3. 跑完回归测试并验证通过后，将最新已校对的 C++ `HEAD` Commit SHA 同步更新到本节、[README.md](README.md) 与 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md)，供下一次增量移植衔接。
