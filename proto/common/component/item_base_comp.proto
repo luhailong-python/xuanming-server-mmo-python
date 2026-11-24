@@ -33,11 +33,18 @@ message EquipGem
 // 这一段随 ItemComp.equip / ItemEntry.equip 整份搬运,穿脱、存档、跨区都不用再逐字段跟。
 // 强化 / 镶嵌只改 has_equip() 的实例;不要为了写这两个字段对未初始化的实例调 mutable_equip()
 // —— 那会把「没掷过属性」变成「已初始化」。
+// V1 固定词条只保存选择；槽位 1/2 是词条位身份，不是装备穿戴位置。
+message EquipFixedAffix {
+  uint32 slot = 1;
+  uint32 affix_id = 2; // EquipV1Affix.id；数值与显示由规则表提供。
+}
+
 message EquipInstanceData
 {
 	repeated EquipAffix affixes = 1;
 	uint32 enhance_level = 2;	// 强化等级(+N),0 = 未强化。入库的只有「+几」,加成按 EquipEnhance 表现查
 	repeated EquipGem gems = 3;	// 已镶嵌宝石;同一 socket 至多一条
+	repeated EquipFixedAffix fixed_affixes = 4; // V1 首次安装的固定词条，不与旧颜色档混用。
 }
 
 message ItemComp
@@ -48,15 +55,14 @@ message ItemComp
 
 	// 入包序号:同一个背包内单调递增,越小越早进包。
 	//
-	// 淘汰策略(临时格先进先出)按它排序。**不能用 item_id 代替** ——
-	// item_id 是 snowflake,看似时间有序,但两条路径会打乱它:
-	//   ① 跨服迁移带回来的实例,号是**源服 node** 铸的;
-	//   ② 邮件附件沿用调用方**预设的 guid**,可能比包里已有的都小。
-	// 两种情况下"先进先出"都会挤错人 —— 挤掉刚拿到的、留下最早的。
+	// 包内实例序按它排(ItemStore::AcquiredBefore):遍历与存盘的顺序、并堆与扣除先动哪一堆、整理的平局。
+	// 2026-11-12 前临时格的先进先出淘汰也按它排,背包的淘汰已整条删除。**不能用 item_id 代替** ——
+	// item_id 是发号器 item 号段的号(经 MixGuid 打散),不单调,大小与先后无关;跨服迁移带回来的实例、
+	// 沿用调用方**预设 guid** 的邮件附件,号更是别处早就铸好的。按 item_id 排,"先进包的先动"就会动错堆。
 	//
 	// 由 ItemStore 在实例入库时统一盖(见 item_store.h 的 nextAcquireSeq_),
 	// 跨服 / 快照随 ItemEntry.acquire_seq 原样带走,还原时恢复水位。
-	// 0 = 未盖章(旧存档),此时退回按 item_id 排序,与本字段落地前的行为一致。
+	// 0 = 未盖章(旧存档),此时退回按 item_id 排序(只为顺序确定,不代表先后),与本字段落地前的行为一致。
 	uint64 acquire_seq = 4;
 
 	// 装备实例数据(随机属性、强化等级、已镶嵌宝石)。仅装备实例有。
@@ -66,4 +72,6 @@ message ItemComp
 	// presence:只在 has_equip() 时拷贝,不要无条件 mutable_equip()。
 	// 镜像 ItemEntry.equip(字段 14),两边必须同改(bag_marshal 的转换函数)。
 	EquipInstanceData equip = 5;
+	// 仅自用绑定标记：true = 不可交易、不可上架集市/聚宝斋、不可赠送（用于五行试炼志拓印兑换的自用法宝等）。
+	bool bound = 6;
 }

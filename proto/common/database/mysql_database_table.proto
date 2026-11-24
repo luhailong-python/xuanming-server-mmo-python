@@ -18,6 +18,10 @@ import "proto/common/component/player_item_gain_block_comp.proto";
 import "proto/common/component/client_request_ledger_comp.proto";
 import "proto/common/component/player_item_hold_comp.proto";
 import "proto/common/component/player_mail_outbox_comp.proto";
+import "proto/common/component/player_season_comp.proto";
+import "proto/common/component/player_trial_journal_comp.proto";
+import "proto/common/component/time_comp.proto";
+import "proto/common/component/buff_comp.proto";
 import "proto/common/database/bag_quest_mail_data.proto";
 
 // ------------------- User basic info table -------------------
@@ -92,7 +96,8 @@ message player_centre_database
   option(OptionTableName) = "player_centre_database";
   option(OptionPrimaryKey) = "player_id";
   option(OptionAutoIncrementKey) = "player_id";
-  // 雪花主键 + TiDB 聚簇表 = 写热点,按 §D3 处方打散(global-data-layer-tidb-decision.md)
+  // 主键 player_id 是发号器发的永久 ID(biz_tag=player,经 MixID 打散),不是雪花。行数据按 _tidb_rowid 存,
+  // 所以 §D3 的 NONCLUSTERED + 打散照旧保留(global-data-layer-tidb-decision.md)。
   option(OptionTiDBNonclusteredPK) = true;
   option(OptionTiDBShardRowIDBits) = 4;
   option(OptionTiDBPreSplitRegions) = 4;
@@ -103,7 +108,7 @@ message player_centre_database
 // 玩家存档的内存形状:没有 OptionTableName,不建表。落库的是 player_store 里按行投影出来的片段
 // (docs/design/player-save-direct-commit.md §1.1)。每个字段都用 OptionPersistGroup 声明属于哪一行,
 // 取值是 playerstore.PlayerStoreKind 的数值:
-//   9 = LOCATION(位置,只顺带写)  6 = CHARACTER(等级、基础属性与当前血蓝)  7 = WALLET(货币与账本)
+//   9 = LOCATION(位置,只顺带写)  6 = CHARACTER(等级、基础属性与当前血蓝、技能冷却、下线保留的 Buff)  7 = WALLET(货币与账本)
 //   8 = BAG(背包)  3 = GROWTH(技能、加点、宠物、任务)  4 = PROFILE(职业、注册时间、身份等小而少变的字段)
 //   0 = 元数据,不进片段。
 // 新字段不标、标到退役的 1 / 2 / 5 或不存在的行,scene 都拒绝启动。
@@ -121,7 +126,8 @@ message player_database
   PlayerSkillListComp skill_list = 4 [(OptionPersistGroup) = 3];  // GROWTH
   // 职业:建角事务里和名字、外观、性别一起写进 PROFILE 行。
   PlayerUint32Comp uint32_pb_component = 5 [(OptionPersistGroup) = 4];  // PROFILE
-  // 字段名沿用旧名:装的是基础属性和当前血蓝(BaseAttributesComp);真正的派生属性 DerivedAttributesComp 不落库,加载时重算。
+  // 字段名沿用旧名。只存当前血蓝(health、mana):BaseAttributesComp 的其余字段(力量、护甲、抗性、暴击、速度)只有职业表和重算
+  // 两个来源,scene 存盘时清掉、加载时写回(player_database_loader.cpp);派生属性 DerivedAttributesComp 同样不落库,加载时重算。
   BaseAttributesComp derived_attributes_component = 6 [(OptionPersistGroup) = 6];  // CHARACTER
   LevelComp level_component = 7 [(OptionPersistGroup) = 6];  // CHARACTER
   CurrencyComp currency = 8 [(OptionPersistGroup) = 7];  // WALLET
@@ -184,10 +190,36 @@ message player_database
   // 加载时无条件挂组件、校验不过挂失效标签(带键请求一律 fail-closed),存盘缺它整份拒存(持久数据)。
   // 取下一个空闲号 25;下一个新字段从 26 起。
   ClientRequestLedgerComp client_request_ledger = 25 [(OptionPersistGroup) = 7];  // WALLET
-  // 与背包及战斗结算同事务持久化的道具预留。
+  // 物品数量预留(docs/design/battle-item-reservation.md):备战时把带进战斗的道具按配置号与数量占住,结算只从这里扣,
+  // 作废或取消时释放。必须与 bag_component 同一次存盘提交 —— 「预留落了、背包没落」会把玩家的东西占住而没有对应的战斗,
+  // 「背包落了、预留没落」会让晚到的结算按持有量夹紧(药白喝)。一次存盘的所有脏行同事务(player-save-direct-commit.md §1.1),
+  // 所以不必与背包同组;它小、只在备战与结算时变,放 PROFILE 行,不让每一次背包写入都带上它。
+  // 加载时无条件挂组件、存盘时缺它整份拒存(持久数据,ecs-component-access-rules.md)。
+  // 取下一个空闲号 26;下一个新字段从 27 起。
   PlayerItemHoldComp item_holds = 26 [(OptionPersistGroup) = 4];  // PROFILE
-  // 与战斗结算同事务持久化、存盘确认后投递的待寄邮件。
+  // 待寄邮件(docs/design/battle-overflow-mail.md):战斗结算两包都放不下时整批改投邮件,还没交到邮件服务的那几封。
+  // 必须与扣消耗、入账同一次存盘提交 —— 「结算落了、待寄没落」物品就没了,「待寄落了、结算没落」结算重做时会再发一份。
+  // 一次存盘的所有脏行同事务(player-save-direct-commit.md §1.1),所以不必与背包同组;它是欠玩家的资产,与 asset_op_ledger、
+  // inbox_ledger 一样放 WALLET 行。正常为空,只在改投与寄出时变。
+  // 加载时无条件挂组件、存盘时缺它整份拒存(持久数据,ecs-component-access-rules.md)。
+  // 取下一个空闲号 27;下一个新字段从 28 起。
   PlayerMailOutboxComp mail_outbox = 27 [(OptionPersistGroup) = 7];  // WALLET
+  // 实时技能冷却与下线保留的 Buff(docs/design/realtime-cooldown-buff-persistence.md):换节点、跨 zone、重登都从存档重建实体,
+  // 不存就会丢,玩家能靠重登清掉长冷却。两者都按 UTC 毫秒的绝对时刻存,离线期间照常走。
+  // 冷却是运行时组件 CooldownTimeListComp 原样(按冷却组覆盖写,条数不超过冷却组数,到点的记录不删);
+  // Buff 只存 Buff 表 keep_on_logout = 1 的条目,按 buff_id 排序写出。
+  // 按需状态:旧存档没有这两个字段 = 没有冷却、没有要恢复的 Buff,合法;存盘缺组件写空,不补建。
+  // 放 CHARACTER 行:与当前血蓝一样,是战斗中会变的小数据。取下一个空闲号 28、29;下一个新字段从 30 起。
+  CooldownTimeListComp skill_cooldowns = 28 [(OptionPersistGroup) = 6];  // CHARACTER
+  repeated SavedBuffComp saved_buffs = 29 [(OptionPersistGroup) = 6];  // CHARACTER
+  // 赛季印（单槽赛季装备栏）与历史赛季进度归档（docs/design/season-skills-and-seal-design.md）。
+  // 放 GROWTH 组：与技能、加点、宠物同组，一次存盘所有脏行同事务提交（满足 I3 原子性）。
+  // 旧存档缺失默认为空合法；加载无条件挂组件，存盘缺组件 fail-closed 拒存。取下一个空闲号 30，后续新字段从 31 起。
+  PlayerSeasonComp season_component = 30 [(OptionPersistGroup) = 3];  // GROWTH
+  // 五行试炼志 V2（战法印永久位图、可比规则最佳回合与复盘快照、赛季隔离卷与里程碑位图；docs/design/long-term-progression-v2.md）。
+  // 放 GROWTH 组：与技能、加点、宠物、赛季印同组，一次存盘所有脏行同事务提交（满足 I3 原子性）。
+  // 旧存档缺失默认为空合法；加载无条件挂组件，存盘缺组件 fail-closed 拒存。取下一个空闲号 31，后续新字段从 32 起。
+  PlayerTrialJournalComp trial_journal_component = 31 [(OptionPersistGroup) = 3];  // GROWTH
 }
 
 // 玩家存档的新表(docs/design/player-save-direct-commit.md §1)。同一玩家的所有行挨在一起:
@@ -208,6 +240,23 @@ message player_store
   uint32 released = 7;         // 只写权行用:1 = 持有者已最终存盘并释放
   bytes payload = 8;
   uint64 claim_seq = 9;        // 只写权行用:每次认领加 1。同实例同代次重新认领时 (owner_epoch, holder_instance) 不变,判死靠它比得出来
+}
+
+// 审计发件箱(docs/design/player-audit-outbox.md,断线重连 R13):和 player_store 在同一个存档库。
+// go/db 在提交一笔存档的同一个事务里写入随这一笔交来的审计记录,转发循环投 Kafka、broker 确认之后按主键删除。
+// 「这里有这条」等于「它描述的改动已提交」。只有 go/db 读写;读写语句在 go/db/internal/playerstore 与 internal/auditoutbox 里手写。
+// 主键片内按时间排:插入即删的队列在 TiDB 里留 MVCC 墓碑,转发从「上一轮最老的未投记录」附近往后扫,跨不过整片的墓碑(设计 §3、§7.2)。
+message player_audit_outbox
+{
+  option(OptionTableName) = "player_audit_outbox";
+  option(OptionPrimaryKey) = "shard,kind,created_ms,player_id,record_id";
+  uint32 shard = 1;        // player_id % 16:转发按 (存档库, 片) 分工、按片扫描
+  uint32 kind = 2;         // playerstore.PlayerAuditKind:1 流水、2 快照
+  uint64 created_ms = 3;   // 写入它的 go/db 在提交事务里取的墙钟毫秒;片内按它扫,积压年龄按它算
+  uint64 player_id = 4;    // Kafka key
+  uint64 record_id = 5;    // tx_id 或 snapshot_id
+  uint64 save_seq = 6;     // 带它提交的那一笔存盘的序号,只供排查
+  bytes payload = 7;       // Kafka 消息体原样:序列化的 TransactionLogEntry / PlayerSnapshotEntry
 }
 
 // player_database_1 已于 2026-11-05 删除(docs/design/player-save-direct-commit.md §1.2):它只剩 player_id、压测探针、
