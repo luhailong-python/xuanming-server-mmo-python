@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, fields
+from urllib.parse import urlsplit
 
 from ..settings import Settings
 from .model import (
@@ -20,6 +21,9 @@ COORDINATOR_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_COORDINATOR"
 ROLE_FENCE_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_TRADE"
 ASSET_OP_SECRET_ENV = "MMORPG_ASSET_OP_SECRET_TRADE"
 MANUAL_RESOLUTION_SECRET_ENV = "MMORPG_TRADE_MANUAL_RESOLUTION_SECRET"
+COMMERCE_GATEWAY_SECRET_ENV = "COMMERCE_GATEWAY_SECRET"
+COMMERCE_DELIVERY_SECRET_ENV = "COMMERCE_DELIVERY_SECRET"
+ACCOUNT_DIRECTORY_TRADE_SECRET_ENV = "MMORPG_ACCOUNT_DIRECTORY_SECRET_TRADE"
 MYSQL_PASSWORD_ENV = "TRADE_MYSQL_PASSWORD"
 
 DEFAULT_GRPC_PORT = 50800
@@ -31,6 +35,9 @@ _TOML_FORBIDDEN_FIELDS = frozenset((
     "coordinator_secret",
     "role_fence_secret",
     "manual_resolution_secret",
+    "mall_gateway_secret",
+    "mall_delivery_secret",
+    "account_directory_secret",
     "mysql_password",
 ))
 
@@ -91,13 +98,21 @@ class TradeConfig:
     commerce_currencies: tuple[int, ...] = (CURRENCY_GOLD,)
     commerce_allow_instances: bool = False
     mall_url: str = ""
+    mall_gateway_secret_env: str = COMMERCE_GATEWAY_SECRET_ENV
+    mall_delivery_secret_env: str = COMMERCE_DELIVERY_SECRET_ENV
+    mall_poll_interval_sec: float = 1.0
     rmb_enabled: bool = False
+    rmb_currencies: tuple[int, ...] = (CURRENCY_GOLD,)
+    content_guard: str = ""
     manual_resolution_secret_env: str = ""
     manual_resolution_environment: str = ""
     asset_op_secret: bytes = b""
     coordinator_secret: bytes = b""
     role_fence_secret: bytes = b""
     manual_resolution_secret: bytes = b""
+    mall_gateway_secret: bytes = b""
+    mall_delivery_secret: bytes = b""
+    account_directory_secret: bytes = b""
 
     @property
     def runs_background_work(self) -> bool:
@@ -143,6 +158,8 @@ class TradeConfig:
             raw["commerce_pets"] = tuple(int(x) for x in raw["commerce_pets"])
         if "commerce_currencies" in raw:
             raw["commerce_currencies"] = tuple(int(x) for x in raw["commerce_currencies"])
+        if "rmb_currencies" in raw:
+            raw["rmb_currencies"] = tuple(int(x) for x in raw["rmb_currencies"])
         if "commerce_item_titles" in raw and isinstance(raw["commerce_item_titles"], dict):
             raw["commerce_item_titles"] = {int(k): str(v) for k, v in raw["commerce_item_titles"].items()}
         raw.setdefault("zone_id", settings.zone_id)
@@ -160,6 +177,19 @@ class TradeConfig:
         manual_env = str(raw.get("manual_resolution_secret_env", "")).strip()
         manual_secret = load_optional_secret(environ, manual_env)
 
+        mall_url = str(raw.get("mall_url", "")).strip()
+        gw_env = str(raw.get("mall_gateway_secret_env", COMMERCE_GATEWAY_SECRET_ENV)).strip() or COMMERCE_GATEWAY_SECRET_ENV
+        dl_env = str(raw.get("mall_delivery_secret_env", COMMERCE_DELIVERY_SECRET_ENV)).strip() or COMMERCE_DELIVERY_SECRET_ENV
+        mall_gw_secret = load_required_secret(environ, gw_env) if mall_url else b""
+        mall_dl_secret = load_required_secret(environ, dl_env) if mall_url else b""
+
+        rmb_enabled = bool(raw.get("rmb_enabled", False))
+        acct_dir_secret = (
+            load_required_secret(environ, ACCOUNT_DIRECTORY_TRADE_SECRET_ENV)
+            if rmb_enabled
+            else load_optional_secret(environ, ACCOUNT_DIRECTORY_TRADE_SECRET_ENV)
+        )
+
         config = cls(
             **raw,
             mysql_password=environ.get(MYSQL_PASSWORD_ENV, ""),
@@ -167,6 +197,9 @@ class TradeConfig:
             coordinator_secret=load_required_secret(environ, COORDINATOR_SECRET_ENV),
             role_fence_secret=load_required_secret(environ, ROLE_FENCE_SECRET_ENV),
             manual_resolution_secret=manual_secret,
+            mall_gateway_secret=mall_gw_secret,
+            mall_delivery_secret=mall_dl_secret,
+            account_directory_secret=acct_dir_secret,
         )
         config.validate(settings=settings)
         return config
@@ -204,8 +237,36 @@ class TradeConfig:
             for cur in self.commerce_currencies:
                 if not is_tradable_currency(cur):
                     raise ValueError(f"non-tradable currency in commerce_currencies: {cur}")
-        if self.rmb_enabled and (not self.asset_op_enabled or not self.mall_url):
-            raise ValueError("rmb consignment requires asset_op_enabled and mall_url")
+        if self.mall_url:
+            parsed = urlsplit(self.mall_url)
+            if (
+                parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in ("", "/")
+            ):
+                raise ValueError(f"trade mall_url invalid: {self.mall_url!r}")
+            if len(self.mall_gateway_secret) < MIN_HMAC_SECRET_BYTES:
+                raise ValueError(f"{self.mall_gateway_secret_env} must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+            if len(self.mall_delivery_secret) < MIN_HMAC_SECRET_BYTES:
+                raise ValueError(f"{self.mall_delivery_secret_env} must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+            if self.mall_gateway_secret == self.mall_delivery_secret:
+                raise ValueError("mall gateway and delivery HMAC secrets must be distinct")
+            if self.mall_poll_interval_sec <= 0:
+                raise ValueError("trade mall_poll_interval_sec must be > 0")
+        if self.rmb_enabled:
+            if not self.asset_op_enabled or not self.mall_url:
+                raise ValueError("rmb consignment requires asset_op_enabled and mall_url")
+            if len(self.account_directory_secret) < MIN_HMAC_SECRET_BYTES:
+                raise ValueError(
+                    f"{ACCOUNT_DIRECTORY_TRADE_SECRET_ENV} must be at least {MIN_HMAC_SECRET_BYTES} bytes"
+                )
+            for cur in self.rmb_currencies:
+                if not is_tradable_currency(cur):
+                    raise ValueError(f"non-tradable currency in rmb_currencies: {cur}")
         if self.asset_loop_interval_sec <= 0 or not 1 <= self.asset_loop_workers <= 64:
             raise ValueError("trade asset_loop interval/workers invalid")
         if self.asset_loop_batch < self.asset_loop_workers:

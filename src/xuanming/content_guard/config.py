@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 import os
+from urllib.parse import urlsplit
 
 from ..settings import Settings
 from .lexstore import DEFAULT_PREFIX, DEFAULT_RESYNC_SEC, DEFAULT_RETRY_BACKOFF_SEC
@@ -16,10 +17,25 @@ DEFAULT_MAX_TEXT_BYTES = 4096
 MIN_TEXT_BYTES = 64
 MAX_TEXT_BYTES_LIMIT = 64 * 1024
 
+# 外部平台审核与渠道身份查询默认超时（毫秒）及合法上限（与 Go config.go 对齐）
+DEFAULT_SYNC_TIMEOUT_MS = 1500
+DEFAULT_WORLD_TIMEOUT_MS = 250
+DEFAULT_ASYNC_TIMEOUT_MS = 2500
+DEFAULT_LOOKUP_TIMEOUT_MS = 150
+MAX_SYNC_TIMEOUT_MS = 5000
+MAX_WORLD_TIMEOUT_MS = 2000
+MAX_ASYNC_TIMEOUT_MS = 10000
+MAX_LOOKUP_TIMEOUT_MS = 2000
+
+_TOML_FORBIDDEN_FIELDS = frozenset((
+    "platform_wechat_app_secret",
+    "platform_douyin_app_secret",
+))
+
 
 @dataclass(frozen=True, slots=True)
 class ContentGuardConfig:
-    """content_guard 无状态节点配置；词库、节点发现与热关停均走 etcd。"""
+    """content_guard 无状态节点配置；词库、节点发现与热关停均走 etcd，外部平台密钥仅从环境变量加载。"""
 
     node_id: int = DEFAULT_NODE_ID
     host: str = "0.0.0.0"
@@ -34,17 +50,45 @@ class ContentGuardConfig:
     max_text_bytes: int = DEFAULT_MAX_TEXT_BYTES
     resync_sec: float = DEFAULT_RESYNC_SEC
     retry_backoff_sec: float = DEFAULT_RETRY_BACKOFF_SEC
+    data_service: str = ""
+
+    # 可选外部平台审核配置（密钥字段仅由环境变量注入，严禁写入 TOML 或 repr）
+    platform_wechat_app_id: str = ""
+    platform_wechat_app_secret_env: str = ""
+    platform_wechat_base_url: str = ""
+    platform_wechat_app_secret: str = field(default="", repr=False)
+
+    platform_douyin_app_id: str = ""
+    platform_douyin_app_secret_env: str = ""
+    platform_douyin_base_url: str = ""
+    platform_douyin_app_secret: str = field(default="", repr=False)
+
+    platform_sync_timeout_ms: int = DEFAULT_SYNC_TIMEOUT_MS
+    platform_world_timeout_ms: int = DEFAULT_WORLD_TIMEOUT_MS
+    platform_async_timeout_ms: int = DEFAULT_ASYNC_TIMEOUT_MS
+    platform_lookup_timeout_ms: int = DEFAULT_LOOKUP_TIMEOUT_MS
 
     @property
     def effective_lexicon_prefix(self) -> str:
         """返回生效的 etcd 词库键前缀（留空时回退缺省值）。"""
         return self.lexicon_prefix or DEFAULT_PREFIX
 
+    @property
+    def has_platform(self) -> bool:
+        """是否启用了任一外部平台审核适配器。"""
+        return bool(self.platform_wechat_app_id or self.platform_douyin_app_id)
+
     @classmethod
     def from_settings(cls, settings: Settings, environ=None) -> "ContentGuardConfig":
         """从 ``Settings.content_guard_node`` 与环境变量组装并校验配置。"""
         environ = os.environ if environ is None else environ
         raw = dict(getattr(settings, "content_guard_node", {}) or {})
+        forbidden = set(raw) & _TOML_FORBIDDEN_FIELDS
+        if forbidden:
+            raise ValueError(
+                "[content_guard_node] platform secrets must come from environment variables, "
+                f"not config: {sorted(forbidden)}"
+            )
         valid_fields = {item.name for item in fields(cls)}
         unknown = set(raw) - valid_fields
         if unknown:
@@ -53,6 +97,7 @@ class ContentGuardConfig:
         raw.setdefault("zone_id", settings.zone_id)
         raw.setdefault("physical_region", settings.physical_region)
         raw.setdefault("release_track", settings.release_track)
+        raw.setdefault("data_service", str(getattr(settings, "data_service", "") or "").strip())
 
         advertise = str(raw.get("advertise_host", "") or "").strip()
         if not advertise:
@@ -68,6 +113,29 @@ class ContentGuardConfig:
 
         if "lexicon_prefix" in raw and not raw["lexicon_prefix"]:
             raw["lexicon_prefix"] = DEFAULT_PREFIX
+
+        for prefix in ("platform_wechat", "platform_douyin"):
+            app_id = str(raw.get(f"{prefix}_app_id", "") or "").strip()
+            secret_env = str(raw.get(f"{prefix}_app_secret_env", "") or "").strip()
+            base_url = str(raw.get(f"{prefix}_base_url", "") or "").strip()
+            if base_url:
+                raw[f"{prefix}_base_url"] = base_url
+            if not app_id and not secret_env:
+                continue
+            if not app_id or "${" in app_id:
+                raise ValueError(
+                    f"content_guard {prefix}_app_id must be set and not contain unexpanded placeholders"
+                )
+            if not secret_env or "${" in secret_env:
+                raise ValueError(
+                    f"content_guard {prefix}_app_secret_env must be an environment variable name"
+                )
+            secret_val = str(environ.get(secret_env, "") or "").strip()
+            if not secret_val:
+                raise ValueError(f"content_guard missing environment variable {secret_env} for {prefix}")
+            raw[f"{prefix}_app_id"] = app_id
+            raw[f"{prefix}_app_secret_env"] = secret_env
+            raw[f"{prefix}_app_secret"] = secret_val
 
         config = cls(**raw)
         config.validate(settings=settings)
@@ -98,5 +166,61 @@ class ContentGuardConfig:
             )
         if self.resync_sec <= 0 or self.retry_backoff_sec <= 0:
             raise ValueError("content_guard resync_sec and retry_backoff_sec must be > 0")
+        self._validate_platform()
         if settings is not None and not settings.etcd:
             raise ValueError("content_guard requires etcd endpoint")
+
+    def _validate_platform(self) -> None:
+        for prefix, app_id, secret_env, secret_val, base_url in (
+            (
+                "platform_wechat",
+                self.platform_wechat_app_id,
+                self.platform_wechat_app_secret_env,
+                self.platform_wechat_app_secret,
+                self.platform_wechat_base_url,
+            ),
+            (
+                "platform_douyin",
+                self.platform_douyin_app_id,
+                self.platform_douyin_app_secret_env,
+                self.platform_douyin_app_secret,
+                self.platform_douyin_base_url,
+            ),
+        ):
+            if not app_id and not secret_env and not secret_val:
+                continue
+            if not app_id or "${" in app_id:
+                raise ValueError(
+                    f"content_guard {prefix}_app_id must be set and not contain unexpanded placeholders"
+                )
+            if not secret_env or "${" in secret_env:
+                raise ValueError(
+                    f"content_guard {prefix}_app_secret_env must be an environment variable name"
+                )
+            if not secret_val:
+                raise ValueError(f"content_guard missing environment variable {secret_env} for {prefix}")
+            if base_url:
+                parts = urlsplit(base_url)
+                if "${" in base_url or parts.scheme not in ("http", "https") or not parts.hostname:
+                    raise ValueError(f"content_guard {prefix}_base_url must be a valid http/https URL")
+
+        if not 0 <= self.platform_sync_timeout_ms <= MAX_SYNC_TIMEOUT_MS:
+            raise ValueError(
+                f"content_guard platform_sync_timeout_ms ({self.platform_sync_timeout_ms}) "
+                f"must be within [0, {MAX_SYNC_TIMEOUT_MS}]"
+            )
+        if not 0 <= self.platform_world_timeout_ms <= MAX_WORLD_TIMEOUT_MS:
+            raise ValueError(
+                f"content_guard platform_world_timeout_ms ({self.platform_world_timeout_ms}) "
+                f"must be within [0, {MAX_WORLD_TIMEOUT_MS}]"
+            )
+        if not 0 <= self.platform_async_timeout_ms <= MAX_ASYNC_TIMEOUT_MS:
+            raise ValueError(
+                f"content_guard platform_async_timeout_ms ({self.platform_async_timeout_ms}) "
+                f"must be within [0, {MAX_ASYNC_TIMEOUT_MS}]"
+            )
+        if not 0 <= self.platform_lookup_timeout_ms <= MAX_LOOKUP_TIMEOUT_MS:
+            raise ValueError(
+                f"content_guard platform_lookup_timeout_ms ({self.platform_lookup_timeout_ms}) "
+                f"must be within [0, {MAX_LOOKUP_TIMEOUT_MS}]"
+            )

@@ -9,11 +9,17 @@ from dataclasses import dataclass
 import grpc
 import pytest
 
+from xuanming.data_service.service import DataService
 from xuanming.grpc_runtime import GrpcClient, serve_grpc, verify_service_call
+from xuanming.nodes.scene_channels import SceneChannels
 from xuanming.protocol import Protocol
 from xuanming.scene_manager import (
     AccountRoleInfo,
     CrossDomainRedisKeyError,
+    DeadHolderReleaseBlockedError,
+    DeadHolderReleaseOutcome,
+    DeadHolderReleaser,
+    DeadNodeSweeper,
     ERR_CHANNEL_FULL,
     ERR_CHANNEL_SWITCH_COOLDOWN,
     ERR_CHANNEL_UNAVAILABLE,
@@ -24,6 +30,7 @@ from xuanming.scene_manager import (
     ERR_NO_AVAILABLE_NODE,
     ERR_OK,
     ERR_PLACEMENT_SESSION_SUPERSEDED,
+    ERR_SCENE_REENTRY_BARRIER,
     ERR_SOURCE_SCENE_GONE,
     EVENT_ID_PLAYER_HOSTED_PLACEMENT,
     EVENT_ID_REDIRECT_TO_GATE,
@@ -32,9 +39,16 @@ from xuanming.scene_manager import (
     GrpcDataServiceClient,
     GrpcSceneNodeClient,
     HomeZoneNotFoundError,
+    IdleInstanceSweeper,
     KafkaCommandPublisher,
     MemoryPlayerPlacementStore,
     MemorySceneControlStore,
+    PlayerStoreHolderInfo,
+    SCENE_CHANNEL_STATE_BUSY,
+    SCENE_CHANNEL_STATE_CLOSING,
+    SCENE_CHANNEL_STATE_FULL,
+    SCENE_CHANNEL_STATE_SMOOTH,
+    SCENE_CHANNEL_STATE_UNAVAILABLE,
     SCENE_NODE_TYPE,
     SCENE_NODE_TYPE_INSTANCE,
     SCENE_NODE_TYPE_MAIN_WORLD,
@@ -43,9 +57,12 @@ from xuanming.scene_manager import (
     SceneIdGenerator,
     SceneManagerConfig,
     SceneManagerService,
+    TeardownJobSweeper,
+    WorldChannelDirectoryPublisher,
     keys,
     load_world_conf_ids,
 )
+from tests.data_service_fakes import MemoryStore as DataMemoryStore
 
 
 # ── 测试夹具与替身 ─────────────────────────────────────────────────────────────
@@ -105,6 +122,7 @@ class FakeSceneNodes:
         self.destroyed: list[tuple[int, str, int]] = []
         self.releases: list[ReleaseCall] = []
         self.fail_create_nodes: set[str] = set()
+        self.fail_destroy_nodes: set[str] = set()
 
     async def create_scene(
         self, zone_id: int, node_id: str, *, config_id: int, scene_id: int,
@@ -115,6 +133,8 @@ class FakeSceneNodes:
         self.created.append((zone_id, node_id, config_id, scene_id, mirror_config_id, tuple(creator_ids)))
 
     async def destroy_scene(self, zone_id: int, node_id: str, *, scene_id: int, placement_generation: int = 0) -> None:
+        if node_id in self.fail_destroy_nodes:
+            raise RuntimeError(f"simulated DestroyScene failure on node {node_id}")
         self.destroyed.append((zone_id, node_id, scene_id))
 
     async def release_player(
@@ -254,12 +274,20 @@ class FakePublisher:
 class Harness:
     """运行真实 serve_grpc(pass_context=True) 与 GrpcClient 的集成测试夹具。"""
 
-    def __init__(self, *, cfg: SceneManagerConfig | None = None) -> None:
-        self.protocol = Protocol()
-        self.clock = FakeClock()
+    def __init__(
+        self,
+        *,
+        cfg: SceneManagerConfig | None = None,
+        data_service=None,
+        dead_holder_releaser: DeadHolderReleaser | None = None,
+        clock: FakeClock | None = None,
+        protocol: Protocol | None = None,
+    ) -> None:
+        self.protocol = protocol or Protocol()
+        self.clock = clock or FakeClock()
         self.control = MemorySceneControlStore(clock_ms=self.clock)
         self.players = MemoryPlayerPlacementStore(clock_ms=self.clock)
-        self.data = FakeDataService()
+        self.data = data_service if data_service is not None else FakeDataService()
         self.scene_nodes = FakeSceneNodes()
         self.registry = FakeNodeRegistry(self.protocol)
         self.publisher = FakePublisher()
@@ -281,6 +309,7 @@ class Harness:
             publisher=self.publisher,
             id_gen=SceneIdGenerator(1, clock_ms=self.clock),
             clock_ms=self.clock,
+            dead_holder_releaser=dead_holder_releaser,
         )
         self.server = None
         self.client: GrpcClient | None = None
@@ -1131,5 +1160,480 @@ def test_leave_dead_owner_no_holder_and_kafka_partitioning():
             h.players.strings[keys.location_revision_key(6002)] = keys.location_revision_tag(2, raw2).encode("ascii")
             await h.leave_scene(player_id=6002, scene_id=0, session_id=801, login_generation=2, zone_id=1)
             assert await h.read_location(6002) is None
+
+    asyncio.run(scenario())
+
+
+# ==============================================================================
+# 10. WorldChannelDirectoryPublisher：稳定 1-based 线号、状态分类、TTL 与 nodes/scene_channels.py 联读
+# ==============================================================================
+
+def test_world_channel_directory_publisher_and_scene_channels_consumer():
+    async def scenario():
+        cfg = SceneManagerConfig(
+            zone_id=1,
+            gate_token_secret=b"C" * 32,
+            world_conf_ids=(1,),
+            world_channel_count=4,
+            channel_max_players=10,
+            channel_busy_percent=60,
+            channel_switch_cooldown_sec=15,
+            channel_directory_refresh_sec=2.0,
+        )
+        async with Harness(cfg=cfg) as h:
+            h.registry.add_scene_node(zone_id=1, node_id=10, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD)
+            h.registry.add_scene_node(zone_id=1, node_id=11, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD)
+            await h.service.sync_nodes_to_control_store(1)
+            await h.service.init_world_scenes(1)
+
+            channels = sorted(int(s) for s in await h.control.get_world_channels(1, 1))
+            assert len(channels) == 4
+            c1, c2, c3, c4 = channels
+
+            # c1: 2 人 -> SMOOTH; c2: 6 人 (60%) -> BUSY; c3: 10 人 (100%) -> FULL; c4: draining -> CLOSING
+            for idx in range(2):
+                await h.control.add_scene_member(1, c1, await h.control.get_scene_node(1, c1), 100 + idx)
+            for idx in range(6):
+                await h.control.add_scene_member(1, c2, await h.control.get_scene_node(1, c2), 200 + idx)
+            for idx in range(10):
+                await h.control.add_scene_member(1, c3, await h.control.get_scene_node(1, c3), 300 + idx)
+            h.control.mark_channel_draining(1, 1, c4)
+
+            publisher = WorldChannelDirectoryPublisher(
+                h.protocol, cfg, control_store=h.control, node_registry=h.registry, clock_ms=h.clock,
+            )
+            assert await publisher.publish_zone(1) == 1
+
+            # 校验键名、TTL (~8s) 与确定性 1-based 线号
+            dir_key = keys.world_channel_directory_key(1, 1)
+            assert dir_key == "world_channel_directory:{ctl:1}:1"
+            assert h.control.get_ttl_remaining_sec(dir_key) == 8
+
+            raw = await h.control.get_world_channel_directory(1, 1)
+            assert raw is not None
+            parsed = h.protocol.parse("SceneChannelDirectory", raw)
+            assert (parsed.zone_id, parsed.scene_config_id, parsed.max_players_per_channel, parsed.switch_cooldown_seconds, parsed.switch_enabled) == (
+                1, 1, 10, 15, True,
+            )
+            assert [(c.scene_id, c.channel_no, c.player_count, c.state) for c in parsed.channels] == [
+                (c1, 1, 2, SCENE_CHANNEL_STATE_SMOOTH),
+                (c2, 2, 6, SCENE_CHANNEL_STATE_BUSY),
+                (c3, 3, 10, SCENE_CHANNEL_STATE_FULL),
+                (c4, 4, 0, SCENE_CHANNEL_STATE_CLOSING),
+            ]
+
+            # 真实 nodes/scene_channels.py SceneChannels 消费直读校验
+            pushed: list[tuple[object, str, object]] = []
+
+            class _FakePlayer:
+                player_id = 9001
+
+            class _FakeWorld:
+                def __init__(self, info, player):
+                    self.info = info
+                    self.players = {player.player_id: player}
+
+            class _FakeScene:
+                def __init__(self, protocol, world, player):
+                    self.protocol = protocol
+                    self.info = protocol.message("NodeInfo", zone_id=1)
+                    self.locations = {player.player_id: world}
+
+                def _push(self, player, name, msg):
+                    pushed.append((player, name, msg))
+
+            player = _FakePlayer()
+            scene_info = h.protocol.message("SceneInfoComp", scene_id=c1, scene_config_id=1)
+            world = _FakeWorld(scene_info, player)
+            fake_scene = _FakeScene(h.protocol, world, player)
+            consumer = SceneChannels(fake_scene, control_redis=h.control)
+            req = h.protocol.message("SceneInfoRequest", with_channel_directory=True)
+            consumer.query(world, player, req)
+            await asyncio.gather(*tuple(consumer._pending))
+            await consumer.close()
+
+            assert len(pushed) == 1
+            _, msg_name, s2c = pushed[0]
+            assert msg_name == "SceneSceneClientPlayerNotifySceneInfo"
+            assert s2c.HasField("channel_directory")
+            assert s2c.channel_directory.scene_config_id == 1
+            assert [c.channel_no for c in s2c.channel_directory.channels] == [1, 2, 3, 4]
+            assert [c.state for c in s2c.channel_directory.channels] == [
+                SCENE_CHANNEL_STATE_SMOOTH,
+                SCENE_CHANNEL_STATE_BUSY,
+                SCENE_CHANNEL_STATE_FULL,
+                SCENE_CHANNEL_STATE_CLOSING,
+            ]
+
+            # c2 下线销毁后新线 c5 复用空出的 2 号线，且属主节点下线后 c1 展示为 UNAVAILABLE
+            h.control.sets[keys.world_channels_key(1, 1)].discard(str(c2))
+            c5 = c4 + 100
+            owner_c1 = await h.control.get_scene_node(1, c1)
+            other_node = "11" if owner_c1 == "10" else "10"
+            h.control.strings[keys.scene_node_key(1, c5)] = other_node.encode("utf-8")
+            h.control.sets[keys.world_channels_key(1, 1)].add(str(c5))
+            await h.control.remove_scene_node(1, owner_c1, death_at_unix_sec=h.clock.now_ms // 1000)
+            await publisher.publish_zone(1)
+            parsed2 = h.protocol.parse("SceneChannelDirectory", await h.control.get_world_channel_directory(1, 1))
+            by_sid = {c.scene_id: (c.channel_no, c.state) for c in parsed2.channels}
+            assert by_sid[c5][0] == 2
+            assert by_sid[c1] == (1, SCENE_CHANNEL_STATE_UNAVAILABLE)
+
+            # 推进时钟越过 8s TTL -> 目录自然过期
+            h.clock.advance_sec(9)
+            assert await h.control.get_world_channel_directory(1, 1) is None
+
+    asyncio.run(scenario())
+
+
+# ==============================================================================
+# 11. IdleInstanceSweeper：空副本 300s vs 镜像 30s、有人保活与并发进入 CAS 保护
+# ==============================================================================
+
+def test_idle_instance_sweeper_timeouts_busy_and_mirror_cascade():
+    async def scenario():
+        cfg = SceneManagerConfig(
+            zone_id=1,
+            gate_token_secret=b"I" * 32,
+            world_conf_ids=(1,),
+            instance_idle_timeout_sec=300,
+            mirror_idle_timeout_sec=30,
+        )
+        async with Harness(cfg=cfg) as h:
+            h.registry.add_scene_node(zone_id=1, node_id=10, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD)
+            h.registry.add_scene_node(zone_id=1, node_id=20, scene_node_type=SCENE_NODE_TYPE_INSTANCE)
+            await h.service.sync_nodes_to_control_store(1)
+            await h.service.init_world_scenes(1)
+            world_ch = int((await h.control.get_world_channels(1, 1))[0])
+
+            inst_empty = await h.create_scene(scene_conf_id=9001, scene_type=SCENE_TYPE_INSTANCE, zone_id=1)
+            inst_busy = await h.create_scene(scene_conf_id=9002, scene_type=SCENE_TYPE_INSTANCE, zone_id=1)
+            inst_parent = await h.create_scene(scene_conf_id=9003, scene_type=SCENE_TYPE_INSTANCE, zone_id=1)
+            mirror_world = await h.create_scene(
+                scene_conf_id=1, scene_type=SCENE_TYPE_INSTANCE, zone_id=1,
+                source_scene_id=world_ch, mirror_config_id=71,
+            )
+            # 给 inst_busy 放一名在线玩家
+            await h.control.add_scene_member(1, inst_busy.scene_id, "20", 7001)
+
+            sweeper = IdleInstanceSweeper(h.service, clock_ms=h.clock)
+
+            # 经过 31s：空镜像（30s）被销毁并摘出源镜像集；普通空副本（300s）与有人副本均保留
+            h.clock.advance_sec(31)
+            assert await sweeper.sweep_once(1) == 1
+            assert not await h.control.scene_node_exists(1, mirror_world.scene_id)
+            assert str(mirror_world.scene_id) not in await h.control.get_scene_mirrors(1, world_ch)
+            assert await h.control.scene_node_exists(1, inst_empty.scene_id)
+            assert await h.control.scene_node_exists(1, inst_busy.scene_id)
+            # inst_busy 的活跃时间戳已刷新到当前时刻
+            scores = dict(await h.control.list_active_instances_with_scores(1))
+            assert int(scores[str(inst_busy.scene_id)]) == h.clock.now_ms // 1000
+
+            # 在 290s 时给 inst_parent 挂一个子镜像（20s 后自身不到 30s，但随父级联销毁）
+            h.clock.advance_sec(259)
+            sub_mirror = await h.create_scene(
+                scene_conf_id=9003, scene_type=SCENE_TYPE_INSTANCE, zone_id=1,
+                source_scene_id=inst_parent.scene_id, mirror_config_id=72,
+            )
+
+            # 再过 15s（总计 305s）：inst_empty 与 inst_parent 超 300s 被销毁（级联销毁 sub_mirror），inst_busy 仍存活
+            h.clock.advance_sec(15)
+            assert await sweeper.sweep_once(1) == 2
+            assert not await h.control.scene_node_exists(1, inst_empty.scene_id)
+            assert not await h.control.scene_node_exists(1, inst_parent.scene_id)
+            assert not await h.control.scene_node_exists(1, sub_mirror.scene_id)
+            assert await h.control.scene_node_exists(1, inst_busy.scene_id)
+            destroyed_ids = {sid for _, _, sid in h.scene_nodes.destroyed}
+            assert {mirror_world.scene_id, inst_empty.scene_id, inst_parent.scene_id, sub_mirror.scene_id}.issubset(destroyed_ids)
+            assert inst_busy.scene_id not in destroyed_ids
+
+            # 直接验证 Lua 空闲 CAS 防竞态：有玩家时 atomic_destroy_instance 返回 busy 且不删键
+            claim = await h.control.atomic_destroy_instance(
+                zone_id=1, scene_id=inst_busy.scene_id, expected_owner="20", now_unix_sec=h.clock.now_ms // 1000,
+            )
+            assert claim.busy is True and claim.claimed is False
+            assert await h.control.scene_node_exists(1, inst_busy.scene_id)
+
+    asyncio.run(scenario())
+
+
+# ==============================================================================
+# 12. TeardownJobSweeper：拆除失败留待办 -> 租期后重试 DestroyScene -> finish_scene_teardown
+# ==============================================================================
+
+def test_teardown_job_sweeper_retry_completion_and_dangling_cleanup():
+    async def scenario():
+        cfg = SceneManagerConfig(
+            zone_id=1,
+            gate_token_secret=b"T" * 32,
+            world_conf_ids=(1,),
+            teardown_job_lease_sec=90,
+        )
+        async with Harness(cfg=cfg) as h:
+            h.registry.add_scene_node(zone_id=1, node_id=20, scene_node_type=SCENE_NODE_TYPE_INSTANCE)
+            await h.service.sync_nodes_to_control_store(1)
+
+            inst = await h.create_scene(scene_conf_id=9101, scene_type=SCENE_TYPE_INSTANCE, zone_id=1)
+            assert inst.error_code == ERR_OK
+
+            # 注入节点 20 DestroyScene 失败 -> 认领已删映射但拆除任务留在 pending
+            h.scene_nodes.fail_destroy_nodes.add("20")
+            await h.destroy_scene(scene_id=inst.scene_id, zone_id=1)
+            assert not await h.control.scene_node_exists(1, inst.scene_id)
+            job = await h.control.load_scene_teardown_job(1, inst.scene_id)
+            assert job is not None and job.kind == "instance" and job.claim.node_id == "20"
+
+            sweeper = TeardownJobSweeper(h.service, clock_ms=h.clock)
+
+            # 租期内（+30s）不接手
+            h.clock.advance_sec(30)
+            assert await sweeper.sweep_once(1) == 0
+
+            # 超租期（+65s，总 95s）但节点仍报错 -> 重试失败，任务继续保留
+            h.clock.advance_sec(65)
+            assert await sweeper.sweep_once(1) == 0
+            assert await h.control.load_scene_teardown_job(1, inst.scene_id) is not None
+
+            # 节点恢复 -> 下次扫描补发 DestroyScene 并 finish_scene_teardown 清空待办
+            h.scene_nodes.fail_destroy_nodes.clear()
+            assert await sweeper.sweep_once(1) == 1
+            assert await h.control.load_scene_teardown_job(1, inst.scene_id) is None
+            assert await h.control.list_due_teardown_jobs(1, h.clock.now_ms // 1000 + 1000, 10) == []
+            assert (1, "20", inst.scene_id) in h.scene_nodes.destroyed
+
+            # 悬空 pending 条目（无 Hash）自动摘除
+            dangling_sid = 999888
+            h.control._zadd(keys.scene_teardown_pending_key(1), str(dangling_sid), float(h.clock.now_ms // 1000 - 200))
+            assert await sweeper.sweep_once(1) == 0
+            assert await h.control.list_due_teardown_jobs(1, h.clock.now_ms // 1000 + 1000, 10) == []
+
+    asyncio.run(scenario())
+
+
+# ==============================================================================
+# 13. DeadNodeSweeper：20s 再入屏障、死节点孤儿副本清理、保大世界频道与同实例回归撤销
+# ==============================================================================
+
+def test_dead_node_sweeper_barrier_orphans_world_preservation_and_returning_instance():
+    async def scenario():
+        cfg = SceneManagerConfig(
+            zone_id=1,
+            gate_token_secret=b"N" * 32,
+            world_conf_ids=(1,),
+            world_channel_count=1,
+            reentry_barrier_sec=20,
+        )
+        async with Harness(cfg=cfg) as h:
+            h.registry.add_scene_node(zone_id=1, node_id=10, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD, node_uuid="uuid-10")
+            h.registry.add_scene_node(zone_id=1, node_id=20, scene_node_type=SCENE_NODE_TYPE_INSTANCE, node_uuid="uuid-20")
+            h.registry.add_scene_node(zone_id=1, node_id=21, scene_node_type=SCENE_NODE_TYPE_INSTANCE, node_uuid="uuid-21")
+            await h.service.sync_nodes_to_control_store(1)
+            await h.service.init_world_scenes(1)
+            world_ch = int((await h.control.get_world_channels(1, 1))[0])
+
+            # 在节点 20 建两个副本，在节点 10 建一个大世界共置镜像
+            inst_orphan = await h.create_scene(scene_conf_id=9201, scene_type=SCENE_TYPE_INSTANCE, zone_id=1, target_node_id="20")
+            inst_moved = await h.create_scene(scene_conf_id=9202, scene_type=SCENE_TYPE_INSTANCE, zone_id=1, target_node_id="20")
+            mirror_on_10 = await h.create_scene(
+                scene_conf_id=1, scene_type=SCENE_TYPE_INSTANCE, zone_id=1,
+                source_scene_id=world_ch, mirror_config_id=73,
+            )
+            assert mirror_on_10.node_id == "10"
+
+            # 节点 20 死亡 -> sync 写 death_at 并入队死节点收尾任务
+            h.registry.remove_scene_node(1, 20)
+            await h.service.sync_nodes_to_control_store(1)
+            tasks, _ = await h.control.list_dead_node_reconcile_tasks(1)
+            assert [t.node_id for t in tasks] == ["20"]
+
+            # 模拟 inst_moved 在收尾前已被改派到存活节点 21
+            assert await h.control.reassign_scene_node(
+                zone_id=1, scene_id=inst_moved.scene_id, old_node_id="20", new_node_id="21", placement_generation=2,
+            )
+
+            sweeper = DeadNodeSweeper(h.service, clock_ms=h.clock)
+
+            # 屏障内（+10s < 20s）：不清理任何孤儿
+            h.clock.advance_sec(10)
+            assert await sweeper.sweep_once(1) == 0
+            assert await h.control.scene_node_exists(1, inst_orphan.scene_id)
+
+            # 过屏障（+15s，总 25s）：销毁 inst_orphan，保留已改派的 inst_moved，清空死节点 20 的 scene_count
+            h.clock.advance_sec(15)
+            assert await sweeper.sweep_once(1) == 1
+            assert not await h.control.scene_node_exists(1, inst_orphan.scene_id)
+            assert not await h.control.is_active_instance(1, inst_orphan.scene_id)
+            assert await h.control.get_scene_node(1, inst_moved.scene_id) == "21"
+            assert await h.control.get_node_scene_count(1, "20") is None
+
+            # 节点 10（承载大世界频道 + 镜像）死亡 -> 过屏障后仅拆镜像，绝不毁大世界频道
+            h.registry.remove_scene_node(1, 10)
+            await h.service.sync_nodes_to_control_store(1)
+            h.clock.advance_sec(25)
+            assert await sweeper.sweep_once(1) == 1
+            assert not await h.control.scene_node_exists(1, mirror_on_10.scene_id)
+            assert await h.control.get_scene_node(1, world_ch) == "10"
+
+            # 判死同一代进程回归（node_uuid 相同）：撤销收尾任务并保住名下副本
+            inst_live = await h.create_scene(scene_conf_id=9203, scene_type=SCENE_TYPE_INSTANCE, zone_id=1, target_node_id="21")
+            h.registry.remove_scene_node(1, 21)
+            await h.service.sync_nodes_to_control_store(1)
+            # 同一进程 uuid-21 在过屏障前重新注册回 etcd（尚未经 sync 撤任务，由 sweeper 主动撤）
+            h.registry.add_scene_node(zone_id=1, node_id=21, scene_node_type=SCENE_NODE_TYPE_INSTANCE, node_uuid="uuid-21")
+            h.clock.advance_sec(25)
+            assert await sweeper.sweep_once(1) == 1
+            assert await h.control.get_scene_node(1, inst_live.scene_id) == "21"
+            assert await h.control.get_node_death_at(1, "21") is None
+
+    asyncio.run(scenario())
+
+
+# ==============================================================================
+# 14. DeadHolderReleaser：对接真实 DataService 的 ReadPlayerStoreHolder / ReleaseDeadPlayerStoreHolder 全链路
+# ==============================================================================
+
+def test_dead_holder_releaser_round_trip_against_real_data_service():
+    async def scenario():
+        protocol = Protocol()
+        clock = FakeClock()
+        secret = b"M" * 32
+
+        # 启动真实 DataService（含真实 HMAC 验签与 ReadPlayerStoreHolder / ReleaseDeadPlayerStoreHolder）
+        ds_store = DataMemoryStore(protocol, clock_ms=clock)
+        ds_service = DataService(protocol, ds_store, {"scene_manager": secret}, clock_ms=clock)
+        await ds_service.start()
+        ds_server, ds_port = await serve_grpc(
+            protocol, "127.0.0.1:0", ds_service.services(), pass_context=True,
+        )
+        ds_grpc = GrpcClient(f"127.0.0.1:{ds_port}", timeout=5)
+        try:
+            ds_client = GrpcDataServiceClient(protocol, ds_grpc, secret, clock_ms=clock)
+
+            # 1. 预置角色与路由到真实 DataService
+            for pid, name in ((8001, "死持有离场"), (8002, "死持有接管")):
+                await ds_store.register_zone(pid, 1, 1_000_000)
+                role_msg = protocol.message("AccountSimplePlayer", player_id=pid, name=name, zone_id=1)
+                await ds_store.create_role(f"acc-{pid}", role_msg)
+
+            # 2. 直连验证 ReadPlayerStoreHolder / ReleaseDeadPlayerStoreHolder 签名往返
+            assert await ds_client.read_player_store_holder(999999) is None
+            ds_store.store_holders[8001] = [100, b"uuid-dead-10", 5, 1]
+            ds_store.store_released[8001] = False
+            seen = await ds_client.read_player_store_holder(8001)
+            assert seen == PlayerStoreHolderInfo(owner_epoch=100, holder_instance=b"uuid-dead-10", claim_seq=5)
+
+            # seen.claim_seq 不匹配 -> 真实 DataService 拒绝 FAILED_PRECONDITION
+            with pytest.raises(grpc.aio.AioRpcError) as mismatch:
+                await ds_client.release_dead_player_store_holder(
+                    8001, 100, seen=PlayerStoreHolderInfo(100, b"uuid-dead-10", 4),
+                )
+            assert mismatch.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+            # 3. 完整接线 SceneManagerService + DeadHolderReleaser + 真实 DataService
+            cfg = SceneManagerConfig(
+                zone_id=1,
+                gate_token_secret=b"P" * 32,
+                world_conf_ids=(1,),
+                reentry_barrier_sec=20,
+            )
+            async with Harness(cfg=cfg, data_service=ds_client, clock=clock, protocol=protocol) as h:
+                h.service.dead_holder_releaser = DeadHolderReleaser(ds_client, h.registry, zone_id=1)
+                h.registry.add_scene_node(zone_id=1, node_id=10, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD, node_uuid="uuid-10")
+                h.registry.add_scene_node(zone_id=1, node_id=11, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD, node_uuid="uuid-11")
+                await h.service.sync_nodes_to_control_store(1)
+                await h.service.init_world_scenes(1)
+
+                # 让 8001 和 8002 落到节点 10
+                ch_on_10 = None
+                for sid_str in await h.control.get_world_channels(1, 1):
+                    if await h.control.get_scene_node(1, int(sid_str)) == "10":
+                        ch_on_10 = int(sid_str)
+                        break
+                if ch_on_10 is None:
+                    ch_on_10 = int((await h.control.get_world_channels(1, 1))[0])
+                    h.control.strings[keys.scene_node_key(1, ch_on_10)] = b"10"
+
+                for pid, sess in ((8001, 1001), (8002, 1002)):
+                    ent = await h.enter_scene(
+                        player_id=pid, scene_id=ch_on_10, session_id=sess,
+                        gate_id="4", gate_instance_id="g-4", gate_zone_id=1,
+                        login_generation=1, owner_revision=1,
+                    )
+                    assert ent.error_code == ERR_OK
+
+                loc_8001 = await h.read_location(8001)
+                loc_8002 = await h.read_location(8002)
+                assert loc_8001.node_id == "10" and loc_8002.node_id == "10"
+
+                # 节点 10 掉线且过 20s 屏障；但先把 8001/8002 写权行指向仍在册的 uuid-11（模拟交接源仍在册/镜像滞后）
+                ds_store.store_holders[8001] = [loc_8001.owner_epoch, b"uuid-11", 7, 1]
+                ds_store.store_released[8001] = False
+                ds_store.store_holders[8002] = [loc_8002.owner_epoch, b"uuid-11", 8, 1]
+                ds_store.store_released[8002] = False
+
+                h.registry.remove_scene_node(1, 10)
+                await h.service.sync_nodes_to_control_store(1)
+                clock.advance_sec(25)
+
+                # 持有实例 uuid-11 仍在 etcd 注册表 -> LeaveScene 拒绝删位置、不释放写权行
+                with pytest.raises(grpc.aio.AioRpcError) as kept_leave:
+                    await h.leave_scene(
+                        player_id=8001, scene_id=loc_8001.scene_id, session_id=1001, login_generation=1, zone_id=1,
+                    )
+                assert kept_leave.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+                assert "holder_release_pending" in (kept_leave.value.details() or "")
+                assert await h.read_location(8001) is not None
+                assert ds_store.store_released[8001] is False
+
+                # 持有实例 uuid-11 仍在册 -> EnterScene 死节点接管也被拦回 ERR_HANDOFF_PENDING，不释放写权行
+                blocked_enter = await h.enter_scene(
+                    player_id=8002, scene_conf_id=1, session_id=1002,
+                    gate_id="4", gate_instance_id="g-4", gate_zone_id=1,
+                    login_generation=2, owner_revision=1,
+                )
+                assert blocked_enter.error_code == ERR_HANDOFF_PENDING
+                assert ds_store.store_released[8002] is False
+                assert (await h.read_location(8002)).node_id == "10"
+
+                # 将写权行改回已不在册的死实例 uuid-10 -> LeaveScene 经真实 DataService 释放写权行并删 location
+                ds_store.store_holders[8001] = [loc_8001.owner_epoch, b"uuid-10", 7, 1]
+                ds_store.store_released[8001] = False
+                await h.leave_scene(
+                    player_id=8001, scene_id=loc_8001.scene_id, session_id=1001, login_generation=1, zone_id=1,
+                )
+                assert await h.read_location(8001) is None
+                after_8001 = await ds_client.read_player_store_holder(8001)
+                assert after_8001 is not None
+                assert after_8001.owner_epoch == loc_8001.owner_epoch + 1
+                assert after_8001.holder_instance == b""
+                assert ds_store.store_released[8001] is True
+
+                # 8002 写权行同样指向死实例 uuid-10 -> EnterScene 先释放死持有者，再接管到活节点 11
+                ds_store.store_holders[8002] = [loc_8002.owner_epoch, b"uuid-10", 8, 1]
+                ds_store.store_released[8002] = False
+                # 在节点 11 上准备可用大世界频道（触发自愈改派）
+                clock.advance_sec(1)
+                await h.service.init_world_scenes(1)
+                takeover = await h.enter_scene(
+                    player_id=8002, scene_conf_id=1, session_id=1002,
+                    gate_id="4", gate_instance_id="g-4", gate_zone_id=1,
+                    login_generation=2, owner_revision=1,
+                )
+                assert takeover.error_code == ERR_OK
+                loc_8002_new = await h.read_location(8002)
+                assert loc_8002_new.node_id == "11" and loc_8002_new.owner_epoch > loc_8002.owner_epoch
+                after_8002 = await ds_client.read_player_store_holder(8002)
+                assert after_8002.owner_epoch == loc_8002.owner_epoch + 1
+                assert after_8002.holder_instance == b""
+                assert ds_store.store_released[8002] is True
+
+                # 额外验证 NO_ROW 与 NEWER_OWNER 均放行
+                releaser = h.service.dead_holder_releaser
+                assert await releaser.release_dead_holder(999999, 50) == DeadHolderReleaseOutcome.NO_ROW
+                assert await releaser.release_dead_holder(8001, loc_8001.owner_epoch) == DeadHolderReleaseOutcome.NEWER_OWNER
+        finally:
+            await ds_grpc.close()
+            await ds_server.stop(1)
+            await ds_service.close()
 
     asyncio.run(scenario())

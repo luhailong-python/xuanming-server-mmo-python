@@ -156,6 +156,41 @@ def world_draining_set_key(zone_id: int, conf_id: int) -> str:
     return f"world_channels:draining:{scene_control_tag(zone_id)}:{conf_id}"
 
 
+def world_channel_lineno_key(zone_id: int, conf_id: int) -> str:
+    """分线号映射表：HASH(scene_id -> 1-based line_no)，与 Go WorldChannelLineNoKeyFmt 逐字节一致。"""
+    return f"world_channel_lineno:{scene_control_tag(zone_id)}:{conf_id}"
+
+
+def world_channel_directory_key(zone_id: int, conf_id: int) -> str:
+    """分线目录快照：STRING(SceneChannelDirectory protobuf)，与 nodes/scene_channels.py 逐字节一致。"""
+    return f"world_channel_directory:{scene_control_tag(zone_id)}:{conf_id}"
+
+
+def dead_node_reconcile_tasks_key(zone_id: int) -> str:
+    return f"scene_manager:dead_node_reconcile:{scene_control_tag(zone_id)}"
+
+
+def node_reconcile_scenes_key(zone_id: int, node_id: str) -> str:
+    return f"node:{scene_control_tag(zone_id)}:{node_id}:reconcile_scenes"
+
+
+def node_reconcile_instance_key(zone_id: int, node_id: str) -> str:
+    return f"node:{scene_control_tag(zone_id)}:{node_id}:reconcile_instance"
+
+
+def pending_dead_node_member(zone_id: int, node_id: str) -> str:
+    return f"{zone_id}/{node_id}"
+
+
+def parse_dead_node_reconcile_member(member: str) -> tuple[int, str] | None:
+    if "/" not in member:
+        return None
+    zone_part, node_id = member.split("/", 1)
+    if not node_id or not zone_part.isascii() or not zone_part.isdigit():
+        return None
+    return int(zone_part), node_id
+
+
 def world_desired_channels_key(zone_id: int) -> str:
     return f"world_channels:desired:{scene_control_tag(zone_id)}"
 

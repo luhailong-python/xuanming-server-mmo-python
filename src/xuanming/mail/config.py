@@ -13,6 +13,12 @@ from .model import (
     SWEEP_MODE_DELETE,
     SWEEP_MODE_REPORT_ONLY,
 )
+from .notify import DEFAULT_NOTIFY_TIMEOUT_SEC
+from .sweep import (
+    DEFAULT_SWEEP_BATCH_LIMIT,
+    DEFAULT_SWEEP_INTERVAL_SEC,
+    DEFAULT_SWEEP_RETENTION_DAYS,
+)
 
 # 密钥与数据库口令环境变量名（与 Go mail/etc/mail.yaml 完全对齐）
 COORDINATOR_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_COORDINATOR"
@@ -89,16 +95,18 @@ class MailConfig:
     data_service: str = ""
     guild_service: str = ""
     redis: str = ""
+    player_redis: str = ""
     kafka: str = ""
     kafka_generation: int = 1
     kafka_partitions: int = 256
+    notify_timeout_sec: float = DEFAULT_NOTIFY_TIMEOUT_SEC
     tables_dir: str = ""
     bootstrap_schema: bool = False
     limits: MailLimits = MailLimits()
     sweep_mode: str = SWEEP_MODE_REPORT_ONLY
-    sweep_interval_sec: float = 300.0
-    sweep_retention_days: int = 7
-    sweep_batch_limit: int = 1000
+    sweep_interval_sec: float = DEFAULT_SWEEP_INTERVAL_SEC
+    sweep_retention_days: int = DEFAULT_SWEEP_RETENTION_DAYS
+    sweep_batch_limit: int = DEFAULT_SWEEP_BATCH_LIMIT
     asset_loop_interval_sec: float = 2.0
     asset_loop_batch: int = 100
     asset_loop_workers: int = 8
@@ -109,6 +117,11 @@ class MailConfig:
 
     def producer_secret_map(self) -> dict[str, bytes]:
         return dict(self.producer_secrets)
+
+    @property
+    def effective_player_redis(self) -> str:
+        """未单独指定 player_redis 时回落到 redis（与 Go mail.go playerRedisConfig 对齐）。"""
+        return self.player_redis or self.redis
 
     @property
     def runs_background_work(self) -> bool:
@@ -170,6 +183,8 @@ class MailConfig:
             raise ValueError("mail timeout/budget must be > 0")
         if self.kafka_generation < 1 or self.kafka_partitions < 1:
             raise ValueError("mail kafka generation/partitions must be >= 1")
+        if self.notify_timeout_sec <= 0:
+            raise ValueError("mail notify_timeout_sec must be > 0")
         self.limits.validate()
         if self.sweep_mode not in (SWEEP_MODE_REPORT_ONLY, SWEEP_MODE_DELETE):
             raise ValueError(f"mail sweep_mode invalid: {self.sweep_mode!r}")

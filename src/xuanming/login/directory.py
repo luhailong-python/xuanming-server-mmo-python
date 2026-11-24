@@ -72,13 +72,18 @@ class DataService:
             raise _classify(error, create=create) from error
         return self.protocol.parse(f"data_service.{response_type}", raw)
 
-    async def read_account(self, account: str, create: bool) -> list:
+    async def read_account_with_lifecycle(self, account: str, create: bool):
+        """读取账号目录，同时返回角色列表、实名 pi 与注销生命周期（Go ``ReadWithLifecycle``）。"""
         request = self.protocol.message("data_service.ReadAccountDirectoryRequest", account=account,
                                         create_if_missing=create)
         response = await self._signed("ReadAccountDirectory", request, "AccountDirectoryResponse")
         if not response.HasField("players"):
             raise DirectoryError("directory reply has no players")
-        return list(response.players.players)
+        return list(response.players.players), response.real_name_pi, response.lifecycle
+
+    async def read_account(self, account: str, create: bool) -> list:
+        players, _, _ = await self.read_account_with_lifecycle(account, create)
+        return players
 
     async def create_role(self, account: str, role) -> list:
         request = self.protocol.message("data_service.CreateAccountRoleRequest", account=account, role=role)
@@ -94,6 +99,85 @@ class DataService:
                 or not 0 < len(owned.account.encode()) <= 191):
             raise DirectoryError("directory ownership reply invalid")
         return owned
+
+    async def remove_account_roles(self, account: str, roles: list[tuple[int, int]]) -> None:
+        """按 (player_id, owner_revision) 列表摘除账号目录中的角色（Go ``AccountDirectory.Remove``）。"""
+        role_versions = [
+            self.protocol.message("data_service.AccountRoleVersion", player_id=pid, owner_revision=rev)
+            for pid, rev in roles
+        ]
+        request = self.protocol.message("data_service.RemoveAccountRolesRequest", account=account, roles=role_versions)
+        path = _PATH + "RemoveAccountRoles"
+        try:
+            sign_service_call(path, request, "login", time.time_ns() // 1_000_000, self.secret)
+            await self.call(path, request.SerializeToString(deterministic=True), timeout=_DIRECTORY_TIMEOUT)
+        except Exception as error:
+            if not status_name(error):
+                raise
+            raise _classify(error) from error
+
+    async def set_real_name(self, account: str, real_name_pi: str) -> str:
+        """写入账号实名 pi（只写一次，返回库中实际存留的 pi，Go ``SetAccountRealName``）。"""
+        request = self.protocol.message("data_service.SetAccountRealNameRequest", account=account,
+                                        real_name_pi=real_name_pi)
+        response = await self._signed("SetAccountRealName", request, "SetAccountRealNameResponse")
+        return response.real_name_pi
+
+    async def reset_real_name(self, account: str) -> bool:
+        """客服重置账号实名，返回重置前是否存在实名（Go ``ResetAccountRealName``）。"""
+        request = self.protocol.message("data_service.ResetAccountRealNameRequest", account=account)
+        response = await self._signed("ResetAccountRealName", request, "ResetAccountRealNameResponse")
+        return bool(response.had_real_name)
+
+    async def request_account_deletion(self, account: str, source: int):
+        """发起账号注销（source: 1=用户本人，2=客服代办，Go ``RequestAccountDeletion``）。"""
+        request = self.protocol.message("data_service.RequestAccountDeletionRequest", account=account, source=source)
+        return await self._signed("RequestAccountDeletion", request, "AccountDeletionResponse")
+
+    async def cancel_account_deletion(self, account: str):
+        """撤销冷静期内的账号注销（Go ``CancelAccountDeletion``）。"""
+        request = self.protocol.message("data_service.CancelAccountDeletionRequest", account=account)
+        return await self._signed("CancelAccountDeletion", request, "AccountDeletionResponse")
+
+    async def count_zone_roles(self, zone_id: int) -> int:
+        """查询本区（含合服最终归属）累计创建角色数（Go ``CountZoneRoles``）。"""
+        request = self.protocol.message("data_service.CountZoneRolesRequest", zone_id=zone_id)
+        raw = await self.call(_PATH + "CountZoneRoles", request.SerializeToString(), timeout=3.0)
+        return int(self.protocol.parse("data_service.CountZoneRolesResponse", raw).roles)
+
+    async def get_player_asset_op_ledger(self, player_id: int) -> bool:
+        """查询 player_store 中是否存在该角色的资产账本行（用于孤儿角色核验）。"""
+        request = self.protocol.message("data_service.GetPlayerAssetOpLedgerRequest", player_id=player_id)
+        raw = await self.call(_PATH + "GetPlayerAssetOpLedger", request.SerializeToString(), timeout=2.5)
+        return bool(self.protocol.parse("data_service.GetPlayerAssetOpLedgerResponse", raw).found)
+
+    async def get_player_home_zone(self, player_id: int) -> int:
+        """查询单个玩家当前归属区；未映射（NOT_FOUND 或老版文案）统一返回 0。"""
+        request = self.protocol.message("data_service.GetPlayerHomeZoneRequest", player_id=player_id)
+        try:
+            raw = await self.call(_PATH + "GetPlayerHomeZone", request.SerializeToString(), timeout=1.5)
+        except Exception as error:
+            if status_name(error) == "NOT_FOUND" or "no home zone mapping" in str(error):
+                return 0
+            raise
+        return int(self.protocol.parse("data_service.GetPlayerHomeZoneResponse", raw).home_zone_id)
+
+    async def get_player_home_zone_strict(self, player_id: int) -> int:
+        """查询玩家归属区；路由缺失时抛出 ``Missing``（供孤儿角色核验区分路由缺失与存储故障）。"""
+        request = self.protocol.message("data_service.GetPlayerHomeZoneRequest", player_id=player_id)
+        try:
+            raw = await self.call(_PATH + "GetPlayerHomeZone", request.SerializeToString(), timeout=2.5)
+        except Exception as error:
+            if status_name(error) == "NOT_FOUND":
+                raise Missing("player route missing") from error
+            raise
+        return int(self.protocol.parse("data_service.GetPlayerHomeZoneResponse", raw).home_zone_id)
+
+    async def get_merged_zones(self) -> dict[int, int]:
+        """读取合服映射（源区 -> 目标区，Go ``GetMergedZones``）。"""
+        request = self.protocol.message("google.protobuf.Empty")
+        raw = await self.call(_PATH + "GetMergedZones", request.SerializeToString(), timeout=1.5)
+        return dict(self.protocol.parse("data_service.GetMergedZonesResponse", raw).merged_into)
 
     async def reserve_name(self, player_id: int, name: str) -> tuple[int, int]:
         request = self.protocol.message("data_service.ReservePlayerNameRequest", player_id=player_id, name=name)

@@ -36,8 +36,13 @@ async def open_service(config: DataServiceConfig, protocol: Protocol, stack: Asy
         stack.push_async_callback(close_pool, item)
     store = SqlStore(pool, protocol, max_roles=config.max_players_per_account, storage_pools=stores)
     await store.bootstrap()
-    service = DataService(protocol, store, config.secrets, id_tags=config.id_tags,
-                          zone_refresh=config.merged_zone_refresh_sec)
+    service = DataService(
+        protocol, store, config.secrets, id_tags=config.id_tags,
+        zone_refresh=config.merged_zone_refresh_sec,
+        admin_token=config.admin_token,
+        deletion_cooling_off_ms=config.deletion_cooling_off_sec * 1000,
+        recall_enabled=config.recall_enabled,
+    )
     await service.start()
     stack.push_async_callback(service.close)
     return service

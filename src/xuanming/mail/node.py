@@ -10,7 +10,7 @@ import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 
-from ..cluster import EtcdDirectory
+from ..cluster import EtcdDirectory, KafkaCommands
 from ..data import ConfigTables
 from ..grpc_runtime import GrpcClient, serve_grpc
 from ..kill_switch import EtcdKillSwitch, KillSwitch
@@ -24,15 +24,18 @@ from .asset_loop import (
     RedisEtcdSceneResolver,
 )
 from .config import MailConfig
-from .model import MAIL_NODE_TYPE, MS_PER_DAY, SWEEP_MODE_DELETE
+from .model import MAIL_NODE_TYPE
+from .notify import KafkaMailNotifier
 from .service import MailService
 from .sql_store import SqlMailStore, open_pool
 from .store import (
     GrpcGuildDirectory,
     GrpcRoleFenceDirectory,
     IdSegmentAllocator,
+    MailNotifier,
     NullGuildDirectory,
 )
+from .sweep import MailExpirySweeper, SweepStore
 
 logger = logging.getLogger(__name__)
 
@@ -48,33 +51,17 @@ def _load_item_exists(tables_dir: str):
     return lambda config_id: item_table.get(config_id) is not None
 
 
-async def _run_sweep_loop(store: SqlMailStore, config: MailConfig, stop_event: asyncio.Event) -> None:
-    delete_rows = config.sweep_mode == SWEEP_MODE_DELETE
-    retention_ms = config.sweep_retention_days * MS_PER_DAY
-    while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=config.sweep_interval_sec)
-            return
-        except asyncio.TimeoutError:
-            pass
-        now_ms = time.time_ns() // 1_000_000
-        cutoff_ms = now_ms - retention_ms
-        if cutoff_ms <= 0:
-            continue
-        try:
-            report = await store.sweep(cutoff_ms, config.sweep_batch_limit, delete_rows)
-            logger.info(
-                "mail sweep finished mode=%s personal_cand=%d personal_del=%d system_cand=%d system_del=%d",
-                config.sweep_mode,
-                report.personal.candidates,
-                report.personal.deleted,
-                report.system.candidates,
-                report.system.deleted,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.error("mail bounded sweep failed mode=%s", config.sweep_mode, exc_info=True)
+def build_sweeper(store: SweepStore, config: MailConfig) -> MailExpirySweeper | None:
+    """按发布轨道构建过期邮件清理器；canary 副本仅承接 RPC，停用清理循环。"""
+    if not config.runs_background_work:
+        return None
+    return MailExpirySweeper(
+        store,
+        mode=config.sweep_mode,
+        retention_days=config.sweep_retention_days,
+        batch_limit=config.sweep_batch_limit,
+        interval_sec=config.sweep_interval_sec,
+    )
 
 
 async def open_service(
@@ -84,8 +71,8 @@ async def open_service(
     *,
     etcd_directory: EtcdDirectory | None = None,
     environ=None,
-) -> tuple[MailService, SqlMailStore, AssetDeliveryLoop | None]:
-    """打开独占库连接池、验表并装配 MailService 与 AssetDeliveryLoop（canary 停用后台循环）。"""
+) -> tuple[MailService, SqlMailStore, AssetDeliveryLoop | None, MailExpirySweeper | None]:
+    """打开独占库连接池、验表并装配 MailService、KafkaMailNotifier、AssetDeliveryLoop 与 MailExpirySweeper。"""
     pool = await open_pool(
         host=config.mysql_host,
         port=config.mysql_port,
@@ -124,6 +111,32 @@ async def open_service(
         await store.bootstrap()
     await store.verify_schema()
 
+    player_redis = None
+    player_redis_url = config.effective_player_redis
+    if player_redis_url:
+        from redis.asyncio import Redis
+
+        player_redis = Redis.from_url(player_redis_url, decode_responses=False)
+        stack.push_async_callback(player_redis.aclose)
+
+    notifier: MailNotifier | None = None
+    if config.kafka and player_redis is not None:
+        kafka = KafkaCommands(
+            config.kafka,
+            partitions=config.kafka_partitions,
+            generation=config.kafka_generation,
+        )
+        await kafka.start()
+        stack.push_async_callback(kafka.close)
+        notifier = KafkaMailNotifier(
+            protocol,
+            player_redis,
+            kafka,
+            timeout_sec=config.notify_timeout_sec,
+        )
+    else:
+        logger.info("mail kafka or player_redis unconfigured: post-commit NotifyMailChanged disabled")
+
     caller_verifier = CallerVerifier.from_env(environ, allowed_callers=("gate",))
     service = MailService(
         protocol,
@@ -131,16 +144,13 @@ async def open_service(
         caller_verifier=caller_verifier,
         producer_secrets=config.producer_secret_map(),
         coordinator_secret=config.coordinator_secret,
+        notifier=notifier,
         request_budget_sec=config.request_budget_sec,
     )
 
     asset_loop: AssetDeliveryLoop | None = None
-    if config.runs_background_work and config.redis and etcd_directory is not None:
-        from redis.asyncio import Redis
-
-        redis_client = Redis.from_url(config.redis, decode_responses=False)
-        stack.push_async_callback(redis_client.aclose)
-        resolver = RedisEtcdSceneResolver(protocol, redis_client, etcd_directory)
+    if config.runs_background_work and player_redis is not None and etcd_directory is not None:
+        resolver = RedisEtcdSceneResolver(protocol, player_redis, etcd_directory)
         stack.push_async_callback(resolver.close)
         caller = AssetOpCaller(protocol, resolver, config.asset_op_secret)
         ledger_reader = GrpcDataServiceLedgerReader(protocol, ds_client.call)
@@ -154,7 +164,8 @@ async def open_service(
             workers=config.asset_loop_workers,
         )
 
-    return service, store, asset_loop
+    sweeper = build_sweeper(store, config)
+    return service, store, asset_loop, sweeper
 
 
 async def run(settings: Settings) -> None:
@@ -181,7 +192,7 @@ async def run(settings: Settings) -> None:
             scene_directory = EtcdDirectory(protocol, settings.etcd, ttl=config.lease_ttl_sec)
             stack.push_async_callback(scene_directory.close)
 
-            service, store, asset_loop = await open_service(
+            service, store, asset_loop, sweeper = await open_service(
                 config, protocol, stack, etcd_directory=scene_directory
             )
 
@@ -206,9 +217,10 @@ async def run(settings: Settings) -> None:
                     t_asset = asyncio.create_task(asset_loop.run(stop_event=stop), name="mail-asset-loop")
                     bg_tasks.append(t_asset)
                     stack.callback(t_asset.cancel)
-                t_sweep = asyncio.create_task(_run_sweep_loop(store, config, stop), name="mail-sweep-loop")
-                bg_tasks.append(t_sweep)
-                stack.callback(t_sweep.cancel)
+                if sweeper is not None:
+                    t_sweep = asyncio.create_task(sweeper.run(stop_event=stop), name="mail-sweep-loop")
+                    bg_tasks.append(t_sweep)
+                    stack.callback(t_sweep.cancel)
             else:
                 logger.info(
                     "mail release_track=%s: asset_loop and sweep disabled (canary serves RPCs only)",

@@ -16,7 +16,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from xuanming.cluster import LocalDirectory
+from xuanming.cluster import KafkaCommands, LocalDirectory
 from xuanming.data import ConfigTables, PlayerRowCodec, PlayerRowKind, PlayerSnapshot
 from xuanming.data.asset_inventory import balance
 from xuanming.data.asset_ledger import Outcome, record as record_ledger
@@ -37,17 +37,25 @@ from xuanming.mail import (
     CLAIM_PENDING,
     CLAIM_UNCLAIMED,
     GrpcDataServiceLedgerReader,
+    KafkaMailNotifier,
     MAIL_KIND_GUILD,
     MAIL_KIND_PERSONAL,
     MAIL_KIND_SYSTEM,
     MAIL_NODE_TYPE,
     MailConfig,
+    MailExpirySweeper,
     MailLimits,
     MailService,
     MemoryMailStore,
+    NOTIFY_MAIL_CHANGED_MSG_ID,
+    PUSH_TO_PLAYER_EVENT_ID,
+    SESSION_STATE_ONLINE,
+    SWEEP_MODE_DELETE,
+    SWEEP_MODE_REPORT_ONLY,
     SceneTarget,
     SqlMailStore,
     manifest_hash,
+    player_session_key,
     shard_hash,
 )
 from xuanming.mail.asset_loop import build_asset_op_request
@@ -72,12 +80,15 @@ from xuanming.mail.errors import (
     RoleFenceUnavailableError,
 )
 from xuanming.mail.model import (
+    MS_PER_DAY,
+    MailRow,
     OP_APPLIED,
     OP_MANUAL,
     OP_PENDING,
     OP_REJECTED,
     ROLE_BLOCKER_ASSET_OP,
 )
+from xuanming.mail.node import build_sweeper
 from xuanming.nodes.scene_assets import SceneAssets
 from xuanming.nodes.scene_mail_outbox import MailSender
 from xuanming.protocol import Protocol
@@ -1514,5 +1525,558 @@ async def test_sql_mail_store_isolation_unhex_and_schema_verify():
     listed = await store.list_mails(RoleOriginal(42, "acct_utf8", 1), PROTOCOL.message("mailpb.ListMailsRequest"))
     assert listed.unread_count == 0 and len(listed.mails) == 0
     assert executed[0][0] == "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+
+
+# ----------------------------------------------------------------------------------------------------
+# 8. KafkaMailNotifier（GateCommand event_id=39 + msg_id=264 显式分区推送、离线跳过与故障吞吐）
+# ----------------------------------------------------------------------------------------------------
+
+
+class _FakeSessionRedis:
+    def __init__(self) -> None:
+        self.kv: dict[str, bytes] = {}
+        self.fail: Exception | None = None
+
+    def put_session(
+        self,
+        player_id: int,
+        *,
+        state: int = SESSION_STATE_ONLINE,
+        gate_id: str = "70",
+        gate_instance_id: str = "gate-inst-70",
+        session_id: int = 98765,
+        override_player_id: int | None = None,
+    ) -> None:
+        sess = PROTOCOL.message(
+            "playerlocator.PlayerSession",
+            player_id=player_id if override_player_id is None else override_player_id,
+            session_id=session_id,
+            gate_id=gate_id,
+            gate_instance_id=gate_instance_id,
+            state=state,
+        )
+        self.kv[player_session_key(player_id)] = sess.SerializeToString()
+
+    async def get(self, key: str):
+        if self.fail is not None:
+            raise self.fail
+        return self.kv.get(key)
+
+
+class _RecordingProducer:
+    def __init__(self, *, fail: Exception | None = None, delay_sec: float = 0.0) -> None:
+        self.records: list[tuple[str, int, bytes | None, bytes]] = []
+        self.fail = fail
+        self.delay_sec = delay_sec
+
+    async def send_and_wait(self, topic: str, value: bytes, *, key: bytes | None = None, partition: int | None = None):
+        if self.delay_sec > 0:
+            await asyncio.sleep(self.delay_sec)
+        if self.fail is not None:
+            raise self.fail
+        self.records.append((topic, int(partition), key, value))
+
+
+@_async_test
+async def test_kafka_mail_notifier_online_explicit_partition_and_payload():
+    """在线玩家发件后向 gate-cmd_g<gen> 显式分区 gate_id%partitions 发送精确 GateCommand(39)/NotifyMailChanged(264)。"""
+    async with AsyncExitStack() as stack:
+        redis_stub = _FakeSessionRedis()
+        redis_stub.put_session(101, state=SESSION_STATE_ONLINE, gate_id="70", gate_instance_id="gate-inst-70", session_id=98765)
+
+        kafka = KafkaCommands("127.0.0.1:9092", partitions=64, generation=3)
+        producer = _RecordingProducer()
+        kafka.producer = producer
+        notifier = KafkaMailNotifier(PROTOCOL, redis_stub, kafka)
+
+        env = await _start_mail_server(stack, notifier=notifier)
+        env.role_dir.register(101, "acc_101", 1)
+
+        req = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=3,
+            request_id=41001,
+            recipient_player_id=101,
+            title="在线提醒",
+            body="新邮件到达",
+        )
+        resp = await _call_admin(env, "SendPersonalMail", req, "rank", SECRET_RANK)
+        assert resp.error_message.id == 0 and resp.mail_id > 0 and not resp.duplicated
+
+        assert len(producer.records) == 1
+        topic, partition, key, raw_cmd = producer.records[0]
+        assert topic == "gate-cmd_g3"
+        assert partition == 70 % 64
+        assert key == b"101"
+
+        cmd = PROTOCOL.parse("contracts.kafka.GateCommand", raw_cmd)
+        assert cmd.event_id == PUSH_TO_PLAYER_EVENT_ID == 39
+        assert cmd.player_id == 101
+        assert cmd.session_id == 98765
+        assert cmd.target_gate_id == 70
+        assert cmd.target_instance_id == "gate-inst-70"
+
+        push = PROTOCOL.parse("contracts.kafka.PushToPlayerEvent", cmd.payload)
+        assert push.session_id == 98765
+        assert push.player_id == 101
+        assert push.message_content.message_id == NOTIFY_MAIL_CHANGED_MSG_ID == 264
+
+        changed = PROTOCOL.parse("mailpb.MailChangedEvent", push.message_content.serialized_message)
+        assert changed.mail_id == resp.mail_id
+        assert notifier.outcomes == {"sent": 1, "offline": 0, "error": 0}
+
+        # 幂等重放 SendPersonalMail 不重复触发 Kafka 提醒
+        replay = await _call_admin(env, "SendPersonalMail", req, "rank", SECRET_RANK)
+        assert replay.duplicated is True and replay.mail_id == resp.mail_id
+        assert len(producer.records) == 1
+
+
+@_async_test
+async def test_kafka_mail_notifier_skips_offline_disconnecting_and_invalid_sessions():
+    """离线、断线中、缺失会话及缺门禁字段的会话一律不发 Kafka 消息，且不抛异常。"""
+    redis_stub = _FakeSessionRedis()
+    kafka = KafkaCommands("127.0.0.1:9092", partitions=256, generation=1)
+    producer = _RecordingProducer()
+    kafka.producer = producer
+    notifier = KafkaMailNotifier(PROTOCOL, redis_stub, kafka)
+
+    # 1) 键不存在
+    await notifier.personal(201, 1001)
+    # 2) SESSION_STATE_DISCONNECTING (2)
+    redis_stub.put_session(202, state=2)
+    await notifier.personal(202, 1002)
+    # 3) SESSION_STATE_OFFLINE (3)
+    redis_stub.put_session(203, state=3)
+    await notifier.personal(203, 1003)
+    # 4) SESSION_STATE_UNKNOWN (0)
+    redis_stub.put_session(204, state=0)
+    await notifier.personal(204, 1004)
+    assert notifier.outcomes == {"sent": 0, "offline": 4, "error": 0}
+
+    # 5) ONLINE 但缺 gate_instance_id / gate_id 非法 / session_id=0 / player_id 不匹配 -> 记 error 且不发送
+    redis_stub.put_session(205, state=SESSION_STATE_ONLINE, gate_instance_id="")
+    await notifier.personal(205, 1005)
+    redis_stub.put_session(206, state=SESSION_STATE_ONLINE, gate_id="not-a-number")
+    await notifier.personal(206, 1006)
+    redis_stub.put_session(207, state=SESSION_STATE_ONLINE, gate_id="0")
+    await notifier.personal(207, 1007)
+    redis_stub.put_session(208, state=SESSION_STATE_ONLINE, session_id=0)
+    await notifier.personal(208, 1008)
+    redis_stub.put_session(209, state=SESSION_STATE_ONLINE, override_player_id=999)
+    await notifier.personal(209, 1009)
+
+    assert len(producer.records) == 0
+    assert notifier.outcomes == {"sent": 0, "offline": 4, "error": 5}
+
+
+@_async_test
+async def test_kafka_mail_notifier_swallows_kafka_and_timeout_errors_without_failing_send():
+    """Kafka 故障或超时均被吞掉，绝不改判已提交的 SendPersonalMail。"""
+    async with AsyncExitStack() as stack:
+        redis_stub = _FakeSessionRedis()
+        redis_stub.put_session(301, state=SESSION_STATE_ONLINE, gate_id="5", gate_instance_id="gate-5", session_id=55)
+
+        kafka = KafkaCommands("127.0.0.1:9092", partitions=256, generation=1)
+        producer = _RecordingProducer(fail=RuntimeError("kafka broker unavailable"))
+        kafka.producer = producer
+        notifier = KafkaMailNotifier(PROTOCOL, redis_stub, kafka, timeout_sec=0.05)
+
+        env = await _start_mail_server(stack, notifier=notifier)
+        env.role_dir.register(301, "acc_301", 1)
+
+        # 1) Kafka 抛出异常 -> SendPersonalMail 依然成功落库
+        req1 = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=42001,
+            recipient_player_id=301,
+            title="容错1",
+            body="Kafka挂了也能收件",
+        )
+        r1 = await _call_admin(env, "SendPersonalMail", req1, "admin", SECRET_ADMIN)
+        assert r1.error_message.id == 0 and r1.mail_id > 0
+        assert notifier.outcomes == {"sent": 0, "offline": 0, "error": 1}
+
+        # 2) Kafka 慢响应触发 50ms 预算超时 -> SendPersonalMail 依然成功落库
+        producer.fail = None
+        producer.delay_sec = 0.3
+        req2 = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=42002,
+            recipient_player_id=301,
+            title="容错2",
+            body="Kafka超时也能收件",
+        )
+        r2 = await _call_admin(env, "SendPersonalMail", req2, "admin", SECRET_ADMIN)
+        assert r2.error_message.id == 0 and r2.mail_id > 0
+        assert notifier.outcomes == {"sent": 0, "offline": 0, "error": 2}
+
+        listed = await _call_client(env, "ListMails", PROTOCOL.message("mailpb.ListMailsRequest"), 301, "acc_301", 1)
+        assert {m.mail_id for m in listed.mails} == {r1.mail_id, r2.mail_id}
+
+
+# ----------------------------------------------------------------------------------------------------
+# 9. MailExpirySweeper（report_only / delete / 保留期与保护不变量 / canary 停用）
+# ----------------------------------------------------------------------------------------------------
+
+
+@_async_test
+async def test_mail_expiry_sweeper_report_only_and_delete_protection_invariants():
+    """验证 report_only 仅计数不删行，delete 只清超保留期非受保护邮件并严守全部表保护不变量。"""
+    async with AsyncExitStack() as stack:
+        clock = FakeClock(1_700_000_000_000)
+        env = await _start_mail_server(stack, clock=clock)
+        env.role_dir.register(401, "acc_401", 1)
+        env.guild_dir.memberships[401] = 77
+
+        # 1) 个人纯文本邮件（1 天后过期）-> 推进 10 天后超 7 天保留期，可删
+        p_text = await _call_admin(
+            env,
+            "SendPersonalMail",
+            PROTOCOL.message(
+                "mailpb.SendMailRequest",
+                sender_kind=1,
+                request_id=51001,
+                recipient_player_id=401,
+                title="过期文本",
+                body="b",
+                expire_ms=clock() + MS_PER_DAY,
+            ),
+            "admin",
+            SECRET_ADMIN,
+        )
+
+        # 2) 个人带附件已领邮件（CLAIM_CLAIMED + 终态 OP_APPLIED）-> 超保留期后删 mail_message/mail_state，但保留 mail_asset_op/mail_box/seq
+        req_claimed = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=51002,
+            recipient_player_id=401,
+            title="已领过期",
+            body="b",
+            expire_ms=clock() + MS_PER_DAY,
+        )
+        req_claimed.attachments.currencies.add(currency_type=0, amount=10)
+        p_claimed = await _call_admin(env, "SendPersonalMail", req_claimed, "admin", SECRET_ADMIN)
+        c_done = await _call_client(
+            env,
+            "ClaimMailAttachments",
+            PROTOCOL.message("mailpb.ClaimMailAttachmentsRequest", mail_ids=[p_claimed.mail_id]),
+            401,
+            "acc_401",
+            1,
+        )
+        op_done_id = c_done.results[0].asset_op_id
+        op_done = await env.store.claim_op(op_done_id, clock(), clock() + 10_000, clock() + 60_000, 101)
+        assert await env.store.finalize_op(
+            op_done, "applied", int(Outcome.APPLIED), 0, partial=False, sql_committed=True, now_ms=clock()
+        )
+
+        # 3) 个人 PENDING(2) 受保护邮件 -> 即使超保留期也绝不删
+        req_pending = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=51003,
+            recipient_player_id=401,
+            title="在途保护",
+            body="b",
+            expire_ms=clock() + MS_PER_DAY,
+        )
+        req_pending.attachments.currencies.add(currency_type=0, amount=20)
+        p_pending = await _call_admin(env, "SendPersonalMail", req_pending, "admin", SECRET_ADMIN)
+        c_pend = await _call_client(
+            env,
+            "ClaimMailAttachments",
+            PROTOCOL.message("mailpb.ClaimMailAttachmentsRequest", mail_ids=[p_pending.mail_id]),
+            401,
+            "acc_401",
+            1,
+        )
+        op_pending_id = c_pend.results[0].asset_op_id
+
+        # 4) 个人 MANUAL(4) 受保护邮件 -> 即使超保留期也绝不删
+        req_manual = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=51004,
+            recipient_player_id=401,
+            title="人工保护",
+            body="b",
+            expire_ms=clock() + MS_PER_DAY,
+        )
+        req_manual.attachments.currencies.add(currency_type=0, amount=30)
+        p_manual = await _call_admin(env, "SendPersonalMail", req_manual, "admin", SECRET_ADMIN)
+        c_man = await _call_client(
+            env,
+            "ClaimMailAttachments",
+            PROTOCOL.message("mailpb.ClaimMailAttachmentsRequest", mail_ids=[p_manual.mail_id]),
+            401,
+            "acc_401",
+            1,
+        )
+        op_manual_id = c_man.results[0].asset_op_id
+        op_man = await env.store.claim_op(op_manual_id, clock(), clock() + 10_000, clock() + 60_000, 102)
+        assert await env.store.finalize_op(
+            op_man,
+            "applied_partial",
+            int(Outcome.APPLIED),
+            ERR_ASSET_PARTIAL_APPLIED,
+            partial=True,
+            sql_committed=True,
+            now_ms=clock(),
+        )
+        assert env.store.state.states[(401, p_manual.mail_id)].claim_state == CLAIM_MANUAL
+
+        # 5) 系统纯文本与帮会纯文本（1 天后过期）-> 超保留期后可删
+        sys_exp = await _call_admin(
+            env,
+            "SendSystemMail",
+            PROTOCOL.message(
+                "mailpb.SendMailRequest",
+                sender_kind=1,
+                request_id=51005,
+                title="过期系统",
+                body="b",
+                expire_ms=clock() + MS_PER_DAY,
+            ),
+            "admin",
+            SECRET_ADMIN,
+        )
+        guild_exp = await _call_admin(
+            env,
+            "SendGuildMail",
+            PROTOCOL.message(
+                "mailpb.SendMailRequest",
+                sender_kind=2,
+                request_id=51006,
+                guild_id=77,
+                title="过期帮会",
+                body="b",
+                expire_ms=clock() + MS_PER_DAY,
+            ),
+            "guild",
+            SECRET_GUILD,
+        )
+
+        # 6) 已封存活动邮件（campaign_id > 0，1 天后过期）-> 永不清理
+        h0, _ = shard_hash([401])
+        mhash = manifest_hash([(0, h0, 1)])
+        camp_req = PROTOCOL.message(
+            "mailpb.SendMailRequest",
+            sender_kind=1,
+            request_id=51007,
+            title="活动审计保留",
+            body="b",
+            expire_ms=clock() + MS_PER_DAY,
+            campaign_id=8801,
+            manifest_generation=1,
+            expected_recipient_count=1,
+            expected_shard_count=1,
+            manifest_hash=mhash,
+        )
+        camp_req.attachments.currencies.add(currency_type=0, amount=5)
+        camp_sent = await _call_admin(env, "SendSystemMail", camp_req, "admin", SECRET_ADMIN)
+        await _call_admin(
+            env,
+            "ImportMailRecipients",
+            PROTOCOL.message(
+                "mailpb.ImportMailRecipientsRequest",
+                sender_kind=1,
+                campaign_id=8801,
+                manifest_generation=1,
+                shard_index=0,
+                player_ids=[401],
+            ),
+            "admin",
+            SECRET_ADMIN,
+        )
+        await _call_admin(
+            env,
+            "SealMailCampaign",
+            PROTOCOL.message("mailpb.SealMailCampaignRequest", sender_kind=1, campaign_id=8801, manifest_generation=1),
+            "admin",
+            SECRET_ADMIN,
+        )
+
+        # 7) 仅过期 3 天（未满 7 天保留期）+ 未过期邮件 -> 均保留
+        p_within_retention = await _call_admin(
+            env,
+            "SendPersonalMail",
+            PROTOCOL.message(
+                "mailpb.SendMailRequest",
+                sender_kind=1,
+                request_id=51008,
+                recipient_player_id=401,
+                title="保留期内",
+                body="b",
+                expire_ms=clock() + 7 * MS_PER_DAY,
+            ),
+            "admin",
+            SECRET_ADMIN,
+        )
+        p_unexpired = await _call_admin(
+            env,
+            "SendPersonalMail",
+            PROTOCOL.message(
+                "mailpb.SendMailRequest",
+                sender_kind=1,
+                request_id=51009,
+                recipient_player_id=401,
+                title="未过期",
+                body="b",
+                expire_ms=clock() + 20 * MS_PER_DAY,
+            ),
+            "admin",
+            SECRET_ADMIN,
+        )
+
+        # 8) 异常 expire_ms=0 行 -> 仅计入 invalid 样本，绝不删除
+        corrupt_id = 999999
+        env.store.state.messages[corrupt_id] = MailRow(
+            mail_id=corrupt_id,
+            owner_player_id=401,
+            guild_id=0,
+            kind=MAIL_KIND_PERSONAL,
+            sender_kind=1,
+            request_id=59999,
+            request_hash="0" * 64,
+            title="zero-expire",
+            body="b",
+            attachments=b"",
+            sent_ms=clock(),
+            expire_ms=0,
+        )
+
+        # 推进 10 天：1 天过期的邮件已过 7 天保留期；7 天过期的仅过期 3 天仍在保留期内
+        clock.advance(10 * MS_PER_DAY)
+
+        # A) report_only 模式：只统计候选与非法样本，零删除
+        msg_count_before = len(env.store.state.messages)
+        state_count_before = len(env.store.state.states)
+        report_sweeper = MailExpirySweeper(
+            env.store,
+            mode=SWEEP_MODE_REPORT_ONLY,
+            retention_days=7,
+            batch_limit=1000,
+            interval_sec=300.0,
+            clock_ms=clock,
+        )
+        rep_only = await report_sweeper.sweep_once()
+        assert rep_only is not None
+        assert rep_only.personal.candidates == 2
+        assert rep_only.system.candidates == 2
+        assert rep_only.personal.deleted == 0
+        assert rep_only.system.deleted == 0
+        assert rep_only.system_state.deleted == 0
+        assert rep_only.personal.invalid == 1
+        assert len(env.store.state.messages) == msg_count_before
+        assert len(env.store.state.states) == state_count_before
+
+        # B) delete 模式：仅删 4 封合格过期邮件及其 mail_state，其余与审计表全部原样保留
+        del_sweeper = MailExpirySweeper(
+            env.store,
+            mode=SWEEP_MODE_DELETE,
+            retention_days=7,
+            batch_limit=1000,
+            interval_sec=300.0,
+            clock_ms=clock,
+        )
+        rep_del = await del_sweeper.sweep_once()
+        assert rep_del is not None
+        assert rep_del.personal.deleted == 2
+        assert rep_del.system.deleted == 2
+        assert rep_del.system_state.deleted == 2
+        assert rep_del.personal.invalid == 1
+
+        for gone in (p_text.mail_id, p_claimed.mail_id, sys_exp.mail_id, guild_exp.mail_id):
+            assert gone not in env.store.state.messages
+        for kept in (
+            p_pending.mail_id,
+            p_manual.mail_id,
+            camp_sent.mail_id,
+            p_within_retention.mail_id,
+            p_unexpired.mail_id,
+            corrupt_id,
+        ):
+            assert kept in env.store.state.messages
+
+        # 审计与基座表绝不删除
+        assert (1, 8801, 1) in env.store.state.campaigns
+        assert 401 in env.store.state.boxes
+        assert (401, ASSET_STREAM_SYSTEM_CREDIT) in env.store.state.seqs
+        assert {op_done_id, op_pending_id, op_manual_id}.issubset(env.store.state.ops.keys())
+
+
+@_async_test
+async def test_mail_expiry_sweeper_run_loop_and_canary_disabled_wiring():
+    """验证清理循环容错、停止时清零活性时刻，以及 canary 轨道禁用 MailExpirySweeper。"""
+    env_vars = {
+        PRODUCER_SECRET_ENVS["admin"]: SECRET_ADMIN.decode(),
+        ASSET_OP_SECRET_ENV: SECRET_ASSET_MAIL.decode(),
+        COORDINATOR_SECRET_ENV: SECRET_COORDINATOR.decode(),
+        ROLE_FENCE_SECRET_ENV: SECRET_ROLE_FENCE_MAIL.decode(),
+    }
+
+    def _cfg(track: str, **extra) -> MailConfig:
+        settings = SimpleNamespace(
+            zone_id=1,
+            physical_region=1,
+            release_track=track,
+            data_service="127.0.0.1:9000",
+            redis="redis://127.0.0.1:6379/0",
+            kafka="127.0.0.1:9092",
+            kafka_generation=1,
+            kafka_partitions=256,
+            etcd="127.0.0.1:2379",
+            mail_node={"advertise_host": "127.0.0.1", **extra},
+        )
+        return MailConfig.from_settings(settings, environ=env_vars)
+
+    canary_cfg = _cfg("canary", sweep_mode=SWEEP_MODE_DELETE)
+    stable_cfg = _cfg(
+        "stable",
+        player_redis="redis://127.0.0.1:6380/0",
+        sweep_mode=SWEEP_MODE_DELETE,
+        sweep_retention_days=14,
+        sweep_batch_limit=500,
+        sweep_interval_sec=60.0,
+    )
+    assert canary_cfg.effective_player_redis == "redis://127.0.0.1:6379/0"
+    assert stable_cfg.effective_player_redis == "redis://127.0.0.1:6380/0"
+
+    store = MemoryMailStore(PROTOCOL)
+    assert build_sweeper(store, canary_cfg) is None
+    wired = build_sweeper(store, stable_cfg)
+    assert wired is not None
+    assert wired.mode == SWEEP_MODE_DELETE
+    assert wired.retention_days == 14
+    assert wired.batch_limit == 500
+    assert wired.interval_sec == 60.0
+
+    # 验证单轮存储异常不会击穿 run() 循环，且 stop_event 退出后活性归零
+    calls = {"n": 0}
+    stop = asyncio.Event()
+
+    class _FlakySweepStore:
+        async def sweep(self, cutoff_ms: int, limit: int, delete_rows: bool, *, owned_shards=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient db error")
+            stop.set()
+            return await store.sweep(cutoff_ms, limit, delete_rows, owned_shards=owned_shards)
+
+    sweeper = MailExpirySweeper(
+        _FlakySweepStore(),
+        mode=SWEEP_MODE_REPORT_ONLY,
+        interval_sec=1.0,
+        rnd=lambda: 0.0,
+    )
+    assert await sweeper.sweep_once() is None
+    assert sweeper.last_run_unixtime > 0
+    await sweeper.run(stop_event=stop)
+    assert calls["n"] == 2
+    assert sweeper.last_run_unixtime == 0.0
+
 
 

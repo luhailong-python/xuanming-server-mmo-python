@@ -17,10 +17,25 @@ from typing import Callable, Protocol as TypingProtocol, runtime_checkable
 from google.protobuf.message import Message
 
 from ..protocol import Protocol
+from .battle_scripts import (
+    REVIEW_REJECT_INVALID,
+    REVIEW_REJECT_STALE,
+    REVIEW_STATE_APPROVED,
+    REVIEW_STATE_PENDING,
+    REVIEW_STATE_REJECTED,
+    SCRIPT_ORIGIN_PLAYER,
+    SCRIPT_ORIGIN_UNSPECIFIED,
+    BattleScriptReviewError,
+)
 from .errors import (
     BattleOutcomeOriginalError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
+    ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED,
+    ERR_MATCH_BATTLE_SCRIPT_LOADOUT_FULL,
+    ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED,
+    ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND,
+    ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT,
     ERR_MATCH_CANCEL_TOO_LATE,
     ERR_MATCH_CHALLENGE_EXPIRED,
     ERR_MATCH_CHALLENGE_NOT_TARGET,
@@ -121,6 +136,26 @@ from .model import (
     valid_role_fence_state,
     validate_terminal_against_formation,
     validate_terminal_payload,
+)
+from .ranked import (
+    RANKED_SEASON_ACTIVE,
+    RankedPlayerPrefsRow,
+    RankedPlayerSeasonRow,
+    RankedRewardRow,
+    RankedSeasonRow,
+)
+from .rating import (
+    DEFAULT_RATING_CENTI,
+    RANK_SOURCE_SHARDS,
+    RANK_SUBMIT_SET,
+    RATING_OUTCOME_APPLIED,
+    RATING_OUTCOME_DUPLICATE,
+    RankSourceRow,
+    RatingApplyResult,
+    RatingChange,
+    compute_elo_delta,
+    is_rated_mode,
+    rank_source_shard,
 )
 
 
@@ -443,6 +478,99 @@ class MatchStore(TypingProtocol):
     async def list_stranded_formations(self, after_battle_id: int, limit: int) -> tuple[list[StrandedFormationEntry], int, int]: ...
     async def inspect_stranded_formation(self, battle_id: int) -> tuple[StrandedFormationEntry | None, int]: ...
 
+    # Battle Scripts
+    async def list_battle_scripts(self, player_id: int) -> list[Message]: ...
+    async def list_battle_script_loadout(self, player_id: int) -> list[Message]: ...
+    async def get_approved_battle_script(self, script_id: int, owner_player_id: int) -> tuple[int, bytes]: ...
+    async def submit_battle_script(
+        self,
+        caller: CallerIdentity,
+        *,
+        script_id: int,
+        expected_revision: int,
+        content: bytes,
+        max_scripts: int,
+    ) -> Message: ...
+    async def delete_battle_script(self, caller: CallerIdentity, script_id: int, expected_revision: int) -> None: ...
+    async def set_battle_script_loadout(
+        self,
+        caller: CallerIdentity,
+        *,
+        match_mode: int,
+        battle_config_id: int,
+        origin: int,
+        official_script_id: int,
+        player_script_id: int,
+        max_entries: int,
+    ) -> list[Message]: ...
+    async def list_pending_battle_scripts(self, limit: int) -> list[Message]: ...
+    async def review_battle_script(
+        self,
+        *,
+        script_id: int,
+        revision: int,
+        approve: bool,
+        reviewer: str,
+        reason: str,
+        validate: Callable[[bytes], None] | None = None,
+    ) -> None: ...
+
+    # Elo Rating & Rank Outbox
+    async def get_rating(self, player_id: int, mode: int) -> tuple[int, int, int]: ...
+    async def apply_rating(
+        self,
+        *,
+        battle_id: int,
+        payload_digest: bytes,
+        mode: int,
+        team_a: list[int],
+        team_b: list[int],
+        score_a: float,
+        source_epoch: int = 1,
+        generation: int = 1,
+        eligible_for_rank: set[int] | None = None,
+    ) -> RatingApplyResult: ...
+    async def stop_rank_source(self, source_epoch: int, mode: int) -> int: ...
+    async def list_rank_sources(self, *, source_epoch: int | None = None) -> list[RankSourceRow]: ...
+    async def bind_rank_board(self, source_epoch: int, mode: int, board_id: int) -> None: ...
+    async def get_rank_outbox_entry(self, source_epoch: int, mode: int, shard: int, source_cursor: int) -> bytes | None: ...
+    async def advance_rank_committed_cursor(self, source_epoch: int, mode: int, shard: int, committed_cursor: int) -> None: ...
+    async def list_rank_removals(self, *, limit: int = 16) -> list[tuple[int, int]]: ...
+    async def delete_rank_removal(self, mode: int, player_id: int) -> None: ...
+
+    # Ranked Play V1
+    async def get_active_ranked_season(self) -> RankedSeasonRow | None: ...
+    async def upsert_ranked_season(self, season: RankedSeasonRow) -> RankedSeasonRow: ...
+    async def list_ranked_seasons(self) -> list[RankedSeasonRow]: ...
+    async def get_ranked_player_prefs(self, player_id: int) -> RankedPlayerPrefsRow | None: ...
+    async def save_ranked_player_prefs(
+        self,
+        caller: CallerIdentity,
+        *,
+        char_preset_id: int,
+        pet_preset_id: int,
+        rule_version: int,
+        cosmetic_loadout: bytes,
+    ) -> RankedPlayerPrefsRow: ...
+    async def get_ranked_player_season(self, season_id: int, player_id: int) -> RankedPlayerSeasonRow | None: ...
+    async def list_ranked_player_seasons(self, player_id: int) -> list[RankedPlayerSeasonRow]: ...
+    async def list_ranked_rewards(self, player_id: int) -> list[RankedRewardRow]: ...
+    async def save_ranked_battle_settlement(
+        self,
+        *,
+        season_id: int,
+        battle_id: int,
+        player_id: int,
+        summary_template: Message,
+        rating_centi: int,
+        tier_after: int,
+        outcome_kind: int,
+        participated: bool,
+        settled_at_ms: int,
+        milestones: tuple[tuple[int, int, int, str], ...],
+    ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]: ...
+    async def get_ranked_battle_result(self, player_id: int, battle_id: int = 0) -> bytes | None: ...
+
 
 # -- 内存快照状态容器 --------------------------------------------------------------------------------
 
@@ -558,6 +686,25 @@ class _MemState:
     reports: dict[int, _MemReportRow] = field(default_factory=dict)
     player_reports: dict[int, list[tuple[int, int, bytes]]] = field(default_factory=dict)  # pid -> [(created, bid, summary)]
     manual_resolutions: dict[int, dict] = field(default_factory=dict)
+
+    # Battle Scripts
+    battle_scripts: dict[int, Message] = field(default_factory=dict)  # script_id -> MatchBattleScriptRecord
+    battle_script_reviews: dict[tuple[int, int], Message] = field(default_factory=dict)  # (script_id, rev) -> review
+    battle_script_loadouts: dict[tuple[int, int, int], Message] = field(default_factory=dict)  # (pid, mode, cfg) -> loadout
+
+    # Elo Rating & Rank Outbox
+    ratings: dict[tuple[int, int], tuple[int, int, int, int]] = field(default_factory=dict)  # (pid, mode) -> (rating_centi, games, updated_ms, score_changed_ms)
+    rating_applied: dict[int, tuple[bytes, int]] = field(default_factory=dict)  # battle_id -> (digest, applied_ms)
+    rank_sources: dict[tuple[int, int, int], RankSourceRow] = field(default_factory=dict)  # (epoch, mode, shard)
+    rank_outbox: dict[tuple[int, int, int, int], tuple[int, bytes]] = field(default_factory=dict)  # (epoch, mode, shard, cursor) -> (req_id, entries)
+    rank_removals: dict[tuple[int, int], int] = field(default_factory=dict)  # (mode, pid) -> created_ms
+
+    # Ranked Play V1
+    ranked_seasons: dict[int, RankedSeasonRow] = field(default_factory=dict)  # season_id -> row
+    ranked_prefs: dict[int, RankedPlayerPrefsRow] = field(default_factory=dict)  # pid -> row
+    ranked_player_seasons: dict[tuple[int, int], RankedPlayerSeasonRow] = field(default_factory=dict)  # (season_id, pid)
+    ranked_rewards: dict[tuple[int, int, int], RankedRewardRow] = field(default_factory=dict)  # (pid, season_id, reward_kind)
+    ranked_battles: dict[tuple[int, int], tuple[int, int, bytes]] = field(default_factory=dict)  # (bid, pid) -> (season_id, settled_ms, summary)
 
 
 class MemoryMatchStore:
@@ -726,6 +873,13 @@ class MemoryMatchStore:
                 s.invite_index.pop(k, None)
             for k in [k for k in s.app_index if k[0] == pid]:
                 s.app_index.pop(k, None)
+            for sid in [sid for sid, rec in s.battle_scripts.items() if int(rec.owner_player_id) == pid]:
+                s.battle_scripts.pop(sid, None)
+            for k in [k for k in s.battle_script_loadouts if k[0] == pid]:
+                s.battle_script_loadouts.pop(k, None)
+            for k in [k for k in s.ratings if k[0] == pid]:
+                s.ratings.pop(k, None)
+                s.rank_removals[(k[1], pid)] = now
             return self.protocol.message("rolefence.PurgeRemovedRoleResponse")
 
         return await self._run_tx(work)
@@ -1046,6 +1200,8 @@ class MemoryMatchStore:
             if app_mem is not None and app_mem.team_id != 0:
                 raise TeamBusinessError(ERR_TEAM_MEMBER_IN_TEAM)
             self._cancel_queued_team_launch(s, row.team_id)
+            for m in rec.members:
+                m.ranked_preset_confirmed = False
             kept_ids = [int(m.player_id) for m in rec.members]
             seq = int(rec.next_join_seq) or (len(rec.members) + 1)
             rec.next_join_seq = seq + 1
@@ -1210,6 +1366,8 @@ class MemoryMatchStore:
             if len(rec.members) >= MAX_TEAM_SIZE:
                 raise TeamBusinessError(ERR_TEAM_MEMBERS_FULL)
             self._cancel_queued_team_launch(s, team_id)
+            for m in rec.members:
+                m.ranked_preset_confirmed = False
             kept_ids = [int(m.player_id) for m in rec.members]
             seq = int(rec.next_join_seq) or (len(rec.members) + 1)
             rec.next_join_seq = seq + 1
@@ -1339,6 +1497,8 @@ class MemoryMatchStore:
                 )
             else:
                 remaining.sort(key=lambda m: (int(m.join_seq), int(m.player_id)))
+                for m in remaining:
+                    m.ranked_preset_confirmed = False
                 del rec.members[:]
                 rec.members.extend(remaining)
                 leader_changed = False
@@ -1393,6 +1553,8 @@ class MemoryMatchStore:
                 raise TeamBusinessError(ERR_TEAM_MEMBER_NOT_IN_TEAM)
             self._cancel_queued_team_launch(s, row.team_id)
             remaining = [m for m in rec.members if int(m.player_id) != target_player_id]
+            for m in remaining:
+                m.ranked_preset_confirmed = False
             del rec.members[:]
             rec.members.extend(remaining)
             self._bump_membership(s, target_player_id, 0)
@@ -1535,6 +1697,8 @@ class MemoryMatchStore:
             if row is None or row.state != TEAM_STATE_ACTIVE:
                 raise TeamBusinessError(ERR_TEAM_NO_TEAM)
             rec = row.data.record
+            if self._team_locked(rec, now):
+                raise TeamBusinessError(ERR_TEAM_IN_MATCH)
             found = next((m for m in rec.members if int(m.player_id) == caller.player_id), None)
             if found is None:
                 raise TeamBusinessError(ERR_TEAM_NO_TEAM)
@@ -2896,3 +3060,629 @@ class MemoryMatchStore:
             if f is None:
                 return None, now
             return self._build_stranded_locked(self._state, f, now, include_tickets=True), now
+
+    # -- Battle Scripts -------------------------------------------------------------------------------
+
+    async def list_battle_scripts(self, player_id: int) -> list[Message]:
+        async with self._lock:
+            items = [
+                self._clone_msg(rec)
+                for rec in self._state.battle_scripts.values()
+                if int(rec.owner_player_id) == player_id
+            ]
+            items.sort(key=lambda r: (-int(r.submitted_ms), int(r.script_id)))
+            return items
+
+    async def list_battle_script_loadout(self, player_id: int) -> list[Message]:
+        async with self._lock:
+            items = [
+                self._clone_msg(rec)
+                for (pid, _, _), rec in self._state.battle_script_loadouts.items()
+                if pid == player_id
+            ]
+            items.sort(key=lambda r: (int(r.match_mode), int(r.battle_config_id)))
+            return items
+
+    async def get_approved_battle_script(self, script_id: int, owner_player_id: int) -> tuple[int, bytes]:
+        async with self._lock:
+            rec = self._state.battle_scripts.get(script_id)
+            if rec is None or int(rec.owner_player_id) != owner_player_id:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+            if int(rec.approved_revision) == 0:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED)
+            return int(rec.approved_revision), bytes(rec.approved_content)
+
+    async def submit_battle_script(
+        self,
+        caller: CallerIdentity,
+        *,
+        script_id: int,
+        expected_revision: int,
+        content: bytes,
+        max_scripts: int,
+    ) -> Message:
+        now = await self.now_ms()
+        new_id = await self.next_id() if script_id == 0 else 0
+
+        def work(s: _MemState) -> Message:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            if script_id == 0:
+                owned = sum(1 for r in s.battle_scripts.values() if int(r.owner_player_id) == caller.player_id)
+                if owned >= max_scripts:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED)
+                rec = self.protocol.message(
+                    "match.MatchBattleScriptRecord",
+                    script_id=new_id,
+                    owner_player_id=caller.player_id,
+                    revision=1,
+                    content=content,
+                    review_state=REVIEW_STATE_PENDING,
+                    approved_revision=0,
+                    approved_content=b"",
+                    reject_reason="",
+                    submitted_ms=now,
+                    reviewed_ms=0,
+                )
+                s.battle_scripts[new_id] = rec
+                return self._clone_msg(rec)
+
+            rec = s.battle_scripts.get(script_id)
+            if rec is None or int(rec.owner_player_id) != caller.player_id:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+            if int(rec.revision) != expected_revision:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT)
+            rec.revision = int(rec.revision) + 1
+            rec.content = content
+            rec.review_state = REVIEW_STATE_PENDING
+            rec.reject_reason = ""
+            rec.submitted_ms = now
+            return self._clone_msg(rec)
+
+        return await self._run_tx(work)
+
+    async def delete_battle_script(self, caller: CallerIdentity, script_id: int, expected_revision: int) -> None:
+        def work(s: _MemState) -> None:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            rec = s.battle_scripts.get(script_id)
+            if rec is None or int(rec.owner_player_id) != caller.player_id:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+            if int(rec.revision) != expected_revision:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT)
+            s.battle_scripts.pop(script_id, None)
+            for key in [
+                k
+                for k, lr in s.battle_script_loadouts.items()
+                if k[0] == caller.player_id and int(lr.player_script_id) == script_id
+            ]:
+                s.battle_script_loadouts.pop(key, None)
+
+        await self._run_tx(work)
+
+    async def set_battle_script_loadout(
+        self,
+        caller: CallerIdentity,
+        *,
+        match_mode: int,
+        battle_config_id: int,
+        origin: int,
+        official_script_id: int,
+        player_script_id: int,
+        max_entries: int,
+    ) -> list[Message]:
+        now = await self.now_ms()
+
+        def work(s: _MemState) -> list[Message]:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            key = (caller.player_id, match_mode, battle_config_id)
+            if origin == SCRIPT_ORIGIN_UNSPECIFIED:
+                s.battle_script_loadouts.pop(key, None)
+            else:
+                if origin == SCRIPT_ORIGIN_PLAYER:
+                    rec = s.battle_scripts.get(player_script_id)
+                    if rec is None or int(rec.owner_player_id) != caller.player_id:
+                        raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+                    if int(rec.approved_revision) == 0:
+                        raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED)
+                others = sum(
+                    1
+                    for k in s.battle_script_loadouts
+                    if k[0] == caller.player_id and k != key
+                )
+                if others >= max_entries:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_LOADOUT_FULL)
+                s.battle_script_loadouts[key] = self.protocol.message(
+                    "match.MatchBattleScriptLoadoutRecord",
+                    player_id=caller.player_id,
+                    match_mode=match_mode,
+                    battle_config_id=battle_config_id,
+                    origin=origin,
+                    official_script_id=official_script_id,
+                    player_script_id=player_script_id,
+                    updated_ms=now,
+                )
+            items = [
+                self._clone_msg(lr)
+                for (pid, _, _), lr in s.battle_script_loadouts.items()
+                if pid == caller.player_id
+            ]
+            items.sort(key=lambda r: (int(r.match_mode), int(r.battle_config_id)))
+            return items
+
+        return await self._run_tx(work)
+
+    async def list_pending_battle_scripts(self, limit: int) -> list[Message]:
+        async with self._lock:
+            items = [
+                self._clone_msg(rec)
+                for rec in self._state.battle_scripts.values()
+                if int(rec.review_state) == REVIEW_STATE_PENDING
+            ]
+            items.sort(key=lambda r: (int(r.submitted_ms), int(r.script_id)))
+            return items[:limit]
+
+    async def review_battle_script(
+        self,
+        *,
+        script_id: int,
+        revision: int,
+        approve: bool,
+        reviewer: str,
+        reason: str,
+        validate: Callable[[bytes], None] | None = None,
+    ) -> None:
+        now = await self.now_ms()
+
+        def work(s: _MemState) -> None:
+            rec = s.battle_scripts.get(script_id)
+            if rec is None or int(rec.revision) != revision or int(rec.review_state) != REVIEW_STATE_PENDING:
+                raise BattleScriptReviewError(REVIEW_REJECT_STALE, "script revision is stale or not pending")
+            if approve and validate is not None:
+                try:
+                    validate(bytes(rec.content))
+                except Exception as exc:
+                    raise BattleScriptReviewError(REVIEW_REJECT_INVALID, str(exc)) from exc
+            if approve:
+                rec.review_state = REVIEW_STATE_APPROVED
+                rec.approved_revision = int(rec.revision)
+                rec.approved_content = bytes(rec.content)
+                rec.reject_reason = ""
+            else:
+                rec.review_state = REVIEW_STATE_REJECTED
+                rec.reject_reason = reason
+            rec.reviewed_ms = now
+            s.battle_script_reviews[(script_id, revision)] = self.protocol.message(
+                "match.MatchBattleScriptReviewRecord",
+                script_id=script_id,
+                revision=revision,
+                owner_player_id=int(rec.owner_player_id),
+                approved=approve,
+                reviewer=reviewer,
+                reason=reason,
+                reviewed_ms=now,
+                content=bytes(rec.content),
+            )
+
+        await self._run_tx(work)
+
+    # -- Elo Rating & Rank Outbox ---------------------------------------------------------------------
+
+    async def get_rating(self, player_id: int, mode: int) -> tuple[int, int, int]:
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+        async with self._lock:
+            row = self._state.ratings.get((player_id, mode))
+            if row is None:
+                return DEFAULT_RATING_CENTI, 0, 0
+            return row[0], row[1], row[3]
+
+    async def apply_rating(
+        self,
+        *,
+        battle_id: int,
+        payload_digest: bytes,
+        mode: int,
+        team_a: list[int],
+        team_b: list[int],
+        score_a: float,
+        source_epoch: int = 1,
+        generation: int = 1,
+        eligible_for_rank: set[int] | None = None,
+    ) -> RatingApplyResult:
+        if battle_id == 0 or not team_a or not team_b:
+            raise ValueError("battle_id and both teams must be non-empty")
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+        now = await self.now_ms()
+
+        def work(s: _MemState) -> RatingApplyResult:
+            existing_applied = s.rating_applied.get(battle_id)
+            if existing_applied is not None:
+                if existing_applied[0] != payload_digest:
+                    raise BattleOutcomeOriginalError(f"rating replay digest mismatch battle_id={battle_id}")
+                return RatingApplyResult(outcome=RATING_OUTCOME_DUPLICATE, battle_id=battle_id, mode=mode)
+            s.rating_applied[battle_id] = (payload_digest, now)
+
+            shard = rank_source_shard(battle_id)
+            src_key = (source_epoch, mode, shard)
+            src = s.rank_sources.get(src_key)
+            if src is None:
+                src = RankSourceRow(
+                    source_epoch=source_epoch,
+                    mode=mode,
+                    shard=shard,
+                    produced_cursor=0,
+                    committed_cursor=0,
+                    board_id=0,
+                    stopped=False,
+                )
+                s.rank_sources[src_key] = src
+
+            members = sorted(list(team_a) + list(team_b))
+            for i, pid in enumerate(members):
+                if pid == 0 or (i > 0 and members[i - 1] == pid):
+                    raise ValueError("rating member list has zero or duplicate player_id")
+
+            ratings_before: dict[int, int] = {}
+            games_before: dict[int, int] = {}
+            changed_before: dict[int, int] = {}
+            for pid in members:
+                row = s.ratings.get((pid, mode))
+                if row is None:
+                    ratings_before[pid] = DEFAULT_RATING_CENTI
+                    games_before[pid] = 0
+                    changed_before[pid] = now
+                else:
+                    ratings_before[pid] = row[0]
+                    games_before[pid] = row[1]
+                    changed_before[pid] = row[3]
+
+            delta = compute_elo_delta(
+                [ratings_before[p] for p in team_a],
+                [ratings_before[p] for p in team_b],
+                score_a,
+            )
+            side_a = set(team_a)
+            next_cursor = src.produced_cursor + 1
+            batch = self.protocol.message(
+                "rankpb.SubmitRankScoresRequest",
+                generation=generation,
+                source_epoch=source_epoch,
+                source_shard=shard,
+                source_cursor=next_cursor,
+                request_id=battle_id,
+                mode=RANK_SUBMIT_SET,
+            )
+            changes: list[RatingChange] = []
+            for pid in members:
+                change = delta if pid in side_a else -delta
+                after = max(0, ratings_before[pid] + change)
+                achieved = now if after != ratings_before[pid] else changed_before[pid]
+                games_after = games_before[pid] + 1
+                s.ratings[(pid, mode)] = (after, games_after, now, achieved)
+                changes.append(
+                    RatingChange(
+                        player_id=pid,
+                        rating_before_centi=ratings_before[pid],
+                        rating_after_centi=after,
+                        delta_centi=after - ratings_before[pid],
+                        games_after=games_after,
+                        achieved_ms=achieved,
+                    )
+                )
+                if eligible_for_rank is None or pid in eligible_for_rank:
+                    batch.entries.add(
+                        entity_id=pid,
+                        score=after,
+                        achieved_ms=achieved,
+                        score_version=games_after,
+                    )
+
+            unpublished = src.stopped or len(batch.entries) == 0
+            written_cursor = 0
+            if not unpublished:
+                body = batch.SerializeToString(deterministic=True)
+                s.rank_outbox[(source_epoch, mode, shard, next_cursor)] = (battle_id, body)
+                s.rank_sources[src_key] = RankSourceRow(
+                    source_epoch=src.source_epoch,
+                    mode=src.mode,
+                    shard=src.shard,
+                    produced_cursor=next_cursor,
+                    committed_cursor=src.committed_cursor,
+                    board_id=src.board_id,
+                    stopped=src.stopped,
+                )
+                written_cursor = next_cursor
+
+            return RatingApplyResult(
+                outcome=RATING_OUTCOME_APPLIED,
+                battle_id=battle_id,
+                mode=mode,
+                shard=shard,
+                source_cursor=written_cursor,
+                unpublished=unpublished,
+                changes=tuple(changes),
+            )
+
+        return await self._run_tx(work)
+
+    async def stop_rank_source(self, source_epoch: int, mode: int) -> int:
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+
+        def work(s: _MemState) -> int:
+            total = 0
+            for shard in range(RANK_SOURCE_SHARDS):
+                key = (source_epoch, mode, shard)
+                src = s.rank_sources.get(key)
+                if src is None:
+                    src = RankSourceRow(
+                        source_epoch=source_epoch,
+                        mode=mode,
+                        shard=shard,
+                        produced_cursor=0,
+                        committed_cursor=0,
+                        board_id=0,
+                        stopped=True,
+                    )
+                else:
+                    src = RankSourceRow(
+                        source_epoch=src.source_epoch,
+                        mode=src.mode,
+                        shard=src.shard,
+                        produced_cursor=src.produced_cursor,
+                        committed_cursor=src.committed_cursor,
+                        board_id=src.board_id,
+                        stopped=True,
+                    )
+                s.rank_sources[key] = src
+                total += src.produced_cursor
+            return total
+
+        return await self._run_tx(work)
+
+    async def list_rank_sources(self, *, source_epoch: int | None = None) -> list[RankSourceRow]:
+        async with self._lock:
+            rows = [
+                row
+                for row in self._state.rank_sources.values()
+                if source_epoch is None or row.source_epoch == source_epoch
+            ]
+            rows.sort(key=lambda r: (r.source_epoch, r.mode, r.shard))
+            return rows
+
+    async def bind_rank_board(self, source_epoch: int, mode: int, board_id: int) -> None:
+        def work(s: _MemState) -> None:
+            for key, row in list(s.rank_sources.items()):
+                if row.source_epoch == source_epoch and row.mode == mode and row.board_id == 0:
+                    s.rank_sources[key] = RankSourceRow(
+                        source_epoch=row.source_epoch,
+                        mode=row.mode,
+                        shard=row.shard,
+                        produced_cursor=row.produced_cursor,
+                        committed_cursor=row.committed_cursor,
+                        board_id=board_id,
+                        stopped=row.stopped,
+                    )
+
+        await self._run_tx(work)
+
+    async def get_rank_outbox_entry(
+        self, source_epoch: int, mode: int, shard: int, source_cursor: int
+    ) -> bytes | None:
+        async with self._lock:
+            row = self._state.rank_outbox.get((source_epoch, mode, shard, source_cursor))
+            return row[1] if row is not None else None
+
+    async def advance_rank_committed_cursor(
+        self, source_epoch: int, mode: int, shard: int, committed_cursor: int
+    ) -> None:
+        def work(s: _MemState) -> None:
+            key = (source_epoch, mode, shard)
+            row = s.rank_sources.get(key)
+            if row is not None and committed_cursor > row.committed_cursor:
+                s.rank_sources[key] = RankSourceRow(
+                    source_epoch=row.source_epoch,
+                    mode=row.mode,
+                    shard=row.shard,
+                    produced_cursor=row.produced_cursor,
+                    committed_cursor=committed_cursor,
+                    board_id=row.board_id,
+                    stopped=row.stopped,
+                )
+
+        await self._run_tx(work)
+
+    async def list_rank_removals(self, *, limit: int = 16) -> list[tuple[int, int]]:
+        async with self._lock:
+            return sorted(self._state.rank_removals.keys())[:limit]
+
+    async def delete_rank_removal(self, mode: int, player_id: int) -> None:
+        def work(s: _MemState) -> None:
+            s.rank_removals.pop((mode, player_id), None)
+
+        await self._run_tx(work)
+
+    # -- Ranked Play V1 -------------------------------------------------------------------------------
+
+    async def get_active_ranked_season(self) -> RankedSeasonRow | None:
+        async with self._lock:
+            actives = [s for s in self._state.ranked_seasons.values() if s.state == RANKED_SEASON_ACTIVE]
+            if not actives:
+                return None
+            actives.sort(key=lambda x: x.season_id, reverse=True)
+            return actives[0]
+
+    async def upsert_ranked_season(self, season: RankedSeasonRow) -> RankedSeasonRow:
+        def work(s: _MemState) -> RankedSeasonRow:
+            s.ranked_seasons[season.season_id] = season
+            return season
+
+        return await self._run_tx(work)
+
+    async def list_ranked_seasons(self) -> list[RankedSeasonRow]:
+        async with self._lock:
+            return sorted(self._state.ranked_seasons.values(), key=lambda x: x.season_id, reverse=True)
+
+    async def get_ranked_player_prefs(self, player_id: int) -> RankedPlayerPrefsRow | None:
+        async with self._lock:
+            return self._state.ranked_prefs.get(player_id)
+
+    async def save_ranked_player_prefs(
+        self,
+        caller: CallerIdentity,
+        *,
+        char_preset_id: int,
+        pet_preset_id: int,
+        rule_version: int,
+        cosmetic_loadout: bytes,
+    ) -> RankedPlayerPrefsRow:
+        now = await self.now_ms()
+
+        def work(s: _MemState) -> RankedPlayerPrefsRow:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            row = RankedPlayerPrefsRow(
+                player_id=caller.player_id,
+                character_preset_id=char_preset_id,
+                pet_preset_id=pet_preset_id,
+                rule_version=rule_version,
+                cosmetic_loadout=cosmetic_loadout,
+                updated_ms=now,
+            )
+            s.ranked_prefs[caller.player_id] = row
+            return row
+
+        return await self._run_tx(work)
+
+    async def get_ranked_player_season(self, season_id: int, player_id: int) -> RankedPlayerSeasonRow | None:
+        async with self._lock:
+            return self._state.ranked_player_seasons.get((season_id, player_id))
+
+    async def list_ranked_player_seasons(self, player_id: int) -> list[RankedPlayerSeasonRow]:
+        async with self._lock:
+            rows = [r for r in self._state.ranked_player_seasons.values() if r.player_id == player_id]
+            rows.sort(key=lambda r: r.season_id, reverse=True)
+            return rows
+
+    async def list_ranked_rewards(self, player_id: int) -> list[RankedRewardRow]:
+        async with self._lock:
+            rows = [r for r in self._state.ranked_rewards.values() if r.player_id == player_id]
+            rows.sort(key=lambda r: (r.season_id, r.reward_kind))
+            return rows
+
+    async def save_ranked_battle_settlement(
+        self,
+        *,
+        season_id: int,
+        battle_id: int,
+        player_id: int,
+        summary_template: Message,
+        rating_centi: int,
+        tier_after: int,
+        outcome_kind: int,
+        participated: bool,
+        settled_at_ms: int,
+        milestones: tuple[tuple[int, int, int, str], ...],
+    ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
+        def work(s: _MemState) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
+            existing_battle = s.ranked_battles.get((battle_id, player_id))
+            if existing_battle is not None:
+                prog = s.ranked_player_seasons[(season_id, player_id)]
+                return prog, [], existing_battle[2]
+
+            prev = s.ranked_player_seasons.get((season_id, player_id))
+            qualified = bool(prev.qualified) if prev else False
+            qualified_at_ms = prev.qualified_at_ms if prev else 0
+            peak_rating = prev.peak_rating_centi if prev else 0
+            peak_tier = prev.peak_tier if prev else 0
+            valid_matches = prev.valid_matches if prev else 0
+            wins = prev.wins if prev else 0
+            losses = prev.losses if prev else 0
+            draws = prev.draws if prev else 0
+            milestone_bits = prev.milestone_bits if prev else 0
+            honor_bits = prev.honor_bits if prev else 0
+            final_rank = prev.final_rank if prev else 0
+
+            if participated:
+                valid_matches += 1
+                if not qualified:
+                    qualified = True
+                    qualified_at_ms = settled_at_ms
+                if outcome_kind == 1:
+                    wins += 1
+                elif outcome_kind == 2:
+                    losses += 1
+                elif outcome_kind == 3:
+                    draws += 1
+
+            if qualified:
+                if peak_rating == 0 or rating_centi > peak_rating:
+                    peak_rating = rating_centi
+                if tier_after > peak_tier:
+                    peak_tier = tier_after
+
+            unlocked: list[RankedRewardRow] = []
+            for threshold, bit_mask, reward_kind, item_code in milestones:
+                if valid_matches >= threshold and not (milestone_bits & bit_mask):
+                    milestone_bits |= bit_mask
+                    rkey = (player_id, season_id, reward_kind)
+                    if rkey not in s.ranked_rewards:
+                        rew = RankedRewardRow(
+                            player_id=player_id,
+                            season_id=season_id,
+                            reward_kind=reward_kind,
+                            tier_value=threshold,
+                            item_code=item_code,
+                            granted_at_ms=settled_at_ms,
+                        )
+                        s.ranked_rewards[rkey] = rew
+                        unlocked.append(rew)
+
+            prog = RankedPlayerSeasonRow(
+                season_id=season_id,
+                player_id=player_id,
+                qualified=qualified,
+                qualified_at_ms=qualified_at_ms,
+                rating_centi=rating_centi,
+                peak_rating_centi=peak_rating,
+                peak_tier=peak_tier,
+                valid_matches=valid_matches,
+                wins=wins,
+                losses=losses,
+                draws=draws,
+                milestone_bits=milestone_bits,
+                honor_bits=honor_bits,
+                final_rank=final_rank,
+                updated_ms=settled_at_ms,
+            )
+            s.ranked_player_seasons[(season_id, player_id)] = prog
+
+            final_summary = self._clone_msg(summary_template)
+            final_summary.season_valid_matches_after = valid_matches
+            for rew in unlocked:
+                final_summary.newly_unlocked_rewards.add(
+                    season_id=rew.season_id,
+                    kind=rew.reward_kind,
+                    tier_value=rew.tier_value,
+                    item_code=rew.item_code,
+                    granted_at_ms=rew.granted_at_ms,
+                )
+            raw_bytes = final_summary.SerializeToString(deterministic=True)
+            s.ranked_battles[(battle_id, player_id)] = (season_id, settled_at_ms, raw_bytes)
+            return prog, unlocked, raw_bytes
+
+        return await self._run_tx(work)
+
+    async def get_ranked_battle_result(self, player_id: int, battle_id: int = 0) -> bytes | None:
+        async with self._lock:
+            if battle_id != 0:
+                row = self._state.ranked_battles.get((battle_id, player_id))
+                return row[2] if row is not None else None
+            matches = [
+                (settled_ms, bid, raw)
+                for (bid, pid), (_, settled_ms, raw) in self._state.ranked_battles.items()
+                if pid == player_id
+            ]
+            if not matches:
+                return None
+            matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            return matches[0][2]

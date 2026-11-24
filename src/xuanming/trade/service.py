@@ -37,26 +37,33 @@ from .errors import (
     ERR_TRADE_HOME_ZONE_UNKNOWN,
     ERR_TRADE_LISTING_NOT_FOUND,
     ERR_TRADE_ORDER_NOT_FOUND,
+    ERR_TRADE_TEXT_CHECK_UNAVAILABLE,
+    ERR_TRADE_TITLE_SENSITIVE,
     InvalidRoleFenceStateError,
     ListingNotFoundError,
     ManualNotAllowedError,
     ManualNotFoundError,
     ManualVersionChangedError,
+    TextCheckUnavailableError,
     TradeRejection,
     TradeRoleConflictError,
     commerce_tip_id,
 )
+from .mall_adapter import MallAdapter
 from .model import (
     COMMERCE_KIND_AUCTION_LOT,
     COMMERCE_KIND_BID,
     COMMERCE_KIND_CONSIGNMENT,
     COMMERCE_KIND_OFFICIAL,
+    COMMERCE_KIND_RMB_CONSIGNMENT,
     LISTING_SECTION_AUCTION,
     LISTING_STATUS_LISTED,
     MANUAL_LIST_PAGE_MAX,
     MANUAL_RESOLUTION_CALLER,
     MARKET_SCOPE_GLOBAL,
     MARKET_SCOPE_ZONE,
+    TEXT_SCENE_TRADE_TITLE,
+    TEXT_VERDICT_PASS,
     CommerceCursor,
     ListingQuery,
     MarketLimits,
@@ -77,6 +84,8 @@ from .model import (
     valid_tab,
     visible_to_buyer,
 )
+from .rmb import RmbConsignments, local_rmb_view
+from .role_trade import ContentGuardChecker, RmbIdentity, RmbIdentityResolver
 from .store import HomeZoneDirectory, TradeStoreBase
 
 logger = logging.getLogger(__name__)
@@ -126,6 +135,10 @@ class TradeService:
         mode: str = "pro",
         mall_url: str = "",
         rmb_enabled: bool = False,
+        mall: MallAdapter | None = None,
+        rmb: RmbConsignments | None = None,
+        rmb_identity: RmbIdentityResolver | None = None,
+        content_guard: ContentGuardChecker | None = None,
         manual_resolution_secret: bytes = b"",
         manual_resolution_environment: str = "",
         request_budget_sec: float = 3.5,
@@ -141,8 +154,12 @@ class TradeService:
         self._market = market
         self._zones_provider = zones_provider or (lambda: MergedZones())
         self._mode = mode
-        self._mall_url = mall_url
+        self._mall_url = mall_url or (mall.base_url if mall is not None else "")
         self._rmb_enabled = rmb_enabled
+        self._mall = mall
+        self._rmb = rmb
+        self._rmb_identity = rmb_identity or (RmbIdentity(rmb.directory) if rmb is not None else None)
+        self._content_guard = content_guard
         self._manual_secret = manual_resolution_secret
         self._manual_target = manual_resolution_environment
         self._replica = socket.gethostname() or "unknown"
@@ -592,17 +609,50 @@ class TradeService:
         resp.server_now_ms = now
         return resp
 
-    # -- Official Mall & RMB (disabled -> 20003 kTradeFeatureDisabled) ----------------------------------
+    # -- Official Mall (2) & RMB Consignment / Withdrawal (11) ------------------------------------------
 
     async def list_official_skus(self, request: Message, context, path: str) -> Message:
-        await self._admit_client(context, path)
+        original = await self._admit_client(context, path)
         resp = self.protocol.message("trade.ListOfficialSkusResponse")
-        resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
-        return resp
+        if self._mall is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        try:
+            return await self._with_budget(
+                self._mall.list_official_skus(original.player_id, int(request.after_sku_id), int(request.limit))
+            )
+        except Exception as exc:
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     async def create_official_order(self, request: Message, context, path: str) -> Message:
-        await self._admit_client(context, path)
-        return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+        original = await self._admit_client(context, path)
+        if self._mall is None:
+            return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+        try:
+            return await self._with_budget(self._mall.create_official_order(original, request))
+        except Exception as exc:
+            return self._order_response(None, error=exc)
+
+    def _rmb_ready(self) -> bool:
+        return bool(self._rmb_enabled and self._rmb is not None and self._mall is not None and self._rmb_identity is not None)
+
+    async def _check_trade_title(self, player_id: int, title: str) -> int:
+        """对全服可见的人民币寄售标题执行内容安全检查（严禁打印标题原文，故障 fail-closed）。"""
+        if self._content_guard is None or not title:
+            return 0
+        try:
+            res = await self._content_guard.check_text(TEXT_SCENE_TRADE_TITLE, player_id, title)
+        except TextCheckUnavailableError:
+            logger.error("trade content guard unavailable, rmb consignment title refused player=%d", player_id)
+            return ERR_TRADE_TEXT_CHECK_UNAVAILABLE
+        except Exception:
+            logger.error("trade content guard error, rmb consignment title refused player=%d", player_id)
+            return ERR_TRADE_TEXT_CHECK_UNAVAILABLE
+        if res.verdict == TEXT_VERDICT_PASS:
+            return 0
+        logger.info("trade rmb consignment title refused by content guard category=%d player=%d", res.category, player_id)
+        return ERR_TRADE_TITLE_SENSITIVE
 
     async def _rmb_disabled(self, context, path: str, resp_name: str, *, with_now: bool = True) -> Message:
         await self._admit_client(context, path)
@@ -613,37 +663,211 @@ class TradeService:
         return resp
 
     async def create_rmb_consignment(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        original = await self._admit_client(context, path)
+        resp = self.protocol.message("trade.RmbConsignmentResponse", server_now_ms=self._now_ms())
+        assert self._rmb is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(
+                self._rmb_identity.resolve(original, int(request.character_player_id))
+            )
+        except Exception as exc:
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
+        title = str(request.title)
+        if not title.strip():
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        reject_tip = await self._with_budget(self._check_trade_title(int(owned.role.player_id), title))
+        if reject_tip != 0:
+            resp.error_message.id = reject_tip
+            return resp
+        zone, zone_code = await self._with_budget(
+            self._resolve_home_zone(int(owned.role.player_id), "CreateRmbConsignment")
+        )
+        if zone_code != 0 or zone == 0:
+            resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+            return resp
+        try:
+            rec = await self._with_budget(
+                self._rmb.create(
+                    original,
+                    str(owned.account),
+                    int(owned.role.player_id),
+                    int(owned.owner_revision),
+                    zone,
+                    request,
+                )
+            )
+            w = decode_workflow(self.protocol, rec)
+            if not w.HasField("rmb"):
+                resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+                return resp
+            if w.rmb.HasField("registered_listing"):
+                resp.listing.CopyFrom(w.rmb.registered_listing)
+            else:
+                resp.listing.CopyFrom(local_rmb_view(self.protocol, rec, w))
+        except Exception as exc:
+            resp.error_message.id = commerce_tip_id(exc)
+        return resp
 
     async def get_rmb_consignment(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        original = await self._admit_client(context, path)
+        resp = self.protocol.message("trade.RmbConsignmentResponse", server_now_ms=self._now_ms())
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            lid = int(request.listing_id)
+            try:
+                view = await self._with_budget(self._mall.rmb_get(lid))
+            except TradeRejection as rej:
+                if rej.tip_id != ERR_TRADE_ORDER_NOT_FOUND:
+                    raise
+                rec = await self._with_budget(self.store.get_commerce(lid))
+                if rec is None or int(rec.kind) != COMMERCE_KIND_RMB_CONSIGNMENT:
+                    raise
+                w = decode_workflow(self.protocol, rec)
+                if not w.HasField("rmb") or str(w.rmb.seller_account) != str(owned.account):
+                    raise
+                view = local_rmb_view(self.protocol, rec, w)
+            resp.listing.CopyFrom(view)
+        except Exception as exc:
+            resp.error_message.id = commerce_tip_id(exc)
+        return resp
 
     async def list_rmb_consignments(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.ListRmbConsignmentsResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.ListRmbConsignmentsResponse")
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            await self._with_budget(self._rmb_identity.resolve(original, 0))
+            out = await self._with_budget(self._mall.rmb_list(str(request.cursor), int(request.limit)))
+            out.server_now_ms = self._now_ms()
+            return out
+        except Exception as exc:
+            resp = self.protocol.message("trade.ListRmbConsignmentsResponse", server_now_ms=self._now_ms())
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     async def buy_rmb_consignment(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.CommerceOrderResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.CommerceOrderResponse")
+        original = await self._admit_client(context, path)
+        assert self._rmb is not None and self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            await self._with_budget(self._rmb.check_buyer_slot(str(owned.account), int(request.listing_id)))
+            return await self._with_budget(
+                self._mall.rmb_buy(str(owned.account), int(owned.role.player_id), int(owned.owner_revision), request)
+            )
+        except Exception as exc:
+            return self._order_response(None, error=exc)
 
     async def cancel_rmb_consignment(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.RmbConsignmentResponse")
+        original = await self._admit_client(context, path)
+        resp = self.protocol.message("trade.RmbConsignmentResponse", server_now_ms=self._now_ms())
+        assert self._rmb is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            lid = int(request.listing_id)
+            await self._with_budget(self._rmb.cancel(original, str(owned.account), lid))
+            resp.listing.listing_id = lid
+            resp.listing.state = "CANCEL_PENDING"
+            resp.listing.phase = "awaiting_escrow_return"
+        except Exception as exc:
+            resp.error_message.id = commerce_tip_id(exc)
+        return resp
+
+    async def _rmb_order_call(self, order_id: str, cancel_order: bool, context, path: str) -> Message:
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.CommerceOrderResponse")
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            return await self._with_budget(self._mall.rmb_order(str(owned.account), order_id, cancel=cancel_order))
+        except Exception as exc:
+            return self._order_response(None, error=exc)
 
     async def get_rmb_order(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.CommerceOrderResponse")
+        return await self._rmb_order_call(str(request.order_id), False, context, path)
 
     async def list_rmb_orders(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.ListCommerceOrdersResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.ListCommerceOrdersResponse")
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            out = await self._with_budget(
+                self._mall.rmb_orders(str(owned.account), str(request.cursor), int(request.limit))
+            )
+            out.server_now_ms = self._now_ms()
+            return out
+        except Exception as exc:
+            resp = self.protocol.message("trade.ListCommerceOrdersResponse", server_now_ms=self._now_ms())
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     async def cancel_rmb_order(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.CommerceOrderResponse")
+        return await self._rmb_order_call(str(request.order_id), True, context, path)
 
     async def list_seller_incomes(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.ListSellerIncomesResponse")
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.ListSellerIncomesResponse")
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            out = await self._with_budget(
+                self._mall.rmb_incomes(str(owned.account), str(request.cursor), int(request.limit))
+            )
+            out.server_now_ms = self._now_ms()
+            return out
+        except Exception as exc:
+            resp = self.protocol.message("trade.ListSellerIncomesResponse", server_now_ms=self._now_ms())
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     async def create_withdrawal(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.WithdrawalResponse", with_now=False)
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.WithdrawalResponse", with_now=False)
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            return await self._with_budget(
+                self._mall.rmb_withdrawal(
+                    str(owned.account),
+                    request_id=str(request.client_request_id),
+                    amount_fen=int(request.amount_fen),
+                )
+            )
+        except Exception as exc:
+            resp = self.protocol.message("trade.WithdrawalResponse")
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     async def get_withdrawal(self, request: Message, context, path: str) -> Message:
-        return await self._rmb_disabled(context, path, "trade.WithdrawalResponse", with_now=False)
+        if not self._rmb_ready():
+            return await self._rmb_disabled(context, path, "trade.WithdrawalResponse", with_now=False)
+        original = await self._admit_client(context, path)
+        assert self._mall is not None and self._rmb_identity is not None
+        try:
+            owned = await self._with_budget(self._rmb_identity.resolve(original, 0))
+            return await self._with_budget(
+                self._mall.rmb_withdrawal(str(owned.account), withdrawal_id=str(request.withdrawal_id))
+            )
+        except Exception as exc:
+            resp = self.protocol.message("trade.WithdrawalResponse")
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
 
     # -- Core Commerce RPCs (18) --------------------------------------------------------------------
 
@@ -659,9 +883,17 @@ class TradeService:
 
     async def get_commerce_order(self, request: Message, context, path: str) -> Message:
         order_id = str(request.order_id)
-        if "-" in order_id and not self._mall_url:
-            await self._admit_client(context, path)
-            return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+        if "-" in order_id:
+            original = await self._admit_client(context, path)
+            if self._mall is None:
+                return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+            try:
+                return await self._with_budget(
+                    self._mall.get_or_cancel_official_order(original, order_id, cancel=False)
+                )
+            except Exception as exc:
+                return self._order_response(None, error=exc)
+
         async def _call(orig: RoleOriginal, eng: CommerceEngine) -> Message:
             if not order_id.isdigit():
                 raise TradeRejection(ERR_INVALID_PARAMETER, "invalid order_id")
@@ -671,9 +903,17 @@ class TradeService:
 
     async def cancel_commerce_order(self, request: Message, context, path: str) -> Message:
         order_id = str(request.order_id)
-        if "-" in order_id and not self._mall_url:
-            await self._admit_client(context, path)
-            return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+        if "-" in order_id:
+            original = await self._admit_client(context, path)
+            if self._mall is None:
+                return self._order_response(None, tip=ERR_TRADE_FEATURE_DISABLED)
+            try:
+                return await self._with_budget(
+                    self._mall.get_or_cancel_official_order(original, order_id, cancel=True)
+                )
+            except Exception as exc:
+                return self._order_response(None, error=exc)
+
         async def _call(orig: RoleOriginal, eng: CommerceEngine) -> Message:
             if not order_id.isdigit():
                 raise TradeRejection(ERR_INVALID_PARAMETER, "invalid order_id")
@@ -689,9 +929,23 @@ class TradeService:
             resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
             return resp
         cursor = str(request.cursor)
+        limit = min(max(int(request.limit), 1), 100)
+        if self._mall is not None and (cursor == "" or cursor.startswith("mall:")):
+            mall_cursor = cursor[len("mall:") :] if cursor.startswith("mall:") else ""
+            try:
+                mall_orders = await self._with_budget(
+                    self._mall.list_official_orders(original, mall_cursor, limit)
+                )
+            except Exception as exc:
+                resp.error_message.id = commerce_tip_id(exc)
+                return resp
+            if mall_orders:
+                for order in mall_orders:
+                    resp.orders.add().CopyFrom(order)
+                resp.next_cursor = "mall:" + str(mall_orders[-1].order_id)
+                return resp
         if cursor.startswith("mall:"):
             cursor = ""
-        limit = min(max(int(request.limit), 1), 100)
         try:
             rows = await self._with_budget(
                 self.store.list_commerce_orders(original.player_id, CommerceCursor.parse(cursor), limit)

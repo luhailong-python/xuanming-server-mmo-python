@@ -12,6 +12,7 @@ from .model import DATABASE_NAME
 COORDINATOR_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_COORDINATOR"
 ROLE_FENCE_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_GUILD"
 ASSET_OP_SECRET_ENV = "MMORPG_ASSET_OP_SECRET_GUILD"
+MATCH_INTERNAL_SECRET_ENV = "MMORPG_MATCH_INTERNAL_SECRET_GUILD"
 MYSQL_PASSWORD_ENV = "GUILD_MYSQL_PASSWORD"
 
 # 显式区别于 player_locator 的 50300，避免本地同机端口冲突
@@ -25,6 +26,7 @@ MAX_APPLICATION_QUOTA_PER_MINUTE = 600
 
 _TOML_FORBIDDEN_FIELDS = frozenset((
     "asset_op_secret",
+    "match_internal_secret",
     "coordinator_secret",
     "role_fence_secret",
     "mysql_password",
@@ -81,7 +83,9 @@ class GuildConfig:
     asset_op_lease_ms: int = 10_000
     terminal_retention_days: int = DEFAULT_TERMINAL_RETENTION_DAYS
     trials_enabled: bool = False
+    match_service: str = ""
     asset_op_secret: bytes = b""
+    match_internal_secret: bytes = b""
     coordinator_secret: bytes = b""
     role_fence_secret: bytes = b""
 
@@ -109,10 +113,12 @@ class GuildConfig:
                 raw["advertise_host"] = pod_ip
 
         asset_op_enabled = bool(raw.get("asset_op_enabled", False))
+        trials_enabled = bool(raw.get("trials_enabled", False))
         config = cls(
             **raw,
             mysql_password=environ.get(MYSQL_PASSWORD_ENV, ""),
             asset_op_secret=load_optional_secret(environ, ASSET_OP_SECRET_ENV, required=asset_op_enabled),
+            match_internal_secret=load_optional_secret(environ, MATCH_INTERNAL_SECRET_ENV, required=trials_enabled),
             coordinator_secret=load_required_secret(environ, COORDINATOR_SECRET_ENV),
             role_fence_secret=load_required_secret(environ, ROLE_FENCE_SECRET_ENV),
         )
@@ -148,6 +154,11 @@ class GuildConfig:
             )
         if self.asset_op_enabled and len(self.asset_op_secret) < MIN_HMAC_SECRET_BYTES:
             raise ValueError(f"{ASSET_OP_SECRET_ENV} must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+        if self.trials_enabled:
+            if len(self.match_internal_secret) < MIN_HMAC_SECRET_BYTES:
+                raise ValueError(f"{MATCH_INTERNAL_SECRET_ENV} must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+            if not self.match_service:
+                raise ValueError("guild trials_enabled requires match_service gRPC endpoint")
         if len(self.coordinator_secret) < MIN_HMAC_SECRET_BYTES:
             raise ValueError(f"{COORDINATOR_SECRET_ENV} must be at least {MIN_HMAC_SECRET_BYTES} bytes")
         if len(self.role_fence_secret) < MIN_HMAC_SECRET_BYTES:

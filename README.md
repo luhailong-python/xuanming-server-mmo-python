@@ -52,13 +52,12 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 | Friend | `xuanming-server friend --config <toml>` | 50400 | 好友申请、关系图、黑名单与在线推荐 |
 | Payment | `xuanming-server payment --config <toml>` | 51200 / 18130 | 充值意图、HTTP 渠道回调与退款核销 |
 | Trade | `xuanming-server trade --config <toml>` | 50800 | 聚宝斋目录、寄售/P2P/市集/拍卖与资产交割 |
-| Guild | `xuanming-server guild --config <toml>` | 50310 | 公会管理、审批、分区排行、升级与活动 |
+| Guild | `xuanming-server guild --config <toml>` | 50310 | 公会管理、审批、分区排行、AssetOp 经济与试炼活动 |
+| Ops 运维工具 | `xuanming-server schemamigrate\|table-sync ...` | — | 全 12 库 123 表 Schema 校验迁移与配置表打包同步 |
 
 设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连 Login 和 Match；保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Python `client_rpc_router` 转发全部客户端业务服务。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做控制面操作，神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。
 
-Python Login（`src/xuanming/login`）沿用 Go login 的 Redis 键、TTL 和 Lua 脚本，可与 Go login 共用同一套 Redis。它使用 `[login]` 段和 `data_service`、`scene_manager`、`player_locator`、`redis`（玩家域）、`login_redis`（登录域，缺省同 `redis`）地址，并读取环境变量 `MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN`、`MMORPG_GATE_TOKEN_SECRET`、`MMORPG_INTERNAL_AUTH_PUBLIC_KEYS`，开发口令登录读取 `LOGIN_DEV_PASSWORD_SHARED_SECRET`（账号前缀 `robot_`、`dev_`）。
-
-login 未移植项：登录排队（QueryQueueStatus 固定回 queue disabled）、gate 排空迁移与 stale 标记（RequestGateMigration 回 DISABLED）、第三方渠道和生产 Argon2 口令认证、防沉迷与实名、账号注销、LoginAdmin、内容安全、归属区重定向进场、kill switch、GetZoneRoleCount、指标。
+Python Login（`src/xuanming/login`）完整实现 `ClientPlayerLogin`、`LoginPreGate` 与 `LoginAdmin` 全部 17 个 RPC，涵盖登录排队、Gate 排空迁移、实名/防沉迷、账号注销、生产口令认证（`scrypt` + 可选 `argon2`）、`ContentGuard` 与 `KillSwitch`，沿用 Go login 的 Redis 键、TTL 和 Lua 脚本，可与原版共用同一套 Redis。它使用 `[login]` 段和 `data_service`、`scene_manager`、`player_locator`、`redis`（玩家域）、`login_redis`（登录域，缺省同 `redis`）地址，并读取环境变量 `MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN`、`MMORPG_GATE_TOKEN_SECRET`、`MMORPG_INTERNAL_AUTH_PUBLIC_KEYS`、`MMORPG_LOGIN_ADMIN_TOKEN`，开发口令登录读取 `LOGIN_DEV_PASSWORD_SHARED_SECRET`（账号前缀 `robot_`、`dev_`）。
 
 Scene 和 Battle 的内部 Match 终局调用会发现 etcd 中的 stable Match 副本；终局提交和只读查询可在通信失败时切换副本。无登记或首次发现失败时使用配置中的 `match` 地址，因此该地址必须指向可信的 stable Match 服务；已有登记但没有合格 stable 副本时不会绕过轨道限制。
 

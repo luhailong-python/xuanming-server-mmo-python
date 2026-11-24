@@ -48,4 +48,20 @@ class NameOutsideWindow(DirectoryError):
 
 
 class TxNeverBegan(RuntimeError):
-    """The transaction failed before any business statement was sent (Go ``txNeverBegan``)."""
+    """事务在任何业务语句发出前失败（对应 Go ``txNeverBegan``）。"""
+
+
+class RecallBatchExists(DirectoryError):
+    """同 request_id 的回收批次已存在。"""
+
+
+class RecallSourceConsumed(DirectoryError):
+    """回收来源流水已被其它批次或人工登记消费。"""
+
+
+class RecallBatchNotFound(DirectoryError):
+    """指定 request_id 的回收批次不存在。"""
+
+
+class RecallOpNotFound(DirectoryError):
+    """指定 op_id 的回收指令不存在。"""

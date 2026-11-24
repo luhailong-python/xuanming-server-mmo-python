@@ -43,6 +43,7 @@ from .model import (
     unique_ints,
     verify_internal_hmac,
 )
+from .ranked import RankedManager
 from .store import MatchStore, TeamMutationOutcome, TeamSnapshotResult
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,7 @@ class TeamGrpcService:
         battle_nodes: BattleNodeResolver,
         gather: GatherPipeline,
         notifier: TeamNotifier | None = None,
+        ranked: RankedManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -151,6 +153,7 @@ class TeamGrpcService:
         self.notifier = notifier or NullTeamNotifier()
         self._inline_gather = inline_gather
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self.ranked = ranked if ranked is not None else RankedManager(protocol, store, clock_ms=self._clock_ms)
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -264,11 +267,16 @@ class TeamGrpcService:
             view.match_battle_config_id = snap.launch_config_id
             view.match_mode = snap.launch_mode
 
+        active_season = await self.store.get_active_ranked_season()
+        active_rule_ver = active_season.rule_version if active_season is not None else self.ranked.rule.rule_version
+        view.ranked_season_id = active_season.season_id if active_season is not None else 1
+        view.ranked_rule_version = active_rule_ver
+
         ordered = sorted(record.members, key=lambda m: (int(m.join_seq), int(m.player_id)))
         all_confirmed = bool(ordered)
         for m in ordered:
             pid = int(m.player_id)
-            if not m.ranked_preset_confirmed:
+            if not m.ranked_preset_confirmed or int(m.ranked_rule_version) != active_rule_ver:
                 all_confirmed = False
             mv = await self._member_view(pid, int(m.zone_id), pid == leader_id, int(m.join_seq), m)
             view.members.add().CopyFrom(mv)
@@ -564,13 +572,17 @@ class TeamGrpcService:
 
     async def confirm_ranked_preset(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
+        char_preset = int(request.character_preset_id)
+        pet_preset = int(request.pet_preset_id)
+        rule_ver = int(request.rule_version)
         try:
+            await self.ranked.validate_team_preset_confirm(char_preset, pet_preset, rule_ver)
             outcome = await self.store.confirm_ranked_preset(
                 caller,
                 int(request.expected_team_id),
-                int(request.character_preset_id),
-                int(request.pet_preset_id),
-                int(request.rule_version),
+                char_preset,
+                pet_preset,
+                rule_ver,
                 request.request_id,
             )
             return await self._outcome_response(caller, outcome)

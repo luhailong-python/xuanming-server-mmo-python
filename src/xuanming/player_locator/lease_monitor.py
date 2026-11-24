@@ -21,6 +21,7 @@ from .config import (
     AFK_PASS_PROBE_RETRY_SEC,
     PlayerLocatorConfig,
 )
+from .hosted_resume import resume_hosted_if_lost
 from .store import (
     AfkPassState,
     CommitLeaseResult,
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _WAKE_QUEUE_CAPACITY = 1024
 _LEAVE_SCENE_PATH = "/scene_manager.SceneManager/LeaveScene"
+_ENTER_SCENE_PATH = "/scene_manager.SceneManager/EnterScene"
 _LEASE_EXPIRED_EVENT_NAME = "ContractsKafkaPlayerLeaseExpiredEvent"
 
 
@@ -45,13 +47,24 @@ class SceneManagerClient(TypingProtocol):
         self, *, player_id: int, scene_id: int, session_id: int, login_generation: int,
     ) -> None: ...
 
+    async def enter_scene(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        login_generation: int,
+        owner_revision: int,
+        gate_zone_id: int,
+        hosted_placement: bool = True,
+    ): ...
+
 
 class GateCommandPublisher(TypingProtocol):
     async def publish_gate_command(self, gate_node_id: int, player_id: int, command) -> None: ...
 
 
 class GrpcSceneManagerClient:
-    """调用 SceneManager.LeaveScene 的 gRPC 适配器。"""
+    """调用 SceneManager.LeaveScene / EnterScene 的 gRPC 适配器。"""
 
     def __init__(self, protocol: Protocol, client: GrpcClient, *, timeout_sec: float = 5.0) -> None:
         self.protocol = protocol
@@ -69,6 +82,28 @@ class GrpcSceneManagerClient:
             login_generation=login_generation,
         )
         await self.client.call(_LEAVE_SCENE_PATH, request.SerializeToString(), timeout=self.timeout_sec)
+
+    async def enter_scene(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        login_generation: int,
+        owner_revision: int,
+        gate_zone_id: int,
+        hosted_placement: bool = True,
+    ):
+        request = self.protocol.message(
+            "scene_manager.EnterSceneRequest",
+            player_id=player_id,
+            session_id=session_id,
+            login_generation=login_generation,
+            owner_revision=owner_revision,
+            gate_zone_id=gate_zone_id,
+            hosted_placement=hosted_placement,
+        )
+        raw = await self.client.call(_ENTER_SCENE_PATH, request.SerializeToString(), timeout=self.timeout_sec)
+        return self.protocol.parse("scene_manager.EnterSceneResponse", raw)
 
 
 class KafkaGatePublisher:
@@ -363,8 +398,13 @@ class LeaseMonitor:
                 if rearm_res == RearmLeaseResult.CLAIM_LOST:
                     logger.error("rearm afk lease failed player=%d reason=claim_lost", claim.player_id)
                     return
+                if rearm_res != RearmLeaseResult.REARMED:
+                    return
                 logger.info("player has active afk pass; lease extended player=%d seconds=%d",
                             claim.player_id, AFK_PASS_LEASE_TTL_SEC)
+                await resume_hosted_if_lost(
+                    self.protocol, self.store, self.scene_manager, session, self.clock(),
+                )
                 return
             if afk_state == AfkPassState.UNKNOWN:
                 rearm_res = await self.store.rearm_lease_claim(claim, now_unix_sec + AFK_PASS_PROBE_RETRY_SEC)

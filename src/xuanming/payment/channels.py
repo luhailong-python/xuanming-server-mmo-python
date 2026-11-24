@@ -13,15 +13,18 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import time
 from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
 
-from .config import MIN_SECRET_BYTES, PaymentConfig
+from .config import MIN_SECRET_BYTES, PaymentConfig, load_env_pem, load_env_secret
 from .errors import BadSignatureError
 from .model import (
     AckKind,
+    CHANNEL_ALIPAY,
     CHANNEL_DEVPAY,
+    CHANNEL_WECHAT_PAY,
     ChannelNotification,
     ChannelOrder,
     ChannelPayment,
@@ -261,10 +264,182 @@ class DevPayChannel:
 def build_channels(
     config: PaymentConfig,
     *,
+    environ: Mapping[str, str] | None = None,
     clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
+    session=None,
+    transport=None,
 ) -> list[PaymentChannel]:
-    """按配置工厂装配启用的渠道列表（生产渠道可按 PaymentChannel 协议扩展接入）。"""
+    """按配置工厂装配全部启用的渠道（DevPay 与 6 个生产渠道）；密钥一律从环境变量 fail-closed 读取。"""
+    from .channel_crypto import (
+        parse_ec_private_key,
+        parse_rsa_private_key,
+        parse_rsa_public_key,
+        parse_x509_certificates,
+    )
+    from .channels_cn import AlipayChannel, AlipayConfig, WechatPayChannel, WechatPayConfig
+    from .channels_minigame import (
+        DouyinMinigameChannel,
+        DouyinMinigameConfig,
+        WechatMinigameChannel,
+        WechatMinigameConfig,
+    )
+    from .channels_store import AppleChannel, AppleConfig, GoogleChannel, GoogleConfig
+
+    env = os.environ if environ is None else environ
+    notify_base = config.notify_base_url.rstrip("/")
+
+    def notify_url(ch_name: str) -> str:
+        return f"{notify_base}/notify/{ch_name}"
+
     channels: list[PaymentChannel] = []
+
     if config.devpay_enabled:
-        channels.append(DevPayChannel(config.devpay_secret, clock_ms=clock_ms))
+        secret = config.devpay_secret or load_env_secret(env, "devpay_secret_env", config.devpay_secret_env, MIN_SECRET_BYTES)
+        channels.append(DevPayChannel(secret, clock_ms=clock_ms))
+
+    if config.wechat_pay_enabled:
+        priv_pem = load_env_pem(env, "wechat_pay_private_key_env", config.wechat_pay_private_key_env)
+        pub_pem = load_env_pem(env, "wechat_pay_platform_key_env", config.wechat_pay_platform_key_env)
+        apiv3 = load_env_secret(env, "wechat_pay_apiv3_key_env", config.wechat_pay_apiv3_key_env, 32)
+        channels.append(
+            WechatPayChannel(
+                WechatPayConfig(
+                    app_id=config.wechat_pay_app_id,
+                    mch_id=config.wechat_pay_mch_id,
+                    merchant_serial_no=config.wechat_pay_merchant_serial_no,
+                    merchant_key=parse_rsa_private_key(priv_pem),
+                    api_v3_key=apiv3,
+                    platform_key_id=config.wechat_pay_platform_key_id,
+                    platform_key=parse_rsa_public_key(pub_pem),
+                    notify_url=notify_url(CHANNEL_WECHAT_PAY),
+                    description=config.wechat_pay_description,
+                    endpoint=config.wechat_pay_endpoint or "https://api.mch.weixin.qq.com",
+                ),
+                clock_ms=clock_ms,
+                session=session,
+                transport=transport,
+            )
+        )
+
+    if config.alipay_enabled:
+        priv_pem = load_env_pem(env, "alipay_private_key_env", config.alipay_private_key_env)
+        pub_pem = load_env_pem(env, "alipay_public_key_env", config.alipay_public_key_env)
+        channels.append(
+            AlipayChannel(
+                AlipayConfig(
+                    app_id=config.alipay_app_id,
+                    app_key=parse_rsa_private_key(priv_pem),
+                    alipay_key=parse_rsa_public_key(pub_pem),
+                    notify_url=notify_url(CHANNEL_ALIPAY),
+                    seller_id=config.alipay_seller_id,
+                    gateway=config.alipay_gateway or "https://openapi.alipay.com/gateway.do",
+                    subject=config.alipay_subject,
+                ),
+                clock_ms=clock_ms,
+                session=session,
+                transport=transport,
+            )
+        )
+
+    if config.wechat_minigame_enabled:
+        app_secret = load_env_secret(
+            env, "wechat_minigame_app_secret_env", config.wechat_minigame_app_secret_env, 16
+        ).decode("utf-8")
+        app_key = load_env_secret(
+            env, "wechat_minigame_app_key_env", config.wechat_minigame_app_key_env, 16
+        ).decode("utf-8")
+        push_token = load_env_secret(
+            env, "wechat_minigame_push_token_env", config.wechat_minigame_push_token_env, 3
+        ).decode("utf-8")
+        aes_key = ""
+        if config.wechat_minigame_encoding_aes_key_env:
+            aes_key = load_env_secret(
+                env, "wechat_minigame_encoding_aes_key_env", config.wechat_minigame_encoding_aes_key_env, 43
+            ).decode("utf-8")
+        channels.append(
+            WechatMinigameChannel(
+                WechatMinigameConfig(
+                    app_id=config.wechat_minigame_app_id,
+                    app_secret=app_secret,
+                    offer_id=config.wechat_minigame_offer_id,
+                    app_key=app_key,
+                    push_token=push_token,
+                    env=config.wechat_minigame_env,
+                    zone_id=config.wechat_minigame_zone_id,
+                    encoding_aes_key=aes_key,
+                    api_base=config.wechat_minigame_api_base or "https://api.weixin.qq.com",
+                ),
+                clock_ms=clock_ms,
+                session=session,
+                transport=transport,
+            )
+        )
+
+    if config.douyin_minigame_enabled:
+        push_token = load_env_secret(
+            env, "douyin_minigame_push_token_env", config.douyin_minigame_push_token_env, 3
+        ).decode("utf-8")
+        channels.append(
+            DouyinMinigameChannel(
+                DouyinMinigameConfig(
+                    app_id=config.douyin_minigame_app_id,
+                    push_token=push_token,
+                    zone_id=config.douyin_minigame_zone_id,
+                    good_name=config.douyin_minigame_good_name,
+                )
+            )
+        )
+
+    if config.apple_enabled:
+        priv_pem = load_env_pem(env, "apple_private_key_env", config.apple_private_key_env)
+        roots_pem = load_env_pem(env, "apple_root_certificates_env", config.apple_root_certificates_env)
+        channels.append(
+            AppleChannel(
+                AppleConfig(
+                    bundle_id=config.apple_bundle_id,
+                    app_apple_id=config.apple_app_apple_id,
+                    issuer_id=config.apple_issuer_id,
+                    key_id=config.apple_key_id,
+                    private_key=parse_ec_private_key(priv_pem),
+                    root_certificates=parse_x509_certificates(roots_pem),
+                    allow_sandbox=config.apple_allow_sandbox,
+                    production_api=config.apple_production_api or "https://api.storekit.apple.com",
+                    sandbox_api=config.apple_sandbox_api or "https://api.storekit-sandbox.apple.com",
+                ),
+                clock_ms=clock_ms,
+                session=session,
+                transport=transport,
+            )
+        )
+
+    if config.google_enabled:
+        sa_raw = load_env_secret(env, "google_service_account_env", config.google_service_account_env, 64)
+        try:
+            sa = json.loads(sa_raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"payment config: {config.google_service_account_env} does not hold a Google service account JSON key"
+            ) from exc
+        if not isinstance(sa, dict) or not sa.get("client_email") or not sa.get("private_key"):
+            raise ValueError(
+                f"payment config: {config.google_service_account_env} does not hold a Google service account JSON key"
+            )
+        channels.append(
+            GoogleChannel(
+                GoogleConfig(
+                    package_name=config.google_package_name,
+                    client_email=str(sa["client_email"]),
+                    private_key=parse_rsa_private_key(str(sa["private_key"])),
+                    push_audience=config.google_push_audience,
+                    push_service_account=config.google_push_service_account,
+                    api_base=config.google_api_base or "https://androidpublisher.googleapis.com",
+                    token_url=config.google_token_url or "https://oauth2.googleapis.com/token",
+                    certs_url=config.google_certs_url or "https://www.googleapis.com/oauth2/v3/certs",
+                ),
+                clock_ms=clock_ms,
+                session=session,
+                transport=transport,
+            )
+        )
+
     return channels

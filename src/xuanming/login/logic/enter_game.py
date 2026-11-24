@@ -79,6 +79,8 @@ async def run(ctx, request, details):
             return fail(tips.ENTER_GAME_GUID)
         if owned.trade_listing_id:
             return fail(tips.IN_PROGRESS)
+        if getattr(owned, "account_deletion_state", 0):
+            return fail(tips.ACCOUNT_DELETION_PENDING)
         state = EnterState(
             player_id=request.player_id, session_id=details.session_id, gate_id=str(details.gate_node_id),
             gate_instance_id=details.gate_instance_id, incarnation=details.session_incarnation, account=account,
@@ -174,11 +176,19 @@ async def _apply(ctx, state: EnterState, bind_sent: list) -> None:
     bind_sent[0] = True
     own_zone = ctx.config.zone_id
     if state.ticket_target_zone_id == own_zone:
-        zone = own_zone  # second leg of a cross-zone redirect pins this zone
+        zone = own_zone  # 跨区重定向第二条腿，钉住本区
     elif decision in (Decision.RECONNECT, Decision.REPLACE):
-        zone = 0  # scene_manager follows the player's location
+        zone = 0  # scene_manager 跟随玩家当前定位
+    elif ctx.config.redirect_on_enter_enabled and (existing is None or not getattr(existing, "scene_id", 0)):
+        try:
+            home = await ctx.data.get_player_home_zone(state.player_id)
+        except Exception:
+            logger.error("EnterGame home_zone lookup failed; keeping own zone player=%d zone=%d",
+                         state.player_id, own_zone, exc_info=True)
+            home = 0
+        zone = home if (home and home != own_zone) else own_zone
     else:
-        zone = own_zone  # shortcut: HomeZone.RedirectOnEnterEnabled (default off) is not ported
+        zone = own_zone
     outcome = await session_fence.recheck(ctx.login_redis, state.conn, state.fence_gen)
     if outcome is not Outcome.OK:
         raise RuntimeError(f"session fence {outcome.value} before EnterScene")

@@ -17,6 +17,7 @@ from google.protobuf.message import Message
 
 from ..login.caller_auth import AuthError, CallerVerifier
 from ..protocol import Protocol
+from .battle_scripts import REVIEW_REJECT_DENIED, BattleScriptManager
 from .config import MatchConfig
 from .errors import (
     BattleOutcomeOriginalError,
@@ -74,6 +75,8 @@ from .model import (
     verify_probe_message,
 )
 from .outbox import OutcomeOutboxWorker
+from .ranked import RankedManager
+from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
 from .store import MatchStore, StrandedFormationEntry
 from .team_service import TeamGrpcService
@@ -100,6 +103,8 @@ class MatchGrpcService:
         battle_nodes: BattleNodeResolver,
         gather: GatherPipeline,
         spectate: SpectateManager,
+        battle_scripts: BattleScriptManager | None = None,
+        ranked: RankedManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -113,6 +118,8 @@ class MatchGrpcService:
         self.spectate = spectate
         self._inline_gather = inline_gather
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self.battle_scripts = battle_scripts if battle_scripts is not None else BattleScriptManager(protocol, store)
+        self.ranked = ranked if ranked is not None else RankedManager(protocol, store, clock_ms=self._clock_ms)
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -132,14 +139,14 @@ class MatchGrpcService:
                 "RequestBattleTicket": self.request_battle_ticket,
                 "ListBattleReports": self.list_battle_reports,
                 "GetBattleReport": self.get_battle_report,
-                "ListBattleScripts": self.unimplemented_rpc,
-                "SubmitBattleScript": self.unimplemented_rpc,
-                "DeleteBattleScript": self.unimplemented_rpc,
-                "SetBattleScriptLoadout": self.unimplemented_rpc,
-                "GetRankedProfile": self.unimplemented_rpc,
-                "SaveRankedPreset": self.unimplemented_rpc,
-                "UpdateRankedCosmetic": self.unimplemented_rpc,
-                "GetRankedBattleResult": self.unimplemented_rpc,
+                "ListBattleScripts": self.list_battle_scripts,
+                "SubmitBattleScript": self.submit_battle_script,
+                "DeleteBattleScript": self.delete_battle_script,
+                "SetBattleScriptLoadout": self.set_battle_script_loadout,
+                "GetRankedProfile": self.get_ranked_profile,
+                "SaveRankedPreset": self.save_ranked_preset,
+                "UpdateRankedCosmetic": self.update_ranked_cosmetic,
+                "GetRankedBattleResult": self.get_ranked_battle_result,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -500,6 +507,42 @@ class MatchGrpcService:
         except MatchBusinessError as exc:
             return set_tip(resp, exc.code, *exc.params)
 
+    # -- BattleScripts 客户端 RPCs -------------------------------------------------------------------
+
+    async def list_battle_scripts(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.battle_scripts.list_battle_scripts(caller)
+
+    async def submit_battle_script(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.battle_scripts.submit_battle_script(caller, request)
+
+    async def delete_battle_script(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.battle_scripts.delete_battle_script(caller, request)
+
+    async def set_battle_script_loadout(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.battle_scripts.set_battle_script_loadout(caller, request)
+
+    # -- Ranked Play V1 客户端 RPCs ------------------------------------------------------------------
+
+    async def get_ranked_profile(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.ranked.get_ranked_profile(caller, request)
+
+    async def save_ranked_preset(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.ranked.save_ranked_preset(caller, request)
+
+    async def update_ranked_cosmetic(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.ranked.update_ranked_cosmetic(caller, request)
+
+    async def get_ranked_battle_result(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.ranked.get_ranked_battle_result(caller, request)
+
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 
     async def commit_battle_outcome(self, request: Message, context, path: str) -> Message:
@@ -832,21 +875,19 @@ class MatchGrpcService:
 
     async def list_pending_battle_scripts(self, request: Message, context, path: str) -> Message:
         await self._reject_client_on_internal(context, path)
-        resp = self.protocol.message("match.ListPendingBattleScriptsResponse")
         if not self.config.ops_secret or not verify_internal_hmac(
             path, request, "ops", self.config.ops_secret, int(self._clock_ms())
         ):
-            resp.reject = 1  # DENIED
-        return resp
+            return self.protocol.message("match.ListPendingBattleScriptsResponse", reject=REVIEW_REJECT_DENIED)
+        return await self.battle_scripts.list_pending_battle_scripts(request)
 
     async def review_battle_script(self, request: Message, context, path: str) -> Message:
         await self._reject_client_on_internal(context, path)
-        resp = self.protocol.message("match.ReviewBattleScriptResponse")
         if not self.config.ops_secret or not verify_internal_hmac(
             path, request, "ops", self.config.ops_secret, int(self._clock_ms())
         ):
-            resp.reject = 1  # DENIED
-        return resp
+            return self.protocol.message("match.ReviewBattleScriptResponse", reject=REVIEW_REJECT_DENIED)
+        return await self.battle_scripts.review_battle_script(request)
 
     # -- RoleFenceParticipant RPCs --------------------------------------------------------------------
 
@@ -896,6 +937,7 @@ class MatchServer:
         matchmaker: Matchmaker,
         outbox: OutcomeOutboxWorker,
         spectate: SpectateManager,
+        rank_publisher: RankOutboxPublisher | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
@@ -906,6 +948,7 @@ class MatchServer:
         self.matchmaker = matchmaker
         self.outbox = outbox
         self.spectate = spectate
+        self.rank_publisher = rank_publisher
 
     def services(self) -> dict[str, dict[str, Callable]]:
         merged = dict(self.match_service.services())

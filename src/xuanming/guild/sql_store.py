@@ -27,6 +27,7 @@ from .errors import (
     StoreUnavailableError,
 )
 from .model import (
+    ASSET_OP_FRESH_ATTEMPT_LIMIT,
     ASSET_OP_MAX_PENDING,
     ASSET_OP_MAX_SPAN,
     ASSET_STREAM_GUILD_CREDIT,
@@ -36,12 +37,14 @@ from .model import (
     ApplicantRow,
     ApplicationRow,
     AssetOpRow,
+    COUNTER_KIND_ACTIVITY,
     GuildData,
     GuildTableCatalog,
     MemberData,
     MergedZones,
     OP_KIND_ACTIVITY_REWARD,
     OP_KIND_DONATE,
+    OP_STATUS_ABANDONED,
     OP_STATUS_APPLIED,
     OP_STATUS_APPLIED_PARTIAL,
     OP_STATUS_PENDING,
@@ -55,6 +58,17 @@ from .model import (
     ROLE_BLOCKER_TRIAL_LOBBY_SLOT,
     ROLE_BLOCKER_TRIAL_REWARD_OWED,
     RoleFenceRow,
+    TRIAL_BATTLE_STATE_STARTED,
+    TRIAL_LAUNCH_ROLE_RELEASED,
+    TRIAL_LAUNCH_STATE_PREPARED,
+    TRIAL_LAUNCH_STATE_TERMINAL,
+    TRIAL_LOBBY_STATE_PENDING,
+    TrialBattleRecord,
+    TrialLaunchRecord,
+    TrialLaunchRoleRecord,
+    TrialLobbyRecord,
+    TrialLobbySlotRecord,
+    TrialOwedRewardRecord,
     is_removal_token,
     role_rank,
     valid_role_fence_state,
@@ -88,6 +102,10 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "guild_asset_op",
     "guild_daily_counter",
     "guild_activity_progress",
+    "guild_trial_lobby",
+    "guild_trial_lobby_slot",
+    "guild_trial_launch",
+    "guild_trial_launch_role",
     "guild_trial_battle",
     "guild_trial_reward_owed",
     "guild_client_request",
@@ -239,6 +257,70 @@ def _scan_asset_op(row) -> AssetOpRow:
         resolved_by=_to_str(row[26]),
         resolve_reason=_to_str(row[27]),
         last_send_ms=int(row[28]),
+    )
+
+
+def _scan_trial_lobby(row) -> TrialLobbyRecord:
+    return TrialLobbyRecord(
+        lobby_id=int(row[0]),
+        guild_id=int(row[1]),
+        activity_id=int(row[2]),
+        initiator_player_id=int(row[3]),
+        state=int(row[4]),
+        view_proto=_to_bytes(row[5]),
+        original_proto=_to_bytes(row[6]),
+        consent_proto=_to_bytes(row[7]),
+        expires_ms=int(row[8]),
+        launch_deadline_ms=int(row[9]),
+        battle_id=int(row[10]),
+        created_ms=int(row[11]),
+        updated_ms=int(row[12]),
+    )
+
+
+def _scan_trial_launch(row) -> TrialLaunchRecord:
+    return TrialLaunchRecord(
+        request_id=int(row[0]),
+        battle_id=int(row[1]),
+        state=int(row[2]),
+        original_proto=_to_bytes(row[3]),
+        request_digest=_to_bytes(row[4]),
+        created_ms=int(row[5]),
+        updated_ms=int(row[6]),
+        cancel_receipt=_to_bytes(row[7]),
+        next_check_ms=int(row[8]),
+        check_attempts=int(row[9]),
+        realtime_end_tip=_to_bytes(row[10]),
+    )
+
+
+def _scan_trial_battle(row) -> TrialBattleRecord:
+    return TrialBattleRecord(
+        battle_id=int(row[0]),
+        guild_id=int(row[1]),
+        activity_id=int(row[2]),
+        period_key=int(row[3]),
+        guild_period_key=int(row[4]),
+        initiator_player_id=int(row[5]),
+        state=int(row[6]),
+        settle_result=int(row[7]),
+        rewarded_count=int(row[8]),
+        created_ms=int(row[9]),
+        settled_ms=int(row[10]),
+        launch_request_id=int(row[11]),
+    )
+
+
+def _scan_trial_reward_owed(row) -> TrialOwedRewardRecord:
+    return TrialOwedRewardRecord(
+        player_id=int(row[0]),
+        battle_id=int(row[1]),
+        guild_id=int(row[2]),
+        activity_id=int(row[3]),
+        period_key=int(row[4]),
+        payload=_to_bytes(row[5]),
+        attempts=int(row[6]),
+        created_ms=int(row[7]),
     )
 
 
@@ -514,6 +596,13 @@ class _SqlTx:
     async def set_guild_funds(self, guild_id: int, new_funds: int) -> None:
         await self._cur.execute("UPDATE `guild` SET `funds`=%s WHERE `guild_id`=%s", (new_funds, guild_id))
 
+    async def credit_guild_funds(self, guild_id: int, delta: int) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild` SET `funds`=`funds`+%s WHERE `guild_id`=%s",
+            (delta, guild_id),
+        )
+        return self._cur.rowcount == 1
+
     async def delete_guild(self, guild_id: int) -> bool:
         await self._cur.execute("DELETE FROM `guild` WHERE `guild_id`=%s", (guild_id,))
         return self._cur.rowcount == 1
@@ -642,6 +731,24 @@ class _SqlTx:
     async def set_member_contribution(self, guild_id: int, player_id: int, total: int, balance: int) -> None:
         await self._cur.execute(SQL_SET_MEMBER_CONTRIBUTION, (total, balance, guild_id, player_id))
 
+    async def credit_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild_member` FORCE INDEX (PRIMARY) "
+            "SET `contribution_total`=`contribution_total`+%s,`contribution_balance`=`contribution_balance`+%s "
+            "WHERE `guild_id`=%s AND `player_id`=%s",
+            (delta, delta, guild_id, player_id),
+        )
+        return self._cur.rowcount == 1
+
+    async def refund_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild_member` FORCE INDEX (PRIMARY) "
+            "SET `contribution_balance`=`contribution_balance`+%s "
+            "WHERE `guild_id`=%s AND `player_id`=%s",
+            (delta, guild_id, player_id),
+        )
+        return self._cur.rowcount == 1
+
     async def debit_member_contribution(self, guild_id: int, player_id: int, cost: int) -> bool:
         await self._cur.execute(SQL_DEBIT_MEMBER_CONTRIBUTION, (cost, guild_id, player_id, cost))
         return self._cur.rowcount == 1
@@ -652,6 +759,17 @@ class _SqlTx:
             (guild_id, player_id),
         )
         return self._cur.rowcount == 1
+
+    async def get_trial_roster_members(self, guild_id: int, player_ids: Sequence[int]) -> dict[int, int]:
+        ids = sorted({int(p) for p in player_ids if int(p) > 0})
+        if not ids:
+            return {}
+        marks = ",".join(["%s"] * len(ids))
+        await self._cur.execute(
+            f"SELECT `player_id`,`join_time_ms` FROM `guild_member` WHERE `guild_id`=%s AND `player_id` IN ({marks})",
+            (guild_id, *ids),
+        )
+        return {int(r[0]): int(r[1]) for r in await self._cur.fetchall()}
 
     # -- guild_application -----------------------------------------------------------------------
 
@@ -779,6 +897,13 @@ class _SqlTx:
             raise StoreUnavailableError(f"guild_player_op_seq vanished player={player_id} stream={stream}")
         return int(row[0]), int(row[1])
 
+    async def lock_seq_guard(self, player_id: int, stream: int) -> bool:
+        await self._cur.execute(
+            "SELECT `next_seq` FROM `guild_player_op_seq` WHERE `player_id`=%s AND `stream`=%s FOR UPDATE",
+            (player_id, stream),
+        )
+        return await self._cur.fetchone() is not None
+
     async def allocate_seq(self, player_id: int, stream: int, now_ms: int) -> tuple[int, int]:
         next_seq, epoch = await self.ensure_and_lock_seq(player_id, stream, now_ms)
         await self._cur.execute(
@@ -845,6 +970,161 @@ class _SqlTx:
         await self._cur.execute(f"SELECT {SQL_ASSET_OP_COLUMNS} FROM `guild_asset_op` WHERE `op_id`=%s", (op_id,))
         row = await self._cur.fetchone()
         return None if row is None else _scan_asset_op(row)
+
+    async def lock_asset_op(self, op_id: int) -> AssetOpRow | None:
+        await self._cur.execute(
+            f"SELECT {SQL_ASSET_OP_COLUMNS} FROM `guild_asset_op` WHERE `op_id`=%s FOR UPDATE", (op_id,)
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_asset_op(row)
+
+    async def list_due_asset_ops(
+        self, now_ms: int, limit: int, owned_shards: frozenset[int] | None = None
+    ) -> list[int]:
+        if limit <= 0:
+            return []
+        shard_clause = ""
+        shard_args: tuple[int, ...] = ()
+        if owned_shards is not None:
+            if not owned_shards:
+                return []
+            marks = ",".join(["%s"] * len(owned_shards))
+            shard_clause = f" AND (`player_id` % 64) IN ({marks})"
+            shard_args = tuple(sorted(owned_shards))
+        half = max(1, limit // 2)
+        await self._cur.execute(
+            "SELECT `op_id` FROM `guild_asset_op` "
+            f"WHERE `status`=%s AND `next_attempt_ms`<=%s AND `lease_until_ms`<=%s AND `attempts`<%s{shard_clause} "
+            "ORDER BY `next_attempt_ms` ASC, `op_id` ASC LIMIT %s",
+            (OP_STATUS_PENDING, now_ms, now_ms, ASSET_OP_FRESH_ATTEMPT_LIMIT, *shard_args, half),
+        )
+        out = [int(r[0]) for r in await self._cur.fetchall()]
+        rem = limit - len(out)
+        if rem > 0:
+            await self._cur.execute(
+                "SELECT `op_id` FROM `guild_asset_op` "
+                f"WHERE `status`=%s AND `next_attempt_ms`<=%s AND `lease_until_ms`<=%s AND `attempts`>=%s{shard_clause} "
+                "ORDER BY `next_attempt_ms` ASC, `op_id` ASC LIMIT %s",
+                (OP_STATUS_PENDING, now_ms, now_ms, ASSET_OP_FRESH_ATTEMPT_LIMIT, *shard_args, rem),
+            )
+            out.extend(int(r[0]) for r in await self._cur.fetchall())
+        rem = limit - len(out)
+        if rem > 0:
+            await self._cur.execute(
+                "SELECT `op_id` FROM `guild_asset_op` "
+                f"WHERE `status`=%s AND `next_attempt_ms`<=%s AND `lease_until_ms`<=%s AND `attempts`<%s{shard_clause} "
+                "ORDER BY `next_attempt_ms` ASC, `op_id` ASC LIMIT %s",
+                (OP_STATUS_PENDING, now_ms, now_ms, ASSET_OP_FRESH_ATTEMPT_LIMIT, *shard_args, limit),
+            )
+            picked = set(out)
+            for (oid,) in await self._cur.fetchall():
+                oid_int = int(oid)
+                if oid_int not in picked:
+                    out.append(oid_int)
+                    picked.add(oid_int)
+                    if len(out) >= limit:
+                        break
+        return out
+
+    async def claim_asset_op(
+        self, op_id: int, now_ms: int, lease_until_ms: int, lease_token: int
+    ) -> AssetOpRow | None:
+        await self._cur.execute(
+            "UPDATE `guild_asset_op` SET `lease_until_ms`=%s,`lease_token`=%s,`updated_ms`=%s "
+            "WHERE `op_id`=%s AND `status`=%s AND `lease_until_ms`<=%s",
+            (lease_until_ms, lease_token, now_ms, op_id, OP_STATUS_PENDING, now_ms),
+        )
+        if self._cur.rowcount != 1:
+            return None
+        return await self.get_asset_op(op_id)
+
+    async def mark_asset_op_poison(self, op_id: int, lease_token: int, poison_until_ms: int, now_ms: int) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_asset_op` SET `next_attempt_ms`=%s,`lease_until_ms`=0,`lease_token`=0,`updated_ms`=%s "
+            "WHERE `op_id`=%s AND `status`=%s AND `lease_token`=%s",
+            (poison_until_ms, now_ms, op_id, OP_STATUS_PENDING, lease_token),
+        )
+
+    async def reschedule_asset_op(
+        self,
+        op_id: int,
+        lease_token: int,
+        next_attempt_ms: int,
+        outcome: int,
+        reason: int,
+        durable: bool,
+        local: bool,
+        now_ms: int,
+    ) -> bool:
+        if local:
+            await self._cur.execute(
+                "UPDATE `guild_asset_op` SET `attempts`=`attempts`+1,`next_attempt_ms`=%s,"
+                "`last_outcome`=%s,`last_reason`=%s,`durable`=%s,`lease_until_ms`=0,`lease_token`=0,`updated_ms`=%s "
+                "WHERE `op_id`=%s AND `status`=%s AND `lease_token`=%s",
+                (
+                    next_attempt_ms,
+                    outcome,
+                    reason,
+                    1 if durable else 0,
+                    now_ms,
+                    op_id,
+                    OP_STATUS_PENDING,
+                    lease_token,
+                ),
+            )
+        else:
+            await self._cur.execute(
+                "UPDATE `guild_asset_op` SET `attempts`=`attempts`+1,`next_attempt_ms`=%s,"
+                "`last_outcome`=%s,`last_reason`=%s,`durable`=%s,`lease_until_ms`=0,`lease_token`=0,"
+                "`last_send_ms`=%s,`updated_ms`=%s "
+                "WHERE `op_id`=%s AND `status`=%s AND `lease_token`=%s",
+                (
+                    next_attempt_ms,
+                    outcome,
+                    reason,
+                    1 if durable else 0,
+                    now_ms,
+                    now_ms,
+                    op_id,
+                    OP_STATUS_PENDING,
+                    lease_token,
+                ),
+            )
+        return self._cur.rowcount == 1
+
+    async def finalize_asset_op_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        last_outcome: int,
+        last_reason: int,
+        reason_tip_id: int,
+        now_ms: int,
+    ) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild_asset_op` SET `status`=%s,`durable`=1,`last_outcome`=%s,`last_reason`=%s,"
+            "`reason_tip_id`=%s,`next_attempt_ms`=%s,`lease_until_ms`=0,`lease_token`=0,`updated_ms`=%s "
+            "WHERE `op_id`=%s AND `status`=%s",
+            (
+                final_status,
+                last_outcome,
+                last_reason,
+                reason_tip_id,
+                now_ms,
+                now_ms,
+                op_id,
+                OP_STATUS_PENDING,
+            ),
+        )
+        return self._cur.rowcount == 1
+
+    async def abandon_asset_op_cas(self, op_id: int, lease_token: int, now_ms: int) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild_asset_op` SET `status`=%s,`lease_until_ms`=0,`lease_token`=0,`updated_ms`=%s "
+            "WHERE `op_id`=%s AND `status`=%s AND `lease_token`=%s",
+            (OP_STATUS_ABANDONED, now_ms, op_id, OP_STATUS_PENDING, lease_token),
+        )
+        return self._cur.rowcount == 1
 
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]:
         await self._cur.execute(
@@ -926,6 +1206,15 @@ class _SqlTx:
         )
         return self._cur.rowcount > 0
 
+    async def refund_counter(
+        self, player_id: int, counter_kind: int, ref_id: int, period_key_val: int, delta: int, now_ms: int
+    ) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_daily_counter` SET `used_count`=IF(`used_count`>=%s,`used_count`-%s,0),`updated_ms`=%s "
+            "WHERE `player_id`=%s AND `counter_kind`=%s AND `ref_id`=%s AND `period_key`=%s",
+            (delta, delta, now_ms, player_id, counter_kind, ref_id, period_key_val),
+        )
+
     async def get_counter_usage(
         self, player_id: int, counter_kind: int, period_keys: Sequence[int]
     ) -> dict[tuple[int, int], int]:
@@ -938,6 +1227,15 @@ class _SqlTx:
             (player_id, counter_kind, *period_keys),
         )
         return {(int(r[0]), int(r[1])): int(r[2]) for r in await self._cur.fetchall()}
+
+    async def get_activity_counter_value(self, player_id: int, activity_id: int, period_key_val: int) -> int:
+        await self._cur.execute(
+            "SELECT `used_count` FROM `guild_daily_counter` "
+            "WHERE `player_id`=%s AND `counter_kind`=%s AND `ref_id`=%s AND `period_key`=%s",
+            (player_id, COUNTER_KIND_ACTIVITY, activity_id, period_key_val),
+        )
+        row = await self._cur.fetchone()
+        return 0 if row is None else int(row[0])
 
     async def list_applied_asset_ops_since(
         self,
@@ -1064,6 +1362,17 @@ class _SqlTx:
             (threshold_reached_ms, 1 if funds_granted else 0, now_ms, guild_id, activity_id, period_key_val),
         )
 
+    async def set_trial_progress_count(
+        self, guild_id: int, activity_id: int, period_key_val: int, count: int, now_ms: int
+    ) -> None:
+        await self._cur.execute(
+            "INSERT INTO `guild_activity_progress` "
+            "(`guild_id`,`activity_id`,`period_key`,`progress_count`,`threshold_reached_ms`,`funds_granted`,`updated_ms`) "
+            "VALUES (%s,%s,%s,%s,0,0,%s) "
+            "ON DUPLICATE KEY UPDATE `progress_count`=%s,`updated_ms`=%s",
+            (guild_id, activity_id, period_key_val, count, now_ms, count, now_ms),
+        )
+
     async def delete_activity_progress_of_guild(self, guild_id: int) -> None:
         await self._cur.execute(
             "SELECT `activity_id`,`period_key` FROM `guild_activity_progress` "
@@ -1154,6 +1463,360 @@ class _SqlTx:
                 "DELETE FROM `guild_client_request` WHERE `player_id`=%s AND `client_request_id`=%s",
                 (player_id, int(req_id)),
             )
+
+    # -- guild_trial_lobby / slot / launch / launch_role / battle / reward_owed ------------------
+
+    _TRIAL_LOBBY_COLS = (
+        "`lobby_id`,`guild_id`,`activity_id`,`initiator_player_id`,`state`,"
+        "`view_proto`,`original_proto`,`consent_proto`,`expires_ms`,`launch_deadline_ms`,"
+        "`battle_id`,`created_ms`,`updated_ms`"
+    )
+    _TRIAL_LAUNCH_COLS = (
+        "`request_id`,`battle_id`,`state`,`original_proto`,`request_digest`,"
+        "`created_ms`,`updated_ms`,`cancel_receipt`,`next_check_ms`,`check_attempts`,`realtime_end_tip`"
+    )
+    _TRIAL_BATTLE_COLS = (
+        "`battle_id`,`guild_id`,`activity_id`,`period_key`,`guild_period_key`,"
+        "`initiator_player_id`,`state`,`settle_result`,`rewarded_count`,"
+        "`created_ms`,`settled_ms`,`launch_request_id`"
+    )
+
+    async def get_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LOBBY_COLS} FROM `guild_trial_lobby` WHERE `lobby_id`=%s", (lobby_id,)
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_lobby(row)
+
+    async def lock_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LOBBY_COLS} FROM `guild_trial_lobby` WHERE `lobby_id`=%s FOR UPDATE", (lobby_id,)
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_lobby(row)
+
+    async def insert_trial_lobby(self, rec: TrialLobbyRecord) -> None:
+        try:
+            await self._cur.execute(
+                f"INSERT INTO `guild_trial_lobby` ({self._TRIAL_LOBBY_COLS}) VALUES ("
+                "%s,%s,%s,%s,%s,UNHEX(%s),UNHEX(%s),UNHEX(%s),%s,%s,%s,%s,%s)",
+                (
+                    rec.lobby_id,
+                    rec.guild_id,
+                    rec.activity_id,
+                    rec.initiator_player_id,
+                    rec.state,
+                    rec.view_proto.hex(),
+                    rec.original_proto.hex(),
+                    rec.consent_proto.hex(),
+                    rec.expires_ms,
+                    rec.launch_deadline_ms,
+                    rec.battle_id,
+                    rec.created_ms,
+                    rec.updated_ms,
+                ),
+            )
+        except pymysql.MySQLError as exc:
+            if _mysql_errno(exc) == DUP_ENTRY_ERRNO:
+                raise _DuplicateKeyError(str(exc), _dup_key_name(exc)) from exc
+            raise
+
+    async def update_trial_lobby(
+        self,
+        lobby_id: int,
+        state: int,
+        view_proto: bytes,
+        consent_proto: bytes,
+        launch_deadline_ms: int,
+        battle_id: int,
+        updated_ms: int,
+    ) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_lobby` SET `state`=%s,`view_proto`=UNHEX(%s),`consent_proto`=UNHEX(%s),"
+            "`launch_deadline_ms`=%s,`battle_id`=%s,`updated_ms`=%s WHERE `lobby_id`=%s",
+            (state, view_proto.hex(), consent_proto.hex(), launch_deadline_ms, battle_id, updated_ms, lobby_id),
+        )
+
+    async def list_expired_pending_lobbies(self, now_ms: int, limit: int) -> list[TrialLobbyRecord]:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LOBBY_COLS} FROM `guild_trial_lobby` "
+            "WHERE `state`=%s AND `expires_ms`<=%s ORDER BY `expires_ms` ASC, `lobby_id` ASC LIMIT %s",
+            (TRIAL_LOBBY_STATE_PENDING, now_ms, limit),
+        )
+        return [_scan_trial_lobby(r) for r in await self._cur.fetchall()]
+
+    async def get_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None:
+        await self._cur.execute(
+            "SELECT `player_id`,`lobby_id`,`cooldown_until_ms` FROM `guild_trial_lobby_slot` WHERE `player_id`=%s",
+            (player_id,),
+        )
+        row = await self._cur.fetchone()
+        if row is None:
+            return None
+        return TrialLobbySlotRecord(player_id=int(row[0]), lobby_id=int(row[1]), cooldown_until_ms=int(row[2]))
+
+    async def lock_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None:
+        await self._cur.execute(
+            "SELECT `player_id`,`lobby_id`,`cooldown_until_ms` FROM `guild_trial_lobby_slot` "
+            "WHERE `player_id`=%s FOR UPDATE",
+            (player_id,),
+        )
+        row = await self._cur.fetchone()
+        if row is None:
+            return None
+        return TrialLobbySlotRecord(player_id=int(row[0]), lobby_id=int(row[1]), cooldown_until_ms=int(row[2]))
+
+    async def upsert_trial_lobby_slot(self, player_id: int, lobby_id: int, cooldown_until_ms: int) -> None:
+        await self._cur.execute(
+            "INSERT INTO `guild_trial_lobby_slot` (`player_id`,`lobby_id`,`cooldown_until_ms`) VALUES (%s,%s,%s) "
+            "ON DUPLICATE KEY UPDATE `lobby_id`=VALUES(`lobby_id`),`cooldown_until_ms`=VALUES(`cooldown_until_ms`)",
+            (player_id, lobby_id, cooldown_until_ms),
+        )
+
+    async def get_trial_launch(self, request_id: int) -> TrialLaunchRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LAUNCH_COLS} FROM `guild_trial_launch` WHERE `request_id`=%s", (request_id,)
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_launch(row)
+
+    async def lock_trial_launch(self, request_id: int) -> TrialLaunchRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LAUNCH_COLS} FROM `guild_trial_launch` WHERE `request_id`=%s FOR UPDATE",
+            (request_id,),
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_launch(row)
+
+    async def get_trial_launch_by_battle(self, battle_id: int) -> TrialLaunchRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LAUNCH_COLS} FROM `guild_trial_launch` WHERE `battle_id`=%s LIMIT 1",
+            (battle_id,),
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_launch(row)
+
+    async def insert_trial_launch(self, rec: TrialLaunchRecord) -> None:
+        try:
+            await self._cur.execute(
+                f"INSERT INTO `guild_trial_launch` ({self._TRIAL_LAUNCH_COLS}) VALUES ("
+                "%s,%s,%s,UNHEX(%s),UNHEX(%s),%s,%s,UNHEX(%s),%s,%s,UNHEX(%s))",
+                (
+                    rec.request_id,
+                    rec.battle_id,
+                    rec.state,
+                    rec.original_proto.hex(),
+                    rec.request_digest.hex(),
+                    rec.created_ms,
+                    rec.updated_ms,
+                    rec.cancel_receipt.hex(),
+                    rec.next_check_ms,
+                    rec.check_attempts,
+                    rec.realtime_end_tip.hex(),
+                ),
+            )
+        except pymysql.MySQLError as exc:
+            if _mysql_errno(exc) == DUP_ENTRY_ERRNO:
+                raise _DuplicateKeyError(str(exc), _dup_key_name(exc)) from exc
+            raise
+
+    async def update_trial_launch(
+        self,
+        request_id: int,
+        battle_id: int,
+        state: int,
+        updated_ms: int,
+        cancel_receipt: bytes | None = None,
+    ) -> None:
+        if cancel_receipt is None:
+            await self._cur.execute(
+                "UPDATE `guild_trial_launch` SET `battle_id`=%s,`state`=%s,`updated_ms`=%s WHERE `request_id`=%s",
+                (battle_id, state, updated_ms, request_id),
+            )
+        else:
+            await self._cur.execute(
+                "UPDATE `guild_trial_launch` SET `battle_id`=%s,`state`=%s,`updated_ms`=%s,`cancel_receipt`=UNHEX(%s) "
+                "WHERE `request_id`=%s",
+                (battle_id, state, updated_ms, cancel_receipt.hex(), request_id),
+            )
+
+    async def record_trial_launch_end_tip(self, request_id: int, tip_bytes: bytes) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_launch` SET `realtime_end_tip`=UNHEX(%s) "
+            "WHERE `request_id`=%s AND (`realtime_end_tip` IS NULL OR OCTET_LENGTH(`realtime_end_tip`)=0)",
+            (tip_bytes.hex(), request_id),
+        )
+
+    async def expedite_trial_launch_check(self, request_id: int, now_ms: int) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_launch` SET `next_check_ms`=%s "
+            "WHERE `request_id`=%s AND `state`=%s AND `next_check_ms`>%s",
+            (now_ms, request_id, TRIAL_LAUNCH_STATE_PREPARED, now_ms),
+        )
+
+    async def list_due_trial_launches(self, now_ms: int, limit: int) -> list[TrialLaunchRecord]:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_LAUNCH_COLS} FROM `guild_trial_launch` "
+            "WHERE `state`=%s AND `next_check_ms`<=%s ORDER BY `next_check_ms` ASC, `request_id` ASC LIMIT %s",
+            (TRIAL_LAUNCH_STATE_PREPARED, now_ms, limit),
+        )
+        return [_scan_trial_launch(r) for r in await self._cur.fetchall()]
+
+    async def claim_trial_launch(self, request_id: int, prev_next_check_ms: int, new_next_check_ms: int) -> bool:
+        await self._cur.execute(
+            "UPDATE `guild_trial_launch` SET `next_check_ms`=%s,`check_attempts`=`check_attempts`+1 "
+            "WHERE `request_id`=%s AND `state`=%s AND `next_check_ms`=%s",
+            (new_next_check_ms, request_id, TRIAL_LAUNCH_STATE_PREPARED, prev_next_check_ms),
+        )
+        return self._cur.rowcount == 1
+
+    async def insert_trial_launch_role(self, rec: TrialLaunchRoleRecord) -> None:
+        try:
+            await self._cur.execute(
+                "INSERT INTO `guild_trial_launch_role` (`player_id`,`request_id`,`account`,`owner_revision`,`state`) "
+                "VALUES (%s,%s,%s,%s,%s)",
+                (rec.player_id, rec.request_id, rec.account, rec.owner_revision, rec.state),
+            )
+        except pymysql.MySQLError as exc:
+            if _mysql_errno(exc) == DUP_ENTRY_ERRNO:
+                raise _DuplicateKeyError(str(exc), _dup_key_name(exc)) from exc
+            raise
+
+    async def lock_trial_launch_role(self, player_id: int, request_id: int) -> TrialLaunchRoleRecord | None:
+        await self._cur.execute(
+            "SELECT `player_id`,`request_id`,`account`,`owner_revision`,`state` "
+            "FROM `guild_trial_launch_role` WHERE `player_id`=%s AND `request_id`=%s FOR UPDATE",
+            (player_id, request_id),
+        )
+        row = await self._cur.fetchone()
+        if row is None:
+            return None
+        return TrialLaunchRoleRecord(
+            player_id=int(row[0]),
+            request_id=int(row[1]),
+            account=_to_str(row[2]),
+            owner_revision=int(row[3]),
+            state=int(row[4]),
+        )
+
+    async def has_active_trial_launch_role(self, player_id: int, exclude_request_id: int = 0) -> bool:
+        await self._cur.execute(
+            "SELECT r.`request_id` FROM `guild_trial_launch_role` r "
+            "LEFT JOIN `guild_trial_launch` l ON l.`request_id`=r.`request_id` "
+            "WHERE r.`player_id`=%s AND r.`request_id`<>%s "
+            "AND (r.`state` IS NULL OR r.`state`<>%s OR l.`request_id` IS NULL OR l.`state` IS NULL OR l.`state`<>%s) "
+            "LIMIT 1 FOR UPDATE",
+            (player_id, exclude_request_id, TRIAL_LAUNCH_ROLE_RELEASED, TRIAL_LAUNCH_STATE_TERMINAL),
+        )
+        return await self._cur.fetchone() is not None
+
+    async def update_trial_launch_role_state(self, player_id: int, request_id: int, state: int) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_launch_role` SET `state`=%s WHERE `player_id`=%s AND `request_id`=%s",
+            (state, player_id, request_id),
+        )
+
+    async def get_trial_battle(self, battle_id: int) -> TrialBattleRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_BATTLE_COLS} FROM `guild_trial_battle` WHERE `battle_id`=%s", (battle_id,)
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_battle(row)
+
+    async def lock_trial_battle(self, battle_id: int) -> TrialBattleRecord | None:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_BATTLE_COLS} FROM `guild_trial_battle` WHERE `battle_id`=%s FOR UPDATE",
+            (battle_id,),
+        )
+        row = await self._cur.fetchone()
+        return None if row is None else _scan_trial_battle(row)
+
+    async def insert_trial_battle(self, rec: TrialBattleRecord) -> None:
+        try:
+            await self._cur.execute(
+                f"INSERT INTO `guild_trial_battle` ({self._TRIAL_BATTLE_COLS}) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    rec.battle_id,
+                    rec.guild_id,
+                    rec.activity_id,
+                    rec.period_key,
+                    rec.guild_period_key,
+                    rec.initiator_player_id,
+                    rec.state,
+                    rec.settle_result,
+                    rec.rewarded_count,
+                    rec.created_ms,
+                    rec.settled_ms,
+                    rec.launch_request_id,
+                ),
+            )
+        except pymysql.MySQLError as exc:
+            if _mysql_errno(exc) == DUP_ENTRY_ERRNO:
+                raise _DuplicateKeyError(str(exc), _dup_key_name(exc)) from exc
+            raise
+
+    async def update_trial_battle(
+        self, battle_id: int, state: int, settle_result: int, rewarded_count: int, settled_ms: int
+    ) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_battle` SET `state`=%s,`settle_result`=%s,`rewarded_count`=%s,`settled_ms`=%s "
+            "WHERE `battle_id`=%s",
+            (state, settle_result, rewarded_count, settled_ms, battle_id),
+        )
+
+    async def list_overdue_trial_battles(self, created_before_ms: int, limit: int) -> list[TrialBattleRecord]:
+        await self._cur.execute(
+            f"SELECT {self._TRIAL_BATTLE_COLS} FROM `guild_trial_battle` "
+            "WHERE `state`=%s AND `created_ms`<=%s ORDER BY `created_ms` ASC, `battle_id` ASC LIMIT %s",
+            (TRIAL_BATTLE_STATE_STARTED, created_before_ms, limit),
+        )
+        return [_scan_trial_battle(r) for r in await self._cur.fetchall()]
+
+    async def insert_trial_reward_owed(self, rec: TrialOwedRewardRecord) -> None:
+        await self._cur.execute(
+            "INSERT IGNORE INTO `guild_trial_reward_owed` "
+            "(`player_id`,`battle_id`,`guild_id`,`activity_id`,`period_key`,`payload`,`attempts`,`created_ms`) "
+            "VALUES (%s,%s,%s,%s,%s,UNHEX(%s),%s,%s)",
+            (
+                rec.player_id,
+                rec.battle_id,
+                rec.guild_id,
+                rec.activity_id,
+                rec.period_key,
+                rec.payload.hex(),
+                rec.attempts,
+                rec.created_ms,
+            ),
+        )
+
+    async def delete_trial_reward_owed(self, player_id: int, battle_id: int) -> bool:
+        await self._cur.execute(
+            "DELETE FROM `guild_trial_reward_owed` WHERE `player_id`=%s AND `battle_id`=%s",
+            (player_id, battle_id),
+        )
+        return self._cur.rowcount == 1
+
+    async def list_trial_rewards_owed(self, limit: int) -> list[TrialOwedRewardRecord]:
+        await self._cur.execute(
+            "SELECT `player_id`,`battle_id`,`guild_id`,`activity_id`,`period_key`,`payload`,`attempts`,`created_ms` "
+            "FROM `guild_trial_reward_owed` ORDER BY `created_ms` ASC, `battle_id` ASC, `player_id` ASC LIMIT %s",
+            (limit,),
+        )
+        return [_scan_trial_reward_owed(r) for r in await self._cur.fetchall()]
+
+    async def count_trial_rewards_owed_by_player(self, player_id: int) -> dict[int, int]:
+        await self._cur.execute(
+            "SELECT `activity_id`, COUNT(*) FROM `guild_trial_reward_owed` WHERE `player_id`=%s GROUP BY `activity_id`",
+            (player_id,),
+        )
+        return {int(r[0]): int(r[1]) for r in await self._cur.fetchall()}
+
+    async def increment_trial_reward_owed_attempts(self, player_id: int, battle_id: int) -> None:
+        await self._cur.execute(
+            "UPDATE `guild_trial_reward_owed` SET `attempts`=`attempts`+1 WHERE `player_id`=%s AND `battle_id`=%s",
+            (player_id, battle_id),
+        )
 
 
 class SqlGuildStore(GuildStoreCore):

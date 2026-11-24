@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import time
 import uuid
@@ -16,10 +17,17 @@ from ..login.caller_auth import CallerVerifier
 from ..protocol import Protocol
 from ..settings import Settings
 from .channels import build_channels
-from .config import DEFAULT_MALL_TIMEOUT_MS, PaymentConfig
+from .config import (
+    DEFAULT_MALL_TIMEOUT_MS,
+    MIN_SECRET_BYTES,
+    MINOR_SPENDING_GATE_REALNAME,
+    PaymentConfig,
+    load_env_secret,
+)
 from .mall_client import HttpMallClient
 from .model import PAYMENT_NODE_TYPE, PaymentOptions
 from .notify_http import PaymentNotifyServer
+from .realname import GrpcRealNameClient
 from .service import PaymentCore, PaymentGrpcService
 from .sql_store import SqlPaymentStore, open_pool
 from .workers import PaymentWorkers
@@ -65,10 +73,28 @@ async def open_service(
     )
     stack.push_async_callback(mall_client.close)
 
-    channels = build_channels(config)
+    env = os.environ if environ is None else environ
+    channels = build_channels(config, environ=env)
+    for ch in channels:
+        close_fn = getattr(ch, "close", None)
+        if callable(close_fn):
+            stack.push_async_callback(close_fn)
+
+    real_names: GrpcRealNameClient | None = None
+    if config.minor_spending_gate == MINOR_SPENDING_GATE_REALNAME:
+        realname_secret = config.realname_secret or load_env_secret(
+            env,
+            "realname_secret_env",
+            config.realname_secret_env,
+            MIN_SECRET_BYTES,
+        )
+        real_names = GrpcRealNameClient.from_endpoint(protocol, config.data_service, realname_secret)
+        stack.push_async_callback(real_names.close)
+
     options = PaymentOptions(
         products=config.products,
         test_policies=config.test_policies,
+        real_names=real_names,
     )
     core = PaymentCore(
         store,

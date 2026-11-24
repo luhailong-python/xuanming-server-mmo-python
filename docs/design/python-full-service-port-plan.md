@@ -85,3 +85,21 @@
 3. 按 `src/xuanming/<service>/` 分层实现服务、配置、Schema、CLI 入口；
 4. 编写面向真实 `serve_grpc` 环回与已有 Python 客户端对接的 `pytest` 回归测试（含异常/越权/并发围栏用例）；
 5. 运行 `.venv\Scripts\python -m pytest -q` 全量通过后，在 `main` 分支按中文提交规范 `git commit` 并 `git push origin main`。
+
+## 7. 阶段 3：全功能生产级补齐（零遗留停用面）
+
+在 14 个核心与外围微服务主干全部跑通之后，阶段 3 彻底消除各服务的“可选/未移植/停用占位”缺口，分两批并行闭环：
+
+- **Wave 3A**：
+  1. `data_service`：补齐实名、账号注销、角色过户（Begin/Confirm/Cancel/Transfer/CheckSlot/AckDrain）、改名、外观同步、渠道身份、PlayerStore 写权核查与快照查询；
+  2. `login`：补齐登录排队（ControlRedis 队列）、Gate 排空迁移、区服角色数查询、实名/防沉迷/账号注销、`LoginAdmin` 管理接口、生产口令认证与 `ContentGuard` 接入；
+  3. `payment`：补齐微信支付、支付宝、微信小游戏、抖音小游戏、Apple AppStore、Google Play 六大生产渠道签名校验/加解密/查询退款适配器与 `MinorSpendingGate="realname"` 接入；
+  4. `trade`：补齐官方商城 HTTP HMAC 轮询与支付撤销（`REVERSING`/`REVERSED`）、11 个 RMB 寄售/提现接口与角色过户协调流程；
+  5. `guild`：补齐公会捐献/商店完整 `AssetOp` 扣发账本闭环与公会试炼大厅/匹配发车/战果结算；
+  6. `match`：补齐战斗剧本 CRUD 与审核、Elo 积分与排行出箱推送、排位赛 V1 接口与队伍预设确认。
+- **Wave 3B**：
+  7. `content_guard`：补齐微信/抖音外部平台审核适配器与 `GetPlayerChannelIdentity` 缓存路由器；
+  8. `player_locator`：补齐月卡托管恢复（`hosted_resume`）与死 Gate 清理对账器；
+  9. `scene_manager`：补齐世界分线目录定时发布、空闲实例/拆场/死节点后台清理与死写权释放；
+  10. `mail`：补齐 Kafka 邮件变更提醒推送（`event_id=39`, `msg_id=264`）与过期邮件清扫器；
+  11. `ops` 运维工具：补齐 Python 版全库 Schema 校验迁移器（对应 Go `schemamigrate`）与配置表打包校验工具（对应 Go `table_sync`）。

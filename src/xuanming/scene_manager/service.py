@@ -22,11 +22,19 @@ from ..cluster import command_route
 from ..grpc_runtime import GrpcClient, sign_service_call
 from ..protocol import Protocol
 from . import config, errors, keys
+from .dead_holder import (
+    DeadHolderReleaseBlockedError,
+    DeadHolderReleaseOutcome,
+    DeadHolderReleaser,
+    PlayerStoreHolderInfo,
+)
 from .store import (
+    DeadNodeTaskFence,
     PlayerPlacementStore,
     RegistrationOutcome,
     SceneControlStore,
     SceneIdGenerator,
+    SceneTeardownJob,
     WorldChannelCandidate,
 )
 
@@ -35,6 +43,8 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = "scene_manager.SceneManager"
 _LOOKUP_ROLE_PATH = "/data_service.DataService/LookupAccountRole"
 _GET_HOME_ZONE_PATH = "/data_service.DataService/GetPlayerHomeZone"
+_READ_PLAYER_STORE_HOLDER_PATH = "/data_service.DataService/ReadPlayerStoreHolder"
+_RELEASE_DEAD_PLAYER_STORE_HOLDER_PATH = "/data_service.DataService/ReleaseDeadPlayerStoreHolder"
 _SCENE_CREATE_PATH = "/scene_node.SceneNodeGrpc/CreateScene"
 _SCENE_DESTROY_PATH = "/scene_node.SceneNodeGrpc/DestroyScene"
 _SCENE_RELEASE_PATH = "/scene_node.SceneNodeGrpc/ReleasePlayer"
@@ -116,6 +126,40 @@ class GrpcDataServiceClient:
         resp = self.protocol.parse("data_service.GetPlayerHomeZoneResponse", raw)
         return int(resp.home_zone_id)
 
+    async def read_player_store_holder(self, player_id: int) -> PlayerStoreHolderInfo | None:
+        req = self.protocol.message("data_service.ReadPlayerStoreHolderRequest", player_id=player_id)
+        sign_service_call(_READ_PLAYER_STORE_HOLDER_PATH, req, "scene_manager", self._clock_ms(), self.secret)
+        raw = await self.client.call(_READ_PLAYER_STORE_HOLDER_PATH, req.SerializeToString(), timeout=self.role_timeout_sec)
+        resp = self.protocol.parse("data_service.ReadPlayerStoreHolderResponse", raw)
+        if not resp.found or not resp.HasField("holder"):
+            return None
+        return PlayerStoreHolderInfo(
+            owner_epoch=int(resp.holder.owner_epoch),
+            holder_instance=bytes(resp.holder.holder_instance),
+            claim_seq=int(resp.holder.claim_seq),
+        )
+
+    async def release_dead_player_store_holder(
+        self,
+        player_id: int,
+        owner_epoch: int,
+        *,
+        seen: PlayerStoreHolderInfo | None = None,
+    ) -> None:
+        req = self.protocol.message(
+            "data_service.ReleaseDeadPlayerStoreHolderRequest",
+            player_id=player_id,
+            owner_epoch=owner_epoch,
+        )
+        if seen is not None:
+            req.seen.owner_epoch = int(seen.owner_epoch)
+            req.seen.holder_instance = bytes(seen.holder_instance)
+            req.seen.claim_seq = int(seen.claim_seq)
+        sign_service_call(_RELEASE_DEAD_PLAYER_STORE_HOLDER_PATH, req, "scene_manager", self._clock_ms(), self.secret)
+        await self.client.call(
+            _RELEASE_DEAD_PLAYER_STORE_HOLDER_PATH, req.SerializeToString(), timeout=self.role_timeout_sec,
+        )
+
 
 class NodeRegistry(TypingProtocol):
     async def list_scene_nodes(self, zone_id: int) -> list: ...
@@ -157,6 +201,11 @@ class EtcdNodeRegistry:
         if zone_id == self.own_zone_id and self._synced:
             return list(self._scene_nodes.get(zone_id, ()))
         return list(await self.directory.candidates(config.SCENE_NODE_TYPE, zone_id))
+
+    async def fresh_scene_instance_uuids(self, zone_id: int) -> set[str]:
+        """对 etcd 执行一次新鲜读取，返回目标 zone 当前在册 Scene 节点的 node_uuid 集合。"""
+        nodes = await self.directory.candidates(config.SCENE_NODE_TYPE, zone_id)
+        return {str(n.node_uuid) for n in nodes if getattr(n, "node_uuid", "")}
 
     async def list_gate_nodes(self, zone_id: int) -> list:
         return list(await self.directory.candidates(config.GATE_NODE_TYPE, zone_id))
@@ -726,6 +775,7 @@ class SceneManagerService:
         id_gen: SceneIdGenerator | None = None,
         clock_ms: Callable[[], int] | None = None,
         rng: random.Random | None = None,
+        dead_holder_releaser: DeadHolderReleaser | None = None,
     ) -> None:
         self.protocol = protocol
         self.config = cfg
@@ -735,12 +785,14 @@ class SceneManagerService:
         self.scene_nodes = scene_nodes
         self.node_registry = node_registry
         self.publisher = publisher
+        self.dead_holder_releaser = dead_holder_releaser
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.id_gen = id_gen or SceneIdGenerator(cfg.node_id, clock_ms=self._clock_ms)
         self._rng = rng
         self._world_conf_ids: tuple[int, ...] = cfg.effective_world_conf_ids()
         self._world_conf_set: frozenset[int] = frozenset(self._world_conf_ids)
         self._bg_tasks: set[asyncio.Task] = set()
+        self._known_node_uuids: dict[tuple[int, str], str] = {}
 
     def services(self) -> dict:
         return {
@@ -790,23 +842,43 @@ class SceneManagerService:
     # ── 节点同步与选点 ────────────────────────────────────────────────────────
 
     async def sync_nodes_to_control_store(self, zone_id: int | None = None) -> list:
-        """将当前注册的 Scene 节点镜像写入控制域负载集与 scene_node_type 键。"""
+        """将当前注册的 Scene 节点镜像写入控制域负载集与 scene_node_type 键，并登记死节点收尾任务。"""
         target_zone = self.config.zone_id if zone_id is None else zone_id
         nodes = await self.node_registry.list_scene_nodes(target_zone)
         live_ids: set[str] = set()
         for info in nodes:
             node_id = str(info.node_id)
+            node_uuid = str(getattr(info, "node_uuid", "") or "")
             live_ids.add(node_id)
+            # 若为判死同一代进程回归则撤销收尾任务并清 death_at；若为新化身复用 node_id 则保留老一代 death_at
+            verdict = await self.control_store.withdraw_dead_node_for_returning_instance(
+                target_zone, node_id, node_uuid,
+            )
             scene_count = await self.control_store.get_node_scene_count(target_zone, node_id) or 0
             score = float(scene_count) + 0.01 * float(info.player_count)
             await self.control_store.upsert_scene_node(
-                target_zone, node_id, score=score, scene_node_type=int(info.scene_node_type),
+                target_zone,
+                node_id,
+                score=score,
+                scene_node_type=int(info.scene_node_type),
+                preserve_death_at=(verdict == 0),
             )
+            if node_uuid:
+                self._known_node_uuids[(target_zone, node_id)] = node_uuid
         existing = await self.control_store.get_node_load_pairs(target_zone)
-        now_sec = self._now_sec()
+        now_ms = self._now_ms()
+        now_sec = now_ms // 1000
         for node_id, _ in existing:
             if node_id not in live_ids:
+                last_uuid = self._known_node_uuids.get((target_zone, node_id), "")
                 await self.control_store.remove_scene_node(target_zone, node_id, death_at_unix_sec=now_sec)
+                await self.control_store.enqueue_dead_node_reconcile(
+                    target_zone,
+                    node_id,
+                    queued_at_ms=now_ms,
+                    detach=True,
+                    node_uuid=last_uuid,
+                )
         return nodes
 
     async def _get_nodes_for_purpose(self, zone_id: int, purpose: errors.NodePurpose) -> list[str]:
@@ -1159,22 +1231,111 @@ class SceneManagerService:
         )
         if not claim.claimed:
             return
+        job = SceneTeardownJob(
+            zone_id=zone_id, scene_id=scene_id, kind="rollback", reason="create_rpc_failed", claim=claim,
+        )
+        await self.complete_scene_teardown(job)
+
+    # ── RPC 2: DestroyScene 与幂等拆除副作用执行 ──────────────────────────────
+
+    async def complete_scene_teardown(
+        self, job: SceneTeardownJob, *, pre_mirror_children: Sequence[str] | None = None,
+    ) -> bool:
+        """执行场景认领后的幂等拆除副作用，全部成功时调用 finish_scene_teardown 清理待办任务。"""
+        zone_id, scene_id, claim = job.zone_id, job.scene_id, job.claim
         all_done = True
+
+        # 1. 副本 / 缩容大世界频道认领后级联销毁子镜像
+        if job.kind in ("instance", "world_drain"):
+            try:
+                children = await self.control_store.get_scene_mirrors(zone_id, scene_id)
+                keep_index = False
+            except Exception:
+                children = list(pre_mirror_children or ())
+                keep_index = True
+            for child_str in children:
+                if not child_str.isascii() or not child_str.isdigit():
+                    continue
+                child_id = int(child_str)
+                if child_id == scene_id:
+                    continue
+                try:
+                    await self._destroy_instance_force(zone_id, child_id, reason="cascade")
+                except Exception as exc:
+                    logger.error(
+                        "cascade destroy mirror failed source=%d mirror=%d error=%s", scene_id, child_id, exc,
+                    )
+                    keep_index = True
+            if keep_index:
+                all_done = False
+            else:
+                try:
+                    await self.control_store.delete_scene_mirrors_index(zone_id, scene_id)
+                except Exception as exc:
+                    logger.error("delete scene mirrors index failed scene=%d error=%s", scene_id, exc)
+                    all_done = False
+
+        # 2. 若属主节点仍存活，通知 SceneNodeGrpc.DestroyScene（节点已死时进程随实体一起消亡）
         if claim.node_id and await self._is_node_alive(zone_id, claim.node_id):
             try:
                 await self.scene_nodes.destroy_scene(zone_id, claim.node_id, scene_id=scene_id)
             except Exception as exc:
-                logger.error("rollback DestroyScene failed scene=%d node=%s error=%s", scene_id, claim.node_id, exc)
+                logger.error("DestroyScene RPC failed scene=%d node=%s error=%s", scene_id, claim.node_id, exc)
                 all_done = False
-        if claim.source:
+
+        # 3. 若本身是镜像，从源场景子镜像集合摘除自身
+        if claim.source and claim.source.isascii() and claim.source.isdigit():
             try:
                 await self.control_store.remove_scene_mirror(zone_id, int(claim.source), scene_id)
-            except Exception:
+            except Exception as exc:
+                logger.error("unlink mirror from source failed scene=%d source=%s error=%s", scene_id, claim.source, exc)
                 all_done = False
-        if all_done:
-            await self.control_store.finish_scene_teardown(zone_id, scene_id, claim.token)
 
-    # ── RPC 2: DestroyScene ──────────────────────────────────────────────────
+        # 4. 清理残留节点成员计数（回滚路径无成员）
+        if claim.node_id and job.kind != "rollback":
+            for member_str in claim.members:
+                if member_str.isascii() and member_str.isdigit():
+                    await self._remove_residual_node_member(int(member_str), scene_id, zone_id, claim.node_id)
+
+        if not all_done:
+            return False
+        return await self.control_store.finish_scene_teardown(zone_id, scene_id, claim.token)
+
+    async def destroy_idle_instance(self, zone_id: int, scene_id: int) -> bool:
+        """空闲副本/镜像原子销毁：使用 LUA_ATOMIC_DESTROY_INSTANCE，若期间有人进入则回 busy 不销毁。"""
+        pre_mirrors = await self.control_store.get_scene_mirrors(zone_id, scene_id)
+        owner = await self.control_store.get_scene_node(zone_id, scene_id)
+        claim = await self.control_store.atomic_destroy_instance(
+            zone_id=zone_id,
+            scene_id=scene_id,
+            expected_owner=owner,
+            now_unix_sec=self._now_sec(),
+        )
+        if not claim.claimed:
+            return False
+        job = SceneTeardownJob(zone_id=zone_id, scene_id=scene_id, kind="instance", reason="idle", claim=claim)
+        await self.complete_scene_teardown(job, pre_mirror_children=pre_mirrors)
+        return True
+
+    async def destroy_orphan_of_dead_node(
+        self, zone_id: int, scene_id: int, dead_node: str, task_fence: DeadNodeTaskFence,
+    ) -> tuple[bool, bool]:
+        """死节点孤儿副本原子销毁，返回 (claimed, withdrawn)。"""
+        pre_mirrors = await self.control_store.get_scene_mirrors(zone_id, scene_id)
+        claim = await self.control_store.atomic_destroy_orphan_of_dead_node(
+            zone_id=zone_id,
+            scene_id=scene_id,
+            dead_node=dead_node,
+            task_fence=task_fence,
+            now_unix_sec=self._now_sec(),
+        )
+        if claim.withdrawn:
+            return False, True
+        if not claim.claimed:
+            return False, False
+        job = SceneTeardownJob(zone_id=zone_id, scene_id=scene_id, kind="instance", reason="node_death", claim=claim)
+        await self.complete_scene_teardown(job, pre_mirror_children=pre_mirrors)
+        return True, False
 
     async def destroy_scene(self, request, context=None, path: str = ""):
         zone_id = int(request.zone_id) or self.config.zone_id
@@ -1218,48 +1379,8 @@ class SceneManagerService:
         if claim is None or not claim.claimed:
             return False
 
-        # 认领成功后级联销毁全部子镜像
-        all_done = True
-        try:
-            children = await self.control_store.get_scene_mirrors(zone_id, scene_id)
-            keep_index = False
-        except Exception:
-            children = pre_mirrors
-            keep_index = True
-        for child_str in children:
-            child_id = int(child_str)
-            if child_id == scene_id:
-                continue
-            try:
-                await self._destroy_instance_force(zone_id, child_id, reason="cascade")
-            except Exception as exc:
-                logger.error("cascade destroy mirror failed source=%d mirror=%d error=%s", scene_id, child_id, exc)
-                keep_index = True
-        if keep_index:
-            all_done = False
-        else:
-            await self.control_store.delete_scene_mirrors_index(zone_id, scene_id)
-
-        if claim.node_id and await self._is_node_alive(zone_id, claim.node_id):
-            try:
-                await self.scene_nodes.destroy_scene(zone_id, claim.node_id, scene_id=scene_id)
-            except Exception as exc:
-                logger.error("DestroyScene RPC failed scene=%d node=%s error=%s", scene_id, claim.node_id, exc)
-                all_done = False
-
-        if claim.source:
-            try:
-                await self.control_store.remove_scene_mirror(zone_id, int(claim.source), scene_id)
-            except Exception:
-                all_done = False
-
-        if claim.node_id:
-            for member_str in claim.members:
-                if member_str.isdigit():
-                    await self._remove_residual_node_member(int(member_str), scene_id, zone_id, claim.node_id)
-
-        if all_done:
-            await self.control_store.finish_scene_teardown(zone_id, scene_id, claim.token)
+        job = SceneTeardownJob(zone_id=zone_id, scene_id=scene_id, kind="instance", reason=reason, claim=claim)
+        await self.complete_scene_teardown(job, pre_mirror_children=pre_mirrors)
         return True
 
     # ── 两域成员集合收敛辅助（绝不跨两域写同一段 Lua） ────────────────────────
@@ -1890,12 +2011,25 @@ class SceneManagerService:
                     if await self.control_store.scene_node_exists(self.config.zone_id, int(current_loc.scene_id)):
                         current_zone_id = self.config.zone_id
 
-            # 死节点接管检测（持有进程无存活租约且节点已确认死亡并过再入屏障）
+            # 死节点接管检测（持有进程无存活租约且节点已确认死亡并过再入屏障；配置死持有者释放时先核查并围栏写权行）
             taken_over_loc = None
             taken_over_zone = 0
             if current_loc is not None and await self._is_owner_dead(current_loc, current_zone_id):
                 holder_lease = await self.player_store.get_holder_lease(player_id)
                 if not holder_lease:
+                    if self.dead_holder_releaser is not None and int(current_loc.owner_epoch) != 0:
+                        try:
+                            await self.dead_holder_releaser.release_dead_holder(
+                                player_id, int(current_loc.owner_epoch), zone_id=current_zone_id,
+                            )
+                        except DeadHolderReleaseBlockedError as exc:
+                            code = (
+                                errors.ERR_HANDOFF_PENDING
+                                if exc.outcome == DeadHolderReleaseOutcome.HOLDER_REGISTERED
+                                else errors.ERR_SCENE_REENTRY_BARRIER
+                            )
+                            response = self._err_resp(code, exc.detail)
+                            return response
                     taken_over_loc, taken_over_zone = current_loc, current_zone_id
                     current_loc, current_loc_raw, current_zone_id = None, b"", 0
 
@@ -2623,6 +2757,30 @@ class SceneManagerService:
                 verdict=release_verdict,
                 req_identity=req_identity,
             )
+
+        if (
+            release_verdict == HolderReleaseVerdict.OWNER_DEAD
+            and self.dead_holder_releaser is not None
+            and int(current_loc.owner_epoch) != 0
+        ):
+            try:
+                await self.dead_holder_releaser.release_dead_holder(
+                    player_id,
+                    int(current_loc.owner_epoch),
+                    zone_id=loc_zone or self.config.zone_id,
+                )
+            except DeadHolderReleaseBlockedError as exc:
+                if exc.keeps_location:
+                    logger.info(
+                        "leave scene dead holder release deferred player=%d scene=%d detail=%s",
+                        player_id, scene_id, exc.detail,
+                    )
+                else:
+                    logger.error(
+                        "leave scene dead holder release failed player=%d scene=%d detail=%s",
+                        player_id, scene_id, exc.detail,
+                    )
+                await self._abort(context, exc.grpc_code, exc.detail)
 
         mode = "released" if release_verdict == HolderReleaseVerdict.RELEASED else "any"
         outcome = await self._delete_location_guarded(

@@ -60,11 +60,14 @@ REMOVAL_TOKEN_BIT = 1 << 63
 RETENTION_REJECTED_PREFIX = "since_ms older than terminal retention; cutoff_ms="
 
 # 资产通道与账本常量（对应 proto/common/asset 与 guild_db.proto）
+ASSET_OP_CALLER = "guild"
+MATCH_INTERNAL_CALLER = "guild"
 ASSET_STREAM_GUILD_DEBIT = 1
 ASSET_STREAM_GUILD_CREDIT = 2
 TX_GUILD_DONATE = 24
 TX_GUILD_SHOP = 25
 TX_GUILD_ACTIVITY_REWARD = 26
+ASSET_OP_FRESH_ATTEMPT_LIMIT = 3
 
 OP_STATUS_UNSPECIFIED = 0
 OP_STATUS_PENDING = 1
@@ -108,6 +111,56 @@ ACTIVITY_STATE_DISABLED = 1
 ACTIVITY_STATE_UPCOMING = 2
 ACTIVITY_STATE_OPEN = 3
 ACTIVITY_STATE_ENDED = 4
+
+# 同道历练状态与跨服务常量（与 guild.proto / guild_db.proto / match_internal.proto 一致）
+TRIAL_LOBBY_STATE_PENDING = 1
+TRIAL_LOBBY_STATE_LAUNCHING = 2
+TRIAL_LOBBY_STATE_LAUNCHED = 3
+TRIAL_LOBBY_STATE_ENDED = 4
+
+TRIAL_LAUNCH_STATE_PREPARED = 1
+TRIAL_LAUNCH_STATE_LAUNCHED = 2
+TRIAL_LAUNCH_STATE_TERMINAL = 3
+
+TRIAL_LAUNCH_ROLE_ACTIVE = 1
+TRIAL_LAUNCH_ROLE_RELEASED = 2
+
+TRIAL_BATTLE_STATE_STARTED = 1
+TRIAL_BATTLE_STATE_SETTLED = 2
+TRIAL_BATTLE_STATE_EXPIRED = 3
+
+TRIAL_SETTLE_RESULT_UNSPECIFIED = 0
+TRIAL_SETTLE_RESULT_WIN = 1
+TRIAL_SETTLE_RESULT_LOSS = 2
+TRIAL_SETTLE_RESULT_GUILD_GONE = 3
+TRIAL_SETTLE_RESULT_CONFIG_MISSING = 4
+TRIAL_SETTLE_RESULT_POISON = 5
+
+BATTLE_ACTIVITY_KIND_GUILD_TRIAL = 1
+BATTLE_OUTCOME_SIDE_A_WIN = 1
+MATCH_MODE_PVE_TEAM = 5
+
+OUTCOME_DECISION_UNKNOWN = 0
+OUTCOME_DECISION_COMPLETE = 1
+OUTCOME_DECISION_ABORT = 2
+
+TRIAL_OCCUPANCY_REJECT_NONE = 0
+TRIAL_OCCUPANCY_REJECT_OCCUPIED = 1
+TRIAL_OCCUPANCY_REJECT_ROLE = 2
+TRIAL_OCCUPANCY_REJECT_DENIED = 3
+TRIAL_OCCUPANCY_REJECT_RETRY = 4
+
+ACTIVITY_BATTLE_REJECT_NONE = 0
+ACTIVITY_BATTLE_REJECT_INVALID_ARGUMENT = 1
+ACTIVITY_BATTLE_REJECT_MEMBER_OFFLINE = 2
+ACTIVITY_BATTLE_REJECT_MEMBER_IN_BATTLE = 3
+ACTIVITY_BATTLE_REJECT_MEMBER_NOT_READY = 4
+ACTIVITY_BATTLE_REJECT_INTERNAL = 5
+
+MAX_TRIAL_LOBBY_ROSTER = 5
+MIN_TRIAL_LOBBY_ROSTER = 2
+TRIAL_OCCUPANCY_MARGIN_MS = 30_000
+TRIAL_LAUNCH_WINDOW_MS = 5_000
 
 # 限购周期枚举
 LIMIT_PERIOD_NONE = 0
@@ -432,6 +485,175 @@ class AssetOpRow:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingAssetOp:
+    """已领取或刚入队的待投递资产指令视图（供 GuildAssetOpLoop 处理）。"""
+
+    op_id: int
+    player_id: int
+    guild_id: int
+    stream: int
+    seq: int
+    stream_epoch: int
+    correlation_id: int
+    tx_type: int
+    kind: int
+    bundle: Message
+    attempts: int
+    deadline_ms: int
+    last_reason: int
+    lease_token: int
+    created_ms: int = 0
+    last_send_ms: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizedAssetOp:
+    """一次本次 CAS 命中的资产指令终结摘要（供推送回调使用）。"""
+
+    op_id: int
+    player_id: int
+    guild_id: int
+    kind: int
+    status: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialLobbyRecord:
+    """guild_trial_lobby 一行快照。"""
+
+    lobby_id: int
+    guild_id: int
+    activity_id: int
+    initiator_player_id: int
+    state: int
+    view_proto: bytes
+    original_proto: bytes
+    consent_proto: bytes
+    expires_ms: int
+    launch_deadline_ms: int
+    battle_id: int
+    created_ms: int
+    updated_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialLobbySlotRecord:
+    """guild_trial_lobby_slot 一行快照。"""
+
+    player_id: int
+    lobby_id: int
+    cooldown_until_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialLaunchRecord:
+    """guild_trial_launch 一行快照。"""
+
+    request_id: int
+    battle_id: int
+    state: int
+    original_proto: bytes
+    request_digest: bytes
+    created_ms: int
+    updated_ms: int
+    cancel_receipt: bytes = b""
+    next_check_ms: int = 0
+    check_attempts: int = 0
+    realtime_end_tip: bytes = b""
+
+
+@dataclass(frozen=True, slots=True)
+class TrialLaunchRoleRecord:
+    """guild_trial_launch_role 一行快照。"""
+
+    player_id: int
+    request_id: int
+    account: str
+    owner_revision: int
+    state: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialBattleKey:
+    """同道历练对局上下文键。"""
+
+    battle_id: int
+    guild_id: int
+    activity_id: int
+    period_key: int
+    guild_period_key: int
+    initiator_player_id: int
+    launch_request_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TrialBattleRecord:
+    """guild_trial_battle 一行快照。"""
+
+    battle_id: int
+    guild_id: int
+    activity_id: int
+    period_key: int
+    guild_period_key: int
+    initiator_player_id: int
+    state: int
+    settle_result: int
+    rewarded_count: int
+    created_ms: int
+    settled_ms: int
+    launch_request_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TrialOwedRewardRecord:
+    """guild_trial_reward_owed 一行快照（未决窗满时溢出暂存）。"""
+
+    player_id: int
+    battle_id: int
+    guild_id: int
+    activity_id: int
+    period_key: int
+    payload: bytes
+    attempts: int
+    created_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialRewardOp:
+    """结算前为单个候选人预分配的物品指令号与租约令牌。"""
+
+    player_id: int
+    op_id: int
+    lease_token: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialEnqueuedReward:
+    """结算事务内成功入队的单个物品指令。"""
+
+    player_id: int
+    op_id: int
+    seq: int
+    stream_epoch: int
+    lease_token: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrialSettleResult:
+    """同道历练结算事务结果。"""
+
+    status: str  # "settled" | "duplicate" | "guild_gone" | "context_mismatch"
+    result: int = TRIAL_SETTLE_RESULT_UNSPECIFIED
+    rewarded: tuple[int, ...] = ()
+    enqueued: tuple[TrialEnqueuedReward, ...] = ()
+    owed: tuple[int, ...] = ()
+    funds_granted: bool = False
+    counted_wins: int = 0
+    release_request_id: int = 0
+    release_players: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ActivityProgress:
     count: int = 0
     threshold_reached_ms: int = 0
@@ -459,6 +681,7 @@ class ActivityTxResult:
     progress: ActivityProgress
     reached_now: bool
     funds_granted: bool
+    op: AssetOpRow | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -707,6 +930,11 @@ def reunion_outcome(row: ActivityRuleRow, progress: ActivityProgress, observed: 
     return True, not progress.latched, not progress.funds_granted and row.guild_funds > 0
 
 
+def trial_funds_counted(row: ActivityRuleRow, counted_wins: int) -> bool:
+    """历练胜利是否计入帮会资金：配表资金 > 0 且当日已计资金胜场未达上限。"""
+    return row.guild_funds > 0 and counted_wins < row.guild_threshold
+
+
 def activity_blocked(
     *,
     state: int,
@@ -750,6 +978,8 @@ class GuildRuleConfig:
     rename_cooldown_seconds: int = 7 * 86400
     name_hold_seconds: int = 7 * 86400
     rename_cost_funds: int = 1000
+    trial_invite_ttl_seconds: int = 30
+    trial_invite_cooldown_seconds: int = 10
 
     @property
     def application_ttl_ms(self) -> int:
@@ -846,6 +1076,8 @@ class GuildTableCatalog:
             rename_cooldown_seconds=int(getattr(rule_row, "rename_cooldown_seconds", 7 * 86400)),
             name_hold_seconds=int(getattr(rule_row, "name_hold_seconds", 7 * 86400)),
             rename_cost_funds=int(getattr(rule_row, "rename_cost_funds", 1000)),
+            trial_invite_ttl_seconds=int(getattr(rule_row, "trial_invite_ttl_seconds", 30)) or 30,
+            trial_invite_cooldown_seconds=int(getattr(rule_row, "trial_invite_cooldown_seconds", 10)),
         )
 
         levels: dict[int, GuildLevelConfig] = {}

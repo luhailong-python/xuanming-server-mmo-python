@@ -63,8 +63,10 @@ ERR_GUILD_TEXT_CHECK_UNAVAILABLE = 14045
 ERR_GUILD_RENAME_COOLDOWN = 14046
 ERR_GUILD_RENAME_SAME_NAME = 14047
 
-# 资产错误码（AssetError）
-ERR_ASSET_CURRENCY_INSUFFICIENT = 27001
+# 资产错误码（AssetError，与 asset_inventory.py / scene_assets.py / Go table.AssetError 一致）
+ERR_ASSET_CURRENCY_INSUFFICIENT = 27000
+ERR_ASSET_BAG_FULL = 27001
+ERR_ASSET_PARTIAL_APPLIED = 27007
 
 
 class GuildError(Exception):
@@ -330,6 +332,42 @@ class InvalidRoleFenceStateError(GuildError):
     """协调者传入的角色护栏状态字段不合法。"""
 
     tip_id = ERR_INVALID_PARAMETER
+
+
+class AssetOpLeaseLostError(GuildError):
+    """重排/放弃 CAS 落空：该资产指令行租约已被其他副本接管或已终结。"""
+
+    tip_id = ERR_GUILD_BUSY_RETRY
+
+
+class AssetOpOutcomeFlipError(GuildError):
+    """Scene 回包结局与重查或 SQL 已提交账本冲突（绝不终结，进入告警退避）。"""
+
+    tip_id = ERR_SERVICE_UNAVAILABLE
+
+
+class AssetOpPoisonRowError(GuildError):
+    """资产指令 payload 为空或无法解码，已推迟等待人工处置。"""
+
+    tip_id = ERR_SERVICE_UNAVAILABLE
+
+
+class TrialMatchUnavailableError(GuildError):
+    """MatchInternal 暂不可达或返回暂时错误，映射为 kGuildTrialServiceBusy。"""
+
+    tip_id = ERR_GUILD_TRIAL_SERVICE_BUSY
+
+
+class TrialInputInvalidError(GuildError):
+    """同道历练结算输入畸形（确定性失败，标成 POISON）。"""
+
+    tip_id = ERR_INVALID_PARAMETER
+
+
+class TrialActivityPoisonError(GuildError):
+    """同道历练结算遇到确定性不可恢复错误（如溢出或周期键已过清理线），标成 POISON。"""
+
+    tip_id = ERR_SERVICE_UNAVAILABLE
 
 
 def tip_for_error(protocol, error: BaseException | None):

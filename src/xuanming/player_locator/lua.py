@@ -180,3 +180,38 @@ redis.call("ZADD", KEYS[2], ARGV[1], ARGV[2])
 redis.call("HSET", KEYS[3], ARGV[2], ARGV[3])
 return 1
 """
+
+# 托管归位信息条件删除（逐字同步自 Go hosted_resume.go luaDeleteHostedReturnIfValue）
+DELETE_HOSTED_RETURN_IF_VALUE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+# 托管归位信息条件续期（逐字同步自 Go hosted_resume.go luaExpireHostedReturnIfValue）
+EXPIRE_HOSTED_RETURN_IF_VALUE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+# 死 gate 索引成员字节守卫摘除（逐字同步自 Go gate_session_index.go pruneGateIndexMemberScript）
+PRUNE_GATE_INDEX_MEMBER_LUA = """
+local current = redis.call("GET", KEYS[1])
+if ARGV[1] == "missing" then
+    if current then return 0 end
+else
+    if (not current) or current ~= ARGV[2] then return 0 end
+end
+return redis.call("SREM", KEYS[2], ARGV[3])
+"""
+
+# 死 gate 索引空集释放（逐字同步自 Go gate_session_index.go releaseGateIndexIfEmptyScript）
+RELEASE_GATE_INDEX_IF_EMPTY_LUA = """
+if redis.call("SCARD", KEYS[1]) > 0 then return 0 end
+redis.call("DEL", KEYS[1])
+redis.call("SREM", KEYS[2], ARGV[1])
+return 1
+"""

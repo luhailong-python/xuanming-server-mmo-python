@@ -15,6 +15,7 @@ from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..protocol import Protocol
 from ..settings import Settings
 from .config import PLAYER_LOCATOR_NODE_TYPE, PlayerLocatorConfig
+from .gate_sweep import DirectoryLiveGateView, GateSweeper
 from .lease_monitor import GrpcSceneManagerClient, KafkaGatePublisher, LeaseMonitor
 from .service import PlayerLocatorService
 from .store import RedisSessionStore, open_player_redis
@@ -121,6 +122,11 @@ async def run(settings: Settings) -> None:
             await directory.register(info)
             keepalive = asyncio.create_task(directory.maintain(info), name="player-locator-etcd-lease")
             stack.callback(keepalive.cancel)
+
+            if config.reconcile_interval_sec > 0:
+                sweeper = GateSweeper(protocol, store, DirectoryLiveGateView(directory), config)
+                sweeper_task = asyncio.create_task(sweeper.run(stop), name="player-locator-gate-sweeper")
+                stack.callback(sweeper_task.cancel)
 
             logger.info(
                 "player_locator ready node_id=%d zone=%d track=%s grpc=%s:%d",

@@ -11,6 +11,8 @@ from pathlib import Path
 import random
 from types import SimpleNamespace
 
+import aiohttp
+from aiohttp import web
 import grpc
 import pytest
 
@@ -26,26 +28,35 @@ from xuanming.content_guard import (
     MAX_CHUNKS,
     MAX_TEXT_BYTES,
     MAX_WORD_RUNES,
+    PROVIDER_DOUYIN,
+    PROVIDER_WECHAT,
+    TOKEN_REFRESH_MARGIN_SEC,
     Category,
     CompileReport,
     ContentGuardConfig,
     ContentGuardService,
+    DouyinAdapter,
     Elem,
     Engine,
     Entry,
+    GrpcIdentityLookup,
     Hit,
+    Identity,
     Lexicon,
     LexiconCorruptError,
     LexiconFormatError,
     LexiconWatcher,
     LexiconWordError,
     Mode,
+    PlatformRouter,
     Pointer,
     ReviewOutcome,
     ReviewResult,
     SceneClass,
     Verdict,
+    WeChatAdapter,
     build_lexicon_watcher,
+    build_platform_router,
     category_name,
     chunk_key,
     chunk_prefix,
@@ -58,15 +69,20 @@ from xuanming.content_guard import (
     fold,
     fold_word,
     is_mark,
+    is_platform_skipped_scene,
     marshal_lexicon,
     mode_name,
     parse_category,
+    parse_channel_account,
     parse_lexicon,
     parse_mode,
     parse_pointer,
     pointer_key,
+    provider_from_identity,
     skippable,
     wait_for_lexicon,
+    wechat_label_category,
+    wechat_scene_code,
 )
 from xuanming.content_guard.textnorm import _T2S
 from xuanming.grpc_runtime import GrpcClient, serve_grpc
@@ -831,3 +847,529 @@ def test_build_lexicon_watcher_logs_metadata_only(caplog):
         asyncio.run(exercise())
     assert "version=9" in caplog.text
     assert "极密词条样例" not in caplog.text
+
+
+# -- platform adapters (WeChat / Douyin) & PlatformRouter --------------------------------------------
+
+
+async def _start_mock_http_server(
+    routes: list[tuple[str, str, object]],
+) -> tuple[web.AppRunner, str]:
+    app = web.Application()
+    for method, path, handler in routes:
+        app.router.add_route(method, path, handler)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    return runner, f"http://127.0.0.1:{port}"
+
+
+def test_wechat_adapter_pass_reject_labels_token_cache_and_retry(caplog):
+    # 校验场景码与标签映射全表
+    assert wechat_scene_code(1) == 1
+    assert wechat_scene_code(2) == 1
+    assert wechat_scene_code(3) == 1
+    assert wechat_scene_code(9) == 1
+    assert wechat_scene_code(4) == 2
+    assert wechat_scene_code(5) == 3
+    assert wechat_scene_code(6) == 4
+    assert wechat_label_category(20001) == Category.POLITICS
+    assert wechat_label_category(20002) == Category.PORN
+    assert wechat_label_category(20003) == Category.PORN
+    assert wechat_label_category(20012) == Category.ABUSE
+    assert wechat_label_category(20013) == Category.ABUSE
+    assert wechat_label_category(10001) == Category.AD
+    assert wechat_label_category(21000) == Category.OTHER
+    assert wechat_label_category(99999) == Category.OTHER
+
+    async def exercise():
+        state = {
+            "token_calls": 0,
+            "check_calls": 0,
+            "suggest": "pass",
+            "label": 100,
+            "expire_errcode": 0,
+            "last_body": None,
+            "last_token_query": None,
+            "http_status": 200,
+        }
+        now = [1000.0]
+
+        async def handle_token(request: web.Request) -> web.Response:
+            assert request.query.get("grant_type") == "client_credential"
+            assert request.query.get("appid") == "wx-app-1"
+            assert request.query.get("secret") == "wx-super-secret-xyz"
+            state["token_calls"] += 1
+            return web.json_response({
+                "access_token": f"wx-tok-{state['token_calls']}",
+                "expires_in": 7200,
+            })
+
+        async def handle_check(request: web.Request) -> web.Response:
+            state["check_calls"] += 1
+            state["last_token_query"] = request.query.get("access_token")
+            state["last_body"] = await request.json()
+            if state["http_status"] != 200:
+                return web.Response(status=state["http_status"], text="upstream error")
+            if state["expire_errcode"]:
+                code = state["expire_errcode"]
+                state["expire_errcode"] = 0
+                return web.json_response({"errcode": code, "errmsg": "invalid credential"})
+            return web.json_response({
+                "errcode": 0,
+                "result": {"suggest": state["suggest"], "label": state["label"]},
+            })
+
+        runner, base_url = await _start_mock_http_server([
+            ("GET", "/cgi-bin/token", handle_token),
+            ("POST", "/wxa/msg_sec_check", handle_check),
+        ])
+        adapter = WeChatAdapter(
+            "wx-app-1",
+            "wx-super-secret-xyz",
+            base_url=base_url,
+            monotonic_clock=lambda: now[0],
+        )
+        try:
+            # 1. 缺 openid 直接跳过外部审核
+            skip = await adapter.check(1, "", "绝密玩家文本A")
+            assert skip == ReviewResult(ReviewOutcome.SKIP, provider=PROVIDER_WECHAT)
+            assert state["token_calls"] == 0
+
+            # 2. 正常放行并校验请求载荷
+            res = await adapter.check(1, "oid-1", "青云剑客")
+            assert res == ReviewResult(ReviewOutcome.PASS, provider=PROVIDER_WECHAT)
+            assert state["last_body"] == {
+                "content": "青云剑客",
+                "version": 2,
+                "scene": 1,
+                "openid": "oid-1",
+            }
+            assert state["last_token_query"] == "wx-tok-1"
+            assert state["token_calls"] == 1
+
+            # 3. 命中各标签映射且复用缓存 token
+            for label, want_cat, scene, want_scene in (
+                (10001, Category.AD, 9, 1),
+                (20001, Category.POLITICS, 4, 2),
+                (20002, Category.PORN, 5, 3),
+                (20013, Category.ABUSE, 6, 4),
+                (20006, Category.OTHER, 1, 1),
+            ):
+                state["suggest"] = "risky"
+                state["label"] = label
+                rej = await adapter.check(scene, "oid-1", "绝密玩家文本B")
+                assert rej == ReviewResult(ReviewOutcome.REJECT, want_cat, PROVIDER_WECHAT)
+                assert state["last_body"]["scene"] == want_scene
+            assert state["token_calls"] == 1
+
+            # 4. 提前 5 分钟刷新窗口生效（expires_in=7200，推进到 7200 - 300 触发刷新）
+            now[0] += 7200.0 - TOKEN_REFRESH_MARGIN_SEC
+            state["suggest"] = "pass"
+            res = await adapter.check(1, "oid-1", "正常昵称")
+            assert res == ReviewResult(ReviewOutcome.PASS, provider=PROVIDER_WECHAT)
+            assert state["token_calls"] == 2
+            assert state["last_token_query"] == "wx-tok-2"
+
+            # 5. errcode 40001 / 40014 / 42001 触发清缓存并重试一次
+            for errcode in (40001, 40014, 42001):
+                before_tok = state["token_calls"]
+                before_chk = state["check_calls"]
+                state["expire_errcode"] = errcode
+                retried = await adapter.check(5, "oid-1", "绝密玩家文本C")
+                assert retried == ReviewResult(ReviewOutcome.PASS, provider=PROVIDER_WECHAT)
+                assert state["token_calls"] == before_tok + 1
+                assert state["check_calls"] == before_chk + 2
+
+            # 6. HTTP 500 -> UNAVAILABLE，日志不泄漏玩家文本与密钥
+            state["http_status"] = 500
+            fail = await adapter.check(1, "oid-1", "绝密玩家文本D")
+            assert fail == ReviewResult(ReviewOutcome.UNAVAILABLE, provider=PROVIDER_WECHAT)
+        finally:
+            await adapter.close()
+            await runner.cleanup()
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(exercise())
+    for forbidden in ("绝密玩家文本A", "绝密玩家文本B", "绝密玩家文本C", "绝密玩家文本D", "wx-super-secret-xyz", "wx-tok-"):
+        assert forbidden not in caplog.text
+
+
+def test_douyin_adapter_pass_reject_prob_and_401_retry(caplog):
+    async def exercise():
+        state = {
+            "token_calls": 0,
+            "check_calls": 0,
+            "hit": False,
+            "prob": 0.0,
+            "retry_401": True,
+            "retry_code": 0,
+            "last_header_token": None,
+            "last_body": None,
+        }
+
+        async def handle_token(request: web.Request) -> web.Response:
+            body = await request.json()
+            assert body == {
+                "appid": "dy-app-1",
+                "secret": "dy-super-secret-xyz",
+                "grant_type": "client_credential",
+            }
+            state["token_calls"] += 1
+            return web.json_response({
+                "err_no": 0,
+                "data": {
+                    "access_token": f"dy-tok-{state['token_calls']}",
+                    "expires_in": 7200,
+                },
+            })
+
+        async def handle_antidirt(request: web.Request) -> web.Response:
+            state["check_calls"] += 1
+            state["last_header_token"] = request.headers.get("X-Token")
+            state["last_body"] = await request.json()
+            if state["retry_401"] and state["last_header_token"] == "dy-tok-1":
+                state["retry_401"] = False
+                return web.Response(status=401)
+            if state["retry_code"]:
+                code = state["retry_code"]
+                state["retry_code"] = 0
+                return web.json_response({"code": code, "message": "token expired"})
+            return web.json_response({
+                "data": [{
+                    "code": 0,
+                    "predicts": [{"hit": state["hit"], "prob": state["prob"], "model_name": "short_content_antidirt"}],
+                }],
+            })
+
+        runner, base_url = await _start_mock_http_server([
+            ("POST", "/api/apps/v2/token", handle_token),
+            ("POST", "/api/v2/tags/text/antidirt", handle_antidirt),
+        ])
+        adapter = DouyinAdapter("dy-app-1", "dy-super-secret-xyz", base_url=base_url)
+        try:
+            # 1. HTTP 401 刷新 token 并重试成功
+            res = await adapter.check(2, "dy-open", "逍遥帮")
+            assert res == ReviewResult(ReviewOutcome.PASS, provider=PROVIDER_DOUYIN)
+            assert state["token_calls"] == 2
+            assert state["check_calls"] == 2
+            assert state["last_header_token"] == "dy-tok-2"
+            assert state["last_body"] == {"tasks": [{"content": "逍遥帮"}]}
+
+            # 2. 业务 code 40002 / 40020 同样刷新重试一次
+            for code in (40002, 40020):
+                before = state["token_calls"]
+                state["retry_code"] = code
+                res = await adapter.check(5, "", "绝密抖音聊天1")
+                assert res == ReviewResult(ReviewOutcome.PASS, provider=PROVIDER_DOUYIN)
+                assert state["token_calls"] == before + 1
+
+            # 3. predict.hit=True -> REJECT(OTHER)
+            state["hit"] = True
+            state["prob"] = 0.0
+            rej_hit = await adapter.check(2, "", "绝密抖音聊天2")
+            assert rej_hit == ReviewResult(ReviewOutcome.REJECT, Category.OTHER, PROVIDER_DOUYIN)
+
+            # 4. predict.hit=False 且 prob >= 1 -> REJECT(OTHER)
+            state["hit"] = False
+            state["prob"] = 1.0
+            rej_prob = await adapter.check(2, "", "绝密抖音聊天3")
+            assert rej_prob == ReviewResult(ReviewOutcome.REJECT, Category.OTHER, PROVIDER_DOUYIN)
+        finally:
+            await adapter.close()
+            await runner.cleanup()
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(exercise())
+    for forbidden in ("绝密抖音聊天1", "绝密抖音聊天2", "绝密抖音聊天3", "dy-super-secret-xyz", "dy-tok-"):
+        assert forbidden not in caplog.text
+
+
+def test_platform_router_identity_cache_and_end_to_end_grpc(caplog):
+    assert parse_channel_account("wx_open1") == (PROVIDER_WECHAT, "open1")
+    assert parse_channel_account("dy_open2") == (PROVIDER_DOUYIN, "open2")
+    assert parse_channel_account("wx_") == ("", "")
+    assert parse_channel_account("guest_1") == ("", "")
+    assert provider_from_identity(Identity("wechat_minigame", "oid-w", "acc")) == (PROVIDER_WECHAT, "oid-w")
+    assert provider_from_identity(Identity("douyin_minigame", "oid-d", "acc")) == (PROVIDER_DOUYIN, "oid-d")
+    assert provider_from_identity(Identity("", "", "wx_fallback_oid")) == (PROVIDER_WECHAT, "fallback_oid")
+    assert is_platform_skipped_scene(6) is True
+    assert is_platform_skipped_scene(7) is True
+    assert is_platform_skipped_scene(8) is True
+    assert is_platform_skipped_scene(5) is False
+
+    async def exercise():
+        protocol = Protocol()
+        ds_calls: list[int] = []
+        now = [100.0]
+
+        async def handle_get_identity(request, context, path):
+            pid = int(request.player_id)
+            ds_calls.append(pid)
+            if pid == 99:
+                return protocol.message("data_service.GetPlayerChannelIdentityResponse", retry=True)
+            if pid == 88:
+                await asyncio.sleep(0.3)
+                return protocol.message("data_service.GetPlayerChannelIdentityResponse", found=False)
+            if pid == 77:
+                return protocol.message(
+                    "data_service.GetPlayerChannelIdentityResponse",
+                    found=True,
+                    channel="douyin_minigame",
+                    open_id="dy-oid-77",
+                    account="custom_77",
+                )
+            return protocol.message(
+                "data_service.GetPlayerChannelIdentityResponse",
+                found=True,
+                channel="wechat_minigame",
+                open_id=f"wx-oid-{pid}",
+                account=f"acc_{pid}",
+            )
+
+        ds_server, ds_port = await serve_grpc(
+            protocol,
+            "127.0.0.1:0",
+            {"data_service.DataService": {"GetPlayerChannelIdentity": handle_get_identity}},
+            pass_context=True,
+        )
+
+        wx_state = {"delay": 0.0, "suggest": "pass", "label": 100}
+        dy_state = {"hit": False}
+
+        async def wx_token(_req: web.Request) -> web.Response:
+            return web.json_response({"access_token": "wx-t", "expires_in": 7200})
+
+        async def wx_check(_req: web.Request) -> web.Response:
+            if wx_state["delay"] > 0:
+                await asyncio.sleep(wx_state["delay"])
+            return web.json_response({
+                "errcode": 0,
+                "result": {"suggest": wx_state["suggest"], "label": wx_state["label"]},
+            })
+
+        async def dy_token(_req: web.Request) -> web.Response:
+            return web.json_response({"err_no": 0, "data": {"access_token": "dy-t", "expires_in": 7200}})
+
+        async def dy_check(_req: web.Request) -> web.Response:
+            return web.json_response({
+                "data": [{"code": 0, "predicts": [{"hit": dy_state["hit"], "prob": 0.0}]}],
+            })
+
+        http_runner, base_url = await _start_mock_http_server([
+            ("GET", "/cgi-bin/token", wx_token),
+            ("POST", "/wxa/msg_sec_check", wx_check),
+            ("POST", "/api/apps/v2/token", dy_token),
+            ("POST", "/api/v2/tags/text/antidirt", dy_check),
+        ])
+
+        lookup = GrpcIdentityLookup(protocol, f"127.0.0.1:{ds_port}", timeout_sec=0.15)
+        wx_adapter = WeChatAdapter("wx-app", "wx-sec", base_url=base_url)
+        dy_adapter = DouyinAdapter("dy-app", "dy-sec", base_url=base_url)
+        router = PlatformRouter(
+            [wx_adapter, dy_adapter],
+            lookup=lookup,
+            sync_timeout_ms=300,
+            world_timeout_ms=40,
+            async_timeout_ms=300,
+            lookup_timeout_ms=100,
+            identity_ttl_sec=300.0,
+            monotonic_clock=lambda: now[0],
+        )
+
+        engine = Engine()
+        service = ContentGuardService(protocol, engine, require_lexicon=False, reviewer=router)
+        cg_server, cg_port = await serve_grpc(
+            protocol,
+            "127.0.0.1:0",
+            service.services(),
+            pass_context=True,
+        )
+        cg_client = GrpcClient(f"127.0.0.1:{cg_port}", timeout=3.0)
+
+        try:
+            async def call(method: str, **kwargs):
+                req = protocol.message("content_guard.CheckTextRequest", **kwargs)
+                raw = await cg_client.call(f"/content_guard.ContentGuard/{method}", req.SerializeToString())
+                return protocol.parse("content_guard.CheckTextResponse", raw)
+
+            # 1. 私有标签 / 队伍 / 私聊跳过外部审核（不查 DataService、不触发微信拒绝）
+            wx_state["suggest"], wx_state["label"] = "risky", 10001
+            for skipped_scene in (6, 7, 8):
+                resp = await call("CheckText", scene=skipped_scene, player_id=10, text="正常文本")
+                assert resp.verdict == int(Verdict.PASS)
+                assert resp.pending_platform_review is False
+            assert ds_calls == []
+
+            # 2. 直传 wx_ 前缀账号（建角无 player_id）：直接命中微信，不查 DataService
+            resp = await call("CheckText", scene=1, player_id=0, account="wx_direct_1", text="绝密建角名")
+            assert resp.verdict == int(Verdict.REJECT)
+            assert resp.category == int(Category.AD)
+            assert ds_calls == []
+
+            # 3. 仅传 player_id 走 DataService.GetPlayerChannelIdentity 且命中 5 分钟 TTL 缓存
+            resp1 = await call("CheckText", scene=1, player_id=12, text="角色名一")
+            resp2 = await call("CheckText", scene=1, player_id=12, text="角色名二")
+            assert resp1.verdict == int(Verdict.REJECT)
+            assert resp2.verdict == int(Verdict.REJECT)
+            assert ds_calls == [12]
+
+            # 超过 5 分钟 TTL 后重新查询一次
+            now[0] += 301.0
+            resp3 = await call("CheckText", scene=1, player_id=12, text="角色名三")
+            assert resp3.verdict == int(Verdict.REJECT)
+            assert ds_calls == [12, 12]
+
+            # 4. DataService 映射到抖音渠道
+            dy_state["hit"] = True
+            dy_resp = await call("CheckText", scene=2, player_id=77, text="抖音帮派名")
+            assert dy_resp.verdict == int(Verdict.REJECT)
+            assert dy_resp.category == int(Category.OTHER)
+
+            # 5. player_id==0 且 account=="" 回退到抖音适配器
+            fallback_resp = await call("CheckText", scene=2, player_id=0, account="", text="无身份回退抖音")
+            assert fallback_resp.verdict == int(Verdict.REJECT)
+            assert fallback_resp.category == int(Category.OTHER)
+
+            # 6. 名字类查 DataService 返回 retry=True 或超时 -> fail-closed 返回 gRPC UNAVAILABLE
+            for failing_pid in (99, 88):
+                with pytest.raises(grpc.aio.AioRpcError) as exc_lookup:
+                    await call("CheckText", scene=1, player_id=failing_pid, text="绝密起名失败")
+                assert exc_lookup.value.code() == grpc.StatusCode.UNAVAILABLE
+
+            # 7. 世界频道短超时（40ms < 120ms）且 async_platform=True -> 放行并标 pending_platform_review=True
+            wx_state["delay"] = 0.12
+            wx_state["suggest"], wx_state["label"] = "risky", 20001
+            world_pending = await call(
+                "CheckText",
+                scene=5,
+                player_id=12,
+                text="绝密世界聊天原文",
+                async_platform=True,
+            )
+            assert world_pending.verdict == int(Verdict.PASS)
+            assert world_pending.pending_platform_review is True
+
+            # 8. 世界频道 async_platform=False 超时 -> 降级跳过（非 pending、非 unavailable）
+            world_skip = await call(
+                "CheckText",
+                scene=5,
+                player_id=12,
+                text="绝密世界聊天原文2",
+                async_platform=False,
+            )
+            assert world_skip.verdict == int(Verdict.PASS)
+            assert world_skip.pending_platform_review is False
+
+            # 9. CheckPlatformText 使用完整 async_timeout_ms(300ms > 120ms) 跑完并返回 REJECT
+            recheck = await call("CheckPlatformText", scene=5, player_id=12, text="绝密世界聊天原文")
+            assert recheck.verdict == int(Verdict.REJECT)
+            assert recheck.category == int(Category.POLITICS)
+            assert recheck.pending_platform_review is False
+
+            # 10. 名字类超过 sync_timeout_ms(300ms < 450ms) -> fail-closed gRPC UNAVAILABLE
+            wx_state["delay"] = 0.45
+            with pytest.raises(grpc.aio.AioRpcError) as exc_timeout:
+                await call("CheckText", scene=1, player_id=0, account="wx_direct_1", text="绝密起名超时")
+            assert exc_timeout.value.code() == grpc.StatusCode.UNAVAILABLE
+        finally:
+            await cg_client.close()
+            await cg_server.stop(0)
+            await router.close()
+            await http_runner.cleanup()
+            await ds_server.stop(0)
+
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(exercise())
+    for secret_text in ("绝密建角名", "绝密起名失败", "绝密世界聊天原文", "绝密起名超时"):
+        assert secret_text not in caplog.text
+
+
+def test_platform_config_env_only_secrets_and_build_platform_router():
+    protocol = Protocol()
+    base_settings = SimpleNamespace(
+        zone_id=1,
+        physical_region=1,
+        release_track="stable",
+        etcd="127.0.0.1:2379",
+        data_service="127.0.0.1:50100",
+        content_guard_node={},
+    )
+
+    # 未配置外部平台时 build_platform_router 返回 None
+    plain_cfg = ContentGuardConfig.from_settings(base_settings, environ={})
+    assert plain_cfg.has_platform is False
+    assert plain_cfg.data_service == "127.0.0.1:50100"
+    assert build_platform_router(protocol, plain_cfg) is None
+
+    # 禁止在 TOML 中明文写平台密钥
+    for forbidden_key in ("platform_wechat_app_secret", "platform_douyin_app_secret"):
+        bad_settings = SimpleNamespace(
+            zone_id=1,
+            physical_region=1,
+            release_track="stable",
+            etcd="127.0.0.1:2379",
+            data_service="",
+            content_guard_node={forbidden_key: "plain-secret"},
+        )
+        with pytest.raises(ValueError, match="environment variables"):
+            ContentGuardConfig.from_settings(bad_settings, environ={})
+
+    # 缺环境变量或含未展开占位符时启动期 fail-closed
+    for bad_node, env in (
+        ({"platform_wechat_app_id": "wx1", "platform_wechat_app_secret_env": "CG_WX_SEC"}, {}),
+        ({"platform_wechat_app_id": "${WX_APP}", "platform_wechat_app_secret_env": "CG_WX_SEC"}, {"CG_WX_SEC": "s"}),
+        ({"platform_douyin_app_id": "dy1"}, {}),
+        ({"platform_sync_timeout_ms": 6000}, {}),
+        ({"platform_world_timeout_ms": 2500}, {}),
+        ({"platform_async_timeout_ms": 12000}, {}),
+        ({"platform_lookup_timeout_ms": 2500}, {}),
+    ):
+        bad_settings = SimpleNamespace(
+            zone_id=1,
+            physical_region=1,
+            release_track="stable",
+            etcd="127.0.0.1:2379",
+            data_service="",
+            content_guard_node=bad_node,
+        )
+        with pytest.raises(ValueError):
+            ContentGuardConfig.from_settings(bad_settings, environ=env)
+
+    # 合法环境密钥加载：repr 不暴露密钥，build_platform_router 装配双平台与 DataService 查询器
+    full_settings = SimpleNamespace(
+        zone_id=1,
+        physical_region=1,
+        release_track="stable",
+        etcd="127.0.0.1:2379",
+        data_service="127.0.0.1:50100",
+        content_guard_node={
+            "platform_wechat_app_id": "wx-id",
+            "platform_wechat_app_secret_env": "CG_WX_SECRET",
+            "platform_wechat_base_url": "http://127.0.0.1:18080",
+            "platform_douyin_app_id": "dy-id",
+            "platform_douyin_app_secret_env": "CG_DY_SECRET",
+            "platform_douyin_base_url": "http://127.0.0.1:18081",
+            "platform_sync_timeout_ms": 1200,
+            "platform_world_timeout_ms": 200,
+            "platform_async_timeout_ms": 2000,
+            "platform_lookup_timeout_ms": 120,
+        },
+    )
+    cfg = ContentGuardConfig.from_settings(
+        full_settings,
+        environ={"CG_WX_SECRET": "secret-wechat-val", "CG_DY_SECRET": "secret-douyin-val"},
+    )
+    assert cfg.has_platform is True
+    assert "secret-wechat-val" not in repr(cfg)
+    assert "secret-douyin-val" not in repr(cfg)
+
+    async def exercise_router():
+        router = build_platform_router(protocol, cfg)
+        assert router is not None
+        assert router.providers == (PROVIDER_DOUYIN, PROVIDER_WECHAT)
+        await router.close()
+
+    asyncio.run(exercise_router())

@@ -40,3 +40,15 @@ def push_tip(protocol, gate_id: str, gate_instance_id: str, session_id: int, pla
     )
     return _command(protocol, gate_id, gate_instance_id, "ContractsKafkaPushToPlayerEvent", event,
                     session_id=session_id, player_id=player_id)
+
+
+def drain_migration(protocol, gate_id: str, gate_instance_id: str, drain_marked_at: int,
+                    rate_per_second: int, lease_ms: int):
+    """向正在排空的 gate 发送迁移许可事件（Go ``buildGateDrainMigrationCommand``）。"""
+    event = protocol.message(
+        "contracts.kafka.GateDrainMigrationEvent",
+        drain_marked_at=drain_marked_at,
+        rate_per_second=rate_per_second,
+        lease_ms=lease_ms,
+    )
+    return _command(protocol, gate_id, gate_instance_id, "ContractsKafkaGateDrainMigrationEvent", event)

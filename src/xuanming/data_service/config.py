@@ -8,6 +8,7 @@ from .model import DEFAULT_ID_TAGS
 
 SECRET_ENVS = {
     "login": "MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN",
+    "payment": "MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT",
     "scene": "MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE",
     "scene_manager": "MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE_MANAGER",
     "trade": "MMORPG_ACCOUNT_DIRECTORY_SECRET_TRADE",
@@ -19,7 +20,7 @@ SECRET_ENVS = {
     "friend": "MMORPG_ROLE_FENCE_SECRET_FRIEND",
     "chat": "MMORPG_ROLE_FENCE_SECRET_CHAT",
 }
-REQUIRED_CALLERS = ("login", "scene")  # Go also requires scene_manager and trade; see docs in the package README
+REQUIRED_CALLERS = ("login", "scene")  # 生产环境按需增配其余调用方密钥，缺配即 fail-closed 停用对应能力
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,9 @@ class DataServiceConfig:
     mysql_user: str = "appuser"
     mysql_database: str = "mmorpg_global"
     mysql_password: str = ""
+    admin_token: str = ""
+    deletion_cooling_off_sec: int = 7 * 86400
+    recall_enabled: bool = False
     logical_shards: int = 1
     max_players_per_account: int = 5
     max_open_conn: int = 8
@@ -45,13 +49,15 @@ class DataServiceConfig:
     def from_settings(cls, settings: Settings, environ=None) -> "DataServiceConfig":
         environ = os.environ if environ is None else environ
         section = dict(settings.data_service_node)
-        unknown = set(section) - {field.name for field in fields(cls)} | (set(section) & {"secrets", "mysql_password"})
+        forbidden = {"secrets", "mysql_password", "admin_token"}
+        unknown = set(section) - {field.name for field in fields(cls)} | (set(section) & forbidden)
         if unknown or not section:
             raise ValueError(f"[data_service_node] 缺失或含未知字段: {sorted(unknown)}")
         for key in ("storage_ids", "id_tags"):
             if key in section:
                 section[key] = tuple(section[key])
         config = cls(**section, mysql_password=environ.get("DATA_SERVICE_MYSQL_PASSWORD", ""),
+                     admin_token=environ.get("DATA_SERVICE_ADMIN_TOKEN", ""),
                      secrets=caller_secrets(environ))
         config.validate(settings)
         return config
@@ -62,6 +68,7 @@ class DataServiceConfig:
         if (not 0 < self.node_id < 1 << 17 or not 0 <= self.grpc_port <= 65535 or not self.advertise_host
                 or not 1 <= self.max_players_per_account <= 100 or not 1 <= self.max_open_conn <= 128
                 or not 1 <= self.merged_zone_refresh_sec <= 60 or not self.storage_ids
+                or not 0 <= self.deletion_cooling_off_sec <= 30 * 86400
                 or any(storage < 1_000_000 for storage in self.storage_ids)):
             raise ValueError("data_service_node 配置无效")
         if not settings.etcd:

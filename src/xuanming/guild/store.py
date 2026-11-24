@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import logging
 import secrets
 import time
@@ -11,11 +12,17 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol as TypingProtocol, TypeVar
 
-from google.protobuf.message import Message
+from google.protobuf.message import DecodeError, Message
 
 from ..grpc_runtime import sign_service_call
 from ..protocol import Protocol
 from .errors import (
+    AssetOpLeaseLostError,
+    AssetOpPoisonRowError,
+    ERR_GUILD_TRIAL_BATTLE_ABORTED,
+    ERR_GUILD_TRIAL_INVITE_DECLINED,
+    ERR_GUILD_TRIAL_INVITE_EXPIRED,
+    ERR_GUILD_TRIAL_SERVICE_BUSY,
     GuildActivityAlreadyClaimedError,
     GuildActivityJoinTooRecentError,
     GuildActivityLevelTooLowError,
@@ -54,10 +61,14 @@ from .errors import (
     RoleFenceUnavailableError,
     RoleNotFoundError,
     StoreUnavailableError,
+    TrialActivityPoisonError,
+    TrialInputInvalidError,
 )
 from .model import (
     ACTIVITY_TYPE_LANTERN,
     ACTIVITY_TYPE_REUNION,
+    ACTIVITY_TYPE_TRIAL,
+    ASSET_OP_FRESH_ATTEMPT_LIMIT,
     ASSET_OP_MAX_PENDING,
     ASSET_OP_MAX_SPAN,
     ASSET_STREAM_GUILD_CREDIT,
@@ -74,11 +85,15 @@ from .model import (
     COUNTER_KIND_DONATE,
     COUNTER_KIND_SHOP,
     DisbandResult,
+    FinalizedAssetOp,
     GuildData,
     GuildTableCatalog,
     MAX_APPLIED_OPS_PAGE_LIMIT,
     MAX_APPLIED_OPS_PLAYER_IDS,
     MAX_RANK_VERSION,
+    MAX_TRIAL_LOBBY_ROSTER,
+    MIN_TRIAL_LOBBY_ROSTER,
+    MS_PER_DAY,
     MemberData,
     MemberWriteResult,
     MergedZones,
@@ -91,6 +106,7 @@ from .model import (
     OP_STATUS_APPLIED_PARTIAL,
     OP_STATUS_PENDING,
     OP_STATUS_REJECTED,
+    PendingAssetOp,
     PrepareFreezeOutcome,
     REJECTED_REWARD_WINDOW_MS,
     ROLE_BLOCKER_ASSET_OP,
@@ -109,9 +125,37 @@ from .model import (
     RolePurgeResult,
     TEXT_VERDICT_MASKED,
     TEXT_VERDICT_PASS,
+    TRIAL_BATTLE_STATE_EXPIRED,
+    TRIAL_BATTLE_STATE_SETTLED,
+    TRIAL_BATTLE_STATE_STARTED,
+    TRIAL_LAUNCH_ROLE_ACTIVE,
+    TRIAL_LAUNCH_ROLE_RELEASED,
+    TRIAL_LAUNCH_STATE_LAUNCHED,
+    TRIAL_LAUNCH_STATE_PREPARED,
+    TRIAL_LAUNCH_STATE_TERMINAL,
+    TRIAL_LOBBY_STATE_ENDED,
+    TRIAL_LOBBY_STATE_LAUNCHED,
+    TRIAL_LOBBY_STATE_LAUNCHING,
+    TRIAL_LOBBY_STATE_PENDING,
+    TRIAL_OCCUPANCY_MARGIN_MS,
+    TRIAL_SETTLE_RESULT_CONFIG_MISSING,
+    TRIAL_SETTLE_RESULT_LOSS,
+    TRIAL_SETTLE_RESULT_POISON,
+    TRIAL_SETTLE_RESULT_UNSPECIFIED,
+    TRIAL_SETTLE_RESULT_WIN,
     TX_GUILD_ACTIVITY_REWARD,
     TX_GUILD_DONATE,
     TX_GUILD_SHOP,
+    TrialBattleKey,
+    TrialBattleRecord,
+    TrialEnqueuedReward,
+    TrialLaunchRecord,
+    TrialLaunchRoleRecord,
+    TrialLobbyRecord,
+    TrialLobbySlotRecord,
+    TrialOwedRewardRecord,
+    TrialRewardOp,
+    TrialSettleResult,
     UINT64_MAX,
     UpgradeResult,
     better_successor_key,
@@ -134,6 +178,7 @@ from .model import (
     role_fence_from_proto,
     role_rank,
     RANK_LEADER,
+    trial_funds_counted,
     valid_role_fence_state,
 )
 
@@ -458,6 +503,7 @@ class GuildTx(TypingProtocol):
         self, guild_id: int, cur_level: int, new_level: int, cost_funds: int, next_max_members: int
     ) -> bool: ...
     async def set_guild_funds(self, guild_id: int, new_funds: int) -> None: ...
+    async def credit_guild_funds(self, guild_id: int, delta: int) -> bool: ...
     async def delete_guild(self, guild_id: int) -> bool: ...
     async def list_guild_zones(self) -> list[int]: ...
     async def list_rank_rows(self) -> list[tuple[int, int, int, int]]: ...
@@ -478,8 +524,11 @@ class GuildTx(TypingProtocol):
     async def insert_member(self, guild_id: int, member: MemberData) -> None: ...
     async def update_member_role(self, guild_id: int, player_id: int, role: int) -> None: ...
     async def set_member_contribution(self, guild_id: int, player_id: int, total: int, balance: int) -> None: ...
+    async def credit_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool: ...
+    async def refund_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool: ...
     async def debit_member_contribution(self, guild_id: int, player_id: int, cost: int) -> bool: ...
     async def delete_member(self, guild_id: int, player_id: int) -> bool: ...
+    async def get_trial_roster_members(self, guild_id: int, player_ids: Sequence[int]) -> dict[int, int]: ...
 
     # guild_application
     async def lock_application_expire(self, guild_id: int, player_id: int) -> int | None: ...
@@ -498,9 +547,39 @@ class GuildTx(TypingProtocol):
 
     # guild_player_op_seq / guild_asset_op / guild_daily_counter / guild_client_request
     async def ensure_and_lock_seq(self, player_id: int, stream: int, now_ms: int) -> tuple[int, int]: ...
+    async def lock_seq_guard(self, player_id: int, stream: int) -> bool: ...
     async def allocate_seq(self, player_id: int, stream: int, now_ms: int) -> tuple[int, int]: ...
     async def insert_asset_op(self, op: AssetOpRow) -> None: ...
     async def get_asset_op(self, op_id: int) -> AssetOpRow | None: ...
+    async def lock_asset_op(self, op_id: int) -> AssetOpRow | None: ...
+    async def list_due_asset_ops(
+        self, now_ms: int, limit: int, owned_shards: frozenset[int] | None = None
+    ) -> list[int]: ...
+    async def claim_asset_op(
+        self, op_id: int, now_ms: int, lease_until_ms: int, lease_token: int
+    ) -> AssetOpRow | None: ...
+    async def mark_asset_op_poison(self, op_id: int, lease_token: int, poison_until_ms: int, now_ms: int) -> None: ...
+    async def reschedule_asset_op(
+        self,
+        op_id: int,
+        lease_token: int,
+        next_attempt_ms: int,
+        outcome: int,
+        reason: int,
+        durable: bool,
+        local: bool,
+        now_ms: int,
+    ) -> bool: ...
+    async def finalize_asset_op_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        last_outcome: int,
+        last_reason: int,
+        reason_tip_id: int,
+        now_ms: int,
+    ) -> bool: ...
+    async def abandon_asset_op_cas(self, op_id: int, lease_token: int, now_ms: int) -> bool: ...
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]: ...
     async def list_recent_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]: ...
     async def accelerate_donation_deadlines(self, guild_id: int, player_ids: Sequence[int], now_ms: int) -> None: ...
@@ -509,9 +588,13 @@ class GuildTx(TypingProtocol):
     async def upsert_counter_with_limit(
         self, player_id: int, counter_kind: int, ref_id: int, period_key_val: int, delta: int, limit: int, now_ms: int
     ) -> bool: ...
+    async def refund_counter(
+        self, player_id: int, counter_kind: int, ref_id: int, period_key_val: int, delta: int, now_ms: int
+    ) -> None: ...
     async def get_counter_usage(
         self, player_id: int, counter_kind: int, period_keys: Sequence[int]
     ) -> dict[tuple[int, int], int]: ...
+    async def get_activity_counter_value(self, player_id: int, activity_id: int, period_key_val: int) -> int: ...
     async def list_applied_asset_ops_since(
         self,
         player_ids: Sequence[int],
@@ -521,7 +604,7 @@ class GuildTx(TypingProtocol):
         zones: Sequence[int],
     ) -> tuple[list[AssetOpRow], int]: ...
 
-    # guild_activity_progress / guild_trial_battle / purge
+    # guild_activity_progress / guild_trial_* / purge
     async def get_activity_progress(
         self, guild_id: int, keys: Sequence[tuple[int, int]]
     ) -> dict[tuple[int, int], ActivityProgress]: ...
@@ -537,10 +620,64 @@ class GuildTx(TypingProtocol):
         funds_granted: bool,
         now_ms: int,
     ) -> None: ...
+    async def set_trial_progress_count(
+        self, guild_id: int, activity_id: int, period_key_val: int, count: int, now_ms: int
+    ) -> None: ...
     async def delete_activity_progress_of_guild(self, guild_id: int) -> None: ...
     async def delete_started_trial_battles_of_guild(self, guild_id: int) -> None: ...
     async def get_activity_reward_statuses(self, player_id: int, now_ms: int) -> dict[int, ActivityRewardStatus]: ...
     async def purge_player_personal_tables(self, player_id: int) -> None: ...
+
+    # guild_trial_lobby / slot / launch / launch_role / battle / reward_owed
+    async def get_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None: ...
+    async def lock_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None: ...
+    async def insert_trial_lobby(self, rec: TrialLobbyRecord) -> None: ...
+    async def update_trial_lobby(
+        self,
+        lobby_id: int,
+        state: int,
+        view_proto: bytes,
+        consent_proto: bytes,
+        launch_deadline_ms: int,
+        battle_id: int,
+        updated_ms: int,
+    ) -> None: ...
+    async def list_expired_pending_lobbies(self, now_ms: int, limit: int) -> list[TrialLobbyRecord]: ...
+    async def get_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None: ...
+    async def lock_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None: ...
+    async def upsert_trial_lobby_slot(self, player_id: int, lobby_id: int, cooldown_until_ms: int) -> None: ...
+    async def get_trial_launch(self, request_id: int) -> TrialLaunchRecord | None: ...
+    async def lock_trial_launch(self, request_id: int) -> TrialLaunchRecord | None: ...
+    async def get_trial_launch_by_battle(self, battle_id: int) -> TrialLaunchRecord | None: ...
+    async def insert_trial_launch(self, rec: TrialLaunchRecord) -> None: ...
+    async def update_trial_launch(
+        self,
+        request_id: int,
+        battle_id: int,
+        state: int,
+        updated_ms: int,
+        cancel_receipt: bytes | None = None,
+    ) -> None: ...
+    async def record_trial_launch_end_tip(self, request_id: int, tip_bytes: bytes) -> None: ...
+    async def expedite_trial_launch_check(self, request_id: int, now_ms: int) -> None: ...
+    async def list_due_trial_launches(self, now_ms: int, limit: int) -> list[TrialLaunchRecord]: ...
+    async def claim_trial_launch(self, request_id: int, prev_next_check_ms: int, new_next_check_ms: int) -> bool: ...
+    async def insert_trial_launch_role(self, rec: TrialLaunchRoleRecord) -> None: ...
+    async def lock_trial_launch_role(self, player_id: int, request_id: int) -> TrialLaunchRoleRecord | None: ...
+    async def has_active_trial_launch_role(self, player_id: int, exclude_request_id: int = 0) -> bool: ...
+    async def update_trial_launch_role_state(self, player_id: int, request_id: int, state: int) -> None: ...
+    async def get_trial_battle(self, battle_id: int) -> TrialBattleRecord | None: ...
+    async def lock_trial_battle(self, battle_id: int) -> TrialBattleRecord | None: ...
+    async def insert_trial_battle(self, rec: TrialBattleRecord) -> None: ...
+    async def update_trial_battle(
+        self, battle_id: int, state: int, settle_result: int, rewarded_count: int, settled_ms: int
+    ) -> None: ...
+    async def list_overdue_trial_battles(self, created_before_ms: int, limit: int) -> list[TrialBattleRecord]: ...
+    async def insert_trial_reward_owed(self, rec: TrialOwedRewardRecord) -> None: ...
+    async def delete_trial_reward_owed(self, player_id: int, battle_id: int) -> bool: ...
+    async def list_trial_rewards_owed(self, limit: int) -> list[TrialOwedRewardRecord]: ...
+    async def count_trial_rewards_owed_by_player(self, player_id: int) -> dict[int, int]: ...
+    async def increment_trial_reward_owed_attempts(self, player_id: int, battle_id: int) -> None: ...
 
 
 # -- 核心领域存储引擎（SqlGuildStore 与 MemoryGuildStore 复用全部业务逻辑） ----------------------
@@ -567,6 +704,7 @@ class GuildStoreCore:
         self._role_directory = role_directory
         self._merged_zones = merged_zones or MergedZones()
         self._clock_ms = clock_ms
+        self.on_asset_finalized: Callable[[FinalizedAssetOp], Awaitable[None]] | None = None
 
     @property
     def merged_zones(self) -> MergedZones:
@@ -1423,6 +1561,7 @@ class GuildStoreCore:
             seq = 0
             epoch = 0
             enqueued = False
+            created_op: AssetOpRow | None = None
             if reward_payload:
                 seq, epoch = await tx.allocate_seq(actor.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
                 op = AssetOpRow(
@@ -1455,6 +1594,7 @@ class GuildStoreCore:
                     last_send_ms=now_ms,
                 )
                 await tx.insert_asset_op(op)
+                created_op = op
                 enqueued = True
             else:
                 await tx.ensure_and_lock_seq(actor.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
@@ -1512,9 +1652,1195 @@ class GuildStoreCore:
                 progress=progress,
                 reached_now=reached_now,
                 funds_granted=grant_funds,
+                op=created_op,
             )
 
         return await self._run_write_tx(_op, actor=actor)
+
+    # -- AssetOp 生命周期（领取 / 重排 / 终结对侧账 / 自动放弃） ---------------------------------
+
+    def op_to_pending(self, op: AssetOpRow) -> PendingAssetOp:
+        """将持久化 AssetOpRow 解码为待投递 PendingAssetOp；空包或畸形包抛 AssetOpPoisonRowError。"""
+        if not op.payload:
+            raise AssetOpPoisonRowError(f"guild asset op {op.op_id}: empty payload")
+        try:
+            bundle = self.protocol.parse("AssetBundle", op.payload)
+        except DecodeError as exc:
+            raise AssetOpPoisonRowError(f"guild asset op {op.op_id}: invalid payload: {exc}") from exc
+        return PendingAssetOp(
+            op_id=op.op_id,
+            player_id=op.player_id,
+            guild_id=op.guild_id,
+            stream=op.stream,
+            seq=op.seq,
+            stream_epoch=op.stream_epoch,
+            correlation_id=op.op_id,
+            tx_type=op.tx_type,
+            kind=op.kind,
+            bundle=bundle,
+            attempts=op.attempts,
+            deadline_ms=op.deadline_ms,
+            last_reason=op.last_reason,
+            lease_token=op.lease_token,
+            created_ms=op.created_ms,
+            last_send_ms=op.last_send_ms,
+        )
+
+    async def get_asset_op(self, op_id: int) -> AssetOpRow | None:
+        return await self._run_tx(lambda tx: tx.get_asset_op(op_id), read_only=True)
+
+    async def list_due_asset_ops(
+        self, now_ms: int, limit: int, *, owned_shards: frozenset[int] | None = None
+    ) -> list[int]:
+        if limit <= 0:
+            return []
+        return await self._run_tx(
+            lambda tx: tx.list_due_asset_ops(now_ms, limit, owned_shards), read_only=True
+        )
+
+    async def claim_asset_op(
+        self,
+        op_id: int,
+        now_ms: int,
+        lease_until_ms: int,
+        poison_until_ms: int,
+        lease_token: int,
+    ) -> PendingAssetOp | None:
+        row = await self._run_tx(lambda tx: tx.claim_asset_op(op_id, now_ms, lease_until_ms, lease_token))
+        if row is None:
+            return None
+        try:
+            return self.op_to_pending(row)
+        except AssetOpPoisonRowError:
+            await self._run_tx(lambda tx: tx.mark_asset_op_poison(op_id, lease_token, poison_until_ms, now_ms))
+            raise
+
+    async def reschedule_asset_op(
+        self,
+        op: PendingAssetOp,
+        next_attempt_ms: int,
+        outcome: int,
+        reason: int,
+        durable: bool,
+        local: bool,
+        now_ms: int,
+    ) -> None:
+        ok = await self._run_tx(
+            lambda tx: tx.reschedule_asset_op(
+                op.op_id, op.lease_token, next_attempt_ms, outcome, reason, durable, local, now_ms
+            )
+        )
+        if not ok:
+            raise AssetOpLeaseLostError(f"guild asset op {op.op_id} lease lost on reschedule")
+
+    @staticmethod
+    def _refunds_counterparty(final_status: int) -> bool:
+        return final_status in (OP_STATUS_REJECTED, OP_STATUS_ABORTED, OP_STATUS_ABANDONED)
+
+    @classmethod
+    def _counter_refund(cls, row: AssetOpRow, final_status: int) -> tuple[int, int] | None:
+        if not cls._refunds_counterparty(final_status) or row.period_key == 0:
+            return None
+        if row.kind == OP_KIND_DONATE:
+            return COUNTER_KIND_DONATE, 1
+        if row.kind == OP_KIND_SHOP and row.ref_count > 0:
+            return COUNTER_KIND_SHOP, row.ref_count
+        return None
+
+    async def _terminate_asset_op(
+        self,
+        op_id: int,
+        final_status: int,
+        *,
+        cas_fn: Callable[[GuildTx], Awaitable[bool]],
+        now_ms: int,
+    ) -> bool:
+        row = await self.get_asset_op(op_id)
+        if row is None:
+            return False
+
+        refund_spec = self._counter_refund(row, final_status)
+        refunded = self._refunds_counterparty(final_status)
+
+        async def _op(tx: GuildTx) -> bool:
+            # 按全库锁序：guild -> guild_member -> guild_player_op_seq -> guild_asset_op -> guild_daily_counter
+            guild_ok = False
+            member_ok = False
+            if row.kind == OP_KIND_DONATE and final_status == OP_STATUS_APPLIED:
+                locked_g = await tx.lock_guild(row.guild_id)
+                guild_ok = locked_g is not None
+                if guild_ok:
+                    member_ok = await tx.lock_member(row.guild_id, row.player_id) is not None
+            elif row.kind == OP_KIND_SHOP and refunded:
+                member_ok = await tx.lock_member(row.guild_id, row.player_id) is not None
+
+            if refund_spec is not None:
+                await tx.lock_seq_guard(row.player_id, row.stream)
+
+            locked_op = await tx.lock_asset_op(op_id)
+            if locked_op is None:
+                return False
+            if not await cas_fn(tx):
+                return False
+
+            # APPLIED_PARTIAL 绝不做对侧账（人工补偿线索留存）
+            if final_status == OP_STATUS_APPLIED_PARTIAL:
+                return True
+
+            if row.kind == OP_KIND_DONATE and final_status == OP_STATUS_APPLIED:
+                if not guild_ok:
+                    logger.info(
+                        "guild asset orphan kind=donate what=guild_gone op_id=%d guild=%d player=%d",
+                        op_id,
+                        row.guild_id,
+                        row.player_id,
+                    )
+                else:
+                    if row.funds_delta > 0:
+                        await tx.credit_guild_funds(row.guild_id, row.funds_delta)
+                    if not member_ok:
+                        logger.info(
+                            "guild asset orphan kind=donate what=member_gone op_id=%d guild=%d player=%d",
+                            op_id,
+                            row.guild_id,
+                            row.player_id,
+                        )
+                    elif row.contribution_delta > 0:
+                        await tx.credit_member_contribution(row.guild_id, row.player_id, row.contribution_delta)
+            elif row.kind == OP_KIND_SHOP and refunded:
+                if not member_ok:
+                    logger.info(
+                        "guild asset orphan kind=shop what=refund_member_gone op_id=%d guild=%d player=%d",
+                        op_id,
+                        row.guild_id,
+                        row.player_id,
+                    )
+                elif row.contribution_delta > 0:
+                    await tx.refund_member_contribution(row.guild_id, row.player_id, row.contribution_delta)
+
+            if refund_spec is not None:
+                c_kind, delta = refund_spec
+                await tx.refund_counter(row.player_id, c_kind, row.ref_id, row.period_key, delta, now_ms)
+            return True
+
+        finalized = await self._run_tx(_op)
+        if finalized and self.on_asset_finalized is not None:
+            try:
+                await self.on_asset_finalized(
+                    FinalizedAssetOp(
+                        op_id=op_id,
+                        player_id=row.player_id,
+                        guild_id=row.guild_id,
+                        kind=row.kind,
+                        status=final_status,
+                    )
+                )
+            except Exception as exc:
+                logger.error("guild asset on_finalized callback failed op_id=%d err=%s", op_id, exc)
+        return finalized
+
+    async def finalize_asset_op(
+        self,
+        op: PendingAssetOp,
+        final_status: int,
+        last_outcome: int,
+        last_reason: int,
+        now_ms: int,
+    ) -> bool:
+        if final_status not in (
+            OP_STATUS_APPLIED,
+            OP_STATUS_REJECTED,
+            OP_STATUS_ABORTED,
+            OP_STATUS_APPLIED_PARTIAL,
+        ):
+            raise ValueError(f"invalid terminal status for finalize: {final_status}")
+        reason_tip = last_reason if final_status == OP_STATUS_REJECTED else 0
+        return await self._terminate_asset_op(
+            op.op_id,
+            final_status,
+            cas_fn=lambda tx: tx.finalize_asset_op_cas(
+                op.op_id, final_status, last_outcome, last_reason, reason_tip, now_ms
+            ),
+            now_ms=now_ms,
+        )
+
+    async def abandon_asset_op(self, op: PendingAssetOp, now_ms: int) -> None:
+        if op.lease_token == 0:
+            raise ValueError(f"abandon asset op {op.op_id}: lease token is zero")
+        done = await self._terminate_asset_op(
+            op.op_id,
+            OP_STATUS_ABANDONED,
+            cas_fn=lambda tx: tx.abandon_asset_op_cas(op.op_id, op.lease_token, now_ms),
+            now_ms=now_ms,
+        )
+        if not done:
+            raise AssetOpLeaseLostError(f"guild asset op {op.op_id} abandon CAS missed")
+
+    # -- 同道历练（guild_trial_lobby / slot / launch / launch_role / battle / reward_owed） -------
+
+    async def get_trial_roster_members(self, guild_id: int, player_ids: Sequence[int]) -> dict[int, int]:
+        return await self._run_tx(lambda tx: tx.get_trial_roster_members(guild_id, player_ids), read_only=True)
+
+    async def allocate_op_id(self) -> int:
+        return await self._op_ids()
+
+    async def get_role_fences_local(self, player_ids: Sequence[int]) -> dict[int, RoleFenceRow]:
+        async def _op(tx: GuildTx) -> dict[int, RoleFenceRow]:
+            out: dict[int, RoleFenceRow] = {}
+            for pid in sorted({int(p) for p in player_ids if int(p) > 0}):
+                row = await tx.get_role_fence(pid)
+                if row is not None:
+                    out[pid] = row
+            return out
+
+        return await self._run_tx(_op, read_only=True)
+
+    async def get_activity_counter_value(self, player_id: int, activity_id: int, period_key_val: int) -> int:
+        return await self._run_tx(
+            lambda tx: tx.get_activity_counter_value(player_id, activity_id, period_key_val),
+            read_only=True,
+        )
+
+    async def get_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
+        return await self._run_tx(lambda tx: tx.get_trial_lobby(lobby_id), read_only=True)
+
+    async def get_player_trial_lobby(self, player_id: int) -> TrialLobbyRecord | None:
+        async def _op(tx: GuildTx) -> TrialLobbyRecord | None:
+            slot = await tx.get_trial_lobby_slot(player_id)
+            if slot is None or slot.lobby_id == 0:
+                return None
+            return await tx.get_trial_lobby(slot.lobby_id)
+
+        return await self._run_tx(_op, read_only=True)
+
+    async def precheck_trial_lobby_create(
+        self, player_ids: Sequence[int], initiator_id: int, now_ms: int
+    ) -> tuple[str, int]:
+        """事务外预检冷却与忙碌槽位：返回 ('ok', 0) / ('cooldown', remaining_ms) / ('busy', player_id)。"""
+
+        async def _op(tx: GuildTx) -> tuple[str, int]:
+            for pid in sorted(set(player_ids)):
+                slot = await tx.get_trial_lobby_slot(pid)
+                if slot is None:
+                    continue
+                if pid == initiator_id and slot.cooldown_until_ms > now_ms:
+                    return "cooldown", slot.cooldown_until_ms - now_ms
+                if slot.lobby_id != 0:
+                    lob = await tx.get_trial_lobby(slot.lobby_id)
+                    if lob is not None and lob.state != TRIAL_LOBBY_STATE_ENDED:
+                        return "busy", pid
+            return "ok", 0
+
+        return await self._run_tx(_op, read_only=True)
+
+    async def create_trial_lobby(
+        self,
+        actor: RoleOriginal,
+        *,
+        lobby_id: int,
+        guild_id: int,
+        activity_id: int,
+        roster: Sequence[int],
+        ttl_ms: int,
+        cooldown_ms: int,
+        now_ms: int,
+    ) -> tuple[str, TrialLobbyRecord | None, int]:
+        """创建 SQL 历练大厅与占位槽：返回 (status, lobby_rec, extra_value)。
+        status: 'created' | 'cooldown' (extra=remaining_ms) | 'busy' (extra=player_id)。
+        """
+        sorted_ids = sorted(set(int(p) for p in roster))
+        if len(sorted_ids) < MIN_TRIAL_LOBBY_ROSTER or len(sorted_ids) > MAX_TRIAL_LOBBY_ROSTER:
+            raise GuildWriteConflictError("invalid trial lobby roster size")
+        if actor.player_id != int(roster[0]):
+            raise GuildWriteConflictError("initiator mismatch")
+        expires_ms = now_ms + ttl_ms
+
+        async def _op(tx: GuildTx) -> tuple[str, TrialLobbyRecord | None, int]:
+            locked_g = await tx.lock_guild(guild_id)
+            if locked_g is None:
+                raise GuildNotFoundError("guild not found")
+
+            original = self.protocol.message(
+                "guildpb.GuildTrialLobbyOriginal",
+                lobby_id=lobby_id,
+                guild_id=guild_id,
+                activity_id=activity_id,
+                initiator_player_id=actor.player_id,
+                created_ms=now_ms,
+                expires_ms=expires_ms,
+            )
+            initiator_identity = None
+            for pid in sorted_ids:
+                member = await tx.lock_member(guild_id, pid)
+                if member is None:
+                    raise GuildWriteConflictError(f"player {pid} not member of guild {guild_id}")
+                fence = await tx.lock_role_fence(pid)
+                if fence is not None:
+                    acc, rev = fence.account, fence.owner_revision
+                elif pid == actor.player_id:
+                    acc, rev = actor.account, actor.owner_revision
+                else:
+                    acc, rev = f"role_{pid}", 1
+                if pid == actor.player_id and fence is not None:
+                    if fence.account != actor.account or fence.owner_revision != actor.owner_revision:
+                        raise GuildWriteConflictError("initiator role identity changed")
+                role_msg = original.roster.add(player_id=pid, account=acc, owner_revision=rev)
+                if pid == actor.player_id:
+                    initiator_identity = role_msg
+
+                slot = await tx.lock_trial_lobby_slot(pid)
+                if slot is not None:
+                    if pid == actor.player_id and slot.cooldown_until_ms > now_ms:
+                        return "cooldown", None, slot.cooldown_until_ms - now_ms
+                    if slot.lobby_id != 0:
+                        existing_lob = await tx.get_trial_lobby(slot.lobby_id)
+                        if existing_lob is None or existing_lob.state != TRIAL_LOBBY_STATE_ENDED:
+                            return "busy", None, pid
+                if await tx.has_active_trial_launch_role(pid):
+                    return "busy", None, pid
+
+            ordered_members = [actor.player_id] + [pid for pid in roster if int(pid) != actor.player_id]
+            view = self.protocol.message(
+                "guildpb.GuildTrialLobbyView",
+                lobby_id=lobby_id,
+                initiator_player_id=actor.player_id,
+                member_player_ids=ordered_members,
+                accepted_player_ids=[actor.player_id],
+                state=TRIAL_LOBBY_STATE_PENDING,
+                expire_at_ms=expires_ms,
+            )
+            consents = self.protocol.message("guildpb.GuildTrialLobbyConsents")
+            c_item = consents.consents.add(lobby_id=lobby_id)
+            assert initiator_identity is not None
+            c_item.identity.CopyFrom(initiator_identity)
+
+            rec = TrialLobbyRecord(
+                lobby_id=lobby_id,
+                guild_id=guild_id,
+                activity_id=activity_id,
+                initiator_player_id=actor.player_id,
+                state=TRIAL_LOBBY_STATE_PENDING,
+                view_proto=view.SerializeToString(deterministic=True),
+                original_proto=original.SerializeToString(deterministic=True),
+                consent_proto=consents.SerializeToString(deterministic=True),
+                expires_ms=expires_ms,
+                launch_deadline_ms=0,
+                battle_id=0,
+                created_ms=now_ms,
+                updated_ms=now_ms,
+            )
+            await tx.insert_trial_lobby(rec)
+            for pid in sorted_ids:
+                cd_until = now_ms + cooldown_ms if pid == actor.player_id else 0
+                await tx.upsert_trial_lobby_slot(pid, lobby_id, cd_until)
+            return "created", rec, 0
+
+        extra = [pid for pid in sorted_ids if pid != actor.player_id]
+        return await self._run_write_tx(_op, actor=actor, extra_targets=extra)
+
+    async def respond_trial_lobby(
+        self,
+        actor: RoleOriginal,
+        *,
+        lobby_id: int,
+        accept: bool,
+        launch_window_ms: int,
+        now_ms: int,
+    ) -> tuple[str, bool, TrialLobbyRecord | None]:
+        """响应历练邀请：返回 (status, already_accepted, updated_lobby)。
+        status: 'gone' | 'not_pending' | 'declined' | 'accepted' | 'launch'。
+        """
+        pre = await self.get_trial_lobby(lobby_id)
+        if pre is None:
+            return "gone", False, None
+        pre_orig = self.protocol.parse("guildpb.GuildTrialLobbyOriginal", pre.original_proto)
+        roster_ids = [int(r.player_id) for r in pre_orig.roster]
+        if actor.player_id not in roster_ids:
+            return "gone", False, None
+
+        async def _op(tx: GuildTx) -> tuple[str, bool, TrialLobbyRecord | None]:
+            await tx.lock_guild(pre.guild_id)
+            row = await tx.lock_trial_lobby(lobby_id)
+            if row is None:
+                return "gone", False, None
+            orig = self.protocol.parse("guildpb.GuildTrialLobbyOriginal", row.original_proto)
+            view = self.protocol.parse("guildpb.GuildTrialLobbyView", row.view_proto)
+            consents = self.protocol.parse("guildpb.GuildTrialLobbyConsents", row.consent_proto)
+
+            roles_by_pid = {int(r.player_id): r for r in orig.roster}
+            my_role = roles_by_pid.get(actor.player_id)
+            if my_role is None:
+                return "gone", False, row
+            if self._role_directory is not None:
+                if my_role.account != actor.account or int(my_role.owner_revision) != actor.owner_revision:
+                    raise GuildWriteConflictError("responder role identity mismatch")
+
+            consented_pids = {int(c.identity.player_id) for c in consents.consents}
+            mine = actor.player_id in consented_pids
+            if row.state != TRIAL_LOBBY_STATE_PENDING:
+                return "not_pending", mine, row
+
+            if now_ms >= row.expires_ms:
+                view.state = TRIAL_LOBBY_STATE_ENDED
+                view.end_tip_id = ERR_GUILD_TRIAL_INVITE_EXPIRED
+                view_bytes = view.SerializeToString(deterministic=True)
+                await tx.update_trial_lobby(
+                    lobby_id, TRIAL_LOBBY_STATE_ENDED, view_bytes, row.consent_proto, 0, 0, now_ms
+                )
+                return "gone", mine, replace(row, state=TRIAL_LOBBY_STATE_ENDED, view_proto=view_bytes, updated_ms=now_ms)
+
+            if not accept:
+                view.state = TRIAL_LOBBY_STATE_ENDED
+                view.end_tip_id = ERR_GUILD_TRIAL_INVITE_DECLINED
+                del view.end_parameters[:]
+                view.end_parameters.append(str(actor.player_id))
+                view_bytes = view.SerializeToString(deterministic=True)
+                await tx.update_trial_lobby(
+                    lobby_id, TRIAL_LOBBY_STATE_ENDED, view_bytes, row.consent_proto, 0, 0, now_ms
+                )
+                return "declined", mine, replace(row, state=TRIAL_LOBBY_STATE_ENDED, view_proto=view_bytes, updated_ms=now_ms)
+
+            if mine:
+                return "accepted", True, row
+
+            # 写入本人同意并保持 player_id 升序
+            consented_pids.add(actor.player_id)
+            new_consents = self.protocol.message("guildpb.GuildTrialLobbyConsents")
+            for pid in sorted(consented_pids):
+                item = new_consents.consents.add(lobby_id=lobby_id)
+                item.identity.CopyFrom(roles_by_pid[pid])
+            del view.accepted_player_ids[:]
+            for pid in view.member_player_ids:
+                if int(pid) in consented_pids:
+                    view.accepted_player_ids.append(int(pid))
+
+            all_ready = len(consented_pids) == len(roles_by_pid)
+            new_state = TRIAL_LOBBY_STATE_LAUNCHING if all_ready else TRIAL_LOBBY_STATE_PENDING
+            launch_deadline = now_ms + launch_window_ms if all_ready else 0
+            view.state = new_state
+            view_bytes = view.SerializeToString(deterministic=True)
+            consent_bytes = new_consents.SerializeToString(deterministic=True)
+            await tx.update_trial_lobby(
+                lobby_id, new_state, view_bytes, consent_bytes, launch_deadline, 0, now_ms
+            )
+            updated = replace(
+                row,
+                state=new_state,
+                view_proto=view_bytes,
+                consent_proto=consent_bytes,
+                launch_deadline_ms=launch_deadline,
+                updated_ms=now_ms,
+            )
+            return ("launch" if all_ready else "accepted"), False, updated
+
+        extra = [pid for pid in roster_ids if pid != actor.player_id]
+        return await self._run_write_tx(_op, actor=actor, extra_targets=extra)
+
+    async def finish_trial_lobby(
+        self,
+        lobby_id: int,
+        *,
+        expected_state: int,
+        new_state: int,
+        battle_id: int = 0,
+        end_tip_id: int = 0,
+        end_params: Sequence[str] = (),
+        now_ms: int,
+    ) -> tuple[bool, TrialLobbyRecord | None]:
+        """推进大厅状态（LAUNCHING -> LAUNCHED 或 ENDED）；存在活跃 launch 时拒绝无证明直接结束。"""
+        pre = await self.get_trial_lobby(lobby_id)
+        if pre is None:
+            return False, None
+
+        async def _op(tx: GuildTx) -> tuple[bool, TrialLobbyRecord | None]:
+            await tx.lock_guild(pre.guild_id)
+            row = await tx.lock_trial_lobby(lobby_id)
+            if row is None or row.state != expected_state:
+                return False, row
+            if new_state == TRIAL_LOBBY_STATE_ENDED:
+                existing_launch = await tx.lock_trial_launch(lobby_id)
+                if existing_launch is not None and existing_launch.state != TRIAL_LAUNCH_STATE_TERMINAL:
+                    return False, row
+            view = self.protocol.parse("guildpb.GuildTrialLobbyView", row.view_proto)
+            view.state = new_state
+            view.battle_id = battle_id
+            if new_state == TRIAL_LOBBY_STATE_ENDED:
+                view.end_tip_id = end_tip_id
+                del view.end_parameters[:]
+                view.end_parameters.extend(end_params)
+            view_bytes = view.SerializeToString(deterministic=True)
+            await tx.update_trial_lobby(
+                lobby_id, new_state, view_bytes, row.consent_proto, row.launch_deadline_ms, battle_id, now_ms
+            )
+            return True, replace(row, state=new_state, view_proto=view_bytes, battle_id=battle_id, updated_ms=now_ms)
+
+        return await self._run_tx(_op)
+
+    async def expire_pending_trial_lobbies(self, now_ms: int, limit: int = 50) -> list[tuple[int, tuple[int, ...]]]:
+        """关闭已过期的 PENDING 大厅，返回需释放占用的 (lobby_id, player_ids) 列表。"""
+        expired = await self._run_tx(lambda tx: tx.list_expired_pending_lobbies(now_ms, limit), read_only=True)
+        released: list[tuple[int, tuple[int, ...]]] = []
+        for lob in expired:
+            orig = self.protocol.parse("guildpb.GuildTrialLobbyOriginal", lob.original_proto)
+            pids = tuple(int(r.player_id) for r in orig.roster)
+            moved, _ = await self.finish_trial_lobby(
+                lob.lobby_id,
+                expected_state=TRIAL_LOBBY_STATE_PENDING,
+                new_state=TRIAL_LOBBY_STATE_ENDED,
+                end_tip_id=ERR_GUILD_TRIAL_INVITE_EXPIRED,
+                now_ms=now_ms,
+            )
+            if moved:
+                released.append((lob.lobby_id, pids))
+        return released
+
+    async def prepare_trial_launch(
+        self,
+        *,
+        request_id: int,
+        battle: TrialBattleKey,
+        dungeon_id: int,
+        now_ms: int,
+    ) -> Message:
+        """提交永久 launch 原件与 launch_role 占位；重复调用幂等返回原件。"""
+        pre_lobby = await self.get_trial_lobby(request_id)
+        if pre_lobby is None:
+            raise GuildWriteConflictError(f"trial lobby {request_id} not found")
+        pre_orig = self.protocol.parse("guildpb.GuildTrialLobbyOriginal", pre_lobby.original_proto)
+        roster_ids = [int(r.player_id) for r in pre_orig.roster]
+
+        async def _op(tx: GuildTx) -> Message:
+            locked_g = await tx.lock_guild(battle.guild_id)
+            if locked_g is None:
+                raise GuildNotFoundError("guild not found")
+            lobby = await tx.lock_trial_lobby(request_id)
+            if lobby is None or lobby.state == TRIAL_LOBBY_STATE_ENDED:
+                raise GuildWriteConflictError("trial lobby ended")
+            lobby_orig = self.protocol.parse("guildpb.GuildTrialLobbyOriginal", lobby.original_proto)
+            lobby_consents = self.protocol.parse("guildpb.GuildTrialLobbyConsents", lobby.consent_proto)
+            if len(lobby_consents.consents) != len(lobby_orig.roster):
+                raise GuildWriteConflictError("trial lobby consents incomplete")
+
+            for role in lobby_orig.roster:
+                pid = int(role.player_id)
+                if await tx.lock_member(battle.guild_id, pid) is None:
+                    raise GuildWriteConflictError(f"member {pid} left guild")
+
+            proposed = self.protocol.message(
+                "guildpb.GuildTrialLaunchOriginal",
+                request_id=request_id,
+                guild_id=battle.guild_id,
+                activity_id=battle.activity_id,
+                period_key=battle.period_key,
+                guild_period_key=battle.guild_period_key,
+                initiator_player_id=battle.initiator_player_id,
+                dungeon_id=dungeon_id,
+                created_ms=now_ms,
+            )
+            for role in sorted(lobby_orig.roster, key=lambda r: int(r.player_id)):
+                proposed.roster.add(
+                    player_id=int(role.player_id),
+                    account=str(role.account),
+                    owner_revision=int(role.owner_revision),
+                )
+
+            existing = await tx.lock_trial_launch(request_id)
+            if existing is not None:
+                saved = self.protocol.parse("guildpb.GuildTrialLaunchOriginal", existing.original_proto)
+                if existing.state == TRIAL_LAUNCH_STATE_TERMINAL:
+                    raise GuildWriteConflictError("trial launch already terminal")
+                proposed.created_ms = saved.created_ms
+                if proposed.SerializeToString(deterministic=True) != existing.original_proto:
+                    raise GuildWriteConflictError("trial launch original mismatch")
+                return saved
+
+            if lobby.state != TRIAL_LOBBY_STATE_LAUNCHING:
+                raise GuildWriteConflictError("trial lobby not launching")
+            for pid in roster_ids:
+                if await tx.has_active_trial_launch_role(pid, exclude_request_id=request_id):
+                    raise GuildWriteConflictError(f"player {pid} has active trial launch role")
+
+            raw = proposed.SerializeToString(deterministic=True)
+            digest = hashlib.sha256(raw).digest()
+            first_check_ms = max(lobby.launch_deadline_ms, now_ms) + TRIAL_OCCUPANCY_MARGIN_MS
+            await tx.insert_trial_launch(
+                TrialLaunchRecord(
+                    request_id=request_id,
+                    battle_id=0,
+                    state=TRIAL_LAUNCH_STATE_PREPARED,
+                    original_proto=raw,
+                    request_digest=digest,
+                    created_ms=now_ms,
+                    updated_ms=now_ms,
+                    cancel_receipt=b"",
+                    next_check_ms=first_check_ms,
+                    check_attempts=0,
+                    realtime_end_tip=b"",
+                )
+            )
+            for role in proposed.roster:
+                await tx.insert_trial_launch_role(
+                    TrialLaunchRoleRecord(
+                        player_id=int(role.player_id),
+                        request_id=request_id,
+                        account=str(role.account),
+                        owner_revision=int(role.owner_revision),
+                        state=TRIAL_LAUNCH_ROLE_ACTIVE,
+                    )
+                )
+            return proposed
+
+        return await self._run_write_tx(_op, extra_targets=roster_ids)
+
+    async def get_trial_launch(self, request_id: int) -> TrialLaunchRecord | None:
+        return await self._run_tx(lambda tx: tx.get_trial_launch(request_id), read_only=True)
+
+    async def record_trial_launch_end_tip(self, request_id: int, tip_id: int, params: Sequence[str] = ()) -> None:
+        if request_id == 0 or tip_id == 0:
+            return
+        tip = self.protocol.message("TipInfoMessage", id=tip_id, parameters=list(params))
+        raw = tip.SerializeToString(deterministic=True)
+        await self._run_tx(lambda tx: tx.record_trial_launch_end_tip(request_id, raw))
+
+    async def expedite_trial_launch_check(self, request_id: int, now_ms: int) -> None:
+        if request_id == 0:
+            return
+        await self._run_tx(lambda tx: tx.expedite_trial_launch_check(request_id, now_ms))
+
+    async def claim_due_trial_launches(self, now_ms: int, limit: int = 20) -> list[TrialLaunchRecord]:
+        due = await self._run_tx(lambda tx: tx.list_due_trial_launches(now_ms, limit), read_only=True)
+        claimed: list[TrialLaunchRecord] = []
+        for rec in due:
+            delay_ms = min(10_000 * (1 << min(rec.check_attempts, 4)), 120_000)
+            ok = await self._run_tx(
+                lambda tx, r=rec, nxt=now_ms + delay_ms: tx.claim_trial_launch(r.request_id, r.next_check_ms, nxt)
+            )
+            if ok:
+                claimed.append(rec)
+        return claimed
+
+    async def _close_trial_lobby_tx(
+        self,
+        tx: GuildTx,
+        lobby_id: int,
+        *,
+        end_tip_id: int,
+        end_params: Sequence[str],
+        now_ms: int,
+    ) -> None:
+        lobby = await tx.lock_trial_lobby(lobby_id)
+        if lobby is None or lobby.state == TRIAL_LOBBY_STATE_ENDED:
+            return
+        view = self.protocol.parse("guildpb.GuildTrialLobbyView", lobby.view_proto)
+        view.state = TRIAL_LOBBY_STATE_ENDED
+        if end_tip_id != 0:
+            view.end_tip_id = end_tip_id
+            del view.end_parameters[:]
+            view.end_parameters.extend(end_params)
+        await tx.update_trial_lobby(
+            lobby_id,
+            TRIAL_LOBBY_STATE_ENDED,
+            view.SerializeToString(deterministic=True),
+            lobby.consent_proto,
+            lobby.launch_deadline_ms,
+            lobby.battle_id,
+            now_ms,
+        )
+
+    async def finish_cancelled_trial_launch(
+        self,
+        request_id: int,
+        receipt: Message,
+        now_ms: int,
+    ) -> tuple[bool, tuple[int, ...]]:
+        """凭 match 签名取消终态回执释放 launch、launch_role 与大厅。返回 (released, roster_ids)。"""
+        pre = await self.get_trial_launch(request_id)
+        if pre is None:
+            return False, ()
+        orig = self.protocol.parse("guildpb.GuildTrialLaunchOriginal", pre.original_proto)
+        roster_ids = tuple(int(r.player_id) for r in orig.roster)
+        receipt_bytes = receipt.SerializeToString(deterministic=True)
+
+        async def _op(tx: GuildTx) -> bool:
+            await tx.lock_guild(int(orig.guild_id))
+            rec = await tx.lock_trial_launch(request_id)
+            if rec is None:
+                return False
+            if rec.state == TRIAL_LAUNCH_STATE_TERMINAL:
+                return False
+            battle_id = int(receipt.battle_id) or rec.battle_id
+            await tx.update_trial_launch(
+                request_id, battle_id, TRIAL_LAUNCH_STATE_TERMINAL, now_ms, cancel_receipt=receipt_bytes
+            )
+            for pid in roster_ids:
+                await tx.update_trial_launch_role_state(pid, request_id, TRIAL_LAUNCH_ROLE_RELEASED)
+
+            end_tip_id = ERR_GUILD_TRIAL_SERVICE_BUSY
+            end_params: list[str] = []
+            if int(receipt.battle_id) != 0:
+                end_tip_id = ERR_GUILD_TRIAL_BATTLE_ABORTED
+            elif rec.realtime_end_tip:
+                try:
+                    parsed_tip = self.protocol.parse("TipInfoMessage", rec.realtime_end_tip)
+                    if int(parsed_tip.id) != 0:
+                        end_tip_id = int(parsed_tip.id)
+                        end_params = [str(p) for p in parsed_tip.parameters]
+                except DecodeError:
+                    pass
+            await self._close_trial_lobby_tx(
+                tx, request_id, end_tip_id=end_tip_id, end_params=end_params, now_ms=now_ms
+            )
+            return True
+
+        released = await self._run_tx(_op)
+        return released, roster_ids
+
+    async def register_trial_battle(self, battle: TrialBattleKey, now_ms: int) -> None:
+        """登记对局行（STARTED）并将对应 launch 推进为 LAUNCHED。"""
+        if battle.battle_id == 0 or battle.guild_id == 0:
+            raise TrialInputInvalidError("trial battle_id and guild_id must be non-zero")
+
+        async def _op(tx: GuildTx) -> None:
+            locked_g = await tx.lock_guild(battle.guild_id)
+            if locked_g is None:
+                raise GuildNotFoundError("guild not found")
+            existing = await tx.get_trial_battle(battle.battle_id)
+            if existing is not None:
+                if existing.guild_id != battle.guild_id:
+                    raise GuildWriteConflictError("battle registered to foreign guild")
+                if existing.state == TRIAL_BATTLE_STATE_SETTLED:
+                    return
+            if battle.launch_request_id != 0:
+                launch = await tx.lock_trial_launch(battle.launch_request_id)
+                if launch is not None and launch.state == TRIAL_LAUNCH_STATE_PREPARED:
+                    await tx.update_trial_launch(
+                        battle.launch_request_id, battle.battle_id, TRIAL_LAUNCH_STATE_LAUNCHED, now_ms
+                    )
+            if existing is None:
+                await tx.insert_trial_battle(
+                    TrialBattleRecord(
+                        battle_id=battle.battle_id,
+                        guild_id=battle.guild_id,
+                        activity_id=battle.activity_id,
+                        period_key=battle.period_key,
+                        guild_period_key=battle.guild_period_key,
+                        initiator_player_id=battle.initiator_player_id,
+                        state=TRIAL_BATTLE_STATE_STARTED,
+                        settle_result=TRIAL_SETTLE_RESULT_UNSPECIFIED,
+                        rewarded_count=0,
+                        created_ms=now_ms,
+                        settled_ms=0,
+                        launch_request_id=battle.launch_request_id,
+                    )
+                )
+
+        await self._run_tx(_op)
+
+    async def get_trial_battle(self, battle_id: int) -> TrialBattleRecord | None:
+        return await self._run_tx(lambda tx: tx.get_trial_battle(battle_id), read_only=True)
+
+    async def list_overdue_trial_battles(self, created_before_ms: int, limit: int = 200) -> list[TrialBattleRecord]:
+        return await self._run_tx(
+            lambda tx: tx.list_overdue_trial_battles(created_before_ms, limit), read_only=True
+        )
+
+    async def expire_trial_battle(self, battle_id: int, guild_id: int, now_ms: int) -> bool:
+        async def _op(tx: GuildTx) -> bool:
+            if await tx.lock_guild(guild_id) is None:
+                return False
+            row = await tx.lock_trial_battle(battle_id)
+            if row is None or row.guild_id != guild_id or row.state != TRIAL_BATTLE_STATE_STARTED:
+                return False
+            await tx.update_trial_battle(battle_id, TRIAL_BATTLE_STATE_EXPIRED, row.settle_result, 0, now_ms)
+            return True
+
+        return await self._run_tx(_op)
+
+    async def mark_trial_battle_poison(
+        self, battle: TrialBattleKey, finished_at_ms: int, now_ms: int
+    ) -> tuple[str, int, tuple[int, ...]]:
+        """将确定性失败的对局标记为 SETTLED/POISON，返回 (outcome, release_req_id, release_players)。"""
+        created_ms = finished_at_ms or now_ms
+
+        async def _op(tx: GuildTx) -> tuple[str, int, tuple[int, ...]]:
+            launch_rec: TrialLaunchRecord | None = None
+            req_id = battle.launch_request_id
+            if req_id == 0 and battle.battle_id != 0:
+                launch_rec = await tx.get_trial_launch_by_battle(battle.battle_id)
+                if launch_rec is not None:
+                    req_id = launch_rec.request_id
+            elif req_id != 0:
+                launch_rec = await tx.get_trial_launch(req_id)
+
+            roster_ids: tuple[int, ...] = ()
+            if launch_rec is not None:
+                orig = self.protocol.parse("guildpb.GuildTrialLaunchOriginal", launch_rec.original_proto)
+                roster_ids = tuple(int(r.player_id) for r in orig.roster)
+
+            locked_g = await tx.lock_guild(battle.guild_id)
+            if locked_g is None:
+                if launch_rec is not None and req_id != 0:
+                    await tx.update_trial_launch(req_id, battle.battle_id, TRIAL_LAUNCH_STATE_TERMINAL, now_ms)
+                    for pid in roster_ids:
+                        await tx.update_trial_launch_role_state(pid, req_id, TRIAL_LAUNCH_ROLE_RELEASED)
+                    await self._close_trial_lobby_tx(tx, req_id, end_tip_id=0, end_params=(), now_ms=now_ms)
+                return "guild_gone", req_id, roster_ids
+
+            existing = await tx.lock_trial_battle(battle.battle_id)
+            if existing is not None:
+                if existing.guild_id != battle.guild_id:
+                    return "mismatch", 0, ()
+                if existing.state == TRIAL_BATTLE_STATE_SETTLED:
+                    return "already_settled", 0, ()
+                await tx.update_trial_battle(
+                    battle.battle_id, TRIAL_BATTLE_STATE_SETTLED, TRIAL_SETTLE_RESULT_POISON, 0, now_ms
+                )
+            elif battle.activity_id != 0 and battle.period_key != 0 and battle.guild_period_key != 0:
+                await tx.insert_trial_battle(
+                    TrialBattleRecord(
+                        battle_id=battle.battle_id,
+                        guild_id=battle.guild_id,
+                        activity_id=battle.activity_id,
+                        period_key=battle.period_key,
+                        guild_period_key=battle.guild_period_key,
+                        initiator_player_id=battle.initiator_player_id,
+                        state=TRIAL_BATTLE_STATE_SETTLED,
+                        settle_result=TRIAL_SETTLE_RESULT_POISON,
+                        rewarded_count=0,
+                        created_ms=created_ms,
+                        settled_ms=now_ms,
+                        launch_request_id=req_id,
+                    )
+                )
+            else:
+                return "missing", 0, ()
+
+            if launch_rec is not None and req_id != 0:
+                await tx.update_trial_launch(req_id, battle.battle_id, TRIAL_LAUNCH_STATE_TERMINAL, now_ms)
+                for pid in roster_ids:
+                    await tx.update_trial_launch_role_state(pid, req_id, TRIAL_LAUNCH_ROLE_RELEASED)
+                await self._close_trial_lobby_tx(tx, req_id, end_tip_id=0, end_params=(), now_ms=now_ms)
+            return "marked", req_id, roster_ids
+
+        return await self._run_tx(_op)
+
+    async def settle_trial_battle(
+        self,
+        *,
+        battle: TrialBattleKey,
+        row: ActivityRuleRow | None,
+        win: bool,
+        candidates: Sequence[int],
+        reward_payload: bytes,
+        reward_ops: Sequence[TrialRewardOp],
+        lease_until_ms: int,
+        finished_at_ms: int,
+        now_ms: int,
+    ) -> TrialSettleResult:
+        """同道历练权威结算事务：单事务完成幂等判重、成员帮贡、帮会资金（含日上限）、物品入队/溢出 owed、对局/launch/大厅终结。"""
+        if (
+            battle.battle_id == 0
+            or battle.guild_id == 0
+            or battle.activity_id == 0
+            or battle.period_key == 0
+            or battle.guild_period_key == 0
+        ):
+            raise TrialInputInvalidError("incomplete trial battle key")
+        sorted_candidates = sorted({int(pid) for pid in candidates})
+        if sorted_candidates and sorted_candidates[0] == 0:
+            raise TrialInputInvalidError("candidate player_id 0")
+
+        if row is None:
+            settle_result = TRIAL_SETTLE_RESULT_CONFIG_MISSING
+        elif win:
+            settle_result = TRIAL_SETTLE_RESULT_WIN
+        else:
+            settle_result = TRIAL_SETTLE_RESULT_LOSS
+
+        should_grant = win and row is not None and len(sorted_candidates) > 0
+        ops_by_pid = {op.player_id: op for op in reward_ops}
+        if should_grant and reward_payload:
+            for pid in sorted_candidates:
+                if pid not in ops_by_pid:
+                    raise TrialInputInvalidError(f"missing reward op for candidate {pid}")
+
+        async def _op(tx: GuildTx) -> TrialSettleResult:
+            launch_rec: TrialLaunchRecord | None = None
+            req_id = battle.launch_request_id
+            if req_id == 0:
+                launch_rec = await tx.get_trial_launch_by_battle(battle.battle_id)
+                if launch_rec is not None:
+                    req_id = launch_rec.request_id
+            else:
+                launch_rec = await tx.lock_trial_launch(req_id)
+
+            roster_ids: tuple[int, ...] = ()
+            if launch_rec is not None:
+                orig = self.protocol.parse("guildpb.GuildTrialLaunchOriginal", launch_rec.original_proto)
+                roster_ids = tuple(int(r.player_id) for r in orig.roster)
+                roster_set = set(roster_ids)
+                for pid in sorted_candidates:
+                    if pid not in roster_set:
+                        raise GuildWriteConflictError(f"candidate {pid} not in original launch roster")
+
+            locked_g = await tx.lock_guild(battle.guild_id)
+            if locked_g is None:
+                if launch_rec is not None and req_id != 0:
+                    await tx.update_trial_launch(req_id, battle.battle_id, TRIAL_LAUNCH_STATE_TERMINAL, now_ms)
+                    for pid in roster_ids:
+                        await tx.update_trial_launch_role_state(pid, req_id, TRIAL_LAUNCH_ROLE_RELEASED)
+                    await self._close_trial_lobby_tx(tx, req_id, end_tip_id=0, end_params=(), now_ms=now_ms)
+                return TrialSettleResult(
+                    status="guild_gone",
+                    release_request_id=req_id,
+                    release_players=roster_ids,
+                )
+
+            existing = await tx.lock_trial_battle(battle.battle_id)
+            if existing is not None:
+                if existing.guild_id != battle.guild_id:
+                    return TrialSettleResult(status="context_mismatch")
+                if existing.state == TRIAL_BATTLE_STATE_SETTLED:
+                    return TrialSettleResult(status="duplicate")
+
+            rewarded_members: list[MemberData] = []
+            enqueued: list[TrialEnqueuedReward] = []
+            owed: list[int] = []
+            funds_granted = False
+            counted_wins = 0
+
+            if should_grant and row is not None:
+                # 周期键必须晚于清理窗口下界（now - 7 天），避免与清理碰同一行
+                oldest_day = day_key(max(0, now_ms - 7 * MS_PER_DAY))
+                if battle.period_key <= oldest_day:
+                    raise TrialActivityPoisonError(
+                        f"trial result period_key {battle.period_key} too old at {now_ms}"
+                    )
+
+                # M -> Q -> 读 C -> O -> C -> P -> G/M
+                members: list[MemberData] = []
+                for pid in sorted_candidates:
+                    m = await tx.lock_member(battle.guild_id, pid)
+                    if m is not None:
+                        members.append(m)
+
+                for m in members:
+                    await tx.ensure_and_lock_seq(m.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
+
+                for m in members:
+                    used = await tx.get_activity_counter_value(m.player_id, battle.activity_id, battle.period_key)
+                    if used < row.daily_limit:
+                        rewarded_members.append(m)
+
+                gain = row.personal_contribution
+                for m in rewarded_members:
+                    if m.contribution_total > UINT64_MAX - gain or m.contribution_balance > UINT64_MAX - gain:
+                        raise TrialActivityPoisonError(f"member {m.player_id} contribution overflow")
+
+                if reward_payload:
+                    for m in rewarded_members:
+                        rw = ops_by_pid[m.player_id]
+                        try:
+                            seq, epoch = await tx.allocate_seq(m.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
+                        except GuildAssetPendingError:
+                            owed.append(m.player_id)
+                            continue
+                        await tx.insert_asset_op(
+                            AssetOpRow(
+                                op_id=rw.op_id,
+                                player_id=m.player_id,
+                                stream=ASSET_STREAM_GUILD_CREDIT,
+                                seq=seq,
+                                guild_id=battle.guild_id,
+                                kind=OP_KIND_ACTIVITY_REWARD,
+                                status=OP_STATUS_PENDING,
+                                durable=0,
+                                attempts=0,
+                                next_attempt_ms=lease_until_ms,
+                                deadline_ms=0,
+                                payload=reward_payload,
+                                ref_id=battle.activity_id,
+                                ref_count=1,
+                                period_key=battle.period_key,
+                                contribution_delta=0,
+                                funds_delta=0,
+                                reason_tip_id=0,
+                                created_ms=now_ms,
+                                updated_ms=now_ms,
+                                lease_until_ms=lease_until_ms,
+                                lease_token=rw.lease_token,
+                                tx_type=TX_GUILD_ACTIVITY_REWARD,
+                                last_outcome=0,
+                                last_reason=0,
+                                stream_epoch=epoch,
+                                last_send_ms=now_ms,
+                            )
+                        )
+                        enqueued.append(
+                            TrialEnqueuedReward(
+                                player_id=m.player_id,
+                                op_id=rw.op_id,
+                                seq=seq,
+                                stream_epoch=epoch,
+                                lease_token=rw.lease_token,
+                            )
+                        )
+
+                for m in rewarded_members:
+                    if not await tx.upsert_counter_with_limit(
+                        m.player_id,
+                        COUNTER_KIND_ACTIVITY,
+                        battle.activity_id,
+                        battle.period_key,
+                        1,
+                        row.daily_limit,
+                        now_ms,
+                    ):
+                        raise GuildWriteConflictError(f"trial counter changed concurrently player={m.player_id}")
+
+                if rewarded_members:
+                    if row.guild_funds > 0:
+                        prog = await tx.upsert_and_lock_activity_progress(
+                            battle.guild_id,
+                            battle.activity_id,
+                            battle.guild_period_key,
+                            increment=False,
+                            now_ms=now_ms,
+                        )
+                        counted_wins = prog.count
+                        if trial_funds_counted(row, prog.count):
+                            if locked_g.funds > UINT64_MAX - row.guild_funds:
+                                raise TrialActivityPoisonError(f"guild {battle.guild_id} funds overflow")
+                            await tx.set_guild_funds(battle.guild_id, locked_g.funds + row.guild_funds)
+                            counted_wins = prog.count + 1
+                            await tx.set_trial_progress_count(
+                                battle.guild_id, battle.activity_id, battle.guild_period_key, counted_wins, now_ms
+                            )
+                            funds_granted = True
+                    if gain > 0:
+                        for m in rewarded_members:
+                            await tx.set_member_contribution(
+                                battle.guild_id,
+                                m.player_id,
+                                m.contribution_total + gain,
+                                m.contribution_balance + gain,
+                            )
+
+            created_ms = finished_at_ms or now_ms
+            if existing is None:
+                await tx.insert_trial_battle(
+                    TrialBattleRecord(
+                        battle_id=battle.battle_id,
+                        guild_id=battle.guild_id,
+                        activity_id=battle.activity_id,
+                        period_key=battle.period_key,
+                        guild_period_key=battle.guild_period_key,
+                        initiator_player_id=battle.initiator_player_id,
+                        state=TRIAL_BATTLE_STATE_SETTLED,
+                        settle_result=settle_result,
+                        rewarded_count=len(rewarded_members),
+                        created_ms=created_ms,
+                        settled_ms=now_ms,
+                        launch_request_id=req_id,
+                    )
+                )
+            else:
+                await tx.update_trial_battle(
+                    battle.battle_id,
+                    TRIAL_BATTLE_STATE_SETTLED,
+                    settle_result,
+                    len(rewarded_members),
+                    now_ms,
+                )
+
+            for owed_pid in owed:
+                await tx.insert_trial_reward_owed(
+                    TrialOwedRewardRecord(
+                        player_id=owed_pid,
+                        battle_id=battle.battle_id,
+                        guild_id=battle.guild_id,
+                        activity_id=battle.activity_id,
+                        period_key=battle.period_key,
+                        payload=reward_payload,
+                        attempts=0,
+                        created_ms=now_ms,
+                    )
+                )
+
+            if launch_rec is not None and req_id != 0:
+                await tx.update_trial_launch(req_id, battle.battle_id, TRIAL_LAUNCH_STATE_TERMINAL, now_ms)
+                for pid in roster_ids:
+                    await tx.update_trial_launch_role_state(pid, req_id, TRIAL_LAUNCH_ROLE_RELEASED)
+                await self._close_trial_lobby_tx(tx, req_id, end_tip_id=0, end_params=(), now_ms=now_ms)
+
+            return TrialSettleResult(
+                status="settled",
+                result=settle_result,
+                rewarded=tuple(m.player_id for m in rewarded_members),
+                enqueued=tuple(enqueued),
+                owed=tuple(owed),
+                funds_granted=funds_granted,
+                counted_wins=counted_wins,
+                release_request_id=req_id,
+                release_players=roster_ids,
+            )
+
+        return await self._run_tx(_op)
+
+    async def list_trial_rewards_owed(self, limit: int = 50) -> list[TrialOwedRewardRecord]:
+        return await self._run_tx(lambda tx: tx.list_trial_rewards_owed(limit), read_only=True)
+
+    async def count_trial_rewards_owed_by_player(self, player_id: int) -> dict[int, int]:
+        return await self._run_tx(lambda tx: tx.count_trial_rewards_owed_by_player(player_id), read_only=True)
+
+    async def convert_owed_reward(
+        self, owed: TrialOwedRewardRecord, op_id: int, now_ms: int
+    ) -> tuple[str, AssetOpRow | None]:
+        """将待入队奖励转为一行 PENDING 资产指令并删除 owed 行；返回 ('converted'|'still_full'|'gone', op)。"""
+
+        async def _op(tx: GuildTx) -> tuple[str, AssetOpRow | None]:
+            try:
+                seq, epoch = await tx.allocate_seq(owed.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
+            except GuildAssetPendingError:
+                raise _TxRollbackReturn(("still_full", None))
+            if not await tx.delete_trial_reward_owed(owed.player_id, owed.battle_id):
+                raise _TxRollbackReturn(("gone", None))
+            row = AssetOpRow(
+                op_id=op_id,
+                player_id=owed.player_id,
+                stream=ASSET_STREAM_GUILD_CREDIT,
+                seq=seq,
+                guild_id=owed.guild_id,
+                kind=OP_KIND_ACTIVITY_REWARD,
+                status=OP_STATUS_PENDING,
+                durable=0,
+                attempts=0,
+                next_attempt_ms=now_ms,
+                deadline_ms=0,
+                payload=owed.payload,
+                ref_id=owed.activity_id,
+                ref_count=1,
+                period_key=owed.period_key,
+                contribution_delta=0,
+                funds_delta=0,
+                reason_tip_id=0,
+                created_ms=now_ms,
+                updated_ms=now_ms,
+                lease_until_ms=0,
+                lease_token=0,
+                tx_type=TX_GUILD_ACTIVITY_REWARD,
+                last_outcome=0,
+                last_reason=0,
+                stream_epoch=epoch,
+                last_send_ms=now_ms,
+            )
+            await tx.insert_asset_op(row)
+            return "converted", row
+
+        status, op_row = await self._run_tx(_op)
+        if status == "still_full":
+            await self._run_tx(lambda tx: tx.increment_trial_reward_owed_attempts(owed.player_id, owed.battle_id))
+        return status, op_row
 
     # -- GuildInternal.ListAppliedAssetOpsSince --------------------------------------------------
 
@@ -1658,10 +2984,12 @@ class _MemoryState:
     asset_ops: dict[int, AssetOpRow]
     daily_counters: dict[tuple[int, int, int, int], tuple[int, int]]  # (pid, kind, ref, period) -> (used, updated_ms)
     activity_progress: dict[tuple[int, int, int], ActivityProgress]  # (gid, act_id, period) -> progress
-    trial_battles: dict[int, tuple[int, int]]  # battle_id -> (guild_id, state)
-    trial_reward_owed: dict[tuple[int, int], bytes]  # (player_id, battle_id) -> payload
-    trial_launch_roles: dict[tuple[int, int], tuple[int, int]]  # (player_id, request_id) -> (role_state, launch_state)
-    trial_lobby_slots: dict[int, tuple[int, int]]  # player_id -> (lobby_id, lobby_state)
+    trial_lobbies: dict[int, TrialLobbyRecord]  # lobby_id -> record
+    trial_lobby_slots: dict[int, TrialLobbySlotRecord]  # player_id -> slot
+    trial_launches: dict[int, TrialLaunchRecord]  # request_id -> record
+    trial_launch_roles: dict[tuple[int, int], TrialLaunchRoleRecord]  # (player_id, request_id) -> record
+    trial_battles: dict[int, TrialBattleRecord]  # battle_id -> record
+    trial_reward_owed: dict[tuple[int, int], TrialOwedRewardRecord]  # (player_id, battle_id) -> record
     client_requests: dict[tuple[int, int], tuple[int, int]]  # (player_id, req_id) -> (op_id, created_ms)
     name_holds: dict[str, tuple[int, int, int]]  # name_norm -> (hold_id, guild_id, held_until_ms)
 
@@ -1677,10 +3005,12 @@ class _MemoryState:
             asset_ops={},
             daily_counters={},
             activity_progress={},
+            trial_lobbies={},
+            trial_lobby_slots={},
+            trial_launches={},
+            trial_launch_roles={},
             trial_battles={},
             trial_reward_owed={},
-            trial_launch_roles={},
-            trial_lobby_slots={},
             client_requests={},
             name_holds={},
         )
@@ -1726,13 +3056,16 @@ class _MemoryTx:
         for owed_pid, _ in self._s.trial_reward_owed:
             if owed_pid == pid:
                 return ROLE_BLOCKER_TRIAL_REWARD_OWED
-        for (l_pid, _), (r_state, l_state) in self._s.trial_launch_roles.items():
-            if l_pid == pid and (r_state != 2 or l_state != 3):
+        for (l_pid, req_id), role_rec in self._s.trial_launch_roles.items():
+            if l_pid != pid:
+                continue
+            launch = self._s.trial_launches.get(req_id)
+            if role_rec.state != TRIAL_LAUNCH_ROLE_RELEASED or launch is None or launch.state != TRIAL_LAUNCH_STATE_TERMINAL:
                 return ROLE_BLOCKER_TRIAL_LAUNCH_ROLE
         slot = self._s.trial_lobby_slots.get(pid)
-        if slot is not None:
-            lobby_id, lobby_state = slot
-            if lobby_id != 0 and lobby_state != 4:
+        if slot is not None and slot.lobby_id != 0:
+            lob = self._s.trial_lobbies.get(slot.lobby_id)
+            if lob is None or lob.state != TRIAL_LOBBY_STATE_ENDED:
                 return ROLE_BLOCKER_TRIAL_LOBBY_SLOT
         return ""
 
@@ -1828,6 +3161,13 @@ class _MemoryTx:
         g = self._s.guilds[guild_id]
         self._s.guilds[guild_id] = replace(g, funds=new_funds)
 
+    async def credit_guild_funds(self, guild_id: int, delta: int) -> bool:
+        g = self._s.guilds.get(guild_id)
+        if g is None:
+            return False
+        self._s.guilds[guild_id] = replace(g, funds=min(UINT64_MAX, g.funds + delta))
+        return True
+
     async def delete_guild(self, guild_id: int) -> bool:
         return self._s.guilds.pop(guild_id, None) is not None
 
@@ -1909,6 +3249,32 @@ class _MemoryTx:
             replace(m, contribution_total=total, contribution_balance=balance),
         )
 
+    async def credit_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool:
+        pair = self._s.members_by_player.get(player_id)
+        if pair is None or pair[0] != guild_id:
+            return False
+        gid, m = pair
+        self._s.members_by_player[player_id] = (
+            gid,
+            replace(
+                m,
+                contribution_total=min(UINT64_MAX, m.contribution_total + delta),
+                contribution_balance=min(UINT64_MAX, m.contribution_balance + delta),
+            ),
+        )
+        return True
+
+    async def refund_member_contribution(self, guild_id: int, player_id: int, delta: int) -> bool:
+        pair = self._s.members_by_player.get(player_id)
+        if pair is None or pair[0] != guild_id:
+            return False
+        gid, m = pair
+        self._s.members_by_player[player_id] = (
+            gid,
+            replace(m, contribution_balance=min(UINT64_MAX, m.contribution_balance + delta)),
+        )
+        return True
+
     async def debit_member_contribution(self, guild_id: int, player_id: int, cost: int) -> bool:
         pair = self._s.members_by_player.get(player_id)
         if pair is None or pair[0] != guild_id or pair[1].contribution_balance < cost:
@@ -1926,6 +3292,14 @@ class _MemoryTx:
             return False
         del self._s.members_by_player[player_id]
         return True
+
+    async def get_trial_roster_members(self, guild_id: int, player_ids: Sequence[int]) -> dict[int, int]:
+        out: dict[int, int] = {}
+        for pid in player_ids:
+            pair = self._s.members_by_player.get(int(pid))
+            if pair is not None and pair[0] == guild_id:
+                out[int(pid)] = pair[1].join_time_ms
+        return out
 
     # guild_application
     async def lock_application_expire(self, guild_id: int, player_id: int) -> int | None:
@@ -2007,6 +3381,9 @@ class _MemoryTx:
         next_seq, epoch, _ = self._s.seqs[key]
         return next_seq, epoch
 
+    async def lock_seq_guard(self, player_id: int, stream: int) -> bool:
+        return (player_id, stream) in self._s.seqs
+
     async def allocate_seq(self, player_id: int, stream: int, now_ms: int) -> tuple[int, int]:
         next_seq, epoch = await self.ensure_and_lock_seq(player_id, stream, now_ms)
         pending_seqs = [
@@ -2031,6 +3408,135 @@ class _MemoryTx:
 
     async def get_asset_op(self, op_id: int) -> AssetOpRow | None:
         return self._s.asset_ops.get(op_id)
+
+    async def lock_asset_op(self, op_id: int) -> AssetOpRow | None:
+        return self._s.asset_ops.get(op_id)
+
+    async def list_due_asset_ops(
+        self, now_ms: int, limit: int, owned_shards: frozenset[int] | None = None
+    ) -> list[int]:
+        if limit <= 0:
+            return []
+        eligible = [
+            op
+            for op in self._s.asset_ops.values()
+            if op.status == OP_STATUS_PENDING
+            and op.next_attempt_ms <= now_ms
+            and op.lease_until_ms <= now_ms
+            and (owned_shards is None or (op.player_id % 64) in owned_shards)
+        ]
+        fresh = [op for op in eligible if op.attempts < ASSET_OP_FRESH_ATTEMPT_LIMIT]
+        aged = [op for op in eligible if op.attempts >= ASSET_OP_FRESH_ATTEMPT_LIMIT]
+        fresh.sort(key=lambda o: (o.next_attempt_ms, o.op_id))
+        aged.sort(key=lambda o: (o.next_attempt_ms, o.op_id))
+        half = max(1, limit // 2)
+        out: list[int] = [o.op_id for o in fresh[:half]]
+        rem = limit - len(out)
+        if rem > 0:
+            out.extend(o.op_id for o in aged[:rem])
+        rem = limit - len(out)
+        if rem > 0:
+            picked = set(out)
+            for o in fresh[half:]:
+                if o.op_id not in picked:
+                    out.append(o.op_id)
+                    if len(out) >= limit:
+                        break
+        return out
+
+    async def claim_asset_op(
+        self, op_id: int, now_ms: int, lease_until_ms: int, lease_token: int
+    ) -> AssetOpRow | None:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING or op.lease_until_ms > now_ms:
+            return None
+        updated = replace(
+            op,
+            lease_until_ms=lease_until_ms,
+            lease_token=lease_token,
+            updated_ms=now_ms,
+        )
+        self._s.asset_ops[op_id] = updated
+        return updated
+
+    async def mark_asset_op_poison(self, op_id: int, lease_token: int, poison_until_ms: int, now_ms: int) -> None:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING or op.lease_token != lease_token:
+            return
+        self._s.asset_ops[op_id] = replace(
+            op,
+            next_attempt_ms=poison_until_ms,
+            lease_until_ms=0,
+            lease_token=0,
+            updated_ms=now_ms,
+        )
+
+    async def reschedule_asset_op(
+        self,
+        op_id: int,
+        lease_token: int,
+        next_attempt_ms: int,
+        outcome: int,
+        reason: int,
+        durable: bool,
+        local: bool,
+        now_ms: int,
+    ) -> bool:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING or op.lease_token != lease_token:
+            return False
+        self._s.asset_ops[op_id] = replace(
+            op,
+            attempts=op.attempts + 1,
+            next_attempt_ms=next_attempt_ms,
+            last_outcome=outcome,
+            last_reason=reason,
+            durable=1 if durable else 0,
+            lease_until_ms=0,
+            lease_token=0,
+            last_send_ms=op.last_send_ms if local else now_ms,
+            updated_ms=now_ms,
+        )
+        return True
+
+    async def finalize_asset_op_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        last_outcome: int,
+        last_reason: int,
+        reason_tip_id: int,
+        now_ms: int,
+    ) -> bool:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING:
+            return False
+        self._s.asset_ops[op_id] = replace(
+            op,
+            status=final_status,
+            durable=1,
+            last_outcome=last_outcome,
+            last_reason=last_reason,
+            reason_tip_id=reason_tip_id,
+            next_attempt_ms=now_ms,
+            lease_until_ms=0,
+            lease_token=0,
+            updated_ms=now_ms,
+        )
+        return True
+
+    async def abandon_asset_op_cas(self, op_id: int, lease_token: int, now_ms: int) -> bool:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING or op.lease_token != lease_token:
+            return False
+        self._s.asset_ops[op_id] = replace(
+            op,
+            status=OP_STATUS_ABANDONED,
+            lease_until_ms=0,
+            lease_token=0,
+            updated_ms=now_ms,
+        )
+        return True
 
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]:
         rows = [
@@ -2090,6 +3596,16 @@ class _MemoryTx:
         self._s.daily_counters[key] = (used + delta, now_ms)
         return True
 
+    async def refund_counter(
+        self, player_id: int, counter_kind: int, ref_id: int, period_key_val: int, delta: int, now_ms: int
+    ) -> None:
+        key = (player_id, counter_kind, ref_id, period_key_val)
+        cur = self._s.daily_counters.get(key)
+        if cur is None:
+            return
+        used, _ = cur
+        self._s.daily_counters[key] = (max(0, used - delta), now_ms)
+
     async def get_counter_usage(
         self, player_id: int, counter_kind: int, period_keys: Sequence[int]
     ) -> dict[tuple[int, int], int]:
@@ -2099,6 +3615,10 @@ class _MemoryTx:
             for (pid, kind, ref_id, pk), (used, _) in self._s.daily_counters.items()
             if pid == player_id and kind == counter_kind and pk in pks
         }
+
+    async def get_activity_counter_value(self, player_id: int, activity_id: int, period_key_val: int) -> int:
+        cur = self._s.daily_counters.get((player_id, COUNTER_KIND_ACTIVITY, activity_id, period_key_val))
+        return 0 if cur is None else cur[0]
 
     async def list_applied_asset_ops_since(
         self,
@@ -2165,12 +3685,26 @@ class _MemoryTx:
             cur, threshold_reached_ms=threshold_reached_ms, funds_granted=funds_granted
         )
 
+    async def set_trial_progress_count(
+        self, guild_id: int, activity_id: int, period_key_val: int, count: int, now_ms: int
+    ) -> None:
+        key = (guild_id, activity_id, period_key_val)
+        cur = self._s.activity_progress.get(key)
+        if cur is None:
+            self._s.activity_progress[key] = ActivityProgress(count=count, threshold_reached_ms=0, funds_granted=False)
+        else:
+            self._s.activity_progress[key] = replace(cur, count=count)
+
     async def delete_activity_progress_of_guild(self, guild_id: int) -> None:
         for key in [k for k in self._s.activity_progress if k[0] == guild_id]:
             del self._s.activity_progress[key]
 
     async def delete_started_trial_battles_of_guild(self, guild_id: int) -> None:
-        for bid in [k for k, (gid, st) in self._s.trial_battles.items() if gid == guild_id and st == 1]:
+        for bid in [
+            k
+            for k, rec in self._s.trial_battles.items()
+            if rec.guild_id == guild_id and rec.state == TRIAL_BATTLE_STATE_STARTED
+        ]:
             del self._s.trial_battles[bid]
 
     async def get_activity_reward_statuses(self, player_id: int, now_ms: int) -> dict[int, ActivityRewardStatus]:
@@ -2211,6 +3745,208 @@ class _MemoryTx:
             del self._s.daily_counters[key]
         for key in [k for k in self._s.client_requests if k[0] == player_id]:
             del self._s.client_requests[key]
+
+    # guild_trial_lobby / slot / launch / launch_role / battle / reward_owed
+    async def get_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
+        return self._s.trial_lobbies.get(lobby_id)
+
+    async def lock_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
+        return self._s.trial_lobbies.get(lobby_id)
+
+    async def insert_trial_lobby(self, rec: TrialLobbyRecord) -> None:
+        if rec.lobby_id in self._s.trial_lobbies:
+            raise _DuplicateKeyError("duplicate lobby_id", "PRIMARY")
+        self._s.trial_lobbies[rec.lobby_id] = rec
+
+    async def update_trial_lobby(
+        self,
+        lobby_id: int,
+        state: int,
+        view_proto: bytes,
+        consent_proto: bytes,
+        launch_deadline_ms: int,
+        battle_id: int,
+        updated_ms: int,
+    ) -> None:
+        cur = self._s.trial_lobbies[lobby_id]
+        self._s.trial_lobbies[lobby_id] = replace(
+            cur,
+            state=state,
+            view_proto=view_proto,
+            consent_proto=consent_proto,
+            launch_deadline_ms=launch_deadline_ms,
+            battle_id=battle_id,
+            updated_ms=updated_ms,
+        )
+
+    async def list_expired_pending_lobbies(self, now_ms: int, limit: int) -> list[TrialLobbyRecord]:
+        rows = [
+            lob
+            for lob in self._s.trial_lobbies.values()
+            if lob.state == TRIAL_LOBBY_STATE_PENDING and lob.expires_ms <= now_ms
+        ]
+        rows.sort(key=lambda r: (r.expires_ms, r.lobby_id))
+        return rows[:limit]
+
+    async def get_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None:
+        return self._s.trial_lobby_slots.get(player_id)
+
+    async def lock_trial_lobby_slot(self, player_id: int) -> TrialLobbySlotRecord | None:
+        return self._s.trial_lobby_slots.get(player_id)
+
+    async def upsert_trial_lobby_slot(self, player_id: int, lobby_id: int, cooldown_until_ms: int) -> None:
+        self._s.trial_lobby_slots[player_id] = TrialLobbySlotRecord(
+            player_id=player_id,
+            lobby_id=lobby_id,
+            cooldown_until_ms=cooldown_until_ms,
+        )
+
+    async def get_trial_launch(self, request_id: int) -> TrialLaunchRecord | None:
+        return self._s.trial_launches.get(request_id)
+
+    async def lock_trial_launch(self, request_id: int) -> TrialLaunchRecord | None:
+        return self._s.trial_launches.get(request_id)
+
+    async def get_trial_launch_by_battle(self, battle_id: int) -> TrialLaunchRecord | None:
+        for rec in self._s.trial_launches.values():
+            if rec.battle_id == battle_id:
+                return rec
+        return None
+
+    async def insert_trial_launch(self, rec: TrialLaunchRecord) -> None:
+        if rec.request_id in self._s.trial_launches:
+            raise _DuplicateKeyError("duplicate request_id", "PRIMARY")
+        self._s.trial_launches[rec.request_id] = rec
+
+    async def update_trial_launch(
+        self,
+        request_id: int,
+        battle_id: int,
+        state: int,
+        updated_ms: int,
+        cancel_receipt: bytes | None = None,
+    ) -> None:
+        cur = self._s.trial_launches[request_id]
+        self._s.trial_launches[request_id] = replace(
+            cur,
+            battle_id=battle_id,
+            state=state,
+            updated_ms=updated_ms,
+            cancel_receipt=cur.cancel_receipt if cancel_receipt is None else cancel_receipt,
+        )
+
+    async def record_trial_launch_end_tip(self, request_id: int, tip_bytes: bytes) -> None:
+        cur = self._s.trial_launches.get(request_id)
+        if cur is not None and not cur.realtime_end_tip:
+            self._s.trial_launches[request_id] = replace(cur, realtime_end_tip=tip_bytes)
+
+    async def expedite_trial_launch_check(self, request_id: int, now_ms: int) -> None:
+        cur = self._s.trial_launches.get(request_id)
+        if cur is not None and cur.state == TRIAL_LAUNCH_STATE_PREPARED and cur.next_check_ms > now_ms:
+            self._s.trial_launches[request_id] = replace(cur, next_check_ms=now_ms)
+
+    async def list_due_trial_launches(self, now_ms: int, limit: int) -> list[TrialLaunchRecord]:
+        rows = [
+            rec
+            for rec in self._s.trial_launches.values()
+            if rec.state == TRIAL_LAUNCH_STATE_PREPARED and rec.next_check_ms <= now_ms
+        ]
+        rows.sort(key=lambda r: (r.next_check_ms, r.request_id))
+        return rows[:limit]
+
+    async def claim_trial_launch(self, request_id: int, prev_next_check_ms: int, new_next_check_ms: int) -> bool:
+        cur = self._s.trial_launches.get(request_id)
+        if (
+            cur is None
+            or cur.state != TRIAL_LAUNCH_STATE_PREPARED
+            or cur.next_check_ms != prev_next_check_ms
+        ):
+            return False
+        self._s.trial_launches[request_id] = replace(
+            cur,
+            next_check_ms=new_next_check_ms,
+            check_attempts=cur.check_attempts + 1,
+        )
+        return True
+
+    async def insert_trial_launch_role(self, rec: TrialLaunchRoleRecord) -> None:
+        key = (rec.player_id, rec.request_id)
+        if key in self._s.trial_launch_roles:
+            raise _DuplicateKeyError("duplicate launch_role", "PRIMARY")
+        self._s.trial_launch_roles[key] = rec
+
+    async def lock_trial_launch_role(self, player_id: int, request_id: int) -> TrialLaunchRoleRecord | None:
+        return self._s.trial_launch_roles.get((player_id, request_id))
+
+    async def has_active_trial_launch_role(self, player_id: int, exclude_request_id: int = 0) -> bool:
+        for (pid, req_id), role_rec in self._s.trial_launch_roles.items():
+            if pid != player_id or req_id == exclude_request_id:
+                continue
+            launch = self._s.trial_launches.get(req_id)
+            if role_rec.state != TRIAL_LAUNCH_ROLE_RELEASED or launch is None or launch.state != TRIAL_LAUNCH_STATE_TERMINAL:
+                return True
+        return False
+
+    async def update_trial_launch_role_state(self, player_id: int, request_id: int, state: int) -> None:
+        key = (player_id, request_id)
+        cur = self._s.trial_launch_roles.get(key)
+        if cur is not None:
+            self._s.trial_launch_roles[key] = replace(cur, state=state)
+
+    async def get_trial_battle(self, battle_id: int) -> TrialBattleRecord | None:
+        return self._s.trial_battles.get(battle_id)
+
+    async def lock_trial_battle(self, battle_id: int) -> TrialBattleRecord | None:
+        return self._s.trial_battles.get(battle_id)
+
+    async def insert_trial_battle(self, rec: TrialBattleRecord) -> None:
+        if rec.battle_id in self._s.trial_battles:
+            raise _DuplicateKeyError("duplicate battle_id", "PRIMARY")
+        self._s.trial_battles[rec.battle_id] = rec
+
+    async def update_trial_battle(
+        self, battle_id: int, state: int, settle_result: int, rewarded_count: int, settled_ms: int
+    ) -> None:
+        cur = self._s.trial_battles[battle_id]
+        self._s.trial_battles[battle_id] = replace(
+            cur,
+            state=state,
+            settle_result=settle_result,
+            rewarded_count=rewarded_count,
+            settled_ms=settled_ms,
+        )
+
+    async def list_overdue_trial_battles(self, created_before_ms: int, limit: int) -> list[TrialBattleRecord]:
+        rows = [
+            rec
+            for rec in self._s.trial_battles.values()
+            if rec.state == TRIAL_BATTLE_STATE_STARTED and rec.created_ms <= created_before_ms
+        ]
+        rows.sort(key=lambda r: (r.created_ms, r.battle_id))
+        return rows[:limit]
+
+    async def insert_trial_reward_owed(self, rec: TrialOwedRewardRecord) -> None:
+        self._s.trial_reward_owed.setdefault((rec.player_id, rec.battle_id), rec)
+
+    async def delete_trial_reward_owed(self, player_id: int, battle_id: int) -> bool:
+        return self._s.trial_reward_owed.pop((player_id, battle_id), None) is not None
+
+    async def list_trial_rewards_owed(self, limit: int) -> list[TrialOwedRewardRecord]:
+        rows = sorted(self._s.trial_reward_owed.values(), key=lambda r: (r.created_ms, r.battle_id, r.player_id))
+        return rows[:limit]
+
+    async def count_trial_rewards_owed_by_player(self, player_id: int) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        for rec in self._s.trial_reward_owed.values():
+            if rec.player_id == player_id:
+                counts[rec.activity_id] = counts.get(rec.activity_id, 0) + 1
+        return counts
+
+    async def increment_trial_reward_owed_attempts(self, player_id: int, battle_id: int) -> None:
+        key = (player_id, battle_id)
+        cur = self._s.trial_reward_owed.get(key)
+        if cur is not None:
+            self._s.trial_reward_owed[key] = replace(cur, attempts=cur.attempts + 1)
 
 
 class MemoryGuildStore(GuildStoreCore):

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import grpc
 import pytest
 
+from xuanming.cluster import GATE, LocalDirectory
 from xuanming.grpc_runtime import GrpcClient, serve_grpc
 from xuanming.login.keys import crc16
 from xuanming.login.sessions import PlayerLocator as LoginPlayerLocatorClient, SessionChanged
@@ -15,15 +16,23 @@ from xuanming.player_locator import (
     DEFAULT_GRPC_PORT,
     PLAYER_LOCATOR_NODE_TYPE,
     CommitLeaseResult,
+    DirectoryLiveGateView,
+    GateSweeper,
     HolderReleasePendingError,
+    HostedResumeVerdict,
+    HostedReturnRecord,
     LeaseClaim,
     LeaseMonitor,
+    LiveViewGate,
+    LiveViewVerdict,
     MemorySessionStore,
     PlayerLocatorConfig,
     PlayerLocatorService,
     RearmLeaseResult,
     RedisSessionStore,
     ReplaceSessionResult,
+    parse_hosted_return_record,
+    resume_hosted_if_lost,
 )
 from xuanming.player_locator import keys, lua
 from xuanming.protocol import Protocol
@@ -48,10 +57,24 @@ class LeaveCall:
     login_generation: int
 
 
+@dataclass(frozen=True)
+class EnterCall:
+    player_id: int
+    session_id: int
+    login_generation: int
+    owner_revision: int
+    gate_zone_id: int
+    hosted_placement: bool
+
+
 class FakeSceneManager:
     def __init__(self) -> None:
         self.calls: list[LeaveCall] = []
+        self.enter_calls: list[EnterCall] = []
         self.next_error: Exception | None = None
+        self.enter_error: Exception | None = None
+        self.enter_response = None
+        self.on_before_enter = None
 
     async def leave_scene(
         self, *, player_id: int, scene_id: int, session_id: int, login_generation: int,
@@ -59,6 +82,31 @@ class FakeSceneManager:
         self.calls.append(LeaveCall(player_id, scene_id, session_id, login_generation))
         if self.next_error is not None:
             raise self.next_error
+
+    async def enter_scene(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        login_generation: int,
+        owner_revision: int,
+        gate_zone_id: int,
+        hosted_placement: bool = True,
+    ):
+        call = EnterCall(
+            player_id=player_id,
+            session_id=session_id,
+            login_generation=login_generation,
+            owner_revision=owner_revision,
+            gate_zone_id=gate_zone_id,
+            hosted_placement=hosted_placement,
+        )
+        self.enter_calls.append(call)
+        if self.on_before_enter is not None:
+            self.on_before_enter(call)
+        if self.enter_error is not None:
+            raise self.enter_error
+        return self.enter_response
 
 
 @dataclass(frozen=True)
@@ -859,6 +907,398 @@ def test_redis_session_store_registers_all_ten_scripts_and_passes_exact_keys():
         assert await store.ack_lease_claim(claims[0]) is True
         assert await store.renew_lease_claims(claims, 1060) == 1
         assert await store.enqueue_offline_cleanup(42, b"retry", 1002) is True
+
+    asyncio.run(exercise())
+
+
+def test_hosted_return_record_parsing_and_same_slot_keys():
+    for pid in (1, 42, 9007199254740995):
+        slot = keys.player_slot(pid)
+        assert keys.hosted_presence_key(pid) == f"player:{{{pid}}}:hosted_presence"
+        assert keys.hosted_return_key(pid) == f"player:{{{pid}}}:hosted_return"
+        assert {
+            keys.hash_slot(keys.session_key(pid)),
+            keys.hash_slot(keys.location_key(pid)),
+            keys.hash_slot(keys.afk_pass_key(pid)),
+            keys.hash_slot(keys.hosted_presence_key(pid)),
+            keys.hash_slot(keys.hosted_return_key(pid)),
+        } == {slot}
+        assert {keys.hash_slot(k) for k in keys.prune_gate_index_member_keys(pid, "g-1")} == {slot}
+        assert {keys.hash_slot(k) for k in keys.release_gate_index_keys(slot, "g-1")} == {slot}
+
+    rec = parse_hosted_return_record("v1:3:9001:44:888")
+    assert rec == HostedReturnRecord(zone_id=3, owner_revision=9001, session_id=44, login_generation=888)
+
+    for bad in (
+        "",
+        "v2:3:9001:44:888",
+        "v1:3:9001:44",
+        "v1:0:9001:44:888",
+        "v1:03:9001:44:888",
+        "v1:3:0:44:888",
+        "v1:3:9001:0:888",
+        "v1:3:9001:44:0",
+        "v1:4294967296:9001:44:888",
+        "v1:3:18446744073709551616:44:888",
+        "v1:3:abc:44:888",
+    ):
+        with pytest.raises(ValueError):
+            parse_hosted_return_record(bad)
+
+
+def test_hosted_resume_via_lease_monitor_active_pass_ttl_align_skip_and_invalid_delete():
+    async def exercise():
+        protocol = Protocol()
+        store = MemorySessionStore()
+        scene_manager = FakeSceneManager()
+        scene_manager.enter_response = protocol.message("scene_manager.EnterSceneResponse", error_code=0)
+        now = [1_700_000_000.0]
+        config = PlayerLocatorConfig(claim_ttl_sec=10.0)
+        monitor = LeaseMonitor(
+            protocol, store, config, scene_manager=scene_manager, clock=lambda: now[0],
+        )
+        service = PlayerLocatorService(protocol, store, config, scene_manager=scene_manager, clock=lambda: now[0])
+
+        pid = 21001
+        session = _make_session(
+            protocol, pid, session_id=61, gate_id="7", gate_instance_id="gate-7",
+            scene_id=501, login_generation=700,
+        )
+        await service.set_session(protocol.message("playerlocator.SetSessionRequest", session=session), None)
+        await service.set_disconnecting(
+            protocol.message(
+                "playerlocator.SetDisconnectingRequest",
+                player_id=pid, session_id=61, lease_ttl_seconds=30, gate_instance_id="gate-7",
+            ),
+            None,
+        )
+        slot = keys.player_slot(pid)
+        return_key = keys.hosted_return_key(pid)
+        return_val = "v1:2:99:61:700"
+
+        # 1. 在场心跳存活 + 活跃月卡 -> 不发 EnterScene，但必须把 hosted_return TTL 对齐到月卡剩余秒数
+        store.set_afk_pass(pid, int(now[0] + 1500))
+        store.set_hosted_presence(pid, "scene-node-7")
+        store.set_hosted_return(pid, return_val, ttl_seconds=120)
+        now[0] += 30.0  # 月卡还剩 1470s
+        await monitor.process_slots([slot])
+        assert len(scene_manager.enter_calls) == 0
+        assert store.ttls[return_key] == 1470
+
+        # 2. 在场心跳消失 + 活跃月卡（location 权威 zone=5 优先于归位记录 zone=2）-> 触发 EnterScene(hosted_placement=True)
+        store.delete_hosted_presence(pid)
+        store.set_location_bytes(
+            pid,
+            protocol.message("storage.PlayerLocation", scene_id=501, zone_id=5, node_id="").SerializeToString(),
+        )
+        now[0] += 300.0  # 下一拍 AFK 续租，月卡还剩 1170s
+        await monitor.process_slots([slot])
+        assert store.ttls[return_key] == 1170
+        assert scene_manager.enter_calls == [
+            EnterCall(
+                player_id=pid,
+                session_id=61,
+                login_generation=700,
+                owner_revision=99,
+                gate_zone_id=5,
+                hosted_placement=True,
+            )
+        ]
+
+        # 3. location 缺失时回退归位记录中的 zone=2；若 SceneManager 返回 FAILED_PRECONDITION 则按值删除 hosted_return
+        store.delete_location(pid)
+        scene_manager.enter_error = FakeRpcError(grpc.StatusCode.FAILED_PRECONDITION, "owner_revision_stale")
+        now[0] += 300.0
+        await monitor.process_slots([slot])
+        assert len(scene_manager.enter_calls) == 2
+        assert scene_manager.enter_calls[-1].gate_zone_id == 2
+        assert await store.get_hosted_return(pid) is None
+
+        # 4. FAILED_PRECONDITION 并发保护：若 EnterScene 在途期间托管节点重写了新记录，不得误删新记录
+        store.set_hosted_return(pid, return_val, ttl_seconds=60)
+        newer_val = "v1:2:100:61:700"
+        scene_manager.on_before_enter = lambda _call: store.set_hosted_return(pid, newer_val, ttl_seconds=900)
+        now[0] += 300.0
+        await monitor.process_slots([slot])
+        assert await store.get_hosted_return(pid) == newer_val.encode("utf-8")
+        scene_manager.on_before_enter = None
+        scene_manager.enter_error = None
+
+        # 5. 月卡剩余不足 60 秒（pass_ending）与旧登录归位记录（other_login）均跳过 EnterScene
+        store.set_afk_pass(pid, int(now[0] + 45))
+        verdict = await resume_hosted_if_lost(protocol, store, scene_manager, session, now[0])
+        assert verdict == HostedResumeVerdict.PASS_ENDING
+        assert store.ttls[return_key] == 45  # 仍大于 1 秒，先对齐 TTL 再判 pass_ending
+        assert len(scene_manager.enter_calls) == 3
+
+        store.set_afk_pass(pid, int(now[0] + 900))
+        store.set_hosted_return(pid, "v1:2:100:61:699", ttl_seconds=50)
+        verdict = await resume_hosted_if_lost(protocol, store, scene_manager, session, now[0])
+        assert verdict == HostedResumeVerdict.OTHER_LOGIN
+        assert store.ttls[return_key] == 50  # 非本次登录记录不改其 TTL
+        assert len(scene_manager.enter_calls) == 3
+
+    asyncio.run(exercise())
+
+
+def test_gate_sweeper_two_tick_debounce_live_sessions_safe_and_stale_pruned():
+    async def exercise():
+        protocol = Protocol()
+        store = MemorySessionStore()
+        now = [1_700_000_000.0]
+        config = PlayerLocatorConfig(default_disconnect_lease_sec=30)
+        service = PlayerLocatorService(protocol, store, config, clock=lambda: now[0])
+
+        directory = LocalDirectory()
+        gate_dead_info = protocol.message(
+            "NodeInfo", node_id=1, node_type=GATE, zone_id=1, node_uuid="gate-dead",
+        )
+        gate_live_info = protocol.message(
+            "NodeInfo", node_id=2, node_type=GATE, zone_id=1, node_uuid="gate-live",
+        )
+        directory.publish(gate_dead_info)
+        directory.publish(gate_live_info)
+
+        # 玩家 A、B 在 gate-dead 上 ONLINE；玩家 C 在 gate-live 上 ONLINE
+        pid_a, pid_b, pid_c = 31001, 31002, 31003
+        await service.set_session(
+            protocol.message(
+                "playerlocator.SetSessionRequest",
+                session=_make_session(protocol, pid_a, session_id=11, gate_id="1", gate_instance_id="gate-dead"),
+            ),
+            None,
+        )
+        await service.set_session(
+            protocol.message(
+                "playerlocator.SetSessionRequest",
+                session=_make_session(protocol, pid_b, session_id=12, gate_id="1", gate_instance_id="gate-dead"),
+            ),
+            None,
+        )
+        await service.set_session(
+            protocol.message(
+                "playerlocator.SetSessionRequest",
+                session=_make_session(protocol, pid_c, session_id=13, gate_id="2", gate_instance_id="gate-live"),
+            ),
+            None,
+        )
+
+        # 模拟玩家 B 已切到 gate-live，但 gate-dead 索引里仍有历史脏成员（检验绝不误杀已迁移活会话）
+        await service.set_session(
+            protocol.message(
+                "playerlocator.SetSessionRequest",
+                session=_make_session(
+                    protocol, pid_b, session_id=14, gate_id="2", gate_instance_id="gate-live",
+                    version=2, login_generation=101,
+                ),
+            ),
+            None,
+        )
+        slot_b = keys.player_slot(pid_b)
+        store.sets.setdefault(keys.gate_session_index_key(slot_b, "gate-dead"), set()).add(str(pid_b))
+        store.sets.setdefault(keys.gate_registry_key(slot_b), set()).add("gate-dead")
+
+        slots = sorted({keys.player_slot(pid_a), slot_b, keys.player_slot(pid_c)})
+        sweeper = GateSweeper(
+            protocol,
+            store,
+            DirectoryLiveGateView(directory),
+            config,
+            slot_owner=lambda: slots,
+            clock=lambda: now[0],
+        )
+
+        # 模拟 gate-dead 从目录消失
+        directory.nodes.pop((GATE, 1, 1))
+
+        # 第 1 拍缺席：仅记入嫌疑（miss=1），绝不转换任何会话
+        r1 = await sweeper.sweep_round()
+        assert r1.stage == "ok"
+        assert r1.dead_gates == []
+        s_a = protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid_a)])
+        assert s_a.state == keys.SESSION_STATE_ONLINE
+
+        # 若第 2 拍前 gate-dead 恢复注册 -> 嫌疑清零
+        directory.publish(gate_dead_info)
+        r_recover = await sweeper.sweep_round()
+        assert r_recover.dead_gates == []
+
+        # 再次消失：需重新连续 2 拍才确认死亡
+        directory.nodes.pop((GATE, 1, 1))
+        r2 = await sweeper.sweep_round()
+        assert r2.dead_gates == []
+        assert protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid_a)]).state == keys.SESSION_STATE_ONLINE
+
+        # 连续第 2 拍缺席：确认 gate-dead 死亡！
+        r3 = await sweeper.sweep_round()
+        assert r3.stage == "ok"
+        assert r3.dead_gates == ["gate-dead"]
+        assert r3.actions.get("to_disconnecting") == 1
+        assert r3.actions.get("pruned_stale") == 1
+
+        # 玩家 A（死 gate 孤儿会话）-> DISCONNECTING + 版本 +1 + 挂断线租约
+        s_a_after = protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid_a)])
+        assert s_a_after.state == keys.SESSION_STATE_DISCONNECTING
+        assert s_a_after.session_version == 2
+        lease_a = keys.lease_keys_for_player(pid_a)
+        assert store.zsets[lease_a.ready][str(pid_a)] == int(now[0] + 30)
+
+        # 玩家 B（已迁到 gate-live）与玩家 C（一直在 gate-live）保持 ONLINE 毫发无损
+        s_b_after = protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid_b)])
+        assert s_b_after.state == keys.SESSION_STATE_ONLINE
+        assert s_b_after.gate_instance_id == "gate-live"
+        assert s_b_after.session_version == 2
+
+        s_c_after = protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid_c)])
+        assert s_c_after.state == keys.SESSION_STATE_ONLINE
+        assert s_c_after.gate_instance_id == "gate-live"
+        assert s_c_after.session_version == 1
+
+        # gate-dead 索引已全部清空并从登记集释放
+        for slot in slots:
+            assert keys.gate_session_index_key(slot, "gate-dead") not in store.sets
+            assert "gate-dead" not in store.sets.get(keys.gate_registry_key(slot), set())
+
+    asyncio.run(exercise())
+
+
+def test_gate_sweeper_live_view_gate_and_fail_closed_protection():
+    async def exercise():
+        protocol = Protocol()
+        store = MemorySessionStore()
+        now = [1_700_000_000.0]
+        config = PlayerLocatorConfig(live_view_hold_sec=1800.0)
+        service = PlayerLocatorService(protocol, store, config, clock=lambda: now[0])
+
+        pid = 32001
+        await service.set_session(
+            protocol.message(
+                "playerlocator.SetSessionRequest",
+                session=_make_session(protocol, pid, session_id=1, gate_id="1", gate_instance_id="gate-1"),
+            ),
+            None,
+        )
+        slot = keys.player_slot(pid)
+
+        class FlakyLiveView:
+            def __init__(self) -> None:
+                self.live: set[str] = set()
+                self.fail = False
+
+            async def live_gate_instances(self) -> set[str]:
+                if self.fail:
+                    raise RuntimeError("etcd unavailable")
+                return set(self.live)
+
+        view = FlakyLiveView()
+        sweeper = GateSweeper(protocol, store, view, config, slot_owner=lambda: [slot], clock=lambda: now[0])
+
+        # 1. etcd 异常 -> fail-closed，不判死
+        view.fail = True
+        r_err = await sweeper.sweep_round()
+        assert r_err.stage == "etcd"
+        assert r_err.dead_gates == []
+
+        # 2. etcd 返回空集但存在登记 gate -> 存活集闸门永久压住（HoldEmpty），绝不误杀
+        view.fail = False
+        view.live = set()
+        for _ in range(3):
+            r_held = await sweeper.sweep_round()
+            assert r_held.stage == "view_held"
+            assert r_held.held is True
+            now[0] += 1800.0
+        assert protocol.parse("playerlocator.PlayerSession", store.strings[keys.session_key(pid)]).state == keys.SESSION_STATE_ONLINE
+
+        # 3. LiveViewGate 4+ gate 骤降超半数：压住满 hold_sec 后放行，恢复到不过半立即复位
+        gate = LiveViewGate(hold_sec=60.0)
+        t = 1000.0
+        assert gate.observe(known=4, missing=3, empty=False, now=t) == LiveViewVerdict.HOLD_DROP
+        assert gate.observe(known=4, missing=3, empty=False, now=t + 59.0) == LiveViewVerdict.HOLD_DROP
+        assert gate.observe(known=4, missing=3, empty=False, now=t + 60.0) == LiveViewVerdict.RELEASE
+        assert gate.observe(known=4, missing=3, empty=False, now=t + 70.0) == LiveViewVerdict.ACCEPT
+        # 恢复到不过半（2/4）后再次骤降重新压住
+        assert gate.observe(known=4, missing=2, empty=False, now=t + 140.0) == LiveViewVerdict.ACCEPT
+        assert gate.observe(known=4, missing=3, empty=False, now=t + 141.0) == LiveViewVerdict.HOLD_DROP
+
+    asyncio.run(exercise())
+
+
+def test_redis_session_store_hosted_resume_and_gate_sweep_scripts():
+    async def exercise():
+        invocations: list[tuple[str, list[str], list]] = []
+
+        class StubPipeline:
+            def __init__(self, transaction):
+                assert transaction is False
+                self._keys: list[str] = []
+
+            def smembers(self, key: str):
+                self._keys.append(key)
+
+            async def execute(self, raise_on_error: bool = False):
+                assert raise_on_error is False
+                return [{b"gate-dead"}] * len(self._keys)
+
+        class StubRedis:
+            def register_script(self, script: str):
+                async def run(*, keys, args):
+                    invocations.append((script, list(keys), list(args)))
+                    return 1
+
+                return run
+
+            async def get(self, key: str):
+                return b"val:" + key.encode("utf-8")
+
+            async def mget(self, *req_keys: str):
+                return [b"raw:" + k.encode("utf-8") for k in req_keys]
+
+            async def sscan(self, key: str, *, cursor: int = 0, count: int = 100):
+                return 0, [b"42"]
+
+            async def srem(self, key: str, member: str):
+                return 1
+
+            def pipeline(self, *, transaction: bool = True):
+                return StubPipeline(transaction)
+
+        store = RedisSessionStore(StubRedis())
+        assert await store.get_hosted_presence(42) == b"val:player:{42}:hosted_presence"
+        assert await store.get_hosted_return(42) == b"val:player:{42}:hosted_return"
+
+        assert await store.expire_hosted_return_if_value(42, "v1:1:2:3:4", 600) is True
+        assert invocations[-1] == (
+            lua.EXPIRE_HOSTED_RETURN_IF_VALUE_LUA,
+            [keys.hosted_return_key(42)],
+            [b"v1:1:2:3:4", 600],
+        )
+
+        assert await store.delete_hosted_return_if_value(42, "v1:1:2:3:4") is True
+        assert invocations[-1] == (
+            lua.DELETE_HOSTED_RETURN_IF_VALUE_LUA,
+            [keys.hosted_return_key(42)],
+            [b"v1:1:2:3:4"],
+        )
+
+        slot = keys.player_slot(42)
+        assert await store.list_registered_gates([slot]) == [(slot, "gate-dead")]
+        assert await store.scan_gate_index_members(slot, "gate-dead") == (0, ["42"])
+        assert await store.mget_sessions_bytes([42]) == [b"raw:player:session:{42}"]
+        assert await store.remove_bad_gate_index_member(slot, "gate-dead", "bad") is True
+
+        assert await store.prune_gate_index_member(42, "gate-dead", "42", b"expected") is True
+        assert invocations[-1] == (
+            lua.PRUNE_GATE_INDEX_MEMBER_LUA,
+            list(keys.prune_gate_index_member_keys(42, "gate-dead")),
+            ["present", b"expected", "42"],
+        )
+
+        assert await store.release_gate_index_if_empty(slot, "gate-dead") is True
+        assert invocations[-1] == (
+            lua.RELEASE_GATE_INDEX_IF_EMPTY_LUA,
+            list(keys.release_gate_index_keys(slot, "gate-dead")),
+            ["gate-dead"],
+        )
 
     asyncio.run(exercise())
 

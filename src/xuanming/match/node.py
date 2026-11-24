@@ -20,6 +20,7 @@ from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..login.caller_auth import CallerVerifier
 from ..protocol import Protocol
 from ..settings import Settings
+from .battle_scripts import BattleScriptManager
 from .config import MatchConfig
 from .gather import (
     EtcdBattleNodeResolver,
@@ -32,6 +33,8 @@ from .gather import (
 from .match_service import MatchGrpcService, MatchServer
 from .model import MATCH_NODE_TYPE, TEAM_NODE_TYPE
 from .outbox import OutcomeOutboxWorker
+from .ranked import RankedManager
+from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
 from .sql_store import SqlMatchStore, open_pool
 from .store import MatchStore, MemoryMatchStore
@@ -106,6 +109,12 @@ async def open_service(
         stack.push_async_callback(inbox_client.close)
         inbox_call = inbox_client.call
 
+    rank_call = None
+    if config.rank_endpoint:
+        rank_client = GrpcClient(config.rank_endpoint, timeout=3.0, enable_retries=False)
+        stack.push_async_callback(rank_client.close)
+        rank_call = rank_client.call
+
     gather = GatherPipeline(protocol, store, config, rpc_pool, presence, battle_nodes)
     matchmaker = Matchmaker(protocol, store, config, gather, battle_nodes)
     outbox = OutcomeOutboxWorker(
@@ -116,7 +125,16 @@ async def open_service(
         publish_result=publish_result,
         interval_sec=config.outbox_interval_sec,
     )
+    rank_publisher = RankOutboxPublisher(
+        protocol,
+        store,
+        rank_call=rank_call,
+        rank_secret=config.rank_secret,
+        interval_sec=config.rank_publish_interval_sec,
+    )
     spectate = SpectateManager(protocol, store, config, rpc_pool, presence)
+    battle_scripts = BattleScriptManager(protocol, store)
+    ranked = RankedManager(protocol, store)
 
     verifier = gate_verifier if gate_verifier is not None else CallerVerifier.from_env()
     team_svc = TeamGrpcService(
@@ -128,6 +146,7 @@ async def open_service(
         battle_nodes=battle_nodes,
         gather=gather,
         notifier=team_notifier,
+        ranked=ranked,
     )
     match_svc = MatchGrpcService(
         protocol,
@@ -138,6 +157,8 @@ async def open_service(
         battle_nodes=battle_nodes,
         gather=gather,
         spectate=spectate,
+        battle_scripts=battle_scripts,
+        ranked=ranked,
     )
     server = MatchServer(
         protocol=protocol,
@@ -149,6 +170,7 @@ async def open_service(
         matchmaker=matchmaker,
         outbox=outbox,
         spectate=spectate,
+        rank_publisher=rank_publisher,
     )
     stack.push_async_callback(server.close)
     return server
@@ -216,6 +238,12 @@ async def run(settings: Settings) -> None:
                 stack.callback(matcher_task.cancel)
                 stack.callback(outbox_task.cancel)
                 bg_tasks.update((matcher_task, outbox_task))
+                if match_server.rank_publisher is not None and config.rank_endpoint and config.rank_secret:
+                    rank_task = asyncio.create_task(
+                        match_server.rank_publisher.run_forever(stop), name="match-rank-publisher-loop"
+                    )
+                    stack.callback(rank_task.cancel)
+                    bg_tasks.add(rank_task)
             else:
                 logger.info(
                     "match release_track=%s: global background loops disabled (canary serves RPCs only)",

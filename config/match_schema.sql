@@ -286,6 +286,168 @@ CREATE TABLE IF NOT EXISTS `match_manual_resolution` (
   PRIMARY KEY (`battle_id`) /*T![clustered_index] NONCLUSTERED */
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_manual_resolution';
 
+-- ---- 战斗剧本表（proto/match/match_authority.proto）----
+
+CREATE TABLE IF NOT EXISTS `match_battle_script` (
+  `script_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `owner_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `revision` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `content` MEDIUMBLOB COMMENT 'pb:4',
+  `review_state` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `approved_revision` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `approved_content` MEDIUMBLOB COMMENT 'pb:7',
+  `reject_reason` VARCHAR(191) NOT NULL DEFAULT '' COMMENT 'pb:8',
+  `submitted_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:9',
+  `reviewed_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:10',
+  PRIMARY KEY (`script_id`) /*T![clustered_index] NONCLUSTERED */,
+  INDEX `idx_match_battle_script_0` (`owner_player_id`,`script_id`),
+  INDEX `idx_match_battle_script_1` (`review_state`,`submitted_ms`,`script_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_battle_script';
+
+CREATE TABLE IF NOT EXISTS `match_battle_script_review` (
+  `script_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `revision` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `owner_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `approved` TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `reviewer` VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'pb:5',
+  `reason` VARCHAR(191) NOT NULL DEFAULT '' COMMENT 'pb:6',
+  `reviewed_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  `content` MEDIUMBLOB COMMENT 'pb:8',
+  PRIMARY KEY (`script_id`,`revision`) /*T![clustered_index] NONCLUSTERED */,
+  INDEX `idx_match_battle_script_review_0` (`reviewed_ms`,`script_id`,`revision`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_battle_script_review';
+
+CREATE TABLE IF NOT EXISTS `match_battle_script_loadout` (
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `match_mode` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `battle_config_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `origin` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `official_script_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `player_script_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  PRIMARY KEY (`player_id`,`match_mode`,`battle_config_id`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_battle_script_loadout';
+
+-- ---- Elo 评分与投榜发件箱表（proto/match/match_authority.proto）----
+
+CREATE TABLE IF NOT EXISTS `match_rating` (
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `mode` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `rating_centi` bigint NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `games` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `score_changed_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  PRIMARY KEY (`player_id`,`mode`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_rating';
+
+CREATE TABLE IF NOT EXISTS `match_rating_applied` (
+  `battle_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `payload_digest` VARBINARY(64) NOT NULL DEFAULT '' COMMENT 'pb:2',
+  `applied_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  PRIMARY KEY (`battle_id`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_rating_applied';
+
+CREATE TABLE IF NOT EXISTS `match_rank_source` (
+  `source_epoch` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `mode` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  `shard` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `produced_cursor` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `committed_cursor` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `board_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `stopped` TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  PRIMARY KEY (`source_epoch`,`mode`,`shard`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_rank_source';
+
+CREATE TABLE IF NOT EXISTS `match_rank_outbox` (
+  `source_epoch` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `mode` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `shard` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `source_cursor` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `request_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `entries` MEDIUMBLOB COMMENT 'pb:4',
+  PRIMARY KEY (`source_epoch`,`mode`,`shard`,`source_cursor`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_rank_outbox';
+
+CREATE TABLE IF NOT EXISTS `match_rank_removal` (
+  `mode` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `created_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  PRIMARY KEY (`mode`,`player_id`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_rank_removal';
+
+-- ---- 论剑排位首发 V1 权威表（proto/match/match_authority.proto）----
+
+CREATE TABLE IF NOT EXISTS `match_ranked_season` (
+  `season_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `season_key` VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'pb:2',
+  `season_name` VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'pb:3',
+  `rank_generation` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `source_epoch` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `rule_version` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `state` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  `rollover_stage` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:8',
+  `start_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:9',
+  `end_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:10',
+  `rank_board_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:11',
+  `expected_rank_cursor` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:12',
+  `champion_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:13',
+  `champion_name` VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'pb:14',
+  `champion_rating_centi` bigint NOT NULL DEFAULT 0 COMMENT 'pb:15',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:16',
+  PRIMARY KEY (`season_id`) /*T![clustered_index] NONCLUSTERED */,
+  INDEX `idx_match_ranked_season_0` (`state`,`season_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_ranked_season';
+
+CREATE TABLE IF NOT EXISTS `match_ranked_player_prefs` (
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `character_preset_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `pet_preset_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `rule_version` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `cosmetic_loadout` MEDIUMBLOB COMMENT 'pb:5',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  PRIMARY KEY (`player_id`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_ranked_player_prefs';
+
+CREATE TABLE IF NOT EXISTS `match_ranked_player_season` (
+  `season_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `qualified` TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `qualified_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `rating_centi` bigint NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `peak_rating_centi` bigint NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `peak_tier` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  `valid_matches` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:8',
+  `wins` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:9',
+  `losses` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:10',
+  `draws` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:11',
+  `milestone_bits` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:12',
+  `honor_bits` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:13',
+  `final_rank` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:14',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:15',
+  PRIMARY KEY (`season_id`,`player_id`) /*T![clustered_index] NONCLUSTERED */,
+  INDEX `idx_match_ranked_player_season_0` (`player_id`,`season_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_ranked_player_season';
+
+CREATE TABLE IF NOT EXISTS `match_ranked_reward` (
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `season_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `reward_kind` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `tier_value` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `item_code` VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'pb:5',
+  `granted_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  PRIMARY KEY (`player_id`,`season_id`,`reward_kind`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_ranked_reward';
+
+CREATE TABLE IF NOT EXISTS `match_ranked_battle` (
+  `battle_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `season_id` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `settled_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `summary` MEDIUMBLOB COMMENT 'pb:5',
+  PRIMARY KEY (`battle_id`,`player_id`) /*T![clustered_index] NONCLUSTERED */,
+  INDEX `idx_match_ranked_battle_0` (`player_id`,`settled_at_ms`,`battle_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='match_ranked_battle';
+
 CREATE TABLE IF NOT EXISTS `role_fence` (
   `player_id` BIGINT UNSIGNED NOT NULL,
   `account` VARBINARY(191) NOT NULL,

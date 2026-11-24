@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 ERR_OK = 0
 ERR_SERVICE_UNAVAILABLE = 1003
 ERR_INVALID_PARAMETER = 1005
+ERR_LOGIN_ACCOUNT_PLAYER_FULL = 2001
 
 ERR_TRADE_LISTING_NOT_FOUND = 20000
 ERR_TRADE_HOME_ZONE_UNKNOWN = 20001
@@ -129,6 +130,38 @@ class ManualVersionChangedError(TradeError):
     """人工处置时合同（或关联出价）版本已变化。"""
 
 
+class RoleDirectoryUnavailableError(TradeError):
+    """全局账号角色目录暂不可用（结局未知）。"""
+
+
+class RoleDirectoryRetryLaterError(RoleDirectoryUnavailableError):
+    """全局账号角色目录返回可重试（结局已知，同参数重放）。"""
+
+
+class RoleDirectoryMissingError(TradeError):
+    """账号或角色目录项不存在。"""
+
+
+class RoleDirectoryConflictError(TradeError):
+    """账号角色归属或交易状态冲突。"""
+
+
+class RoleDirectoryFullError(TradeError):
+    """目标账号存活角色数已达全局上限。"""
+
+
+class RoleDirectoryInvalidError(TradeError):
+    """账号角色目录请求参数非法。"""
+
+
+class RolePreparingError(TradeError):
+    """买家角色仍在冻结投票中，下一轮再判。"""
+
+
+class TextCheckUnavailableError(TradeError):
+    """内容安全服务暂不可用（fail-closed 拒绝上架）。"""
+
+
 def commerce_tip_id(error: BaseException | None) -> int:
     """将交易/护栏领域异常映射为客户端带内 Tip 错误码（与 Go logic.commerceCode 对齐）。"""
     if error is None:
@@ -137,9 +170,15 @@ def commerce_tip_id(error: BaseException | None) -> int:
         return error.tip_id
     if isinstance(error, RoleNotFoundError):
         return ERR_TRADE_COUNTERPARTY_UNKNOWN
-    if isinstance(error, RoleFenceUnavailableError):
-        logger.info("trade role fence authority unavailable err=%s", error)
+    if isinstance(error, (RoleFenceUnavailableError, RoleDirectoryConflictError, RoleDirectoryRetryLaterError)):
+        logger.info("trade role fence or directory state conflict err=%s", error)
         return ERR_TRADE_ORDER_STATE_CONFLICT
+    if isinstance(error, RoleDirectoryFullError):
+        return ERR_LOGIN_ACCOUNT_PLAYER_FULL
+    if isinstance(error, RoleDirectoryInvalidError):
+        return ERR_INVALID_PARAMETER
+    if isinstance(error, RoleDirectoryMissingError):
+        return ERR_TRADE_ORDER_NOT_FOUND
     if isinstance(error, ListingNotFoundError):
         return ERR_TRADE_LISTING_NOT_FOUND
     logger.error("trade authoritative request failed err=%s", error)

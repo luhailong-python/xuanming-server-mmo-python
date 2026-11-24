@@ -19,6 +19,10 @@ DEFAULT_SCENE_MANAGER_TIMEOUT_SEC = 5.0
 HOLDER_RELEASE_FIRST_RETRY_DELAY_SEC = 2.0
 AFK_PASS_LEASE_TTL_SEC = 300
 AFK_PASS_PROBE_RETRY_SEC = 10
+DEFAULT_RECONCILE_INTERVAL_SEC = 60.0
+DEFAULT_DEAD_GATE_MEMBERS_PER_ROUND = 200
+DEFAULT_GATE_SCAN_COUNT = 100
+DEFAULT_LIVE_VIEW_HOLD_SEC = 1800.0
 
 
 def parse_release_track(raw: str) -> str | None:
@@ -47,6 +51,10 @@ class PlayerLocatorConfig:
     claim_ttl_sec: float = DEFAULT_CLAIM_TTL_SEC
     claim_heartbeat_sec: float = DEFAULT_CLAIM_HEARTBEAT_SEC
     scene_manager_timeout_sec: float = DEFAULT_SCENE_MANAGER_TIMEOUT_SEC
+    reconcile_interval_sec: float = DEFAULT_RECONCILE_INTERVAL_SEC
+    dead_gate_members_per_round: int = DEFAULT_DEAD_GATE_MEMBERS_PER_ROUND
+    gate_scan_count: int = DEFAULT_GATE_SCAN_COUNT
+    live_view_hold_sec: float = DEFAULT_LIVE_VIEW_HOLD_SEC
 
     def validate(self) -> None:
         if not 0 < self.node_id < (1 << 17):
@@ -71,6 +79,12 @@ class PlayerLocatorConfig:
             raise ValueError("player_locator claim TTL 与心跳间隔必须 > 0")
         if self.scene_manager_timeout_sec <= 0:
             raise ValueError("player_locator scene_manager_timeout_sec 必须 > 0")
+        if self.dead_gate_members_per_round <= 0:
+            raise ValueError("player_locator dead_gate_members_per_round 必须 > 0")
+        if self.gate_scan_count <= 0:
+            raise ValueError("player_locator gate_scan_count 必须 > 0")
+        if self.live_view_hold_sec < 0:
+            raise ValueError("player_locator live_view_hold_sec 必须 >= 0")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "PlayerLocatorConfig":
@@ -99,6 +113,10 @@ class PlayerLocatorConfig:
             claim_ttl_sec=float(raw.get("claim_ttl_sec", DEFAULT_CLAIM_TTL_SEC)),
             claim_heartbeat_sec=float(raw.get("claim_heartbeat_sec", DEFAULT_CLAIM_HEARTBEAT_SEC)),
             scene_manager_timeout_sec=float(raw.get("scene_manager_timeout_sec", DEFAULT_SCENE_MANAGER_TIMEOUT_SEC)),
+            reconcile_interval_sec=float(raw.get("reconcile_interval_sec", DEFAULT_RECONCILE_INTERVAL_SEC)),
+            dead_gate_members_per_round=int(raw.get("dead_gate_members_per_round", DEFAULT_DEAD_GATE_MEMBERS_PER_ROUND)),
+            gate_scan_count=int(raw.get("gate_scan_count", DEFAULT_GATE_SCAN_COUNT)),
+            live_view_hold_sec=float(raw.get("live_view_hold_sec", DEFAULT_LIVE_VIEW_HOLD_SEC)),
         )
         cfg.validate()
         return cfg

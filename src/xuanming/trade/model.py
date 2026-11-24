@@ -21,7 +21,25 @@ DATABASE_NAME = "mmorpg_trade"
 TRADE_NODE_TYPE = 12  # common.base.eNodeType.TradeNodeService
 ASSET_OP_CALLER = "trade"
 ROLE_FENCE_CALLER = "trade"
+ACCOUNT_DIRECTORY_CALLER = "trade"
 MANUAL_RESOLUTION_CALLER = "ops-commerce"
+
+# 内容安全场景与判定枚举（与 proto/content_guard/content_guard.proto 对齐）
+TEXT_SCENE_TRADE_TITLE = 9
+TEXT_VERDICT_PASS = 1
+TEXT_VERDICT_MASKED = 2
+TEXT_VERDICT_REJECT = 3
+
+# 官方商城交付与付款撤销常量（与 Go official_reversal.go 对齐）
+STAGE_OFFICIAL_DELIVER = "official_deliver"
+STAGE_OFFICIAL_REVERSED = "official_reversed"
+OFFICIAL_CREDIT_ROLE = "official_credit"
+OFFICIAL_REVERSE_PREFIX = "official_reverse_"
+OFFICIAL_REGRANT_PREFIX = "official_regrant_"
+
+# 人民币寄售限值（与 Go rmb.go / rmb_mall.go 对齐）
+MAX_RMB_PRICE_FEN = 9_000_000_000_000_000
+MAX_RMB_TITLE_UTF16 = 128
 
 # 资产通道流与交易类型（与 proto/common/asset/asset_op.proto & transaction_log.proto 对齐）
 ASSET_STREAM_TRADE_DEBIT = 3
@@ -184,6 +202,11 @@ MAX_SUBCATEGORIES: dict[int, int] = {
 def is_tradable_currency(currency_type: int) -> bool:
     """交易与人民币寄售允许的币种：仅银两(0)与灵石(1)，绑定灵石(2)禁售。"""
     return currency_type in (CURRENCY_GOLD, CURRENCY_DIAMOND)
+
+
+def is_known_currency(currency_type: int) -> bool:
+    """协议 CurrencyType 完整取值表校验（银两/灵石/绑定灵石，供官方商城发放校验）。"""
+    return currency_type in (CURRENCY_GOLD, CURRENCY_DIAMOND, CURRENCY_BIND_DIAMOND)
 
 
 def valid_account(account: str) -> bool:

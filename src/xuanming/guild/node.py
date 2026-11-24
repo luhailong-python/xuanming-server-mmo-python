@@ -17,6 +17,12 @@ from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..login.caller_auth import CallerVerifier
 from ..protocol import Protocol
 from ..settings import Settings
+from .asset_loop import (
+    GrpcDataServiceLedgerReader,
+    GuildAssetOpCaller,
+    GuildAssetOpLoop,
+    RedisEtcdSceneResolver,
+)
 from .config import GuildConfig
 from .model import GUILD_NODE_TYPE, GuildTableCatalog
 from .rank_store import GuildRankStore, MemoryGuildRankStore, RedisGuildRankStore
@@ -31,7 +37,10 @@ from .store import (
     GrpcRoleFenceDirectory,
     IdSegmentAllocator,
     NullContentGuardChecker,
+    NullGuildNotifier,
+    NullOnlineStatusResolver,
 )
+from .trials import GuildTrialCoordinator, MatchInternalClient
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +60,11 @@ async def open_service(
     protocol: Protocol,
     stack: AsyncExitStack,
     *,
+    directory: EtcdDirectory | None = None,
+    stop_event: asyncio.Event | None = None,
     environ=None,
 ) -> tuple[GuildService, SqlGuildStore]:
-    """打开独占库连接池、验表、加载合服映射并装配 GuildService。"""
+    """打开独占库连接池、验表、加载合服映射并装配 GuildService（含 AssetOpLoop 与 Trials 协调器）。"""
     catalog = _load_catalog(config.tables_dir)
     pool = await open_pool(
         host=config.mysql_host,
@@ -97,6 +108,7 @@ async def open_service(
         await store.bootstrap()
     await store.verify_schema()
 
+    redis_client = None
     rank_store: GuildRankStore
     if config.redis:
         from redis.asyncio import Redis
@@ -107,6 +119,35 @@ async def open_service(
     else:
         rank_store = MemoryGuildRankStore(merged_zones=merged_zones)
 
+    asset_loop: GuildAssetOpLoop | None = None
+    if config.asset_op_enabled and redis_client is not None and directory is not None:
+        resolver = RedisEtcdSceneResolver(protocol, redis_client, directory)
+        stack.push_async_callback(resolver.close)
+        asset_caller = GuildAssetOpCaller(protocol, resolver, config.asset_op_secret)
+        ledger_reader = GrpcDataServiceLedgerReader(protocol, ds_client.call)
+        asset_loop = GuildAssetOpLoop(
+            protocol,
+            store,
+            asset_caller,
+            ledger_reader,
+            lease_ms=config.asset_op_lease_ms,
+        )
+
+    trials: GuildTrialCoordinator | None = None
+    if config.trials_enabled and config.match_service:
+        match_grpc = GrpcClient(config.match_service, timeout=2.0, enable_retries=False)
+        stack.push_async_callback(match_grpc.close)
+        match_client = MatchInternalClient(protocol, match_grpc.call, config.match_internal_secret)
+        trials = GuildTrialCoordinator(
+            protocol,
+            store,
+            match_client,
+            online_resolver=NullOnlineStatusResolver(),
+            notifier=NullGuildNotifier(),
+            asset_loop=asset_loop,
+            asset_op_lease_ms=config.asset_op_lease_ms,
+        )
+
     if config.runs_background_work:
         try:
             rank_rows = await store.list_rank_rows()
@@ -114,6 +155,12 @@ async def open_service(
             logger.info("guild rank reconciled rows=%d", len(rank_rows))
         except Exception:
             logger.error("guild rank initial rebuild failed", exc_info=True)
+        if asset_loop is not None:
+            asset_task = asyncio.create_task(asset_loop.run(stop_event=stop_event), name="guild-asset-op-loop")
+            stack.callback(asset_task.cancel)
+        if trials is not None:
+            trial_task = asyncio.create_task(trials.run(stop_event=stop_event), name="guild-trial-sweep-loop")
+            stack.callback(trial_task.cancel)
 
     caller_verifier = CallerVerifier.from_env(environ, allowed_callers=("gate",))
     service = GuildService(
@@ -125,6 +172,8 @@ async def open_service(
         home_zones=home_zones,
         player_names=player_names,
         content_guard=content_guard,
+        asset_loop=asset_loop,
+        trials=trials,
         asset_op_enabled=config.asset_op_enabled,
         asset_op_lease_ms=config.asset_op_lease_ms,
         terminal_retention_days=config.terminal_retention_days,
@@ -157,7 +206,10 @@ async def run(settings: Settings) -> None:
                 protocol_type=1,
             )
 
-            service, _ = await open_service(config, protocol, stack)
+            directory = EtcdDirectory(protocol, settings.etcd, ttl=config.lease_ttl_sec)
+            stack.push_async_callback(directory.close)
+
+            service, _ = await open_service(config, protocol, stack, directory=directory, stop_event=stop)
 
             kill_switch = KillSwitch(protocol, info)
             etcd_ks = EtcdKillSwitch(protocol, settings.etcd, kill_switch)
@@ -176,8 +228,6 @@ async def run(settings: Settings) -> None:
 
             info.grpc_endpoint.ip = info.endpoint.ip = config.advertise_host
             info.grpc_endpoint.port = info.endpoint.port = port
-            directory = EtcdDirectory(protocol, settings.etcd, ttl=config.lease_ttl_sec)
-            stack.push_async_callback(directory.close)
             await directory.register(info)
             keepalive = asyncio.create_task(directory.maintain(info), name="guild-etcd-lease")
             stack.callback(keepalive.cancel)

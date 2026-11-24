@@ -3,24 +3,94 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 import logging
 import signal
 import time
 import uuid
 
+import aiohttp
+
 from ..cluster import EtcdDirectory
 from ..grpc_runtime import serve_grpc
 from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..protocol import Protocol
 from ..settings import Settings
-from .config import CONTENT_GUARD_NODE_TYPE, ContentGuardConfig
+from .config import CONTENT_GUARD_NODE_TYPE, DEFAULT_LOOKUP_TIMEOUT_MS, ContentGuardConfig
 from .engine import Engine
 from .lexstore import LexiconWatcher, Pointer, wait_for_lexicon
+from .platform import (
+    DouyinAdapter,
+    GrpcIdentityLookup,
+    Identity,
+    IdentityLookup,
+    PlatformAdapter,
+    PlatformRouter,
+    WeChatAdapter,
+)
 from .service import ContentGuardService, PlatformReviewer
 from .wordlist import parse_lexicon
 
 logger = logging.getLogger(__name__)
+
+
+def build_platform_router(
+    protocol: Protocol,
+    config: ContentGuardConfig,
+    *,
+    lookup: IdentityLookup | Callable[[int], Awaitable[Identity]] | None = None,
+    session: aiohttp.ClientSession | None = None,
+) -> PlatformRouter | None:
+    """根据可选外部平台配置装配审核路由器；未配置任一渠道时返回 ``None``（仅运行本地词库层）。"""
+    adapters: list[PlatformAdapter] = []
+    if config.platform_wechat_app_id:
+        if not config.platform_wechat_app_secret:
+            raise ValueError(
+                f"content_guard missing environment variable {config.platform_wechat_app_secret_env} "
+                "for platform_wechat"
+            )
+        adapters.append(
+            WeChatAdapter(
+                config.platform_wechat_app_id,
+                config.platform_wechat_app_secret,
+                base_url=config.platform_wechat_base_url,
+                session=session,
+            )
+        )
+    if config.platform_douyin_app_id:
+        if not config.platform_douyin_app_secret:
+            raise ValueError(
+                f"content_guard missing environment variable {config.platform_douyin_app_secret_env} "
+                "for platform_douyin"
+            )
+        adapters.append(
+            DouyinAdapter(
+                config.platform_douyin_app_id,
+                config.platform_douyin_app_secret,
+                base_url=config.platform_douyin_base_url,
+                session=session,
+            )
+        )
+    if not adapters:
+        return None
+
+    resolved_lookup = lookup
+    if resolved_lookup is None and config.data_service:
+        timeout_ms = config.platform_lookup_timeout_ms or DEFAULT_LOOKUP_TIMEOUT_MS
+        resolved_lookup = GrpcIdentityLookup(
+            protocol,
+            config.data_service,
+            timeout_sec=timeout_ms / 1000.0,
+        )
+    return PlatformRouter(
+        adapters,
+        lookup=resolved_lookup,
+        sync_timeout_ms=config.platform_sync_timeout_ms,
+        world_timeout_ms=config.platform_world_timeout_ms,
+        async_timeout_ms=config.platform_async_timeout_ms,
+        lookup_timeout_ms=config.platform_lookup_timeout_ms,
+    )
 
 
 def build_lexicon_watcher(
@@ -98,6 +168,12 @@ async def run(
                     engine.current().version,
                 )
 
+            if reviewer is None:
+                built_router = build_platform_router(protocol, config)
+                if built_router is not None:
+                    stack.push_async_callback(built_router.close)
+                    reviewer = built_router
+
             service = ContentGuardService(
                 protocol,
                 engine,
@@ -144,9 +220,15 @@ async def run(
             )
             stack.callback(keepalive.cancel)
 
+            providers = (
+                ",".join(reviewer.providers)
+                if isinstance(reviewer, PlatformRouter) and reviewer.providers
+                else ("custom" if reviewer is not None else "none")
+            )
             logger.info(
                 "content_guard ready node_id=%d zone=%d grpc=%s:%d ttl=%d "
-                "lexicon_prefix=%s require_lexicon=%s lexicon_version=%d max_text_bytes=%d",
+                "lexicon_prefix=%s require_lexicon=%s lexicon_version=%d max_text_bytes=%d "
+                "platform_providers=%s",
                 config.node_id,
                 config.zone_id,
                 config.advertise_host,
@@ -156,6 +238,7 @@ async def run(
                 config.require_lexicon,
                 engine.current().version,
                 config.max_text_bytes,
+                providers,
             )
             stop_wait = asyncio.create_task(stop.wait())
             try:

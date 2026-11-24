@@ -78,12 +78,50 @@ class SceneClaimResult:
     claimed: bool = False
     busy: bool = False
     pending: bool = False
+    withdrawn: bool = False
     node_id: str = ""
     agones_gs: str = ""
     source: str = ""
     mirror_flag: str = ""
     members: tuple[str, ...] = ()
     token: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SceneTeardownJob:
+    """拆除任务快照（对应 scene:{ctl:<z>}:<id>:teardown）。"""
+
+    zone_id: int
+    scene_id: int
+    kind: str
+    reason: str
+    claim: SceneClaimResult
+
+
+@dataclass(frozen=True, slots=True)
+class DeadNodeTaskFence:
+    """死节点收尾任务身份围栏，用于逐个认领与结束时的同脚本防撤销核对。"""
+
+    tasks_key: str
+    member: str
+    queued_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class DeadNodeReconcileTask:
+    """从 scene_manager:dead_node_reconcile:{ctl:<z>} 读出的一条死节点收尾任务。"""
+
+    member: str
+    zone_id: int
+    node_id: str
+    queued_at_ms: int
+
+    def fence(self) -> DeadNodeTaskFence:
+        return DeadNodeTaskFence(
+            tasks_key=keys.dead_node_reconcile_tasks_key(self.zone_id),
+            member=self.member,
+            queued_at_ms=self.queued_at_ms,
+        )
 
 
 class SceneIdGenerator:
@@ -112,7 +150,9 @@ class SceneIdGenerator:
 # ── 控制域存储协议 ─────────────────────────────────────────────────────────────
 
 class SceneControlStore(Protocol):
-    async def upsert_scene_node(self, zone_id: int, node_id: str, *, score: float, scene_node_type: int) -> None: ...
+    async def upsert_scene_node(
+        self, zone_id: int, node_id: str, *, score: float, scene_node_type: int, preserve_death_at: bool = False,
+    ) -> None: ...
     async def remove_scene_node(self, zone_id: int, node_id: str, *, death_at_unix_sec: int | None = None) -> None: ...
     async def get_node_load_pairs(self, zone_id: int) -> list[tuple[str, float]]: ...
     async def is_node_in_load_set(self, zone_id: int, node_id: str) -> bool: ...
@@ -125,14 +165,21 @@ class SceneControlStore(Protocol):
     async def remove_scene_mirror(self, zone_id: int, source_scene_id: int, mirror_scene_id: int) -> None: ...
     async def delete_scene_mirrors_index(self, zone_id: int, source_scene_id: int) -> None: ...
     async def is_scene_draining(self, zone_id: int, scene_id: int) -> bool: ...
+    async def is_scene_mirror(self, zone_id: int, scene_id: int) -> bool: ...
     async def get_scene_placement_gen(self, zone_id: int, scene_id: int) -> int: ...
     async def allocate_placement_generation(self, zone_id: int) -> int: ...
     async def reassign_scene_node(
         self, *, zone_id: int, scene_id: int, old_node_id: str, new_node_id: str, placement_generation: int,
     ) -> bool: ...
     async def get_world_channels(self, zone_id: int, conf_id: int) -> list[str]: ...
+    async def get_world_draining_channels(self, zone_id: int, conf_id: int) -> list[str]: ...
     async def is_world_channel_active(self, zone_id: int, conf_id: int, scene_id: int) -> bool: ...
     async def is_world_channel_draining(self, zone_id: int, conf_id: int, scene_id: int) -> bool: ...
+    async def allocate_world_channel_line_numbers(
+        self, zone_id: int, conf_id: int, scene_ids: Sequence[int],
+    ) -> dict[int, int]: ...
+    async def set_world_channel_directory(self, zone_id: int, conf_id: int, payload: bytes, ttl_sec: int) -> None: ...
+    async def get_world_channel_directory(self, zone_id: int, conf_id: int) -> bytes | None: ...
     async def get_or_seed_desired_world_channels(self, zone_id: int, conf_id: int, seed_count: int) -> int: ...
     async def acquire_world_init_lock(self, zone_id: int, token: str, ttl_sec: int) -> bool: ...
     async def release_world_init_lock(self, zone_id: int, token: str) -> bool: ...
@@ -143,6 +190,9 @@ class SceneControlStore(Protocol):
     async def register_world_channel(
         self, *, zone_id: int, scene_id: int, node_id: str, conf_id: int, desired_channels: int,
     ) -> RegistrationOutcome: ...
+    async def list_active_instances_with_scores(self, zone_id: int) -> list[tuple[str, float]]: ...
+    async def touch_active_instance(self, zone_id: int, scene_id: int, now_unix_sec: int) -> None: ...
+    async def is_active_instance(self, zone_id: int, scene_id: int) -> bool: ...
     async def atomic_add_scene_member(self, zone_id: int, scene_id: int, node_id: str, player_id: int) -> int: ...
     async def add_scene_member(self, zone_id: int, scene_id: int, node_id: str, player_id: int) -> None: ...
     async def remove_scene_member_keys(self, zone_id: int, scene_id: int, node_id: str, player_id: int) -> None: ...
@@ -150,11 +200,33 @@ class SceneControlStore(Protocol):
     async def reserve_best_world_channel(
         self, candidates: Sequence[WorldChannelCandidate], player_id: int,
     ) -> tuple[int, str, int] | None: ...
+    async def atomic_destroy_instance(
+        self, *, zone_id: int, scene_id: int, expected_owner: str, now_unix_sec: int | None = None,
+    ) -> SceneClaimResult: ...
     async def atomic_destroy_instance_force(
         self, *, zone_id: int, scene_id: int, expected_owner: str, kind: str, reason: str,
         count_owner: bool = True, now_unix_sec: int | None = None,
     ) -> SceneClaimResult: ...
+    async def atomic_destroy_orphan_of_dead_node(
+        self, *, zone_id: int, scene_id: int, dead_node: str, task_fence: DeadNodeTaskFence,
+        now_unix_sec: int | None = None,
+    ) -> SceneClaimResult: ...
     async def finish_scene_teardown(self, zone_id: int, scene_id: int, token: str) -> bool: ...
+    async def list_due_teardown_jobs(self, zone_id: int, max_claimed_at_sec: int, limit: int) -> list[tuple[str, float]]: ...
+    async def load_scene_teardown_job(self, zone_id: int, scene_id: int) -> SceneTeardownJob | None: ...
+    async def drop_dangling_teardown(self, zone_id: int, scene_id: int) -> bool: ...
+    async def enqueue_dead_node_reconcile(
+        self, zone_id: int, node_id: str, *, queued_at_ms: int, detach: bool = True, node_uuid: str = "",
+    ) -> int: ...
+    async def withdraw_dead_node_for_returning_instance(self, zone_id: int, node_id: str, node_uuid: str) -> int: ...
+    async def list_dead_node_reconcile_tasks(self, zone_id: int) -> tuple[list[DeadNodeReconcileTask], list[str]]: ...
+    async def remove_dead_node_reconcile_member(self, zone_id: int, member: str) -> None: ...
+    async def get_node_reconcile_scenes(self, zone_id: int, node_id: str) -> list[str]: ...
+    async def remove_node_reconcile_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None: ...
+    async def remove_node_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None: ...
+    async def finish_dead_node_reconcile(
+        self, zone_id: int, node_id: str, member: str, queued_at_ms: int, *, abandon: bool = False,
+    ) -> bool: ...
     async def get_gate_marks(self, zone_id: int, gate_node_ids: Sequence[int]) -> tuple[set[int], set[int]]: ...
 
 
@@ -221,6 +293,8 @@ def _parse_scene_claim_reply(raw, token: str) -> SceneClaimResult:
         return SceneClaimResult(busy=True)
     if status == "pending":
         return SceneClaimResult(pending=True)
+    if status == "withdrawn":
+        return SceneClaimResult(withdrawn=True)
     if status == "claimed":
         return SceneClaimResult(
             claimed=True,
@@ -232,6 +306,30 @@ def _parse_scene_claim_reply(raw, token: str) -> SceneClaimResult:
             token=token,
         )
     return SceneClaimResult()
+
+
+def _sorted_unique_scene_ids(scene_ids: Sequence[int]) -> list[int]:
+    """去重并过滤非正数，按 uint64 数值升序排列（与 Go sortedUniqueSceneIDs 一致）。"""
+    return sorted({int(sid) for sid in scene_ids if int(sid) > 0})
+
+
+def _parse_line_numbers_reply(raw, ids: Sequence[int]) -> dict[int, int]:
+    """校验并解析 LUA_ALLOC_WORLD_CHANNEL_LINE_NUMBERS 返回的扁平列表。"""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2 * len(ids):
+        raise ValueError(f"unexpected line number reply shape: len={len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__}")
+    expected = set(ids)
+    line_nos: dict[int, int] = {}
+    used_lines: set[int] = set()
+    for i in range(0, len(raw), 2):
+        sid = int(_as_text(raw[i]))
+        line_no = int(_as_text(raw[i + 1]))
+        if sid not in expected or sid in line_nos:
+            raise ValueError(f"unexpected or duplicate scene_id {sid} in line number reply")
+        if line_no <= 0 or line_no > 0xFFFFFFFF or line_no in used_lines:
+            raise ValueError(f"invalid or duplicate line_no {line_no} for scene_id {sid}")
+        line_nos[sid] = line_no
+        used_lines.add(line_no)
+    return line_nos
 
 
 class RedisSceneControlStore:
@@ -246,19 +344,29 @@ class RedisSceneControlStore:
         self._add_member_script = redis_client.register_script(lua.LUA_ADD_SCENE_MEMBER)
         self._remove_member_script = redis_client.register_script(lua.LUA_REMOVE_SCENE_MEMBER)
         self._reserve_best_script = redis_client.register_script(lua.LUA_RESERVE_BEST_WORLD_CHANNEL)
+        self._destroy_idle_script = redis_client.register_script(lua.LUA_ATOMIC_DESTROY_INSTANCE)
         self._destroy_force_script = redis_client.register_script(lua.LUA_ATOMIC_DESTROY_INSTANCE_FORCE)
+        self._destroy_orphan_script = redis_client.register_script(lua.LUA_ATOMIC_DESTROY_ORPHAN_OF_DEAD_NODE)
         self._finish_teardown_script = redis_client.register_script(lua.LUA_FINISH_SCENE_TEARDOWN)
+        self._drop_dangling_teardown_script = redis_client.register_script(lua.LUA_DROP_DANGLING_TEARDOWN)
         self._release_init_lock_script = redis_client.register_script(lua.LUA_RELEASE_WORLD_INIT_LOCK)
         self._reassign_scene_script = redis_client.register_script(lua.LUA_REASSIGN_SCENE_NODE)
+        self._alloc_lineno_script = redis_client.register_script(lua.LUA_ALLOC_WORLD_CHANNEL_LINE_NUMBERS)
+        self._enqueue_dead_node_script = redis_client.register_script(lua.LUA_ENQUEUE_DEAD_NODE_RECONCILE)
+        self._withdraw_dead_node_script = redis_client.register_script(lua.LUA_WITHDRAW_DEAD_NODE_FOR_RETURNING_INSTANCE)
+        self._finish_dead_node_script = redis_client.register_script(lua.LUA_FINISH_DEAD_NODE_RECONCILE)
 
-    async def upsert_scene_node(self, zone_id: int, node_id: str, *, score: float, scene_node_type: int) -> None:
+    async def upsert_scene_node(
+        self, zone_id: int, node_id: str, *, score: float, scene_node_type: int, preserve_death_at: bool = False,
+    ) -> None:
         load_k = keys.node_load_key(zone_id)
         type_k = keys.node_scene_node_type_key(zone_id, node_id)
         death_k = keys.node_death_at_key(zone_id, node_id)
         keys.assert_control_domain_keys((load_k, type_k, death_k))
         await self.redis.zadd(load_k, {node_id: float(score)})
         await self.redis.set(type_k, str(scene_node_type))
-        await self.redis.delete(death_k)
+        if not preserve_death_at:
+            await self.redis.delete(death_k)
 
     async def remove_scene_node(self, zone_id: int, node_id: str, *, death_at_unix_sec: int | None = None) -> None:
         load_k = keys.node_load_key(zone_id)
@@ -342,6 +450,11 @@ class RedisSceneControlStore:
         keys.assert_control_domain_keys((k,))
         return int(await self.redis.exists(k)) == 1
 
+    async def is_scene_mirror(self, zone_id: int, scene_id: int) -> bool:
+        k = keys.scene_mirror_flag_key(zone_id, scene_id)
+        keys.assert_control_domain_keys((k,))
+        return _as_text(await self.redis.get(k)) == "1"
+
     async def get_scene_placement_gen(self, zone_id: int, scene_id: int) -> int:
         k = keys.scene_placement_gen_key(zone_id, scene_id)
         keys.assert_control_domain_keys((k,))
@@ -376,6 +489,11 @@ class RedisSceneControlStore:
         keys.assert_control_domain_keys((k,))
         return sorted(_as_text(m) for m in await self.redis.smembers(k))
 
+    async def get_world_draining_channels(self, zone_id: int, conf_id: int) -> list[str]:
+        k = keys.world_draining_set_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        return sorted(_as_text(m) for m in await self.redis.smembers(k))
+
     async def is_world_channel_active(self, zone_id: int, conf_id: int, scene_id: int) -> bool:
         k = keys.world_channels_key(zone_id, conf_id)
         keys.assert_control_domain_keys((k,))
@@ -385,6 +503,28 @@ class RedisSceneControlStore:
         k = keys.world_draining_set_key(zone_id, conf_id)
         keys.assert_control_domain_keys((k,))
         return bool(await self.redis.sismember(k, str(scene_id)))
+
+    async def allocate_world_channel_line_numbers(
+        self, zone_id: int, conf_id: int, scene_ids: Sequence[int],
+    ) -> dict[int, int]:
+        ids = _sorted_unique_scene_ids(scene_ids)
+        if not ids:
+            return {}
+        k = keys.world_channel_lineno_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        raw = await self._alloc_lineno_script(keys=[k], args=[str(sid) for sid in ids])
+        return _parse_line_numbers_reply(raw, ids)
+
+    async def set_world_channel_directory(self, zone_id: int, conf_id: int, payload: bytes, ttl_sec: int) -> None:
+        k = keys.world_channel_directory_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        await self.redis.set(k, payload, ex=max(1, int(ttl_sec)))
+
+    async def get_world_channel_directory(self, zone_id: int, conf_id: int) -> bytes | None:
+        k = keys.world_channel_directory_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        raw = await self.redis.get(k)
+        return None if raw is None else _as_bytes(raw)
 
     async def get_or_seed_desired_world_channels(self, zone_id: int, conf_id: int, seed_count: int) -> int:
         k = keys.world_desired_channels_key(zone_id)
@@ -548,12 +688,26 @@ class RedisSceneControlStore:
         winner = candidates[best_idx - 1]
         return winner.scene_id, winner.node_id, int(_as_text(raw[2]))
 
-    async def atomic_destroy_instance_force(
-        self, *, zone_id: int, scene_id: int, expected_owner: str, kind: str, reason: str,
-        count_owner: bool = True, now_unix_sec: int | None = None,
-    ) -> SceneClaimResult:
-        token = str(uuid.uuid4())
-        now_sec = int(time.time()) if now_unix_sec is None else int(now_unix_sec)
+    async def list_active_instances_with_scores(self, zone_id: int) -> list[tuple[str, float]]:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        rows = await self.redis.zrange(k, 0, -1, withscores=True)
+        return [(_as_text(member), float(score)) for member, score in rows]
+
+    async def touch_active_instance(self, zone_id: int, scene_id: int, now_unix_sec: int) -> None:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        await self.redis.zadd(k, {str(scene_id): float(now_unix_sec)}, xx=True)
+
+    async def is_active_instance(self, zone_id: int, scene_id: int) -> bool:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        return (await self.redis.zscore(k, str(scene_id))) is not None
+
+    def _build_claim_keys(
+        self, zone_id: int, scene_id: int, expected_owner: str,
+        *, task_fence: DeadNodeTaskFence | None = None,
+    ) -> list[str]:
         script_keys = [
             keys.scene_node_key(zone_id, scene_id),
             keys.instance_members_key(zone_id, scene_id),
@@ -569,6 +723,28 @@ class RedisSceneControlStore:
                 keys.node_scenes_key(zone_id, expected_owner),
                 keys.node_scene_count_key(zone_id, expected_owner),
             ))
+        if task_fence is not None:
+            script_keys.append(task_fence.tasks_key)
+        return script_keys
+
+    async def atomic_destroy_instance(
+        self, *, zone_id: int, scene_id: int, expected_owner: str, now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        token = str(uuid.uuid4())
+        now_sec = int(time.time()) if now_unix_sec is None else int(now_unix_sec)
+        script_keys = self._build_claim_keys(zone_id, scene_id, expected_owner)
+        keys.assert_control_domain_keys(script_keys)
+        args = [str(scene_id), token, now_sec, "instance", "idle", expected_owner, "1", "0", "", ""]
+        raw = await self._destroy_idle_script(keys=script_keys, args=args)
+        return _parse_scene_claim_reply(raw, token)
+
+    async def atomic_destroy_instance_force(
+        self, *, zone_id: int, scene_id: int, expected_owner: str, kind: str, reason: str,
+        count_owner: bool = True, now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        token = str(uuid.uuid4())
+        now_sec = int(time.time()) if now_unix_sec is None else int(now_unix_sec)
+        script_keys = self._build_claim_keys(zone_id, scene_id, expected_owner)
         keys.assert_control_domain_keys(script_keys)
         args = [
             str(scene_id), token, now_sec, kind, reason, expected_owner,
@@ -577,11 +753,143 @@ class RedisSceneControlStore:
         raw = await self._destroy_force_script(keys=script_keys, args=args)
         return _parse_scene_claim_reply(raw, token)
 
+    async def atomic_destroy_orphan_of_dead_node(
+        self, *, zone_id: int, scene_id: int, dead_node: str, task_fence: DeadNodeTaskFence,
+        now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        if not dead_node:
+            raise ValueError("dead_node must be non-empty")
+        token = str(uuid.uuid4())
+        now_sec = int(time.time()) if now_unix_sec is None else int(now_unix_sec)
+        script_keys = self._build_claim_keys(zone_id, scene_id, dead_node, task_fence=task_fence)
+        keys.assert_control_domain_keys(script_keys)
+        args = [
+            str(scene_id), token, now_sec, "instance", "node_death", dead_node,
+            "1", "1", task_fence.member, str(task_fence.queued_at_ms),
+        ]
+        raw = await self._destroy_orphan_script(keys=script_keys, args=args)
+        return _parse_scene_claim_reply(raw, token)
+
     async def finish_scene_teardown(self, zone_id: int, scene_id: int, token: str) -> bool:
         script_keys = [keys.scene_teardown_job_key(zone_id, scene_id), keys.scene_teardown_pending_key(zone_id)]
         keys.assert_control_domain_keys(script_keys)
         res = await self._finish_teardown_script(keys=script_keys, args=[str(scene_id), token])
         return _as_int(res) == 1
+
+    async def list_due_teardown_jobs(self, zone_id: int, max_claimed_at_sec: int, limit: int) -> list[tuple[str, float]]:
+        k = keys.scene_teardown_pending_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        rows = await self.redis.zrangebyscore(
+            k, "-inf", float(max_claimed_at_sec), start=0, num=max(1, int(limit)), withscores=True,
+        )
+        return [(_as_text(member), float(score)) for member, score in rows]
+
+    async def load_scene_teardown_job(self, zone_id: int, scene_id: int) -> SceneTeardownJob | None:
+        k = keys.scene_teardown_job_key(zone_id, scene_id)
+        keys.assert_control_domain_keys((k,))
+        fields = await self.redis.hmget(k, "token", "kind", "reason", "reply")
+        if not fields or len(fields) < 4 or not fields[0]:
+            return None
+        token = _as_text(fields[0])
+        kind = _as_text(fields[1])
+        reason = _as_text(fields[2])
+        reply = json.loads(_as_text(fields[3]))
+        claim = _parse_scene_claim_reply(reply, token)
+        if not claim.claimed:
+            raise ValueError(f"teardown job for scene {scene_id} does not hold a valid claim")
+        return SceneTeardownJob(zone_id=zone_id, scene_id=scene_id, kind=kind, reason=reason, claim=claim)
+
+    async def drop_dangling_teardown(self, zone_id: int, scene_id: int) -> bool:
+        script_keys = [keys.scene_teardown_job_key(zone_id, scene_id), keys.scene_teardown_pending_key(zone_id)]
+        keys.assert_control_domain_keys(script_keys)
+        res = await self._drop_dangling_teardown_script(keys=script_keys, args=[str(scene_id)])
+        return _as_int(res) == 1
+
+    async def enqueue_dead_node_reconcile(
+        self, zone_id: int, node_id: str, *, queued_at_ms: int, detach: bool = True, node_uuid: str = "",
+    ) -> int:
+        script_keys = [
+            keys.dead_node_reconcile_tasks_key(zone_id),
+            keys.node_reconcile_scenes_key(zone_id, node_id),
+            keys.node_scenes_key(zone_id, node_id),
+            keys.node_load_key(zone_id),
+            keys.node_reconcile_instance_key(zone_id, node_id),
+        ]
+        keys.assert_control_domain_keys(script_keys)
+        args = [
+            keys.pending_dead_node_member(zone_id, node_id),
+            str(int(queued_at_ms)),
+            "index",
+            node_id if detach else "",
+            node_uuid,
+        ]
+        return _as_int(await self._enqueue_dead_node_script(keys=script_keys, args=args))
+
+    async def withdraw_dead_node_for_returning_instance(self, zone_id: int, node_id: str, node_uuid: str) -> int:
+        script_keys = [
+            keys.dead_node_reconcile_tasks_key(zone_id),
+            keys.node_reconcile_scenes_key(zone_id, node_id),
+            keys.node_reconcile_instance_key(zone_id, node_id),
+            keys.node_death_at_key(zone_id, node_id),
+        ]
+        keys.assert_control_domain_keys(script_keys)
+        args = [keys.pending_dead_node_member(zone_id, node_id), node_uuid]
+        return _as_int(await self._withdraw_dead_node_script(keys=script_keys, args=args))
+
+    async def list_dead_node_reconcile_tasks(self, zone_id: int) -> tuple[list[DeadNodeReconcileTask], list[str]]:
+        k = keys.dead_node_reconcile_tasks_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        rows = await self.redis.zrange(k, 0, -1, withscores=True)
+        tasks: list[DeadNodeReconcileTask] = []
+        malformed: list[str] = []
+        for raw_member, score in rows:
+            member = _as_text(raw_member)
+            parsed = keys.parse_dead_node_reconcile_member(member)
+            if parsed is None or parsed[0] != zone_id:
+                malformed.append(member)
+                continue
+            tasks.append(DeadNodeReconcileTask(
+                member=member, zone_id=parsed[0], node_id=parsed[1], queued_at_ms=int(score),
+            ))
+        return tasks, malformed
+
+    async def remove_dead_node_reconcile_member(self, zone_id: int, member: str) -> None:
+        k = keys.dead_node_reconcile_tasks_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        await self.redis.zrem(k, member)
+
+    async def get_node_reconcile_scenes(self, zone_id: int, node_id: str) -> list[str]:
+        k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        return sorted(_as_text(m) for m in await self.redis.smembers(k))
+
+    async def remove_node_reconcile_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None:
+        if not scene_ids:
+            return
+        k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        await self.redis.srem(k, *scene_ids)
+
+    async def remove_node_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None:
+        if not scene_ids:
+            return
+        k = keys.node_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        await self.redis.srem(k, *scene_ids)
+
+    async def finish_dead_node_reconcile(
+        self, zone_id: int, node_id: str, member: str, queued_at_ms: int, *, abandon: bool = False,
+    ) -> bool:
+        script_keys = [
+            keys.node_reconcile_scenes_key(zone_id, node_id),
+            keys.node_scene_count_key(zone_id, node_id),
+            keys.node_members_key(zone_id, node_id),
+            keys.dead_node_reconcile_tasks_key(zone_id),
+            keys.node_reconcile_instance_key(zone_id, node_id),
+        ]
+        keys.assert_control_domain_keys(script_keys)
+        args = [member, "1" if abandon else "0", str(int(queued_at_ms))]
+        return _as_int(await self._finish_dead_node_script(keys=script_keys, args=args)) == 1
 
     async def get_gate_marks(self, zone_id: int, gate_node_ids: Sequence[int]) -> tuple[set[int], set[int]]:
         if not gate_node_ids:
@@ -851,7 +1159,18 @@ class MemorySceneControlStore:
             self.zsets.pop(key, None)
         return 1
 
-    # ── 测试辅助写入口 ────────────────────────────────────────────────────────
+    # ── 测试辅助写入口与直接字节读（供 nodes/scene_channels.py 消费者直读） ──────
+    async def get(self, key: str) -> bytes | None:
+        self._purge_if_expired(key)
+        return self.strings.get(key)
+
+    def get_ttl_remaining_sec(self, key: str) -> int | None:
+        self._purge_if_expired(key)
+        exp = self.expires_ms.get(key)
+        if exp is None:
+            return None
+        return max(0, (exp - self._clock_ms()) // 1000)
+
     def mark_channel_draining(self, zone_id: int, conf_id: int, scene_id: int) -> None:
         self._srem(keys.world_channels_key(zone_id, conf_id), str(scene_id))
         self._sadd(keys.world_draining_set_key(zone_id, conf_id), str(scene_id))
@@ -864,14 +1183,17 @@ class MemorySceneControlStore:
         self._set_str(keys.gate_stale_key(zone_id, gate_node_id), "1")
 
     # ── Protocol 方法实现 ─────────────────────────────────────────────────────
-    async def upsert_scene_node(self, zone_id: int, node_id: str, *, score: float, scene_node_type: int) -> None:
+    async def upsert_scene_node(
+        self, zone_id: int, node_id: str, *, score: float, scene_node_type: int, preserve_death_at: bool = False,
+    ) -> None:
         load_k = keys.node_load_key(zone_id)
         type_k = keys.node_scene_node_type_key(zone_id, node_id)
         death_k = keys.node_death_at_key(zone_id, node_id)
         keys.assert_control_domain_keys((load_k, type_k, death_k))
         self._zadd(load_k, node_id, score)
         self._set_str(type_k, str(scene_node_type))
-        self._del(death_k)
+        if not preserve_death_at:
+            self._del(death_k)
 
     async def remove_scene_node(self, zone_id: int, node_id: str, *, death_at_unix_sec: int | None = None) -> None:
         load_k = keys.node_load_key(zone_id)
@@ -953,6 +1275,11 @@ class MemorySceneControlStore:
         keys.assert_control_domain_keys((k,))
         return self._get_str(k) is not None
 
+    async def is_scene_mirror(self, zone_id: int, scene_id: int) -> bool:
+        k = keys.scene_mirror_flag_key(zone_id, scene_id)
+        keys.assert_control_domain_keys((k,))
+        return self._get_str(k) == "1"
+
     async def get_scene_placement_gen(self, zone_id: int, scene_id: int) -> int:
         k = keys.scene_placement_gen_key(zone_id, scene_id)
         keys.assert_control_domain_keys((k,))
@@ -995,6 +1322,11 @@ class MemorySceneControlStore:
         keys.assert_control_domain_keys((k,))
         return sorted(self.sets.get(k, set()))
 
+    async def get_world_draining_channels(self, zone_id: int, conf_id: int) -> list[str]:
+        k = keys.world_draining_set_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        return sorted(self.sets.get(k, set()))
+
     async def is_world_channel_active(self, zone_id: int, conf_id: int, scene_id: int) -> bool:
         k = keys.world_channels_key(zone_id, conf_id)
         keys.assert_control_domain_keys((k,))
@@ -1004,6 +1336,55 @@ class MemorySceneControlStore:
         k = keys.world_draining_set_key(zone_id, conf_id)
         keys.assert_control_domain_keys((k,))
         return str(scene_id) in self.sets.get(k, set())
+
+    async def allocate_world_channel_line_numbers(
+        self, zone_id: int, conf_id: int, scene_ids: Sequence[int],
+    ) -> dict[int, int]:
+        ids = _sorted_unique_scene_ids(scene_ids)
+        if not ids:
+            return {}
+        k = keys.world_channel_lineno_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        wanted = {str(sid) for sid in ids}
+        table = self.hashes.setdefault(k, {})
+        kept: dict[str, int] = {}
+        used: set[int] = set()
+        for field in list(table.keys()):
+            raw_val = _as_text(table[field])
+            try:
+                line_no = int(raw_val)
+            except ValueError:
+                line_no = 0
+            if field in wanted and 1 <= line_no <= 0xFFFFFFFF and line_no not in used:
+                kept[field] = line_no
+                used.add(line_no)
+            else:
+                del table[field]
+        out: dict[int, int] = {}
+        candidate = 1
+        for sid in ids:
+            sid_str = str(sid)
+            line_no = kept.get(sid_str)
+            if line_no is None:
+                while candidate in used:
+                    candidate += 1
+                line_no = candidate
+                used.add(line_no)
+                kept[sid_str] = line_no
+                table[sid_str] = str(line_no).encode("ascii")
+            out[sid] = line_no
+        return out
+
+    async def set_world_channel_directory(self, zone_id: int, conf_id: int, payload: bytes, ttl_sec: int) -> None:
+        k = keys.world_channel_directory_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        self.strings[k] = bytes(payload)
+        self.expires_ms[k] = self._clock_ms() + max(1, int(ttl_sec)) * 1000
+
+    async def get_world_channel_directory(self, zone_id: int, conf_id: int) -> bytes | None:
+        k = keys.world_channel_directory_key(zone_id, conf_id)
+        keys.assert_control_domain_keys((k,))
+        return await self.get(k)
 
     async def get_or_seed_desired_world_channels(self, zone_id: int, conf_id: int, seed_count: int) -> int:
         k = keys.world_desired_channels_key(zone_id)
@@ -1175,9 +1556,36 @@ class MemorySceneControlStore:
         self._sadd(node_mem_k, str(player_id))
         return best.scene_id, best.node_id, len(self.sets.get(mem_k, set()))
 
-    async def atomic_destroy_instance_force(
-        self, *, zone_id: int, scene_id: int, expected_owner: str, kind: str, reason: str,
-        count_owner: bool = True, now_unix_sec: int | None = None,
+    async def list_active_instances_with_scores(self, zone_id: int) -> list[tuple[str, float]]:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        z = self.zsets.get(k, {})
+        return sorted(z.items(), key=lambda item: (item[1], item[0]))
+
+    async def touch_active_instance(self, zone_id: int, scene_id: int, now_unix_sec: int) -> None:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        z = self.zsets.get(k)
+        if z is not None and str(scene_id) in z:
+            z[str(scene_id)] = float(now_unix_sec)
+
+    async def is_active_instance(self, zone_id: int, scene_id: int) -> bool:
+        k = keys.active_instances_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        return str(scene_id) in self.zsets.get(k, {})
+
+    def _claim_scene_teardown(
+        self,
+        *,
+        zone_id: int,
+        scene_id: int,
+        expected_owner: str,
+        kind: str,
+        reason: str,
+        count_owner: bool,
+        require_idle: bool,
+        task_fence: DeadNodeTaskFence | None,
+        now_unix_sec: int | None,
     ) -> SceneClaimResult:
         token = str(uuid.uuid4())
         now_sec = (self._clock_ms() // 1000) if now_unix_sec is None else int(now_unix_sec)
@@ -1189,14 +1597,23 @@ class MemorySceneControlStore:
         agones_k = keys.scene_agones_gs_key(zone_id, scene_id)
         td_k = keys.scene_teardown_job_key(zone_id, scene_id)
         pending_k = keys.scene_teardown_pending_key(zone_id)
-        keys.assert_control_domain_keys((node_k, mem_k, active_k, td_k, pending_k))
+        check_keys = [node_k, mem_k, active_k, td_k, pending_k]
+        if task_fence is not None:
+            check_keys.append(task_fence.tasks_key)
+        keys.assert_control_domain_keys(check_keys)
 
         td_hash = self.hashes.get(td_k)
-        if td_hash and b"token" in {k.encode() if isinstance(k, str) else k for k in td_hash}:
+        if td_hash and "token" in td_hash:
             existing_token = _as_text(td_hash.get("token"))
             if existing_token == token:
                 return _parse_scene_claim_reply(json.loads(_as_text(td_hash.get("reply"))), token)
             return SceneClaimResult(pending=True)
+
+        if task_fence is not None:
+            z = self.zsets.get(task_fence.tasks_key, {})
+            queued = z.get(task_fence.member)
+            if queued is None or int(queued) != int(task_fence.queued_at_ms):
+                return SceneClaimResult(withdrawn=True)
 
         current_owner = self._get_str(node_k)
         if expected_owner == "":
@@ -1207,6 +1624,12 @@ class MemorySceneControlStore:
             if current_owner != expected_owner:
                 return SceneClaimResult()
             owner_val = current_owner
+
+        if require_idle and len(self.sets.get(mem_k, set())) > 0:
+            z = self.zsets.get(active_k)
+            if z is not None and str(scene_id) in z:
+                z[str(scene_id)] = float(now_sec)
+            return SceneClaimResult(busy=True)
 
         agones_gs = self._get_str(agones_k) or ""
         source = self._get_str(source_k) or ""
@@ -1232,6 +1655,55 @@ class MemorySceneControlStore:
         self._zadd(pending_k, str(scene_id), float(now_sec))
         return _parse_scene_claim_reply(reply, token)
 
+    async def atomic_destroy_instance(
+        self, *, zone_id: int, scene_id: int, expected_owner: str, now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        return self._claim_scene_teardown(
+            zone_id=zone_id,
+            scene_id=scene_id,
+            expected_owner=expected_owner,
+            kind="instance",
+            reason="idle",
+            count_owner=True,
+            require_idle=True,
+            task_fence=None,
+            now_unix_sec=now_unix_sec,
+        )
+
+    async def atomic_destroy_instance_force(
+        self, *, zone_id: int, scene_id: int, expected_owner: str, kind: str, reason: str,
+        count_owner: bool = True, now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        return self._claim_scene_teardown(
+            zone_id=zone_id,
+            scene_id=scene_id,
+            expected_owner=expected_owner,
+            kind=kind,
+            reason=reason,
+            count_owner=count_owner,
+            require_idle=False,
+            task_fence=None,
+            now_unix_sec=now_unix_sec,
+        )
+
+    async def atomic_destroy_orphan_of_dead_node(
+        self, *, zone_id: int, scene_id: int, dead_node: str, task_fence: DeadNodeTaskFence,
+        now_unix_sec: int | None = None,
+    ) -> SceneClaimResult:
+        if not dead_node:
+            raise ValueError("dead_node must be non-empty")
+        return self._claim_scene_teardown(
+            zone_id=zone_id,
+            scene_id=scene_id,
+            expected_owner=dead_node,
+            kind="instance",
+            reason="node_death",
+            count_owner=True,
+            require_idle=False,
+            task_fence=task_fence,
+            now_unix_sec=now_unix_sec,
+        )
+
     async def finish_scene_teardown(self, zone_id: int, scene_id: int, token: str) -> bool:
         td_k = keys.scene_teardown_job_key(zone_id, scene_id)
         pending_k = keys.scene_teardown_pending_key(zone_id)
@@ -1241,6 +1713,136 @@ class MemorySceneControlStore:
             return False
         self._del(td_k)
         self._zrem(pending_k, str(scene_id))
+        return True
+
+    async def list_due_teardown_jobs(self, zone_id: int, max_claimed_at_sec: int, limit: int) -> list[tuple[str, float]]:
+        k = keys.scene_teardown_pending_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        z = self.zsets.get(k, {})
+        due = [(member, score) for member, score in z.items() if score <= float(max_claimed_at_sec)]
+        due.sort(key=lambda item: (item[1], item[0]))
+        return due[:max(1, int(limit))]
+
+    async def load_scene_teardown_job(self, zone_id: int, scene_id: int) -> SceneTeardownJob | None:
+        k = keys.scene_teardown_job_key(zone_id, scene_id)
+        keys.assert_control_domain_keys((k,))
+        td_hash = self.hashes.get(k)
+        if not td_hash or not td_hash.get("token"):
+            return None
+        token = _as_text(td_hash.get("token"))
+        kind = _as_text(td_hash.get("kind"))
+        reason = _as_text(td_hash.get("reason"))
+        reply = json.loads(_as_text(td_hash.get("reply")))
+        claim = _parse_scene_claim_reply(reply, token)
+        if not claim.claimed:
+            raise ValueError(f"teardown job for scene {scene_id} does not hold a valid claim")
+        return SceneTeardownJob(zone_id=zone_id, scene_id=scene_id, kind=kind, reason=reason, claim=claim)
+
+    async def drop_dangling_teardown(self, zone_id: int, scene_id: int) -> bool:
+        td_k = keys.scene_teardown_job_key(zone_id, scene_id)
+        pending_k = keys.scene_teardown_pending_key(zone_id)
+        keys.assert_control_domain_keys((td_k, pending_k))
+        if td_k in self.hashes:
+            return False
+        return self._zrem(pending_k, str(scene_id)) == 1
+
+    async def enqueue_dead_node_reconcile(
+        self, zone_id: int, node_id: str, *, queued_at_ms: int, detach: bool = True, node_uuid: str = "",
+    ) -> int:
+        tasks_k = keys.dead_node_reconcile_tasks_key(zone_id)
+        scope_k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        scenes_k = keys.node_scenes_key(zone_id, node_id)
+        load_k = keys.node_load_key(zone_id)
+        inst_k = keys.node_reconcile_instance_key(zone_id, node_id)
+        keys.assert_control_domain_keys((tasks_k, scope_k, scenes_k, load_k, inst_k))
+        if detach:
+            self._zrem(load_k, node_id)
+        merged = set(self.sets.get(scope_k, set())) | set(self.sets.get(scenes_k, set()))
+        if merged:
+            self.sets[scope_k] = merged
+        if node_uuid:
+            self._set_str(inst_k, node_uuid)
+        else:
+            self._del(inst_k)
+        member = keys.pending_dead_node_member(zone_id, node_id)
+        z = self.zsets.setdefault(tasks_k, {})
+        if member not in z:
+            z[member] = float(queued_at_ms)
+        return len(self.sets.get(scope_k, set()))
+
+    async def withdraw_dead_node_for_returning_instance(self, zone_id: int, node_id: str, node_uuid: str) -> int:
+        tasks_k = keys.dead_node_reconcile_tasks_key(zone_id)
+        scope_k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        inst_k = keys.node_reconcile_instance_key(zone_id, node_id)
+        death_k = keys.node_death_at_key(zone_id, node_id)
+        keys.assert_control_domain_keys((tasks_k, scope_k, inst_k, death_k))
+        dead = self._get_str(inst_k)
+        if node_uuid and dead and dead == node_uuid:
+            self._zrem(tasks_k, keys.pending_dead_node_member(zone_id, node_id))
+            self._del(scope_k, inst_k, death_k)
+            return 1
+        if self._get_str(death_k) is not None:
+            return 0
+        return -1
+
+    async def list_dead_node_reconcile_tasks(self, zone_id: int) -> tuple[list[DeadNodeReconcileTask], list[str]]:
+        k = keys.dead_node_reconcile_tasks_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        rows = sorted(self.zsets.get(k, {}).items(), key=lambda item: (item[1], item[0]))
+        tasks: list[DeadNodeReconcileTask] = []
+        malformed: list[str] = []
+        for member, score in rows:
+            parsed = keys.parse_dead_node_reconcile_member(member)
+            if parsed is None or parsed[0] != zone_id:
+                malformed.append(member)
+                continue
+            tasks.append(DeadNodeReconcileTask(
+                member=member, zone_id=parsed[0], node_id=parsed[1], queued_at_ms=int(score),
+            ))
+        return tasks, malformed
+
+    async def remove_dead_node_reconcile_member(self, zone_id: int, member: str) -> None:
+        k = keys.dead_node_reconcile_tasks_key(zone_id)
+        keys.assert_control_domain_keys((k,))
+        self._zrem(k, member)
+
+    async def get_node_reconcile_scenes(self, zone_id: int, node_id: str) -> list[str]:
+        k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        return sorted(self.sets.get(k, set()))
+
+    async def remove_node_reconcile_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None:
+        if not scene_ids:
+            return
+        k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        for sid in scene_ids:
+            self._srem(k, sid)
+
+    async def remove_node_scenes(self, zone_id: int, node_id: str, scene_ids: Sequence[str]) -> None:
+        if not scene_ids:
+            return
+        k = keys.node_scenes_key(zone_id, node_id)
+        keys.assert_control_domain_keys((k,))
+        for sid in scene_ids:
+            self._srem(k, sid)
+
+    async def finish_dead_node_reconcile(
+        self, zone_id: int, node_id: str, member: str, queued_at_ms: int, *, abandon: bool = False,
+    ) -> bool:
+        scope_k = keys.node_reconcile_scenes_key(zone_id, node_id)
+        cnt_k = keys.node_scene_count_key(zone_id, node_id)
+        mem_k = keys.node_members_key(zone_id, node_id)
+        tasks_k = keys.dead_node_reconcile_tasks_key(zone_id)
+        inst_k = keys.node_reconcile_instance_key(zone_id, node_id)
+        keys.assert_control_domain_keys((scope_k, cnt_k, mem_k, tasks_k, inst_k))
+        queued = self.zsets.get(tasks_k, {}).get(member)
+        if queued is None or int(queued) != int(queued_at_ms):
+            return True
+        if not abandon and len(self.sets.get(scope_k, set())) > 0:
+            return False
+        self._del(scope_k, cnt_k, mem_k, inst_k)
+        self._zrem(tasks_k, member)
         return True
 
     async def get_gate_marks(self, zone_id: int, gate_node_ids: Sequence[int]) -> tuple[set[int], set[int]]:

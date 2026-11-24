@@ -1,5 +1,15 @@
 """scene_manager 服务包公共导出。"""
 
+from .channel_directory import (
+    SCENE_CHANNEL_STATE_BUSY,
+    SCENE_CHANNEL_STATE_CLOSING,
+    SCENE_CHANNEL_STATE_FULL,
+    SCENE_CHANNEL_STATE_SMOOTH,
+    SCENE_CHANNEL_STATE_UNAVAILABLE,
+    SCENE_CHANNEL_STATE_UNKNOWN,
+    WorldChannelDirectoryPublisher,
+    world_channel_state,
+)
 from .config import (
     DEFAULT_ETCD_LEASE_TTL_SEC,
     DEFAULT_GRPC_PORT,
@@ -12,6 +22,13 @@ from .config import (
     SCENE_NODE_TYPE,
     SceneManagerConfig,
     load_world_conf_ids,
+)
+from .dead_holder import (
+    DeadHolderReleaseBlockedError,
+    DeadHolderReleaseOutcome,
+    DeadHolderReleaser,
+    PlayerStoreHolderClient,
+    PlayerStoreHolderInfo,
 )
 from .errors import (
     ERR_CHANNEL_FULL,
@@ -78,6 +95,8 @@ from .service import (
     sign_gate_token,
 )
 from .store import (
+    DeadNodeReconcileTask,
+    DeadNodeTaskFence,
     MemoryPlayerPlacementStore,
     MemorySceneControlStore,
     PlayerPlacementStore,
@@ -87,8 +106,14 @@ from .store import (
     SceneClaimResult,
     SceneControlStore,
     SceneIdGenerator,
+    SceneTeardownJob,
     WorldChannelCandidate,
     open_redis,
+)
+from .sweepers import (
+    DeadNodeSweeper,
+    IdleInstanceSweeper,
+    TeardownJobSweeper,
 )
 
 __all__ = [
@@ -98,6 +123,12 @@ __all__ = [
     "DEFAULT_ETCD_LEASE_TTL_SEC",
     "DEFAULT_GRPC_PORT",
     "DataServiceClient",
+    "DeadHolderReleaseBlockedError",
+    "DeadHolderReleaseOutcome",
+    "DeadHolderReleaser",
+    "DeadNodeReconcileTask",
+    "DeadNodeSweeper",
+    "DeadNodeTaskFence",
     "ERR_CHANNEL_FULL",
     "ERR_CHANNEL_SWITCH_COOLDOWN",
     "ERR_CHANNEL_UNAVAILABLE",
@@ -133,6 +164,7 @@ __all__ = [
     "HANDOFF_TTL_SEC",
     "HolderReleaseVerdict",
     "HomeZoneNotFoundError",
+    "IdleInstanceSweeper",
     "KafkaCommandPublisher",
     "LeaveIdentityVerdict",
     "MemoryPlayerPlacementStore",
@@ -142,11 +174,19 @@ __all__ = [
     "PlacementIdentity",
     "PlacementVerdict",
     "PlayerPlacementStore",
+    "PlayerStoreHolderClient",
+    "PlayerStoreHolderInfo",
     "REDIRECT_TOKEN_TTL_SEC",
     "ROLE_DIRECTORY_SECRET_ENV",
     "RedisPlayerPlacementStore",
     "RedisSceneControlStore",
     "RegistrationOutcome",
+    "SCENE_CHANNEL_STATE_BUSY",
+    "SCENE_CHANNEL_STATE_CLOSING",
+    "SCENE_CHANNEL_STATE_FULL",
+    "SCENE_CHANNEL_STATE_SMOOTH",
+    "SCENE_CHANNEL_STATE_UNAVAILABLE",
+    "SCENE_CHANNEL_STATE_UNKNOWN",
     "SCENE_MANAGER_NODE_TYPE",
     "SCENE_NODE_TYPE",
     "SCENE_NODE_TYPE_INSTANCE",
@@ -162,7 +202,10 @@ __all__ = [
     "SceneManagerConfig",
     "SceneManagerService",
     "SceneNodeClient",
+    "SceneTeardownJob",
+    "TeardownJobSweeper",
     "WorldChannelCandidate",
+    "WorldChannelDirectoryPublisher",
     "decide_holder_release",
     "decide_leave_identity",
     "decide_placement_identity",
@@ -174,4 +217,5 @@ __all__ = [
     "run",
     "select_gate_and_sign_redirect",
     "sign_gate_token",
+    "world_channel_state",
 ]

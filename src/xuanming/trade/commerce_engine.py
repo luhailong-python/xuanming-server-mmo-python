@@ -62,6 +62,7 @@ from .model import (
     OP_STATUS_APPLIED_PARTIAL,
     OP_STATUS_PENDING,
     QUARANTINE_DETAIL_MAX_BYTES,
+    STAGE_OFFICIAL_DELIVER,
     LegOutcome,
     RoleFenceExpect,
     RoleFenceRow,
@@ -69,6 +70,7 @@ from .model import (
     TradePolicy,
     build_asset_bundle,
     empty_bundle,
+    is_official_reverse_leg,
     leg_tx_type,
     market_remainder,
     request_digest,
@@ -77,6 +79,8 @@ from .model import (
     truncate_utf8,
     valid_account,
 )
+from .mall_adapter import MANUAL_REASON_PAYMENT_REVERSAL, plan_official
+from .rmb import plan_rmb
 from .store import TradeStoreBase, TradeTx, _DuplicateKeyError
 
 logger = logging.getLogger(__name__)
@@ -514,6 +518,31 @@ def _failed_credits(w: Message) -> list[Message]:
     ]
 
 
+def _failed_official_reversal_legs(w: Message) -> list[Message]:
+    return [
+        l
+        for l in w.legs
+        if not l.superseded_by
+        and leg_done(l)
+        and not leg_applied(l)
+        and int(l.outcome) != OP_STATUS_APPLIED_PARTIAL
+        and (
+            int(l.stream) == ASSET_STREAM_TRADE_CREDIT
+            or (int(l.stream) == ASSET_STREAM_TRADE_DEBIT and is_official_reverse_leg(str(l.role)))
+        )
+    ]
+
+
+def _reissuable_quarantine(q: Message) -> bool:
+    if q.reason == MANUAL_REASON_FINAL_CREDIT:
+        return q.stage in ("deliver", "return")
+    if q.reason == MANUAL_REASON_RMB_RETURN:
+        return True
+    if q.reason == MANUAL_REASON_PAYMENT_REVERSAL:
+        return q.stage == STAGE_OFFICIAL_DELIVER
+    return False
+
+
 def _is_refund_leg(role: str) -> bool:
     return role.split("#", 1)[0].endswith("/refund")
 
@@ -584,6 +613,7 @@ class CommerceEngine:
         policy: TradePolicy,
         asset_caller: AssetOpCaller | None = None,
         ledger_reader: SqlCommittedLedgerReader | None = None,
+        rmb=None,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -593,11 +623,59 @@ class CommerceEngine:
         self.policy = policy
         self._asset_caller = asset_caller
         self._ledger_reader = ledger_reader
+        self.rmb = rmb
         self._clock_ms = clock_ms
         self._ack_after_op_id = 0
 
     def now_ms(self) -> int:
         return int(self._clock_ms())
+
+    async def next_commerce_id(self) -> int:
+        return int(await self._commerce_ids())
+
+    async def lock_roles(
+        self,
+        tx: TradeTx,
+        original: RoleOriginal | None,
+        allow_listing: int,
+        *players: int,
+    ) -> dict[int, RoleFenceRow]:
+        return await self._lock_roles(tx, original, allow_listing, *players)
+
+    async def create_contract(
+        self,
+        original: RoleOriginal | None,
+        player_id: int,
+        client_req_id: str,
+        input_msg: Message,
+        rec: Message,
+        w: Message,
+    ) -> Message:
+        return await self._create(original, player_id, client_req_id, input_msg, rec, w)
+
+    async def advance_contract(self, rec: Message) -> None:
+        await self._advance(rec)
+
+    async def apply_payment_revision(self, commerce_id: int, revision: int) -> Message:
+        """记录官方商城报来的付款修订号（只增不减），并让非人工合同回到收敛阶段。"""
+        rev = int(revision)
+
+        async def _tx(tx: TradeTx) -> Message:
+            rec = await tx.lock_commerce(int(commerce_id))
+            if rec is None:
+                raise TradeCorruptContractError(f"official commerce {commerce_id} vanished")
+            w = decode_workflow(self.protocol, rec)
+            if int(rec.kind) != COMMERCE_KIND_OFFICIAL or int(w.payment_revision) >= rev:
+                return rec
+            w.payment_revision = rev
+            w.payment_revoked = (rev % 2 == 1)
+            if int(rec.status) != COMMERCE_MANUAL:
+                w.stage = STAGE_OFFICIAL_DELIVER
+                rec.status = COMMERCE_DELIVERING
+            await tx.save_commerce(rec, w, self.now_ms())
+            return rec
+
+        return await self.store.run_tx(_tx)
 
     # -- 内部角色锁与校验 ---------------------------------------------------------------------------
 
@@ -687,6 +765,19 @@ class CommerceEngine:
 
         async def _tx(tx: TradeTx) -> None:
             await self._lock_roles(tx, original, 0, int(rec.seller_player_id), int(rec.buyer_player_id))
+            if int(rec.kind) == COMMERCE_KIND_RMB_CONSIGNMENT:
+                if not w.HasField("rmb"):
+                    raise TradeRejection(ERR_INVALID_PARAMETER, "rmb contract missing terms")
+                seller_fence = await self.store.read_ownership(tx, int(rec.seller_player_id))
+                if seller_fence.owner_revision < int(w.rmb.seller_owner_revision):
+                    raise RoleFenceStaleError(int(rec.seller_player_id), reject=TradeRoleConflictError())
+                trade_listing_id = seller_fence.freeze_token if seller_fence.freeze_final else 0
+                if (
+                    seller_fence.account != str(w.rmb.seller_account)
+                    or seller_fence.owner_revision != int(w.rmb.seller_owner_revision)
+                    or trade_listing_id != 0
+                ):
+                    raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "rmb seller role ownership conflict")
             if int(rec.seller_player_id) != 0:
                 fence = await self.store.read_ownership(tx, int(rec.seller_player_id))
                 w.seller_identity.account = fence.account
@@ -993,6 +1084,12 @@ class CommerceEngine:
 
     def _plan(self, rec: Message, w: Message, now_ms: int) -> None:
         kind = int(rec.kind)
+        if kind == COMMERCE_KIND_RMB_CONSIGNMENT:
+            plan_rmb(self.protocol, self.policy, rec, w, now_ms)
+            return
+        if w.stage == STAGE_OFFICIAL_DELIVER:
+            plan_official(rec, w, now_ms)
+            return
         if w.stage == "offer_escrow":
             add_leg(w, "seller_debit", int(rec.seller_player_id), ASSET_STREAM_TRADE_DEBIT, build_asset_bundle(self.protocol, w.seller_assets))
             a = find_leg(w, "seller_debit")
@@ -1556,6 +1653,11 @@ class CommerceEngine:
         return await self.store.run_tx(_tx)
 
     async def _step(self, rec: Message) -> None:
+        if int(rec.kind) == COMMERCE_KIND_RMB_CONSIGNMENT:
+            if self.rmb is None:
+                raise TradeCorruptContractError("rmb consignment coordinator not wired")
+            await self.rmb.step(rec)
+            return
         w = decode_workflow(self.protocol, rec)
         if w.stage == "bid_ready":
             await self._accept_bid(int(rec.commerce_id))
@@ -1873,26 +1975,29 @@ class CommerceEngine:
         res = ManualResult(quarantine=q_copy)
 
         if req.action == "resume":
-            if q.reason == MANUAL_REASON_FINAL_CREDIT and q.stage in ("deliver", "return"):
-                raise ManualNotAllowedError("final credit failed; use reissue or refund")
+            if _reissuable_quarantine(q):
+                raise ManualNotAllowedError("failed delivery or reversal leg; use reissue or refund")
             w.stage = q.stage
             rec.status = int(q.status)
 
         elif req.action == "reissue":
-            if not (
-                (q.reason == MANUAL_REASON_FINAL_CREDIT and q.stage in ("deliver", "return"))
-                or q.reason == MANUAL_REASON_RMB_RETURN
-            ):
+            if not _reissuable_quarantine(q):
                 raise ManualNotAllowedError(f"reissue not allowed for reason={q.reason}")
-            failed = _failed_credits(w)
+            if q.reason == MANUAL_REASON_PAYMENT_REVERSAL:
+                failed = _failed_official_reversal_legs(w)
+            else:
+                failed = _failed_credits(w)
             if not failed:
-                raise ManualNotAllowedError("no failed credit legs to reissue")
+                raise ManualNotAllowedError("no failed credit or reversal legs to reissue")
             for l in failed:
                 new_role = _reissue_role(w, l.role)
                 l.superseded_by = new_role
                 b_copy = self.protocol.message("AssetBundle")
                 b_copy.CopyFrom(l.bundle)
-                add_escrow_leg(w, new_role, int(l.player_id), int(l.escrow_owner_id), b_copy)
+                if q.reason == MANUAL_REASON_PAYMENT_REVERSAL:
+                    add_leg(w, new_role, int(l.player_id), int(l.stream), b_copy)
+                else:
+                    add_escrow_leg(w, new_role, int(l.player_id), int(l.escrow_owner_id), b_copy)
                 res.new_legs.append(new_role)
                 res.superseded_legs.append(l.role)
             w.stage = q.stage

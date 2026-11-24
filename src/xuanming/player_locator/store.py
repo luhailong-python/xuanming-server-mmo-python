@@ -55,6 +55,20 @@ class SessionStore(Protocol):
     async def get_session_and_location_bytes(self, player_id: int) -> tuple[bytes | None, bytes | None]: ...
     async def get_location_bytes(self, player_id: int) -> bytes | None: ...
     async def get_afk_pass_bytes(self, player_id: int) -> bytes | None: ...
+    async def get_hosted_presence(self, player_id: int) -> bytes | None: ...
+    async def get_hosted_return(self, player_id: int) -> bytes | None: ...
+    async def delete_hosted_return_if_value(self, player_id: int, expected: bytes | str) -> bool: ...
+    async def expire_hosted_return_if_value(self, player_id: int, expected: bytes | str, ttl_seconds: int) -> bool: ...
+    async def list_registered_gates(self, slots: Sequence[int]) -> list[tuple[int, str]]: ...
+    async def scan_gate_index_members(
+        self, slot: int, gate_uuid: str, cursor: int = 0, count: int = 100,
+    ) -> tuple[int, list[str]]: ...
+    async def mget_sessions_bytes(self, player_ids: Sequence[int]) -> list[bytes | None]: ...
+    async def remove_bad_gate_index_member(self, slot: int, gate_uuid: str, member: str) -> bool: ...
+    async def prune_gate_index_member(
+        self, player_id: int, gate_uuid: str, member: str, expected: bytes | None,
+    ) -> bool: ...
+    async def release_gate_index_if_empty(self, slot: int, gate_uuid: str) -> bool: ...
     async def replace_session_and_cancel_lease(
         self, player_id: int, expected: bytes | None, updated: bytes, ttl_ms: int,
         previous_gate: str, next_gate: str,
@@ -117,6 +131,14 @@ class RedisSessionStore:
         self._renew_script = redis_client.register_script(lua.RENEW_LEASE_CLAIMS_LUA)
         self._rearm_script = redis_client.register_script(lua.REARM_LEASE_CLAIM_LUA)
         self._enqueue_script = redis_client.register_script(lua.ENQUEUE_OFFLINE_CLEANUP_LUA)
+        self._extra_scripts: dict[str, object] = {}
+
+    def _lazy_script(self, name: str, source: str):
+        script = self._extra_scripts.get(name)
+        if script is None:
+            script = self.redis.register_script(source)
+            self._extra_scripts[name] = script
+        return script
 
     async def get_session_bytes(self, player_id: int) -> bytes | None:
         return _as_bytes_or_none(await self.redis.get(keys.session_key(player_id)))
@@ -132,6 +154,91 @@ class RedisSessionStore:
 
     async def get_afk_pass_bytes(self, player_id: int) -> bytes | None:
         return _as_bytes_or_none(await self.redis.get(keys.afk_pass_key(player_id)))
+
+    async def get_hosted_presence(self, player_id: int) -> bytes | None:
+        return _as_bytes_or_none(await self.redis.get(keys.hosted_presence_key(player_id)))
+
+    async def get_hosted_return(self, player_id: int) -> bytes | None:
+        return _as_bytes_or_none(await self.redis.get(keys.hosted_return_key(player_id)))
+
+    async def delete_hosted_return_if_value(self, player_id: int, expected: bytes | str) -> bool:
+        script = self._lazy_script("delete_hosted_return", lua.DELETE_HOSTED_RETURN_IF_VALUE_LUA)
+        expected_bytes = expected.encode("utf-8") if isinstance(expected, str) else expected
+        result = await script(keys=[keys.hosted_return_key(player_id)], args=[expected_bytes])
+        return int(result) == 1
+
+    async def expire_hosted_return_if_value(self, player_id: int, expected: bytes | str, ttl_seconds: int) -> bool:
+        script = self._lazy_script("expire_hosted_return", lua.EXPIRE_HOSTED_RETURN_IF_VALUE_LUA)
+        expected_bytes = expected.encode("utf-8") if isinstance(expected, str) else expected
+        result = await script(keys=[keys.hosted_return_key(player_id)], args=[expected_bytes, int(ttl_seconds)])
+        return int(result) == 1
+
+    async def list_registered_gates(self, slots: Sequence[int]) -> list[tuple[int, str]]:
+        pairs: list[tuple[int, str]] = []
+        for start in range(0, len(slots), _LEASE_PROBE_SLOTS_PER_PIPELINE):
+            chunk = slots[start:start + _LEASE_PROBE_SLOTS_PER_PIPELINE]
+            pipe = self.redis.pipeline(transaction=False)
+            for slot in chunk:
+                pipe.smembers(keys.gate_registry_key(slot))
+            replies = await pipe.execute(raise_on_error=False)
+            for slot, reply in zip(chunk, replies):
+                if isinstance(reply, Exception):
+                    if "WRONGTYPE" in str(reply):
+                        logger.error("skipped gate registry slot=%d reason=wrongtype error=%s", slot, reply)
+                        continue
+                    raise reply
+                for raw_gate in reply:
+                    gate = _as_text(raw_gate)
+                    if gate:
+                        pairs.append((slot, gate))
+        return pairs
+
+    async def scan_gate_index_members(
+        self, slot: int, gate_uuid: str, cursor: int = 0, count: int = 100,
+    ) -> tuple[int, list[str]]:
+        next_cursor, raw_members = await self.redis.sscan(
+            keys.gate_session_index_key(slot, gate_uuid), cursor=cursor, count=count,
+        )
+        return int(next_cursor), [_as_text(m) for m in raw_members]
+
+    async def mget_sessions_bytes(self, player_ids: Sequence[int]) -> list[bytes | None]:
+        if not player_ids:
+            return []
+        result: list[bytes | None] = [None] * len(player_ids)
+        by_slot: dict[int, list[int]] = defaultdict(list)
+        for idx, pid in enumerate(player_ids):
+            by_slot[keys.player_slot(pid)].append(idx)
+        for indices in by_slot.values():
+            req_keys = [keys.session_key(player_ids[i]) for i in indices]
+            values = await self.redis.mget(*req_keys)
+            if len(values) != len(indices):
+                raise RuntimeError(f"unexpected mget reply length {len(values)} want {len(indices)}")
+            for i, val in zip(indices, values):
+                result[i] = _as_bytes_or_none(val)
+        return result
+
+    async def remove_bad_gate_index_member(self, slot: int, gate_uuid: str, member: str) -> bool:
+        removed = await self.redis.srem(keys.gate_session_index_key(slot, gate_uuid), member)
+        return int(removed) == 1
+
+    async def prune_gate_index_member(
+        self, player_id: int, gate_uuid: str, member: str, expected: bytes | None,
+    ) -> bool:
+        script = self._lazy_script("prune_gate_index_member", lua.PRUNE_GATE_INDEX_MEMBER_LUA)
+        mode = "missing" if expected is None else "present"
+        result = await script(
+            keys=list(keys.prune_gate_index_member_keys(player_id, gate_uuid)),
+            args=[mode, b"" if expected is None else expected, member],
+        )
+        return int(result) == 1
+
+    async def release_gate_index_if_empty(self, slot: int, gate_uuid: str) -> bool:
+        script = self._lazy_script("release_gate_index_if_empty", lua.RELEASE_GATE_INDEX_IF_EMPTY_LUA)
+        result = await script(
+            keys=list(keys.release_gate_index_keys(slot, gate_uuid)),
+            args=[gate_uuid],
+        )
+        return int(result) == 1
 
     async def replace_session_and_cancel_lease(
         self, player_id: int, expected: bytes | None, updated: bytes, ttl_ms: int,
@@ -290,6 +397,7 @@ class MemorySessionStore:
 
     def __init__(self) -> None:
         self.strings: dict[str, bytes] = {}
+        self.ttls: dict[str, int] = {}
         self.zsets: dict[str, dict[str, float]] = {}
         self.hashes: dict[str, dict[str, bytes]] = {}
         self.sets: dict[str, set[str]] = {}
@@ -309,6 +417,27 @@ class MemorySessionStore:
 
     def delete_afk_pass(self, player_id: int) -> None:
         self.strings.pop(keys.afk_pass_key(player_id), None)
+
+    def set_hosted_presence(self, player_id: int, value: bytes | str = b"scene-1") -> None:
+        raw = value if isinstance(value, bytes) else value.encode("utf-8")
+        self.strings[keys.hosted_presence_key(player_id)] = raw
+
+    def delete_hosted_presence(self, player_id: int) -> None:
+        self.strings.pop(keys.hosted_presence_key(player_id), None)
+
+    def set_hosted_return(
+        self, player_id: int, value: bytes | str, ttl_seconds: int | None = None,
+    ) -> None:
+        raw = value if isinstance(value, bytes) else value.encode("utf-8")
+        key = keys.hosted_return_key(player_id)
+        self.strings[key] = raw
+        if ttl_seconds is not None:
+            self.ttls[key] = int(ttl_seconds)
+
+    def delete_hosted_return(self, player_id: int) -> None:
+        key = keys.hosted_return_key(player_id)
+        self.strings.pop(key, None)
+        self.ttls.pop(key, None)
 
     def _zadd(self, key: str, member: str, score: float) -> None:
         self.zsets.setdefault(key, {})[member] = float(score)
@@ -370,6 +499,91 @@ class MemorySessionStore:
         if self.fail_afk_probe:
             raise RuntimeError("simulated redis afk pass failure")
         return self.strings.get(keys.afk_pass_key(player_id))
+
+    async def get_hosted_presence(self, player_id: int) -> bytes | None:
+        return self.strings.get(keys.hosted_presence_key(player_id))
+
+    async def get_hosted_return(self, player_id: int) -> bytes | None:
+        return self.strings.get(keys.hosted_return_key(player_id))
+
+    async def delete_hosted_return_if_value(self, player_id: int, expected: bytes | str) -> bool:
+        key = keys.hosted_return_key(player_id)
+        expected_bytes = expected.encode("utf-8") if isinstance(expected, str) else expected
+        if self.strings.get(key) != expected_bytes:
+            return False
+        self.strings.pop(key, None)
+        self.ttls.pop(key, None)
+        return True
+
+    async def expire_hosted_return_if_value(self, player_id: int, expected: bytes | str, ttl_seconds: int) -> bool:
+        key = keys.hosted_return_key(player_id)
+        expected_bytes = expected.encode("utf-8") if isinstance(expected, str) else expected
+        if self.strings.get(key) != expected_bytes:
+            return False
+        if ttl_seconds <= 0:
+            self.strings.pop(key, None)
+            self.ttls.pop(key, None)
+        else:
+            self.ttls[key] = int(ttl_seconds)
+        return True
+
+    async def list_registered_gates(self, slots: Sequence[int]) -> list[tuple[int, str]]:
+        pairs: list[tuple[int, str]] = []
+        for slot in slots:
+            gates = self.sets.get(keys.gate_registry_key(slot))
+            if not gates:
+                continue
+            for gate in sorted(gates):
+                if gate:
+                    pairs.append((slot, gate))
+        return pairs
+
+    async def scan_gate_index_members(
+        self, slot: int, gate_uuid: str, cursor: int = 0, count: int = 100,
+    ) -> tuple[int, list[str]]:
+        members = sorted(self.sets.get(keys.gate_session_index_key(slot, gate_uuid), ()))
+        if not members or cursor >= len(members):
+            return 0, []
+        step = max(1, count)
+        end = cursor + step
+        page = members[cursor:end]
+        next_cursor = end if end < len(members) else 0
+        return next_cursor, page
+
+    async def mget_sessions_bytes(self, player_ids: Sequence[int]) -> list[bytes | None]:
+        return [self.strings.get(keys.session_key(pid)) for pid in player_ids]
+
+    async def remove_bad_gate_index_member(self, slot: int, gate_uuid: str, member: str) -> bool:
+        idx_key = keys.gate_session_index_key(slot, gate_uuid)
+        s = self.sets.get(idx_key)
+        if s is None or member not in s:
+            return False
+        self._srem(idx_key, member)
+        return True
+
+    async def prune_gate_index_member(
+        self, player_id: int, gate_uuid: str, member: str, expected: bytes | None,
+    ) -> bool:
+        current = self.strings.get(keys.session_key(player_id))
+        if expected is None:
+            if current is not None:
+                return False
+        elif current is None or current != expected:
+            return False
+        idx_key = keys.gate_session_index_key(keys.player_slot(player_id), gate_uuid)
+        s = self.sets.get(idx_key)
+        if s is None or member not in s:
+            return False
+        self._srem(idx_key, member)
+        return True
+
+    async def release_gate_index_if_empty(self, slot: int, gate_uuid: str) -> bool:
+        idx_key = keys.gate_session_index_key(slot, gate_uuid)
+        if self._scard(idx_key) > 0:
+            return False
+        self.sets.pop(idx_key, None)
+        self._srem(keys.gate_registry_key(slot), gate_uuid)
+        return True
 
     async def replace_session_and_cancel_lease(
         self, player_id: int, expected: bytes | None, updated: bytes, ttl_ms: int,

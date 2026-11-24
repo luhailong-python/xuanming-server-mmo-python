@@ -14,11 +14,13 @@ from ..grpc_runtime import GrpcClient, serve_grpc
 from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..protocol import Protocol
 from ..settings import Settings, secret as require_secret
+from .channel_directory import WorldChannelDirectoryPublisher
 from .config import (
     ROLE_DIRECTORY_SECRET_ENV,
     SCENE_MANAGER_NODE_TYPE,
     SceneManagerConfig,
 )
+from .dead_holder import DeadHolderReleaser
 from .service import (
     EtcdNodeRegistry,
     GrpcDataServiceClient,
@@ -31,6 +33,7 @@ from .store import (
     RedisSceneControlStore,
     open_redis,
 )
+from .sweepers import DeadNodeSweeper, IdleInstanceSweeper, TeardownJobSweeper
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,18 @@ async def _close_redis(client) -> None:
         result = close()
         if asyncio.iscoroutine(result):
             await result
+
+
+async def _cancel_task(task: asyncio.Task) -> None:
+    if not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _start_periodic_task(stack: AsyncExitStack, coro, *, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    stack.push_async_callback(_cancel_task, task)
+    return task
 
 
 async def _node_sync_loop(
@@ -145,6 +160,12 @@ async def run(settings: Settings) -> None:
             )
             stack.push_async_callback(scene_node_client.close)
 
+            dead_holder_releaser = (
+                DeadHolderReleaser(data_service, registry, zone_id=cfg.zone_id)
+                if cfg.enable_dead_holder_release
+                else None
+            )
+
             service = SceneManagerService(
                 protocol,
                 cfg,
@@ -154,6 +175,7 @@ async def run(settings: Settings) -> None:
                 scene_nodes=scene_node_client,
                 node_registry=registry,
                 publisher=publisher,
+                dead_holder_releaser=dead_holder_releaser,
             )
             stack.push_async_callback(service.close)
 
@@ -162,11 +184,25 @@ async def run(settings: Settings) -> None:
             await service.sync_nodes_to_control_store()
             await service.init_world_scenes(cfg.zone_id, wait_for_lock=False)
 
-            sync_task = asyncio.create_task(
+            _start_periodic_task(
+                stack,
                 _node_sync_loop(registry, service, cfg.node_sync_interval_sec, stop),
                 name="scene-manager-node-sync",
             )
-            stack.callback(sync_task.cancel)
+            if cfg.effective_channel_directory_refresh_sec() > 0:
+                channel_publisher = WorldChannelDirectoryPublisher(
+                    protocol, cfg, control_store=control_store, node_registry=registry,
+                )
+                _start_periodic_task(stack, channel_publisher.run(stop), name="scene-manager-channel-directory")
+            if cfg.instance_idle_timeout_sec > 0 or cfg.effective_mirror_idle_timeout_sec() > 0:
+                idle_sweeper = IdleInstanceSweeper(service)
+                _start_periodic_task(stack, idle_sweeper.run(stop), name="scene-manager-idle-sweeper")
+            if cfg.teardown_sweep_interval_sec > 0:
+                teardown_sweeper = TeardownJobSweeper(service)
+                _start_periodic_task(stack, teardown_sweeper.run(stop), name="scene-manager-teardown-sweeper")
+            if cfg.dead_node_sweep_interval_sec > 0:
+                dead_node_sweeper = DeadNodeSweeper(service)
+                _start_periodic_task(stack, dead_node_sweeper.run(stop), name="scene-manager-dead-node-sweeper")
 
             server, port = await serve_grpc(
                 protocol,

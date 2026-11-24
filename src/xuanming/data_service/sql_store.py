@@ -17,10 +17,50 @@ import pymysql
 
 from .. import portal_sql
 from .errors import (Conflict, DirectoryError, Full, Invalid, Missing, NameConflict, NameInUse, NameOutsideWindow,
-                     NotCommitted, TxNeverBegan, ZoneConflict)
-from .model import (INITIAL_OWNER_EPOCH, INITIAL_SAVE_SEQ, MAX_ROLE_BYTES, NAME_BATCH_LIMIT,
-                    ROUTE_BATCH_LIMIT, ROUTE_SHARDS, SCHEMA_GEN, Ownership, valid_account)
+                     NotCommitted, RetryLater, TxNeverBegan, ZoneConflict)
+from .model import (
+    AccountDirectoryRead,
+    DELETION_DELETING,
+    DELETION_LEASE_MS,
+    DELETION_NONE,
+    DELETION_OUTCOME_BLOCKED,
+    DELETION_OUTCOME_NOT_FOUND,
+    DELETION_OUTCOME_OK,
+    DELETION_OUTCOME_TOO_LATE,
+    DELETION_PENDING,
+    DELETION_SOURCE_ADMIN,
+    DELETION_SOURCE_USER,
+    INITIAL_OWNER_EPOCH,
+    INITIAL_SAVE_SEQ,
+    MAX_APPEARANCE_ID_BYTES,
+    MAX_DELETION_CLAIM,
+    MAX_DELETION_COOLING_OFF_MS,
+    MAX_ROLE_BYTES,
+    MAX_UINT64,
+    NAME_BATCH_LIMIT,
+    RENAME_COOLDOWN,
+    RENAME_FROZEN,
+    RENAME_INVALID,
+    RENAME_NOT_FOUND,
+    RENAME_OK,
+    RENAME_SAME_NAME,
+    RENAME_STALE_SEQ,
+    RENAME_STATE_COMMITTED,
+    RENAME_STATE_PENDING,
+    RENAME_STATE_REJECTED,
+    RENAME_STATE_REJECTED_DIRTY,
+    RENAME_STATE_SETTLED,
+    RENAME_TAKEN,
+    ROUTE_BATCH_LIMIT,
+    ROUTE_SHARDS,
+    SCHEMA_GEN,
+    Ownership,
+    valid_account,
+    valid_pi,
+)
 from . import names
+from .sql_audit import _SqlAuditMixin
+from .sql_trade import _SqlTradeMixin
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +123,7 @@ def _marks(count: int) -> str:
     return ",".join(["%s"] * count)
 
 
-class SqlStore:
+class SqlStore(_SqlTradeMixin, _SqlAuditMixin):
     def __init__(self, pool, protocol, *, max_roles: int = 5, storage_pools=None, writer: str = "data_service@py",
                  generation: str = "py1") -> None:
         self.pool, self.protocol, self.max_roles = pool, protocol, max_roles
@@ -159,24 +199,32 @@ class SqlStore:
         return Ownership(account, bytes(raw), rev, listing, prepare)
 
     # -- account directory ---------------------------------------------------------------------------
-    async def _read_account(self, account: str):
-        """Directory row existence and the ref player ids (ordered), without row locks."""
-        def work(cursor):
-            return self._read_account_in(cursor, account)
-
-        return await self._tx(work)
-
-    async def _read_account_in(self, cursor, account: str):
-        await cursor.execute("SELECT account,deletion_state,deletion_execute_after_ms,real_name_pi "
-                             "FROM account_directory WHERE account=%s", (account,))
-        if await cursor.fetchone() is None:
-            return False, []
-        await cursor.execute("SELECT player_id,held_ms FROM account_role_ref WHERE account=%s "
-                             "ORDER BY player_id LIMIT %s", (account, MAX_REF_ROWS + 1))
-        refs = [row[0] for row in await cursor.fetchall()]
+    async def _read_account_detail_in(self, cursor, account: str):
+        await cursor.execute(
+            "SELECT account,deletion_state,deletion_execute_after_ms,real_name_pi "
+            "FROM account_directory WHERE account=%s", (account,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None, []
+        await cursor.execute(
+            "SELECT player_id,held_ms FROM account_role_ref WHERE account=%s "
+            "ORDER BY player_id LIMIT %s", (account, MAX_REF_ROWS + 1),
+        )
+        refs = [int(r[0]) for r in await cursor.fetchall()]
         if len(refs) > MAX_REF_ROWS:
             raise RuntimeError("账号角色目录超过硬上限")
-        return True, refs
+        detail = {
+            "deletion_state": int(row[1]),
+            "deletion_execute_after_ms": int(row[2]),
+            "real_name_pi": bytes(row[3] or b"").decode("utf-8"),
+        }
+        return detail, refs
+
+    async def _read_account(self, account: str):
+        """无锁读取目录行存在性与有序 ref 列表。"""
+        detail, refs = await self._tx(lambda cursor: self._read_account_detail_in(cursor, account))
+        return detail is not None, refs
 
     @staticmethod
     async def _lock_directory(cursor, account: str, create: bool) -> int:
@@ -185,16 +233,17 @@ class SqlStore:
         if create:
             await cursor.execute(
                 "INSERT INTO account_directory(account,created_ms) VALUES (%s,UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3))*1000)"
-                " ON DUPLICATE KEY UPDATE account=account", (account,))
+                " ON DUPLICATE KEY UPDATE account=account", (account,),
+            )
         await cursor.execute("SELECT account,deletion_state FROM account_directory WHERE account=%s FOR UPDATE",
                              (account,))
         row = await cursor.fetchone()
         if row is None:
             raise Missing(account)
-        return row[1]
+        return int(row[1])
 
     async def _roles_of_refs(self, account: str, refs: list[int]) -> list[bytes]:
-        """Roles whose truth row (account_role.account) is this account, ordered by player id."""
+        """按真相 account_role.account 过滤 ref，返回有序角色序列化字节列表。"""
         if not refs:
             return []
         _, rows = await self._one(f"SELECT player_id,{OWNERSHIP_COLUMNS} FROM account_role "
@@ -202,17 +251,52 @@ class SqlStore:
         owners = {row[0]: self._decode(*row, self.role_type) for row in rows}
         return [owners[pid].role for pid in refs if pid in owners and owners[pid].account == account]
 
-    async def read_account(self, account: str, create: bool) -> list[bytes]:
+    async def _ensure_account_with_receipt(self, account: str) -> int:
+        """建账号行并查询是否曾注销过（返回 previous_deleted_ms）。"""
+        digest = hashlib.sha256(account.encode("utf-8")).digest()
+
+        async def work(cursor):
+            await self._lock_directory(cursor, account, True)
+            await cursor.execute(
+                "SELECT deleted_ms FROM account_deletion_receipt WHERE account_digest=UNHEX(%s)",
+                (digest.hex(),),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+        return await self._tx(work)
+
+    async def read_account_with_lifecycle(self, account: str, create: bool) -> AccountDirectoryRead:
+        """同一次读取账号角色列表、注销生命周期与实名 pi。"""
         if not valid_account(account):
             raise Invalid("account")
-        exists, refs = await self._read_account(account)
-        if not exists:
+        detail, refs = await self._tx(lambda cursor: self._read_account_detail_in(cursor, account))
+        previous_deleted_ms = 0
+        if detail is None:
             if not create:
                 raise Missing(account)
-            # shortcut: the account-deletion receipt lookup (previous_deleted_ms) is skipped, no deletion in v1.
-            await self._tx(lambda cursor: self._lock_directory(cursor, account, True))
-            _, refs = await self._read_account(account)
-        return await self._roles_of_refs(account, refs)
+            previous_deleted_ms = await self._ensure_account_with_receipt(account)
+            detail, refs = await self._tx(lambda cursor: self._read_account_detail_in(cursor, account))
+            if detail is None:
+                detail = {"deletion_state": 0, "deletion_execute_after_ms": 0, "real_name_pi": ""}
+        roles = await self._roles_of_refs(account, refs)
+        return AccountDirectoryRead(
+            roles=roles,
+            deletion_state=detail["deletion_state"],
+            deletion_execute_after_ms=detail["deletion_execute_after_ms"],
+            previous_deleted_ms=previous_deleted_ms,
+            real_name_pi=detail["real_name_pi"],
+        )
+
+    async def read_account(self, account: str, create: bool) -> list[bytes]:
+        return (await self.read_account_with_lifecycle(account, create)).roles
+
+    async def account_deletion_state(self, account: str) -> int:
+        """点读账号注销状态；账号行不存在返回 DELETION_NONE(0)。"""
+        if not valid_account(account):
+            raise Invalid("account")
+        _, rows = await self._one("SELECT deletion_state FROM account_directory WHERE account=%s", (account,))
+        return int(rows[0][0]) if rows else DELETION_NONE
 
     async def _read_owner(self, player: int) -> Ownership | None:
         _, rows = await self._one(f"SELECT {OWNERSHIP_COLUMNS},initial_player_commit FROM account_role "
@@ -664,8 +748,19 @@ class SqlStore:
             }
         return result
 
+    async def upsert_channel_identity(self, account: str, channel: str, open_id: str) -> None:
+        """在账号分片登记或刷新第三方登录渠道标识与 open_id。"""
+        if not valid_account(account) or not channel or len(channel) > 32 or len(open_id) > 191:
+            raise Invalid("channel identity")
+        await self._one(
+            f"INSERT INTO account_channel_identity(account,channel,open_id,updated_ms) "
+            f"VALUES (%s,%s,%s,{DB_NOW_MS}) ON DUPLICATE KEY UPDATE "
+            "channel=VALUES(channel),open_id=VALUES(open_id),updated_ms=VALUES(updated_ms)",
+            (account, channel, open_id),
+        )
+
     async def player_channel_identity(self, player_id: int) -> dict | None:
-        """读取角色所属账号及建号时间，用于聊天与内容审核画像。"""
+        """读取角色所属账号、已持久化渠道身份、建号时间与角色等级，用于聊天与内容审核画像。"""
         owned = await self._read_owner(player_id)
         if owned is None or not owned.account:
             return None
@@ -673,13 +768,551 @@ class SqlStore:
             "SELECT created_ms FROM account_directory WHERE account=%s", (owned.account,),
         )
         created_ms = int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        _, ch_rows = await self._one(
+            "SELECT channel,open_id FROM account_channel_identity WHERE account=%s", (owned.account,),
+        )
+        channel, open_id = (str(ch_rows[0][0]), str(ch_rows[0][1])) if ch_rows else ("", "")
+        displays = await self.player_displays([player_id])
+        level = int(displays[player_id]["level"]) if player_id in displays else 0
         return {
             "account": owned.account,
-            "channel": "",
-            "open_id": "",
+            "channel": channel,
+            "open_id": open_id,
             "account_created_ms": created_ms,
-            "player_level": 0,
+            "player_level": level,
         }
+
+    # -- real name -----------------------------------------------------------------------------------
+    async def set_real_name(self, account: str, pi: str) -> str:
+        """只写一次实名 pi；已有不同 pi 时不改并返回库里现存值，账号不存在抛 Missing。"""
+        if not valid_account(account) or not valid_pi(pi):
+            raise Invalid("real_name")
+
+        async def work(cursor):
+            await cursor.execute(
+                "UPDATE account_directory SET real_name_pi=%s WHERE account=%s AND real_name_pi=''",
+                (pi, account),
+            )
+            await cursor.execute("SELECT real_name_pi FROM account_directory WHERE account=%s", (account,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise Missing(account)
+            return bytes(row[0] or b"").decode("utf-8")
+
+        return await self._tx(work)
+
+    async def reset_real_name(self, account: str) -> bool:
+        """客服重置实名：清空账号行上的 real_name_pi，返回重置前是否存在实名。"""
+        if not valid_account(account):
+            raise Invalid("account")
+
+        async def work(cursor):
+            await cursor.execute(
+                "SELECT real_name_pi FROM account_directory WHERE account=%s FOR UPDATE", (account,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise Missing(account)
+            had = len(bytes(row[0] or b"")) > 0
+            if had:
+                await cursor.execute("UPDATE account_directory SET real_name_pi='' WHERE account=%s", (account,))
+            return had
+
+        return await self._tx(work)
+
+    async def get_real_name_of_player(self, player_id: int) -> tuple[bool, str]:
+        """按玩家查所属账号的实名 pi；角色不存在/已删或账号不存在返回 (False, '')。"""
+        if not player_id:
+            raise Invalid("player_id")
+        owned = await self._read_owner(player_id)
+        if owned is None or not owned.account:
+            return False, ""
+        _, rows = await self._one("SELECT real_name_pi FROM account_directory WHERE account=%s", (owned.account,))
+        if not rows:
+            return False, ""
+        return True, bytes(rows[0][0] or b"").decode("utf-8")
+
+    # -- repair & remove roles -----------------------------------------------------------------------
+    def _merge_role(self, old_raw: bytes, patch):
+        merged = self.role_type.FromString(old_raw)
+        if patch.class_id:
+            if merged.class_id and merged.class_id != patch.class_id:
+                raise Conflict("class_id mismatch")
+            merged.class_id = patch.class_id
+        if patch.gender:
+            if merged.gender and merged.gender != patch.gender:
+                raise Conflict("gender mismatch")
+            merged.gender = patch.gender
+        if patch.appearance_id:
+            if merged.appearance_id and merged.appearance_id != patch.appearance_id:
+                raise Conflict("appearance_id mismatch")
+            merged.appearance_id = patch.appearance_id
+        if patch.name:
+            if merged.name and merged.name != patch.name:
+                raise Conflict("name mismatch")
+            merged.name = patch.name
+        return merged
+
+    async def repair_role(self, account: str, role, expected_owner_revision: int) -> list[bytes]:
+        """仅补齐缺失的身份字段，不改变归属或 owner_revision。"""
+        if (not valid_account(account) or not role.player_id or role.ByteSize() > MAX_ROLE_BYTES
+                or not expected_owner_revision):
+            raise Invalid("repair")
+
+        async def work(cursor):
+            await cursor.execute(LOCK_OWNERSHIP, (role.player_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise Missing(role.player_id)
+            owned = self._decode(role.player_id, *row, self.role_type)
+            if (owned.account != account or owned.owner_revision != expected_owner_revision
+                    or owned.trade_listing_id != 0 or owned.prepare_token != 0):
+                raise Conflict("ownership changed or frozen")
+            merged = self._merge_role(owned.role, role)
+            raw = merged.SerializeToString()
+            if raw != owned.role:
+                await cursor.execute(
+                    f"UPDATE account_role SET role_proto=UNHEX(%s),updated_ms={DB_NOW_MS} "
+                    "WHERE player_id=%s AND account=%s AND owner_revision=%s",
+                    (raw.hex(), role.player_id, account, expected_owner_revision),
+                )
+
+        await self._tx(work)
+        return await self._role_list(account)
+
+    async def remove_roles(self, account: str, roles: list[tuple[int, int]]) -> None:
+        """批量删角（逐个落墓碑并清 ref 与名字登记；存在开放入场登记/冻结/进行中改名时拒绝）。"""
+        if not valid_account(account) or not roles or len(roles) > MAX_REF_ROWS:
+            raise Invalid("remove")
+        ordered = sorted(roles, key=lambda item: item[0])
+        seen: set[int] = set()
+        for pid, rev in ordered:
+            if not pid or not rev or pid in seen:
+                raise Invalid("remove role item")
+            seen.add(pid)
+
+        for pid, rev in ordered:
+            await self._remove_one_role(account, pid, rev)
+
+    async def _remove_one_role(self, account: str, player_id: int, revision: int) -> None:
+        async def work(cursor):
+            await cursor.execute(LOCK_OWNERSHIP, (player_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                return ""
+            owned = self._decode(player_id, *row, self.role_type)
+            if not owned.account:
+                return self.role_type.FromString(owned.role).name
+            if (owned.account != account or owned.owner_revision != revision
+                    or owned.trade_listing_id != 0 or owned.prepare_token != 0):
+                raise Conflict("role ownership changed or frozen")
+            if owned.owner_revision == MAX_UINT64:
+                raise RuntimeError("owner_revision exhausted")
+            if await self._rename_open_tx(cursor, player_id):
+                raise RetryLater("rename in progress")
+            await cursor.execute(
+                "SELECT EXISTS(SELECT 1 FROM account_role_admission "
+                "WHERE player_id=%s AND closed_through<highest_generation)",
+                (player_id,),
+            )
+            if int((await cursor.fetchone())[0]):
+                raise Conflict("open role admission exists")
+            await cursor.execute(
+                f"UPDATE account_role SET account='',owner_revision=owner_revision+1,trade_listing_id=0,"
+                f"prepare_token=0,fence_version=fence_version+1,updated_ms={DB_NOW_MS} WHERE player_id=%s",
+                (player_id,),
+            )
+            return self.role_type.FromString(owned.role).name
+
+        role_name = await self._tx(work)
+        await self._one("DELETE FROM account_role_ref WHERE account=%s AND player_id=%s", (account, player_id))
+        if role_name:
+            _, norm, _ = names.normalize(role_name)
+            if norm:
+                await self._one("DELETE FROM player_name WHERE player_id=%s AND name_norm=%s", (player_id, norm))
+                await self._one(NAME_OWNER_DELETE, (player_id, norm))
+
+    # -- account deletion (0 -> 1 -> 2 -> deleted + receipt) -----------------------------------------
+    async def request_deletion(self, account: str, source: int, cooling_off_ms: int) -> dict:
+        """申请账号注销：预检全部角色无寄售/准备冻结后 0 -> 1；已是 1/2 幂等原样回。"""
+        if (not valid_account(account) or source not in (DELETION_SOURCE_USER, DELETION_SOURCE_ADMIN)
+                or not 0 <= cooling_off_ms <= MAX_DELETION_COOLING_OFF_MS):
+            raise Invalid("request_deletion")
+        detail, refs = await self._tx(lambda cursor: self._read_account_detail_in(cursor, account))
+        if detail is None:
+            return {"outcome": DELETION_OUTCOME_NOT_FOUND, "lifecycle": None, "blockers": []}
+        if detail["deletion_state"] != DELETION_NONE:
+            return {
+                "outcome": DELETION_OUTCOME_OK,
+                "lifecycle": {
+                    "deletion_state": detail["deletion_state"],
+                    "deletion_execute_after_ms": detail["deletion_execute_after_ms"],
+                },
+                "blockers": [],
+            }
+        blockers: list[tuple[int, str]] = []
+        if refs:
+            _, rows = await self._one(
+                f"SELECT player_id,{OWNERSHIP_COLUMNS} FROM account_role WHERE player_id IN ({_marks(len(refs))})",
+                refs,
+            )
+            for row in rows:
+                pid = int(row[0])
+                owned = self._decode(*row, self.role_type)
+                if owned.account != account:
+                    continue
+                if owned.trade_listing_id:
+                    blockers.append((pid, "role_listed"))
+                elif owned.prepare_token:
+                    blockers.append((pid, "role_preparing"))
+        if blockers:
+            return {"outcome": DELETION_OUTCOME_BLOCKED, "lifecycle": {"deletion_state": 0, "deletion_execute_after_ms": 0},
+                    "blockers": blockers}
+
+        async def work(cursor):
+            state = await self._lock_directory(cursor, account, False)
+            if state == DELETION_NONE:
+                await cursor.execute(
+                    f"UPDATE account_directory SET deletion_state=%s,deletion_requested_ms={DB_NOW_MS},"
+                    f"deletion_execute_after_ms={DB_NOW_MS}+%s,deletion_lease_until_ms=0,deletion_source=%s "
+                    "WHERE account=%s",
+                    (DELETION_PENDING, cooling_off_ms, source, account),
+                )
+            await cursor.execute(
+                "SELECT deletion_state,deletion_execute_after_ms FROM account_directory WHERE account=%s",
+                (account,),
+            )
+            st, exec_after = await cursor.fetchone()
+            return {"deletion_state": int(st), "deletion_execute_after_ms": int(exec_after)}
+
+        try:
+            lifecycle = await self._tx(work)
+        except Missing:
+            return {"outcome": DELETION_OUTCOME_NOT_FOUND, "lifecycle": None, "blockers": []}
+        return {"outcome": DELETION_OUTCOME_OK, "lifecycle": lifecycle, "blockers": []}
+
+    async def cancel_deletion(self, account: str) -> dict:
+        """撤销注销：1 -> 0，0 原样回，2 回 TOO_LATE。"""
+        if not valid_account(account):
+            raise Invalid("account")
+
+        async def work(cursor):
+            state = await self._lock_directory(cursor, account, False)
+            outcome = DELETION_OUTCOME_OK
+            if state == DELETION_PENDING:
+                await cursor.execute(
+                    "UPDATE account_directory SET deletion_state=0,deletion_requested_ms=0,"
+                    "deletion_execute_after_ms=0,deletion_lease_until_ms=0,deletion_source=0 WHERE account=%s",
+                    (account,),
+                )
+            elif state == DELETION_DELETING:
+                outcome = DELETION_OUTCOME_TOO_LATE
+            await cursor.execute(
+                "SELECT deletion_state,deletion_execute_after_ms FROM account_directory WHERE account=%s",
+                (account,),
+            )
+            st, exec_after = await cursor.fetchone()
+            return {
+                "outcome": outcome,
+                "lifecycle": {"deletion_state": int(st), "deletion_execute_after_ms": int(exec_after)},
+                "blockers": [],
+            }
+
+        try:
+            return await self._tx(work)
+        except Missing:
+            return {"outcome": DELETION_OUTCOME_NOT_FOUND, "lifecycle": None, "blockers": []}
+
+    async def claim_deletions(self, limit: int) -> list[str]:
+        """认领冷静期满的 1 与租约过期的 2，条件置为 2 并写租约（不可撤销）。"""
+        if not 1 <= limit <= MAX_DELETION_CLAIM:
+            raise Invalid("limit")
+        _, due_rows = await self._one(
+            f"SELECT account FROM account_directory WHERE deletion_state IN (1,2) "
+            f"AND deletion_execute_after_ms<={DB_NOW_MS} AND deletion_lease_until_ms<={DB_NOW_MS} "
+            "ORDER BY deletion_execute_after_ms LIMIT %s",
+            (limit,),
+        )
+        claimed: list[str] = []
+        for (account_b,) in due_rows:
+            acct = bytes(account_b).decode("utf-8")
+
+            async def claim_one(cursor, target=acct):
+                await cursor.execute(
+                    f"UPDATE account_directory SET deletion_state=%s,deletion_lease_until_ms={DB_NOW_MS}+%s "
+                    f"WHERE account=%s AND deletion_state IN (1,2) "
+                    f"AND deletion_execute_after_ms<={DB_NOW_MS} AND deletion_lease_until_ms<={DB_NOW_MS}",
+                    (DELETION_DELETING, DELETION_LEASE_MS, target),
+                )
+                return cursor.rowcount == 1
+
+            if await self._tx(claim_one):
+                claimed.append(acct)
+        return claimed
+
+    async def finish_deletion(self, account: str) -> tuple[bool, int]:
+        """收尾账号注销：清陈旧 ref，状态为 2 且无剩余 ref 时写回执并删账号行。"""
+        if not valid_account(account):
+            raise Invalid("account")
+        detail, refs = await self._tx(lambda cursor: self._read_account_detail_in(cursor, account))
+        if detail is None:
+            return True, 0
+        if detail["deletion_state"] != DELETION_DELETING:
+            raise Conflict("account is not in deleting state")
+        # 清理可证明陈旧的 ref（角色不存在、已删墓碑或归属已转走）
+        if refs:
+            _, rows = await self._one(
+                f"SELECT player_id,{OWNERSHIP_COLUMNS} FROM account_role WHERE player_id IN ({_marks(len(refs))})",
+                refs,
+            )
+            live = {int(r[0]) for r in rows if bytes(r[1]).decode("utf-8") == account}
+            for pid in refs:
+                if pid not in live:
+                    await self._one("DELETE FROM account_role_ref WHERE account=%s AND player_id=%s", (account, pid))
+
+        digest = hashlib.sha256(account.encode("utf-8")).digest()
+
+        async def work(cursor):
+            try:
+                state = await self._lock_directory(cursor, account, False)
+            except Missing:
+                return True, 0
+            if state != DELETION_DELETING:
+                raise Conflict("account is not in deleting state")
+            await cursor.execute("SELECT player_id FROM account_role_ref WHERE account=%s", (account,))
+            left = await cursor.fetchall()
+            if left:
+                return False, len(left)
+            await cursor.execute(
+                "SELECT deletion_requested_ms,deletion_source FROM account_directory WHERE account=%s", (account,),
+            )
+            requested_ms, source = await cursor.fetchone()
+            await cursor.execute(
+                f"INSERT INTO account_deletion_receipt(account_digest,requested_ms,deleted_ms,source) "
+                f"VALUES (UNHEX(%s),%s,{DB_NOW_MS},%s) ON DUPLICATE KEY UPDATE "
+                f"requested_ms=%s,deleted_ms={DB_NOW_MS},source=%s",
+                (digest.hex(), int(requested_ms), int(source), int(requested_ms), int(source)),
+            )
+            await cursor.execute("DELETE FROM account_directory WHERE account=%s", (account,))
+            return True, 0
+
+        return await self._tx(work)
+
+    # -- role appearance & rename --------------------------------------------------------------------
+    async def update_role_appearance(self, player_id: int, appearance_id: str) -> bool:
+        """同步角色永久外观到 account_role.role_proto，不改动 owner_revision 与 fence_version。"""
+        if not player_id or not appearance_id or len(appearance_id.encode("utf-8")) > MAX_APPEARANCE_ID_BYTES:
+            raise Invalid("appearance")
+
+        async def work(cursor):
+            await cursor.execute(LOCK_OWNERSHIP, (player_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                return False
+            owned = self._decode(player_id, *row, self.role_type)
+            if not owned.account:
+                return False
+            role = self.role_type.FromString(owned.role)
+            if role.appearance_id == appearance_id:
+                return False
+            role.appearance_id = appearance_id
+            raw = role.SerializeToString()
+            await cursor.execute(
+                f"UPDATE account_role SET role_proto=UNHEX(%s),updated_ms={DB_NOW_MS} WHERE player_id=%s",
+                (raw.hex(), player_id),
+            )
+            return True
+
+        return await self._tx(work)
+
+    @staticmethod
+    async def _rename_open_tx(cursor, player_id: int) -> bool:
+        await cursor.execute("SELECT state FROM account_role_rename WHERE player_id=%s", (player_id,))
+        row = await cursor.fetchone()
+        return row is not None and int(row[0]) in (
+            RENAME_STATE_PENDING, RENAME_STATE_COMMITTED, RENAME_STATE_REJECTED_DIRTY,
+        )
+
+    async def rename_role(
+        self, player_id: int, seq: int, display: str, norm: str, *,
+        invalid: bool, cooldown_ms: int, hold_ms: int, now_ms: int,
+    ) -> dict:
+        """角色改名（按 seq 幂等与防倒流，提交点改 account_role 与 player_name_owner，随后绑定新名并保护旧名）。"""
+        if not player_id or not seq or cooldown_ms < 0 or hold_ms < 0:
+            raise Invalid("rename")
+
+        def replay(rec) -> dict:
+            r_seq, state, result, new_name, _new_norm, _old_norm, renamed_ms, _held = rec
+            if state in (RENAME_STATE_COMMITTED, RENAME_STATE_SETTLED):
+                return {"result": RENAME_OK, "current_seq": r_seq, "name": new_name,
+                        "renamed_ms": renamed_ms, "next_allowed_ms": 0}
+            next_ms = (renamed_ms + cooldown_ms) if result == RENAME_COOLDOWN else 0
+            return {"result": result, "current_seq": r_seq, "name": "", "renamed_ms": 0, "next_allowed_ms": next_ms}
+
+        async def begin_tx(cursor):
+            await cursor.execute(LOCK_OWNERSHIP, (player_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                return "done", {"result": RENAME_NOT_FOUND, "current_seq": 0, "name": "", "renamed_ms": 0, "next_allowed_ms": 0}
+            owned = self._decode(player_id, *row, self.role_type)
+            if not owned.account:
+                return "done", {"result": RENAME_NOT_FOUND, "current_seq": 0, "name": "", "renamed_ms": 0, "next_allowed_ms": 0}
+            await cursor.execute(
+                "SELECT seq,state,result,new_name,new_norm,old_norm,renamed_ms,held_until_ms "
+                "FROM account_role_rename WHERE player_id=%s FOR UPDATE",
+                (player_id,),
+            )
+            rec = await cursor.fetchone()
+            prev_renamed_ms = 0
+            if rec is not None:
+                r_seq, r_state, r_res, r_new_name, r_new_norm, r_old_norm, r_renamed_ms, r_held = (
+                    int(rec[0]), int(rec[1]), int(rec[2]), str(rec[3]), str(rec[4]), str(rec[5]), int(rec[6]), int(rec[7]),
+                )
+                prev_renamed_ms = r_renamed_ms
+                if r_seq > seq or (r_seq == seq and r_new_norm != norm):
+                    return "done", {"result": RENAME_STALE_SEQ, "current_seq": r_seq, "name": "", "renamed_ms": 0, "next_allowed_ms": 0}
+                if r_seq == seq:
+                    if r_state == RENAME_STATE_PENDING:
+                        return "proceed", None
+                    return "done", replay((r_seq, r_state, r_res, r_new_name, r_new_norm, r_old_norm, r_renamed_ms, r_held))
+            role = self.role_type.FromString(owned.role)
+            _, cur_norm, _ = names.normalize(role.name)
+            verdict_res = 0
+            next_allowed = 0
+            if invalid:
+                verdict_res = RENAME_INVALID
+            elif owned.trade_listing_id or owned.prepare_token:
+                verdict_res = RENAME_FROZEN
+            elif cur_norm == norm:
+                verdict_res = RENAME_SAME_NAME
+            elif prev_renamed_ms and now_ms < prev_renamed_ms + cooldown_ms:
+                verdict_res = RENAME_COOLDOWN
+                next_allowed = prev_renamed_ms + cooldown_ms
+            state = RENAME_STATE_REJECTED if verdict_res else RENAME_STATE_PENDING
+            await cursor.execute(
+                "INSERT INTO account_role_rename(player_id,seq,state,result,new_name,new_norm,old_norm,"
+                "renamed_ms,held_until_ms,updated_ms) VALUES (%s,%s,%s,%s,%s,%s,'',0,0,%s) "
+                "ON DUPLICATE KEY UPDATE seq=VALUES(seq),state=VALUES(state),result=VALUES(result),"
+                "new_name=VALUES(new_name),new_norm=VALUES(new_norm),old_norm='',held_until_ms=0,updated_ms=VALUES(updated_ms)",
+                (player_id, seq, state, verdict_res, display, norm, now_ms),
+            )
+            if state == RENAME_STATE_REJECTED:
+                return "done", {"result": verdict_res, "current_seq": seq, "name": "", "renamed_ms": 0, "next_allowed_ms": next_allowed}
+            return "proceed", None
+
+        step, out = await self._tx(begin_tx)
+        if step == "done":
+            return out
+
+        # 预留新名（只动 player_name 表）
+        outcome, _owner = await self._reserve_row(player_id, display, norm, now_ms)
+        if outcome == names.RESERVE_TAKEN:
+            async def reject_tx(cursor):
+                await cursor.execute(
+                    "UPDATE account_role_rename SET state=%s,result=%s,updated_ms=%s "
+                    "WHERE player_id=%s AND seq=%s AND state=%s",
+                    (RENAME_STATE_REJECTED, RENAME_TAKEN, now_ms, player_id, seq, RENAME_STATE_PENDING),
+                )
+            await self._tx(reject_tx)
+            return {"result": RENAME_TAKEN, "current_seq": seq, "name": "", "renamed_ms": 0, "next_allowed_ms": 0}
+
+        # 提交点：更新 account_role.role_proto、player_name_owner 与改名记录
+        async def commit_tx(cursor):
+            await cursor.execute(LOCK_OWNERSHIP, (player_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise Missing(player_id)
+            owned = self._decode(player_id, *row, self.role_type)
+            if not owned.account or owned.trade_listing_id or owned.prepare_token:
+                raise Conflict("role removed or frozen during rename")
+            role = self.role_type.FromString(owned.role)
+            _, old_norm, _ = names.normalize(role.name)
+            role.name = display
+            raw = role.SerializeToString()
+            held_until = now_ms + hold_ms
+            await cursor.execute(
+                "UPDATE account_role SET role_proto=UNHEX(%s),updated_ms=%s WHERE player_id=%s",
+                (raw.hex(), now_ms, player_id),
+            )
+            await cursor.execute(
+                "INSERT INTO player_name_owner(player_id,name_norm,name) VALUES (%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE name_norm=VALUES(name_norm),name=VALUES(name)",
+                (player_id, norm, display),
+            )
+            await cursor.execute(
+                "UPDATE account_role_rename SET state=%s,old_norm=%s,renamed_ms=%s,held_until_ms=%s,updated_ms=%s "
+                "WHERE player_id=%s AND seq=%s AND state=%s",
+                (RENAME_STATE_COMMITTED, old_norm, now_ms, held_until, now_ms, player_id, seq, RENAME_STATE_PENDING),
+            )
+            return old_norm, held_until
+
+        old_norm, held_until = await self._tx(commit_tx)
+        # 收尾：绑定新名，旧名置保护期，记录置已收尾
+        await self._one(NAME_BIND, (now_ms, norm, player_id))
+        if old_norm and old_norm != norm:
+            await self._one(
+                "UPDATE player_name SET held_until_ms=%s WHERE name_norm=%s AND player_id=%s",
+                (max(1, held_until), old_norm, player_id),
+            )
+        await self._one(
+            "UPDATE account_role_rename SET state=%s,updated_ms=%s WHERE player_id=%s AND seq=%s AND state=%s",
+            (RENAME_STATE_SETTLED, now_ms, player_id, seq, RENAME_STATE_COMMITTED),
+        )
+        return {"result": RENAME_OK, "current_seq": seq, "name": display, "renamed_ms": now_ms, "next_allowed_ms": 0}
+
+    # -- player_store dead holder read / release -----------------------------------------------------
+    async def read_player_store_holder(self, player_id: int) -> tuple[int, bytes, int] | None:
+        """读取 player_store 写权行 (owner_epoch, holder_instance, claim_seq)；无路由或写权行返回 None。"""
+        if not player_id:
+            raise Invalid("player_id")
+        route = await self.route_detail(player_id)
+        if route is None:
+            return None
+        pool = self.storage_pools.get(route[1])
+        if pool is None:
+            raise RuntimeError(f"storage pool unavailable: {route[1]}")
+        _, rows = await self._one(
+            "SELECT owner_epoch,holder_instance,claim_seq FROM player_store WHERE player_id=%s AND kind=0",
+            (player_id,), pool=pool,
+        )
+        if not rows:
+            return None
+        return int(rows[0][0]), bytes(rows[0][1] or b""), int(rows[0][2])
+
+    async def release_dead_player_store_holder(
+        self, player_id: int, owner_epoch: int, seen: tuple[int, bytes, int] | None = None,
+    ) -> None:
+        """判死释放 player_store 写权行：抬代次至 owner_epoch+1、清 holder_instance、置 released=1。"""
+        if not player_id or not owner_epoch or owner_epoch == MAX_UINT64:
+            raise Invalid("release_dead_holder")
+        route = await self.route_detail(player_id)
+        if route is None:
+            return
+        pool = self.storage_pools.get(route[1])
+        if pool is None:
+            raise RuntimeError(f"storage pool unavailable: {route[1]}")
+
+        async def work(cursor):
+            await cursor.execute(
+                "SELECT owner_epoch,holder_instance,claim_seq FROM player_store "
+                "WHERE player_id=%s AND kind=0 FOR UPDATE",
+                (player_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            cur = (int(row[0]), bytes(row[1] or b""), int(row[2]))
+            if cur[0] > owner_epoch:
+                return
+            if seen is not None and cur != seen:
+                raise Conflict("player store holder changed since read")
+            await cursor.execute(
+                "UPDATE player_store SET owner_epoch=%s,holder_instance='',released=1 "
+                "WHERE player_id=%s AND kind=0",
+                (owner_epoch + 1, player_id),
+            )
+
+        await self._tx(work, pool=pool)
 
     # -- names ---------------------------------------------------------------------------------------
     async def _owned_norm(self, player_id: int):

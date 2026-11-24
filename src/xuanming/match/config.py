@@ -14,7 +14,9 @@ SCENE_SECRET_ENV = "MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE"
 COORDINATOR_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_COORDINATOR"
 PLAYER_INBOX_SECRET_ENV = "MMORPG_PLAYER_INBOX_SECRET_MATCH"
 GUILD_INTERNAL_SECRET_ENV = "MMORPG_MATCH_INTERNAL_SECRET_GUILD"
+OPS_CALLER_SECRET_ENV = "MMORPG_MATCH_OPS_CALLER_SECRET"
 OPS_SECRET_ENV = "MMORPG_MATCH_OPS_SECRET"
+RANK_PRODUCER_SECRET_ENV = "RANK_PRODUCER_SECRET_MATCH"
 MANUAL_RESOLUTION_SECRET_ENV = "MMORPG_MATCH_MANUAL_RESOLUTION_SECRET"
 PROBE_SECRET_ENV = "MATCH_PROBE_SECRET"
 SPECTATE_TOKEN_SECRET_ENV = "MMORPG_SPECTATE_TOKEN_SECRET"
@@ -32,6 +34,7 @@ _TOML_FORBIDDEN_FIELDS = frozenset((
     "player_inbox_secret",
     "guild_secret",
     "ops_secret",
+    "rank_secret",
     "manual_resolution_secret",
     "probe_secret",
     "spectate_secret",
@@ -90,6 +93,7 @@ class MatchConfig:
     kafka_partitions: int = 256
     result_topic: str = "match-results"
     player_inbox: str = ""
+    rank_endpoint: str = ""
 
     # 业务规则参数
     allow_cross_zone: bool = True
@@ -104,6 +108,7 @@ class MatchConfig:
     request_budget_sec: float = 4.5
     matcher_interval_sec: float = 0.25
     outbox_interval_sec: float = 0.5
+    rank_publish_interval_sec: float = 2.0
     table_fingerprint_mode: str = "warn"
     pve_team_sizes: dict[int, int] = field(default_factory=lambda: {1: 5, 2: 5, 3: 5})
     manual_resolution_env: str = ""
@@ -115,6 +120,7 @@ class MatchConfig:
     player_inbox_secret: bytes = b""
     guild_secret: bytes = b""
     ops_secret: bytes = b""
+    rank_secret: bytes = b""
     manual_resolution_secret: bytes = b""
     probe_secret: bytes = b""
     spectate_secret: bytes = b""
@@ -166,7 +172,11 @@ class MatchConfig:
         kwargs["coordinator_secret"] = load_required_secret(env, COORDINATOR_SECRET_ENV)
         kwargs["player_inbox_secret"] = load_optional_secret(env, PLAYER_INBOX_SECRET_ENV)
         kwargs["guild_secret"] = load_optional_secret(env, GUILD_INTERNAL_SECRET_ENV)
-        kwargs["ops_secret"] = load_optional_secret(env, OPS_SECRET_ENV)
+        ops_secret = load_optional_secret(env, OPS_CALLER_SECRET_ENV)
+        if not ops_secret:
+            ops_secret = load_optional_secret(env, OPS_SECRET_ENV)
+        kwargs["ops_secret"] = ops_secret
+        kwargs["rank_secret"] = load_optional_secret(env, RANK_PRODUCER_SECRET_ENV)
         kwargs["manual_resolution_secret"] = load_optional_secret(env, MANUAL_RESOLUTION_SECRET_ENV)
         kwargs["probe_secret"] = load_optional_secret(env, PROBE_SECRET_ENV)
         kwargs["spectate_secret"] = load_optional_secret(env, SPECTATE_TOKEN_SECRET_ENV)

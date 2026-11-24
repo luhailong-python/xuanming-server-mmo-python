@@ -223,6 +223,13 @@ redis.call('ZADD', KEYS[8], ARGV[3], ARGV[1])
 return reply
 """
 
+_LUA_SCENE_CLAIM_DEAD_NODE_TASK_CHECK = """
+local deadNodeTaskQueuedAt = redis.call('ZSCORE', KEYS[#KEYS], ARGV[9])
+if not deadNodeTaskQueuedAt or tonumber(deadNodeTaskQueuedAt) ~= tonumber(ARGV[10]) then
+    return {'withdrawn', '', '', '', ''}
+end
+"""
+
 # 空闲副本销毁认领脚本（有人即回 busy 并重置空闲时钟）
 LUA_ATOMIC_DESTROY_INSTANCE = (
     _LUA_SCENE_CLAIM_PRELUDE
@@ -238,6 +245,14 @@ LUA_ATOMIC_DESTROY_INSTANCE_FORCE = (
     + _LUA_SCENE_CLAIM_COMMIT
 )
 
+# 死节点孤儿副本销毁认领脚本（先核对收尾任务未被撤，再核对属主仍是死节点）
+LUA_ATOMIC_DESTROY_ORPHAN_OF_DEAD_NODE = (
+    _LUA_SCENE_CLAIM_PRELUDE
+    + _LUA_SCENE_CLAIM_DEAD_NODE_TASK_CHECK
+    + _LUA_SCENE_CLAIM_OWNER_CHECK
+    + _LUA_SCENE_CLAIM_COMMIT
+)
+
 # 完成拆除任务后按 token 清理待办记录
 LUA_FINISH_SCENE_TEARDOWN = """
 if redis.call('HGET', KEYS[1], 'token') ~= ARGV[2] then
@@ -245,6 +260,109 @@ if redis.call('HGET', KEYS[1], 'token') ~= ARGV[2] then
 end
 redis.call('DEL', KEYS[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
+return 1
+"""
+
+# 摘掉没有任务 Hash 的悬空待办条目
+LUA_DROP_DANGLING_TEARDOWN = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return 0
+end
+return redis.call('ZREM', KEYS[2], ARGV[1])
+"""
+
+# 原子分配并对齐大世界分线 1-based 线号（与 Go world_channel_directory.go 一致）
+LUA_ALLOC_WORLD_CHANNEL_LINE_NUMBERS = """
+if #ARGV == 0 then
+    return {}
+end
+
+local wanted = {}
+for i = 1, #ARGV do
+    wanted[ARGV[i]] = true
+end
+
+local kept = {}
+local used = {}
+local flat = redis.call('HGETALL', KEYS[1])
+for i = 1, #flat, 2 do
+    local sceneId = flat[i]
+    local lineNo = tonumber(flat[i + 1])
+    if wanted[sceneId] and lineNo and lineNo >= 1 and lineNo <= 4294967295
+        and lineNo == math.floor(lineNo) and not used[lineNo] then
+        kept[sceneId] = lineNo
+        used[lineNo] = true
+    else
+        redis.call('HDEL', KEYS[1], sceneId)
+    end
+end
+
+local out = {}
+local candidate = 1
+for i = 1, #ARGV do
+    local sceneId = ARGV[i]
+    local lineNo = kept[sceneId]
+    if not lineNo then
+        while used[candidate] do
+            candidate = candidate + 1
+        end
+        lineNo = candidate
+        used[lineNo] = true
+        kept[sceneId] = lineNo
+        redis.call('HSET', KEYS[1], sceneId, tostring(lineNo))
+    end
+    out[#out + 1] = sceneId
+    out[#out + 1] = tostring(lineNo)
+end
+return out
+"""
+
+# 写入死节点收尾任务并可选同脚本摘负载集（与 Go reentry_barrier.go luaEnqueueDeadNodeReconcile 一致）
+LUA_ENQUEUE_DEAD_NODE_RECONCILE = """
+if ARGV[4] ~= '' then
+    redis.call('ZREM', KEYS[4], ARGV[4])
+end
+if ARGV[3] == 'index' then
+    redis.call('SUNIONSTORE', KEYS[2], KEYS[2], KEYS[3])
+else
+    for i = 6, #ARGV do
+        redis.call('SADD', KEYS[2], ARGV[i])
+    end
+end
+if ARGV[5] ~= '' then
+    redis.call('SET', KEYS[5], ARGV[5])
+else
+    redis.call('DEL', KEYS[5])
+end
+redis.call('ZADD', KEYS[1], 'NX', ARGV[2], ARGV[1])
+return redis.call('SCARD', KEYS[2])
+"""
+
+# 判死同一实例重新注册时，原子撤销收尾任务并清除 death_at（与 Go luaWithdrawDeadNodeForReturningInstance 一致）
+LUA_WITHDRAW_DEAD_NODE_FOR_RETURNING_INSTANCE = """
+local dead = redis.call('GET', KEYS[3])
+if ARGV[2] ~= '' and dead and dead == ARGV[2] then
+    redis.call('ZREM', KEYS[1], ARGV[1])
+    redis.call('DEL', KEYS[2], KEYS[3], KEYS[4])
+    return 1
+end
+if redis.call('EXISTS', KEYS[4]) == 1 then
+    return 0
+end
+return -1
+"""
+
+# 结束死节点收尾任务并清理计数键（与 Go luaFinishDeadNodeReconcile 一致）
+LUA_FINISH_DEAD_NODE_RECONCILE = """
+local queuedAt = redis.call('ZSCORE', KEYS[4], ARGV[1])
+if not queuedAt or tonumber(queuedAt) ~= tonumber(ARGV[3]) then
+    return 1
+end
+if ARGV[2] ~= '1' and redis.call('SCARD', KEYS[1]) > 0 then
+    return 0
+end
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[5])
+redis.call('ZREM', KEYS[4], ARGV[1])
 return 1
 """
 

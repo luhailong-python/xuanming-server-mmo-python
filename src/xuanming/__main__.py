@@ -81,7 +81,11 @@ def main() -> None:
     trade_cmd.add_argument("--config", type=Path, required=True)
     guild_cmd = commands.add_parser("guild", help="启动 guild（公会、成员权限、排行与活动服务）")
     guild_cmd.add_argument("--config", type=Path, required=True)
-    args = parser.parse_args()
+    migrate_cmd = commands.add_parser("schemamigrate", help="校验并执行全库 SQL Schema 幂等迁移", add_help=False)
+    sync_cmd = commands.add_parser("table-sync", help="打包、校验或解包配置表与指针文件", add_help=False)
+    args, extra = parser.parse_known_args()
+    if args.command not in ("schemamigrate", "table-sync") and extra:
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
@@ -165,6 +169,14 @@ def main() -> None:
             from .guild.node import run as run_guild
 
             asyncio.run(run_guild(Settings.load(args.config)))
+        elif args.command == "schemamigrate":
+            from .ops.schemamigrate import main as run_schemamigrate
+
+            raise SystemExit(run_schemamigrate(extra))
+        elif args.command == "table-sync":
+            from .ops.table_sync import main as run_table_sync
+
+            raise SystemExit(run_table_sync(extra))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

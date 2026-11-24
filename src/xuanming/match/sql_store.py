@@ -21,10 +21,25 @@ from google.protobuf.message import Message
 
 from .. import portal_sql
 from ..protocol import Protocol
+from .battle_scripts import (
+    REVIEW_REJECT_INVALID,
+    REVIEW_REJECT_STALE,
+    REVIEW_STATE_APPROVED,
+    REVIEW_STATE_PENDING,
+    REVIEW_STATE_REJECTED,
+    SCRIPT_ORIGIN_PLAYER,
+    SCRIPT_ORIGIN_UNSPECIFIED,
+    BattleScriptReviewError,
+)
 from .errors import (
     BattleOutcomeOriginalError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
+    ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED,
+    ERR_MATCH_BATTLE_SCRIPT_LOADOUT_FULL,
+    ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED,
+    ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND,
+    ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT,
     ERR_MATCH_CANCEL_TOO_LATE,
     ERR_MATCH_CHALLENGE_EXPIRED,
     ERR_MATCH_CHALLENGE_NOT_TARGET,
@@ -121,6 +136,26 @@ from .model import (
     validate_terminal_against_formation,
     validate_terminal_payload,
 )
+from .ranked import (
+    RANKED_SEASON_ACTIVE,
+    RankedPlayerPrefsRow,
+    RankedPlayerSeasonRow,
+    RankedRewardRow,
+    RankedSeasonRow,
+)
+from .rating import (
+    DEFAULT_RATING_CENTI,
+    RANK_SOURCE_SHARDS,
+    RANK_SUBMIT_SET,
+    RATING_OUTCOME_APPLIED,
+    RATING_OUTCOME_DUPLICATE,
+    RankSourceRow,
+    RatingApplyResult,
+    RatingChange,
+    compute_elo_delta,
+    is_rated_mode,
+    rank_source_shard,
+)
 from .store import (
     CompletionOutboxRow,
     IncomingInviteInfo,
@@ -154,6 +189,19 @@ REQUIRED_TABLES = (
     "match_battle_settlement_source",
     "match_spectator",
     "match_battle_report",
+    "match_battle_script",
+    "match_battle_script_review",
+    "match_battle_script_loadout",
+    "match_rating",
+    "match_rating_applied",
+    "match_rank_source",
+    "match_rank_outbox",
+    "match_rank_removal",
+    "match_ranked_season",
+    "match_ranked_player_prefs",
+    "match_ranked_player_season",
+    "match_ranked_reward",
+    "match_ranked_battle",
     "role_fence",
 )
 
@@ -569,12 +617,24 @@ class SqlMatchStore:
             fence = await self._lock_fence(cur, pid)
             if fence is None or fence.account != "":
                 raise StoreUnavailableError("role_fence is not tombstone")
+            now = await self._db_now(cur)
+            await cur.execute("SELECT `mode` FROM `match_rating` WHERE `player_id`=%s FOR UPDATE", (pid,))
+            rated_modes = [int(r[0]) for r in await cur.fetchall()]
+            for mode in rated_modes:
+                await cur.execute(
+                    "INSERT INTO `match_rank_removal`(`mode`,`player_id`,`created_ms`) VALUES (%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE `created_ms`=VALUES(`created_ms`)",
+                    (mode, pid, now),
+                )
             for table, col in (
                 ("match_network_profile", "player_id"),
                 ("match_authority_ticket", "player_id"),
                 ("match_role_occupancy", "player_id"),
                 ("match_spectator", "player_id"),
                 ("match_player_battle_report", "player_id"),
+                ("match_battle_script", "owner_player_id"),
+                ("match_battle_script_loadout", "player_id"),
+                ("match_rating", "player_id"),
                 ("team_invite_index", "invitee_id"),
                 ("team_application_index", "applicant_id"),
             ):
@@ -846,6 +906,8 @@ class SqlMatchStore:
             if app_tid != 0:
                 raise TeamBusinessError(ERR_TEAM_MEMBER_IN_TEAM)
             await self._cancel_queued_team_launch_tx(cur, my_tid)
+            for m in rec.members:
+                m.ranked_preset_confirmed = False
             kept = [int(m.player_id) for m in rec.members]
             seq = int(rec.next_join_seq) or (len(rec.members) + 1)
             rec.next_join_seq = seq + 1
@@ -967,6 +1029,8 @@ class SqlMatchStore:
             if len(rec.members) >= MAX_TEAM_SIZE:
                 raise TeamBusinessError(ERR_TEAM_MEMBERS_FULL)
             await self._cancel_queued_team_launch_tx(cur, team_id)
+            for m in rec.members:
+                m.ranked_preset_confirmed = False
             kept = [int(m.player_id) for m in rec.members]
             seq = int(rec.next_join_seq) or (len(rec.members) + 1)
             rec.next_join_seq = seq + 1
@@ -1053,6 +1117,8 @@ class SqlMatchStore:
                     reason=7, actor_id=caller.player_id, now_ms=now, left=(caller.player_id,),
                 )
             remaining.sort(key=lambda m: (int(m.join_seq), int(m.player_id)))
+            for m in remaining:
+                m.ranked_preset_confirmed = False
             del rec.members[:]
             rec.members.extend(remaining)
             leader_changed = False
@@ -1097,6 +1163,8 @@ class SqlMatchStore:
                 raise TeamBusinessError(ERR_TEAM_MEMBER_NOT_IN_TEAM)
             await self._cancel_queued_team_launch_tx(cur, my_tid)
             remaining = [m for m in rec.members if int(m.player_id) != target_player_id]
+            for m in remaining:
+                m.ranked_preset_confirmed = False
             del rec.members[:]
             rec.members.extend(remaining)
             await self._bump_membership_tx(cur, target_player_id, 0)
@@ -1202,6 +1270,8 @@ class SqlMatchStore:
             version, data, _ = loaded
             rec = data.record
             now = await self._db_now(cur)
+            if self._team_locked(rec, now):
+                raise TeamBusinessError(ERR_TEAM_IN_MATCH)
             found = next((m for m in rec.members if int(m.player_id) == caller.player_id), None)
             if found is None:
                 raise TeamBusinessError(ERR_TEAM_NO_TEAM)
@@ -2530,3 +2600,900 @@ class SqlMatchStore:
                 if not row:
                     return None, now
                 return await self._build_stranded_sql(cur, self._scan_formation(row), now, include_tickets=True), now
+
+    # -- Battle Scripts -------------------------------------------------------------------------------
+
+    def _scan_battle_script(self, row) -> Message:
+        return self.protocol.message(
+            "match.MatchBattleScriptRecord",
+            script_id=int(row[0]),
+            owner_player_id=int(row[1]),
+            revision=int(row[2]),
+            content=_to_bytes(row[3]),
+            review_state=int(row[4]),
+            approved_revision=int(row[5]),
+            approved_content=_to_bytes(row[6]),
+            reject_reason=_to_str(row[7]),
+            submitted_ms=int(row[8]),
+            reviewed_ms=int(row[9]),
+        )
+
+    def _scan_battle_script_loadout(self, row) -> Message:
+        return self.protocol.message(
+            "match.MatchBattleScriptLoadoutRecord",
+            player_id=int(row[0]),
+            match_mode=int(row[1]),
+            battle_config_id=int(row[2]),
+            origin=int(row[3]),
+            official_script_id=int(row[4]),
+            player_script_id=int(row[5]),
+            updated_ms=int(row[6]),
+        )
+
+    async def list_battle_scripts(self, player_id: int) -> list[Message]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `script_id`,`owner_player_id`,`revision`,`content`,`review_state`,"
+                    "`approved_revision`,`approved_content`,`reject_reason`,`submitted_ms`,`reviewed_ms` "
+                    "FROM `match_battle_script` WHERE `owner_player_id`=%s "
+                    "ORDER BY `submitted_ms` DESC, `script_id` ASC",
+                    (player_id,),
+                )
+                return [self._scan_battle_script(r) for r in await cur.fetchall()]
+
+    async def list_battle_script_loadout(self, player_id: int) -> list[Message]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `player_id`,`match_mode`,`battle_config_id`,`origin`,`official_script_id`,"
+                    "`player_script_id`,`updated_ms` FROM `match_battle_script_loadout` "
+                    "WHERE `player_id`=%s ORDER BY `match_mode` ASC, `battle_config_id` ASC",
+                    (player_id,),
+                )
+                return [self._scan_battle_script_loadout(r) for r in await cur.fetchall()]
+
+    async def get_approved_battle_script(self, script_id: int, owner_player_id: int) -> tuple[int, bytes]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `owner_player_id`,`approved_revision`,`approved_content` "
+                    "FROM `match_battle_script` WHERE `script_id`=%s",
+                    (script_id,),
+                )
+                row = await cur.fetchone()
+                if not row or int(row[0]) != owner_player_id:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+                if int(row[1]) == 0:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED)
+                return int(row[1]), _to_bytes(row[2])
+
+    async def submit_battle_script(
+        self,
+        caller: CallerIdentity,
+        *,
+        script_id: int,
+        expected_revision: int,
+        content: bytes,
+        max_scripts: int,
+    ) -> Message:
+        new_id = await self.next_id() if script_id == 0 else 0
+
+        async def work(cur) -> Message:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            now = await self._db_now(cur)
+            if script_id == 0:
+                await cur.execute(
+                    "SELECT COUNT(*) FROM `match_battle_script` WHERE `owner_player_id`=%s",
+                    (caller.player_id,),
+                )
+                cnt_row = await cur.fetchone()
+                if cnt_row and int(cnt_row[0]) >= max_scripts:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED)
+                await cur.execute(
+                    "INSERT INTO `match_battle_script`(`script_id`,`owner_player_id`,`revision`,`content`,"
+                    "`review_state`,`approved_revision`,`approved_content`,`reject_reason`,`submitted_ms`,`reviewed_ms`) "
+                    "VALUES (%s,%s,1,UNHEX(%s),%s,0,UNHEX(%s),'',%s,0)",
+                    (new_id, caller.player_id, _hex(content), REVIEW_STATE_PENDING, "", now),
+                )
+                return self.protocol.message(
+                    "match.MatchBattleScriptRecord",
+                    script_id=new_id,
+                    owner_player_id=caller.player_id,
+                    revision=1,
+                    content=content,
+                    review_state=REVIEW_STATE_PENDING,
+                    submitted_ms=now,
+                )
+
+            await cur.execute(
+                "SELECT `script_id`,`owner_player_id`,`revision`,`content`,`review_state`,"
+                "`approved_revision`,`approved_content`,`reject_reason`,`submitted_ms`,`reviewed_ms` "
+                "FROM `match_battle_script` WHERE `script_id`=%s FOR UPDATE",
+                (script_id,),
+            )
+            row = await cur.fetchone()
+            if not row or int(row[1]) != caller.player_id:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+            rec = self._scan_battle_script(row)
+            if int(rec.revision) != expected_revision:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT)
+            rec.revision = int(rec.revision) + 1
+            rec.content = content
+            rec.review_state = REVIEW_STATE_PENDING
+            rec.reject_reason = ""
+            rec.submitted_ms = now
+            await cur.execute(
+                "UPDATE `match_battle_script` SET `revision`=%s,`content`=UNHEX(%s),`review_state`=%s,"
+                "`reject_reason`='',`submitted_ms`=%s WHERE `script_id`=%s",
+                (int(rec.revision), _hex(content), REVIEW_STATE_PENDING, now, script_id),
+            )
+            return rec
+
+        return await self._run_tx(work)
+
+    async def delete_battle_script(self, caller: CallerIdentity, script_id: int, expected_revision: int) -> None:
+        async def work(cur) -> None:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            await cur.execute(
+                "SELECT `owner_player_id`,`revision` FROM `match_battle_script` WHERE `script_id`=%s FOR UPDATE",
+                (script_id,),
+            )
+            row = await cur.fetchone()
+            if not row or int(row[0]) != caller.player_id:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+            if int(row[1]) != expected_revision:
+                raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_REVISION_CONFLICT)
+            await cur.execute("DELETE FROM `match_battle_script` WHERE `script_id`=%s", (script_id,))
+            await cur.execute(
+                "DELETE FROM `match_battle_script_loadout` WHERE `player_id`=%s AND `player_script_id`=%s",
+                (caller.player_id, script_id),
+            )
+
+        await self._run_tx(work)
+
+    async def set_battle_script_loadout(
+        self,
+        caller: CallerIdentity,
+        *,
+        match_mode: int,
+        battle_config_id: int,
+        origin: int,
+        official_script_id: int,
+        player_script_id: int,
+        max_entries: int,
+    ) -> list[Message]:
+        async def work(cur) -> list[Message]:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            if origin == SCRIPT_ORIGIN_UNSPECIFIED:
+                await cur.execute(
+                    "DELETE FROM `match_battle_script_loadout` "
+                    "WHERE `player_id`=%s AND `match_mode`=%s AND `battle_config_id`=%s",
+                    (caller.player_id, match_mode, battle_config_id),
+                )
+            else:
+                if origin == SCRIPT_ORIGIN_PLAYER:
+                    await cur.execute(
+                        "SELECT `owner_player_id`,`approved_revision` FROM `match_battle_script` "
+                        "WHERE `script_id`=%s FOR UPDATE",
+                        (player_script_id,),
+                    )
+                    row = await cur.fetchone()
+                    if not row or int(row[0]) != caller.player_id:
+                        raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_FOUND)
+                    if int(row[1]) == 0:
+                        raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_NOT_APPROVED)
+                await cur.execute(
+                    "SELECT COUNT(*) FROM `match_battle_script_loadout` "
+                    "WHERE `player_id`=%s AND NOT (`match_mode`=%s AND `battle_config_id`=%s)",
+                    (caller.player_id, match_mode, battle_config_id),
+                )
+                cnt = await cur.fetchone()
+                if cnt and int(cnt[0]) >= max_entries:
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_SCRIPT_LOADOUT_FULL)
+                now = await self._db_now(cur)
+                await cur.execute(
+                    "INSERT INTO `match_battle_script_loadout`(`player_id`,`match_mode`,`battle_config_id`,"
+                    "`origin`,`official_script_id`,`player_script_id`,`updated_ms`) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE "
+                    "`origin`=VALUES(`origin`),`official_script_id`=VALUES(`official_script_id`),"
+                    "`player_script_id`=VALUES(`player_script_id`),`updated_ms`=VALUES(`updated_ms`)",
+                    (caller.player_id, match_mode, battle_config_id, origin, official_script_id, player_script_id, now),
+                )
+            await cur.execute(
+                "SELECT `player_id`,`match_mode`,`battle_config_id`,`origin`,`official_script_id`,"
+                "`player_script_id`,`updated_ms` FROM `match_battle_script_loadout` "
+                "WHERE `player_id`=%s ORDER BY `match_mode` ASC, `battle_config_id` ASC",
+                (caller.player_id,),
+            )
+            return [self._scan_battle_script_loadout(r) for r in await cur.fetchall()]
+
+        return await self._run_tx(work)
+
+    async def list_pending_battle_scripts(self, limit: int) -> list[Message]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `script_id`,`owner_player_id`,`revision`,`content`,`review_state`,"
+                    "`approved_revision`,`approved_content`,`reject_reason`,`submitted_ms`,`reviewed_ms` "
+                    "FROM `match_battle_script` WHERE `review_state`=%s "
+                    "ORDER BY `submitted_ms` ASC, `script_id` ASC LIMIT %s",
+                    (REVIEW_STATE_PENDING, limit),
+                )
+                return [self._scan_battle_script(r) for r in await cur.fetchall()]
+
+    async def review_battle_script(
+        self,
+        *,
+        script_id: int,
+        revision: int,
+        approve: bool,
+        reviewer: str,
+        reason: str,
+        validate: Callable[[bytes], None] | None = None,
+    ) -> None:
+        async def work(cur) -> None:
+            await cur.execute(
+                "SELECT `script_id`,`owner_player_id`,`revision`,`content`,`review_state`,"
+                "`approved_revision`,`approved_content`,`reject_reason`,`submitted_ms`,`reviewed_ms` "
+                "FROM `match_battle_script` WHERE `script_id`=%s FOR UPDATE",
+                (script_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                raise BattleScriptReviewError(REVIEW_REJECT_STALE, "script not found")
+            rec = self._scan_battle_script(row)
+            if int(rec.revision) != revision or int(rec.review_state) != REVIEW_STATE_PENDING:
+                raise BattleScriptReviewError(REVIEW_REJECT_STALE, "script revision stale or not pending")
+            content = bytes(rec.content)
+            if approve and validate is not None:
+                try:
+                    validate(content)
+                except Exception as exc:
+                    raise BattleScriptReviewError(REVIEW_REJECT_INVALID, str(exc)) from exc
+            now = await self._db_now(cur)
+            if approve:
+                await cur.execute(
+                    "UPDATE `match_battle_script` SET `review_state`=%s,`approved_revision`=%s,"
+                    "`approved_content`=UNHEX(%s),`reject_reason`='',`reviewed_ms`=%s WHERE `script_id`=%s",
+                    (REVIEW_STATE_APPROVED, revision, _hex(content), now, script_id),
+                )
+            else:
+                await cur.execute(
+                    "UPDATE `match_battle_script` SET `review_state`=%s,`reject_reason`=%s,`reviewed_ms`=%s "
+                    "WHERE `script_id`=%s",
+                    (REVIEW_STATE_REJECTED, reason, now, script_id),
+                )
+            await cur.execute(
+                "INSERT INTO `match_battle_script_review`(`script_id`,`revision`,`owner_player_id`,"
+                "`approved`,`reviewer`,`reason`,`reviewed_ms`,`content`) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,UNHEX(%s))",
+                (script_id, revision, int(rec.owner_player_id), int(approve), reviewer, reason, now, _hex(content)),
+            )
+
+        await self._run_tx(work)
+
+    # -- Elo Rating & Rank Outbox ---------------------------------------------------------------------
+
+    async def get_rating(self, player_id: int, mode: int) -> tuple[int, int, int]:
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `rating_centi`,`games`,`score_changed_ms` FROM `match_rating` "
+                    "WHERE `player_id`=%s AND `mode`=%s",
+                    (player_id, mode),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return DEFAULT_RATING_CENTI, 0, 0
+                return int(row[0]), int(row[1]), int(row[2])
+
+    async def apply_rating(
+        self,
+        *,
+        battle_id: int,
+        payload_digest: bytes,
+        mode: int,
+        team_a: list[int],
+        team_b: list[int],
+        score_a: float,
+        source_epoch: int = 1,
+        generation: int = 1,
+        eligible_for_rank: set[int] | None = None,
+    ) -> RatingApplyResult:
+        if battle_id == 0 or not team_a or not team_b:
+            raise ValueError("battle_id and both teams must be non-empty")
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+
+        async def work(cur) -> RatingApplyResult:
+            now = await self._db_now(cur)
+            try:
+                await cur.execute(
+                    "INSERT INTO `match_rating_applied`(`battle_id`,`payload_digest`,`applied_ms`) "
+                    "VALUES (%s,UNHEX(%s),%s)",
+                    (battle_id, _hex(payload_digest), now),
+                )
+            except pymysql.IntegrityError as exc:
+                if _mysql_errno(exc) != 1062:
+                    raise
+                await cur.execute(
+                    "SELECT `payload_digest` FROM `match_rating_applied` WHERE `battle_id`=%s",
+                    (battle_id,),
+                )
+                prior = await cur.fetchone()
+                if not prior or _to_bytes(prior[0]) != payload_digest:
+                    raise BattleOutcomeOriginalError(f"rating replay digest mismatch battle_id={battle_id}")
+                return RatingApplyResult(outcome=RATING_OUTCOME_DUPLICATE, battle_id=battle_id, mode=mode)
+
+            shard = rank_source_shard(battle_id)
+            await cur.execute(
+                "INSERT INTO `match_rank_source`(`source_epoch`,`mode`,`shard`,`produced_cursor`,"
+                "`committed_cursor`,`board_id`,`stopped`) VALUES (%s,%s,%s,0,0,0,0) "
+                "ON DUPLICATE KEY UPDATE `source_epoch`=`source_epoch`",
+                (source_epoch, mode, shard),
+            )
+            await cur.execute(
+                "SELECT `produced_cursor`,`stopped` FROM `match_rank_source` "
+                "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s FOR UPDATE",
+                (source_epoch, mode, shard),
+            )
+            src_row = await cur.fetchone()
+            cursor = int(src_row[0])
+            stopped = bool(src_row[1])
+
+            members = sorted(list(team_a) + list(team_b))
+            ratings_before: dict[int, int] = {}
+            games_before: dict[int, int] = {}
+            changed_before: dict[int, int] = {}
+            for i, pid in enumerate(members):
+                if pid == 0 or (i > 0 and members[i - 1] == pid):
+                    raise ValueError("rating member list has zero or duplicate player_id")
+                await cur.execute(
+                    "INSERT INTO `match_rating`(`player_id`,`mode`,`rating_centi`,`games`,`updated_ms`,`score_changed_ms`) "
+                    "VALUES (%s,%s,%s,0,%s,%s) ON DUPLICATE KEY UPDATE `player_id`=`player_id`",
+                    (pid, mode, DEFAULT_RATING_CENTI, now, now),
+                )
+                await cur.execute(
+                    "SELECT `rating_centi`,`games`,`score_changed_ms` FROM `match_rating` "
+                    "WHERE `player_id`=%s AND `mode`=%s FOR UPDATE",
+                    (pid, mode),
+                )
+                rrow = await cur.fetchone()
+                ratings_before[pid] = int(rrow[0])
+                games_before[pid] = int(rrow[1])
+                changed_before[pid] = int(rrow[2])
+
+            delta = compute_elo_delta(
+                [ratings_before[p] for p in team_a],
+                [ratings_before[p] for p in team_b],
+                score_a,
+            )
+            side_a = set(team_a)
+            next_cursor = cursor + 1
+            batch = self.protocol.message(
+                "rankpb.SubmitRankScoresRequest",
+                generation=generation,
+                source_epoch=source_epoch,
+                source_shard=shard,
+                source_cursor=next_cursor,
+                request_id=battle_id,
+                mode=RANK_SUBMIT_SET,
+            )
+            changes: list[RatingChange] = []
+            for pid in members:
+                change = delta if pid in side_a else -delta
+                after = max(0, ratings_before[pid] + change)
+                achieved = now if after != ratings_before[pid] else changed_before[pid]
+                games_after = games_before[pid] + 1
+                await cur.execute(
+                    "UPDATE `match_rating` SET `rating_centi`=%s,`games`=`games`+1,`updated_ms`=%s,"
+                    "`score_changed_ms`=%s WHERE `player_id`=%s AND `mode`=%s",
+                    (after, now, achieved, pid, mode),
+                )
+                changes.append(
+                    RatingChange(
+                        player_id=pid,
+                        rating_before_centi=ratings_before[pid],
+                        rating_after_centi=after,
+                        delta_centi=after - ratings_before[pid],
+                        games_after=games_after,
+                        achieved_ms=achieved,
+                    )
+                )
+                if eligible_for_rank is None or pid in eligible_for_rank:
+                    batch.entries.add(
+                        entity_id=pid,
+                        score=after,
+                        achieved_ms=achieved,
+                        score_version=games_after,
+                    )
+
+            unpublished = stopped or len(batch.entries) == 0
+            written_cursor = 0
+            if not unpublished:
+                body = batch.SerializeToString(deterministic=True)
+                await cur.execute(
+                    "INSERT INTO `match_rank_outbox`(`source_epoch`,`mode`,`shard`,`source_cursor`,"
+                    "`request_id`,`entries`) VALUES (%s,%s,%s,%s,%s,UNHEX(%s))",
+                    (source_epoch, mode, shard, next_cursor, battle_id, _hex(body)),
+                )
+                await cur.execute(
+                    "UPDATE `match_rank_source` SET `produced_cursor`=%s "
+                    "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s",
+                    (next_cursor, source_epoch, mode, shard),
+                )
+                written_cursor = next_cursor
+
+            return RatingApplyResult(
+                outcome=RATING_OUTCOME_APPLIED,
+                battle_id=battle_id,
+                mode=mode,
+                shard=shard,
+                source_cursor=written_cursor,
+                unpublished=unpublished,
+                changes=tuple(changes),
+            )
+
+        return await self._run_tx(work)
+
+    async def stop_rank_source(self, source_epoch: int, mode: int) -> int:
+        if not is_rated_mode(mode):
+            raise ValueError(f"mode {mode} is not rated")
+
+        async def work(cur) -> int:
+            total = 0
+            for shard in range(RANK_SOURCE_SHARDS):
+                await cur.execute(
+                    "INSERT INTO `match_rank_source`(`source_epoch`,`mode`,`shard`,`produced_cursor`,"
+                    "`committed_cursor`,`board_id`,`stopped`) VALUES (%s,%s,%s,0,0,0,1) "
+                    "ON DUPLICATE KEY UPDATE `source_epoch`=`source_epoch`",
+                    (source_epoch, mode, shard),
+                )
+                await cur.execute(
+                    "SELECT `produced_cursor` FROM `match_rank_source` "
+                    "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s FOR UPDATE",
+                    (source_epoch, mode, shard),
+                )
+                row = await cur.fetchone()
+                total += int(row[0]) if row else 0
+                await cur.execute(
+                    "UPDATE `match_rank_source` SET `stopped`=1 "
+                    "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s",
+                    (source_epoch, mode, shard),
+                )
+            return total
+
+        return await self._run_tx(work)
+
+    async def list_rank_sources(self, *, source_epoch: int | None = None) -> list[RankSourceRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                if source_epoch is None:
+                    await cur.execute(
+                        "SELECT `source_epoch`,`mode`,`shard`,`produced_cursor`,`committed_cursor`,`board_id`,`stopped` "
+                        "FROM `match_rank_source` ORDER BY `source_epoch` ASC, `mode` ASC, `shard` ASC"
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT `source_epoch`,`mode`,`shard`,`produced_cursor`,`committed_cursor`,`board_id`,`stopped` "
+                        "FROM `match_rank_source` WHERE `source_epoch`=%s ORDER BY `mode` ASC, `shard` ASC",
+                        (source_epoch,),
+                    )
+                return [
+                    RankSourceRow(
+                        source_epoch=int(r[0]),
+                        mode=int(r[1]),
+                        shard=int(r[2]),
+                        produced_cursor=int(r[3]),
+                        committed_cursor=int(r[4]),
+                        board_id=int(r[5]),
+                        stopped=bool(r[6]),
+                    )
+                    for r in await cur.fetchall()
+                ]
+
+    async def bind_rank_board(self, source_epoch: int, mode: int, board_id: int) -> None:
+        async def work(cur) -> None:
+            await cur.execute(
+                "UPDATE `match_rank_source` SET `board_id`=%s "
+                "WHERE `source_epoch`=%s AND `mode`=%s AND `board_id`=0",
+                (board_id, source_epoch, mode),
+            )
+
+        await self._run_tx(work)
+
+    async def get_rank_outbox_entry(
+        self, source_epoch: int, mode: int, shard: int, source_cursor: int
+    ) -> bytes | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `entries` FROM `match_rank_outbox` "
+                    "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s AND `source_cursor`=%s",
+                    (source_epoch, mode, shard, source_cursor),
+                )
+                row = await cur.fetchone()
+                return _to_bytes(row[0]) if row else None
+
+    async def advance_rank_committed_cursor(
+        self, source_epoch: int, mode: int, shard: int, committed_cursor: int
+    ) -> None:
+        async def work(cur) -> None:
+            await cur.execute(
+                "UPDATE `match_rank_source` SET `committed_cursor`=%s "
+                "WHERE `source_epoch`=%s AND `mode`=%s AND `shard`=%s AND `committed_cursor`<%s",
+                (committed_cursor, source_epoch, mode, shard, committed_cursor),
+            )
+
+        await self._run_tx(work)
+
+    async def list_rank_removals(self, *, limit: int = 16) -> list[tuple[int, int]]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `mode`,`player_id` FROM `match_rank_removal` ORDER BY `mode` ASC, `player_id` ASC LIMIT %s",
+                    (limit,),
+                )
+                return [(int(r[0]), int(r[1])) for r in await cur.fetchall()]
+
+    async def delete_rank_removal(self, mode: int, player_id: int) -> None:
+        async def work(cur) -> None:
+            await cur.execute(
+                "DELETE FROM `match_rank_removal` WHERE `mode`=%s AND `player_id`=%s",
+                (mode, player_id),
+            )
+
+        await self._run_tx(work)
+
+    # -- Ranked Play V1 -------------------------------------------------------------------------------
+
+    def _scan_ranked_season(self, r) -> RankedSeasonRow:
+        return RankedSeasonRow(
+            season_id=int(r[0]),
+            season_key=_to_str(r[1]),
+            season_name=_to_str(r[2]),
+            rank_generation=int(r[3]),
+            source_epoch=int(r[4]),
+            rule_version=int(r[5]),
+            state=int(r[6]),
+            rollover_stage=int(r[7]),
+            start_ms=int(r[8]),
+            end_ms=int(r[9]),
+            rank_board_id=int(r[10]),
+            expected_rank_cursor=int(r[11]),
+            champion_player_id=int(r[12]),
+            champion_name=_to_str(r[13]),
+            champion_rating_centi=int(r[14]),
+            updated_ms=int(r[15]),
+        )
+
+    def _scan_ranked_player_season(self, r) -> RankedPlayerSeasonRow:
+        return RankedPlayerSeasonRow(
+            season_id=int(r[0]),
+            player_id=int(r[1]),
+            qualified=bool(r[2]),
+            qualified_at_ms=int(r[3]),
+            rating_centi=int(r[4]),
+            peak_rating_centi=int(r[5]),
+            peak_tier=int(r[6]),
+            valid_matches=int(r[7]),
+            wins=int(r[8]),
+            losses=int(r[9]),
+            draws=int(r[10]),
+            milestone_bits=int(r[11]),
+            honor_bits=int(r[12]),
+            final_rank=int(r[13]),
+            updated_ms=int(r[14]),
+        )
+
+    async def get_active_ranked_season(self) -> RankedSeasonRow | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`season_key`,`season_name`,`rank_generation`,`source_epoch`,"
+                    "`rule_version`,`state`,`rollover_stage`,`start_ms`,`end_ms`,`rank_board_id`,"
+                    "`expected_rank_cursor`,`champion_player_id`,`champion_name`,`champion_rating_centi`,`updated_ms` "
+                    "FROM `match_ranked_season` WHERE `state`=%s ORDER BY `season_id` DESC LIMIT 1",
+                    (RANKED_SEASON_ACTIVE,),
+                )
+                row = await cur.fetchone()
+                return self._scan_ranked_season(row) if row else None
+
+    async def upsert_ranked_season(self, season: RankedSeasonRow) -> RankedSeasonRow:
+        async def work(cur) -> RankedSeasonRow:
+            await cur.execute(
+                "INSERT INTO `match_ranked_season`(`season_id`,`season_key`,`season_name`,`rank_generation`,"
+                "`source_epoch`,`rule_version`,`state`,`rollover_stage`,`start_ms`,`end_ms`,`rank_board_id`,"
+                "`expected_rank_cursor`,`champion_player_id`,`champion_name`,`champion_rating_centi`,`updated_ms`) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE `season_key`=VALUES(`season_key`),`season_name`=VALUES(`season_name`),"
+                "`rank_generation`=VALUES(`rank_generation`),`source_epoch`=VALUES(`source_epoch`),"
+                "`rule_version`=VALUES(`rule_version`),`state`=VALUES(`state`),`rollover_stage`=VALUES(`rollover_stage`),"
+                "`start_ms`=VALUES(`start_ms`),`end_ms`=VALUES(`end_ms`),`rank_board_id`=VALUES(`rank_board_id`),"
+                "`expected_rank_cursor`=VALUES(`expected_rank_cursor`),`champion_player_id`=VALUES(`champion_player_id`),"
+                "`champion_name`=VALUES(`champion_name`),`champion_rating_centi`=VALUES(`champion_rating_centi`),"
+                "`updated_ms`=VALUES(`updated_ms`)",
+                (
+                    season.season_id, season.season_key, season.season_name, season.rank_generation,
+                    season.source_epoch, season.rule_version, season.state, season.rollover_stage,
+                    season.start_ms, season.end_ms, season.rank_board_id, season.expected_rank_cursor,
+                    season.champion_player_id, season.champion_name, season.champion_rating_centi, season.updated_ms,
+                ),
+            )
+            return season
+
+        return await self._run_tx(work)
+
+    async def list_ranked_seasons(self) -> list[RankedSeasonRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`season_key`,`season_name`,`rank_generation`,`source_epoch`,"
+                    "`rule_version`,`state`,`rollover_stage`,`start_ms`,`end_ms`,`rank_board_id`,"
+                    "`expected_rank_cursor`,`champion_player_id`,`champion_name`,`champion_rating_centi`,`updated_ms` "
+                    "FROM `match_ranked_season` ORDER BY `season_id` DESC"
+                )
+                return [self._scan_ranked_season(r) for r in await cur.fetchall()]
+
+    async def get_ranked_player_prefs(self, player_id: int) -> RankedPlayerPrefsRow | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `player_id`,`character_preset_id`,`pet_preset_id`,`rule_version`,"
+                    "`cosmetic_loadout`,`updated_ms` FROM `match_ranked_player_prefs` WHERE `player_id`=%s",
+                    (player_id,),
+                )
+                r = await cur.fetchone()
+                if not r:
+                    return None
+                return RankedPlayerPrefsRow(
+                    player_id=int(r[0]),
+                    character_preset_id=int(r[1]),
+                    pet_preset_id=int(r[2]),
+                    rule_version=int(r[3]),
+                    cosmetic_loadout=_to_bytes(r[4]),
+                    updated_ms=int(r[5]),
+                )
+
+    async def save_ranked_player_prefs(
+        self,
+        caller: CallerIdentity,
+        *,
+        char_preset_id: int,
+        pet_preset_id: int,
+        rule_version: int,
+        cosmetic_loadout: bytes,
+    ) -> RankedPlayerPrefsRow:
+        async def work(cur) -> RankedPlayerPrefsRow:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            now = await self._db_now(cur)
+            await cur.execute(
+                "INSERT INTO `match_ranked_player_prefs`(`player_id`,`character_preset_id`,`pet_preset_id`,"
+                "`rule_version`,`cosmetic_loadout`,`updated_ms`) VALUES (%s,%s,%s,%s,UNHEX(%s),%s) "
+                "ON DUPLICATE KEY UPDATE `character_preset_id`=VALUES(`character_preset_id`),"
+                "`pet_preset_id`=VALUES(`pet_preset_id`),`rule_version`=VALUES(`rule_version`),"
+                "`cosmetic_loadout`=VALUES(`cosmetic_loadout`),`updated_ms`=VALUES(`updated_ms`)",
+                (caller.player_id, char_preset_id, pet_preset_id, rule_version, _hex(cosmetic_loadout), now),
+            )
+            return RankedPlayerPrefsRow(
+                player_id=caller.player_id,
+                character_preset_id=char_preset_id,
+                pet_preset_id=pet_preset_id,
+                rule_version=rule_version,
+                cosmetic_loadout=cosmetic_loadout,
+                updated_ms=now,
+            )
+
+        return await self._run_tx(work)
+
+    async def get_ranked_player_season(self, season_id: int, player_id: int) -> RankedPlayerSeasonRow | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`player_id`,`qualified`,`qualified_at_ms`,`rating_centi`,"
+                    "`peak_rating_centi`,`peak_tier`,`valid_matches`,`wins`,`losses`,`draws`,"
+                    "`milestone_bits`,`honor_bits`,`final_rank`,`updated_ms` "
+                    "FROM `match_ranked_player_season` WHERE `season_id`=%s AND `player_id`=%s",
+                    (season_id, player_id),
+                )
+                r = await cur.fetchone()
+                return self._scan_ranked_player_season(r) if r else None
+
+    async def list_ranked_player_seasons(self, player_id: int) -> list[RankedPlayerSeasonRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`player_id`,`qualified`,`qualified_at_ms`,`rating_centi`,"
+                    "`peak_rating_centi`,`peak_tier`,`valid_matches`,`wins`,`losses`,`draws`,"
+                    "`milestone_bits`,`honor_bits`,`final_rank`,`updated_ms` "
+                    "FROM `match_ranked_player_season` WHERE `player_id`=%s ORDER BY `season_id` DESC",
+                    (player_id,),
+                )
+                return [self._scan_ranked_player_season(r) for r in await cur.fetchall()]
+
+    async def list_ranked_rewards(self, player_id: int) -> list[RankedRewardRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `player_id`,`season_id`,`reward_kind`,`tier_value`,`item_code`,`granted_at_ms` "
+                    "FROM `match_ranked_reward` WHERE `player_id`=%s ORDER BY `season_id` ASC, `reward_kind` ASC",
+                    (player_id,),
+                )
+                return [
+                    RankedRewardRow(
+                        player_id=int(r[0]),
+                        season_id=int(r[1]),
+                        reward_kind=int(r[2]),
+                        tier_value=int(r[3]),
+                        item_code=_to_str(r[4]),
+                        granted_at_ms=int(r[5]),
+                    )
+                    for r in await cur.fetchall()
+                ]
+
+    async def save_ranked_battle_settlement(
+        self,
+        *,
+        season_id: int,
+        battle_id: int,
+        player_id: int,
+        summary_template: Message,
+        rating_centi: int,
+        tier_after: int,
+        outcome_kind: int,
+        participated: bool,
+        settled_at_ms: int,
+        milestones: tuple[tuple[int, int, int, str], ...],
+    ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
+        async def work(cur) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
+            await cur.execute(
+                "SELECT `summary` FROM `match_ranked_battle` WHERE `battle_id`=%s AND `player_id`=%s FOR UPDATE",
+                (battle_id, player_id),
+            )
+            existing = await cur.fetchone()
+            if existing:
+                await cur.execute(
+                    "SELECT `season_id`,`player_id`,`qualified`,`qualified_at_ms`,`rating_centi`,"
+                    "`peak_rating_centi`,`peak_tier`,`valid_matches`,`wins`,`losses`,`draws`,"
+                    "`milestone_bits`,`honor_bits`,`final_rank`,`updated_ms` "
+                    "FROM `match_ranked_player_season` WHERE `season_id`=%s AND `player_id`=%s",
+                    (season_id, player_id),
+                )
+                prow = await cur.fetchone()
+                return self._scan_ranked_player_season(prow), [], _to_bytes(existing[0])
+
+            await cur.execute(
+                "SELECT `season_id`,`player_id`,`qualified`,`qualified_at_ms`,`rating_centi`,"
+                "`peak_rating_centi`,`peak_tier`,`valid_matches`,`wins`,`losses`,`draws`,"
+                "`milestone_bits`,`honor_bits`,`final_rank`,`updated_ms` "
+                "FROM `match_ranked_player_season` WHERE `season_id`=%s AND `player_id`=%s FOR UPDATE",
+                (season_id, player_id),
+            )
+            prow = await cur.fetchone()
+            prev = self._scan_ranked_player_season(prow) if prow else None
+            qualified = bool(prev.qualified) if prev else False
+            qualified_at_ms = prev.qualified_at_ms if prev else 0
+            peak_rating = prev.peak_rating_centi if prev else 0
+            peak_tier = prev.peak_tier if prev else 0
+            valid_matches = prev.valid_matches if prev else 0
+            wins = prev.wins if prev else 0
+            losses = prev.losses if prev else 0
+            draws = prev.draws if prev else 0
+            milestone_bits = prev.milestone_bits if prev else 0
+            honor_bits = prev.honor_bits if prev else 0
+            final_rank = prev.final_rank if prev else 0
+
+            if participated:
+                valid_matches += 1
+                if not qualified:
+                    qualified = True
+                    qualified_at_ms = settled_at_ms
+                if outcome_kind == 1:
+                    wins += 1
+                elif outcome_kind == 2:
+                    losses += 1
+                elif outcome_kind == 3:
+                    draws += 1
+
+            if qualified:
+                if peak_rating == 0 or rating_centi > peak_rating:
+                    peak_rating = rating_centi
+                if tier_after > peak_tier:
+                    peak_tier = tier_after
+
+            unlocked: list[RankedRewardRow] = []
+            for threshold, bit_mask, reward_kind, item_code in milestones:
+                if valid_matches >= threshold and not (milestone_bits & bit_mask):
+                    milestone_bits |= bit_mask
+                    await cur.execute(
+                        "INSERT IGNORE INTO `match_ranked_reward`(`player_id`,`season_id`,`reward_kind`,"
+                        "`tier_value`,`item_code`,`granted_at_ms`) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (player_id, season_id, reward_kind, threshold, item_code, settled_at_ms),
+                    )
+                    if cur.rowcount > 0:
+                        unlocked.append(
+                            RankedRewardRow(
+                                player_id=player_id,
+                                season_id=season_id,
+                                reward_kind=reward_kind,
+                                tier_value=threshold,
+                                item_code=item_code,
+                                granted_at_ms=settled_at_ms,
+                            )
+                        )
+
+            await cur.execute(
+                "INSERT INTO `match_ranked_player_season`(`season_id`,`player_id`,`qualified`,`qualified_at_ms`,"
+                "`rating_centi`,`peak_rating_centi`,`peak_tier`,`valid_matches`,`wins`,`losses`,`draws`,"
+                "`milestone_bits`,`honor_bits`,`final_rank`,`updated_ms`) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE `qualified`=VALUES(`qualified`),`qualified_at_ms`=VALUES(`qualified_at_ms`),"
+                "`rating_centi`=VALUES(`rating_centi`),`peak_rating_centi`=VALUES(`peak_rating_centi`),"
+                "`peak_tier`=VALUES(`peak_tier`),`valid_matches`=VALUES(`valid_matches`),"
+                "`wins`=VALUES(`wins`),`losses`=VALUES(`losses`),`draws`=VALUES(`draws`),"
+                "`milestone_bits`=VALUES(`milestone_bits`),`honor_bits`=VALUES(`honor_bits`),"
+                "`final_rank`=VALUES(`final_rank`),`updated_ms`=VALUES(`updated_ms`)",
+                (
+                    season_id, player_id, int(qualified), qualified_at_ms, rating_centi, peak_rating,
+                    peak_tier, valid_matches, wins, losses, draws, milestone_bits, honor_bits, final_rank,
+                    settled_at_ms,
+                ),
+            )
+            prog = RankedPlayerSeasonRow(
+                season_id=season_id,
+                player_id=player_id,
+                qualified=qualified,
+                qualified_at_ms=qualified_at_ms,
+                rating_centi=rating_centi,
+                peak_rating_centi=peak_rating,
+                peak_tier=peak_tier,
+                valid_matches=valid_matches,
+                wins=wins,
+                losses=losses,
+                draws=draws,
+                milestone_bits=milestone_bits,
+                honor_bits=honor_bits,
+                final_rank=final_rank,
+                updated_ms=settled_at_ms,
+            )
+
+            final_summary = type(summary_template)()
+            final_summary.CopyFrom(summary_template)
+            final_summary.season_valid_matches_after = valid_matches
+            for rew in unlocked:
+                final_summary.newly_unlocked_rewards.add(
+                    season_id=rew.season_id,
+                    kind=rew.reward_kind,
+                    tier_value=rew.tier_value,
+                    item_code=rew.item_code,
+                    granted_at_ms=rew.granted_at_ms,
+                )
+            raw_bytes = final_summary.SerializeToString(deterministic=True)
+            await cur.execute(
+                "INSERT INTO `match_ranked_battle`(`battle_id`,`player_id`,`season_id`,`settled_at_ms`,`summary`) "
+                "VALUES (%s,%s,%s,%s,UNHEX(%s))",
+                (battle_id, player_id, season_id, settled_at_ms, _hex(raw_bytes)),
+            )
+            return prog, unlocked, raw_bytes
+
+        return await self._run_tx(work)
+
+    async def get_ranked_battle_result(self, player_id: int, battle_id: int = 0) -> bytes | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                if battle_id != 0:
+                    await cur.execute(
+                        "SELECT `summary` FROM `match_ranked_battle` WHERE `battle_id`=%s AND `player_id`=%s",
+                        (battle_id, player_id),
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT `summary` FROM `match_ranked_battle` WHERE `player_id`=%s "
+                        "ORDER BY `settled_at_ms` DESC, `battle_id` DESC LIMIT 1",
+                        (player_id,),
+                    )
+                row = await cur.fetchone()
+                return _to_bytes(row[0]) if row else None

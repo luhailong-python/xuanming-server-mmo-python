@@ -44,11 +44,31 @@ MINOR_SPENDING_GATE_OVERSEAS = "overseas"
 MYSQL_PASSWORD_ENV = "PAYMENT_MYSQL_PASSWORD"
 MALL_PAYMENT_SECRET_ENV = "COMMERCE_PAYMENT_SECRET"
 DEVPAY_SECRET_ENV = "PAYMENT_DEVPAY_SECRET"
+REALNAME_SECRET_ENV = "MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT"
+
+WECHATPAY_PRIVATE_KEY_ENV = "PAYMENT_WECHATPAY_PRIVATE_KEY"
+WECHATPAY_APIV3_KEY_ENV = "PAYMENT_WECHATPAY_APIV3_KEY"
+WECHATPAY_PUBLIC_KEY_ENV = "PAYMENT_WECHATPAY_PUBLIC_KEY"
+
+ALIPAY_PRIVATE_KEY_ENV = "PAYMENT_ALIPAY_PRIVATE_KEY"
+ALIPAY_PUBLIC_KEY_ENV = "PAYMENT_ALIPAY_PUBLIC_KEY"
+
+WECHAT_MINIGAME_APP_SECRET_ENV = "PAYMENT_WECHAT_MINIGAME_APP_SECRET"
+WECHAT_MINIGAME_APP_KEY_ENV = "PAYMENT_WECHAT_MINIGAME_APP_KEY"
+WECHAT_MINIGAME_PUSH_TOKEN_ENV = "PAYMENT_WECHAT_MINIGAME_PUSH_TOKEN"
+
+DOUYIN_PUSH_TOKEN_ENV = "PAYMENT_DOUYIN_PUSH_TOKEN"
+
+APPLE_PRIVATE_KEY_ENV = "PAYMENT_APPLE_PRIVATE_KEY"
+APPLE_ROOT_CERTIFICATES_ENV = "PAYMENT_APPLE_ROOT_CERTIFICATES"
+
+GOOGLE_SERVICE_ACCOUNT_ENV = "PAYMENT_GOOGLE_SERVICE_ACCOUNT"
 
 _TOML_FORBIDDEN_FIELDS = frozenset((
     "mysql_password",
     "mall_payment_secret",
     "devpay_secret",
+    "realname_secret",
 ))
 
 _PRODUCTION_APP_CHANNELS = (
@@ -77,6 +97,16 @@ def load_env_secret(environ, field_name: str, env_name: str, min_bytes: int = MI
     if len(encoded) < min_bytes:
         raise ValueError(f"payment config: the value of {env_name} is shorter than {min_bytes} bytes")
     return encoded
+
+
+def load_env_pem(environ, field_name: str, env_name: str) -> str:
+    """读取多行 PEM/证书环境变量（允许首尾换行），缺失或全空时仅点变量名报错。"""
+    if not env_name:
+        raise ValueError(f"payment config: {field_name} names no environment variable")
+    raw = environ.get(env_name, "")
+    if not raw or not raw.strip():
+        raise ValueError(f"payment config: {field_name}={env_name}, but that environment variable is unset or empty")
+    return raw
 
 
 def validate_base_url(field_name: str, raw: str, *, allow_http: bool, allow_path: bool = True) -> None:
@@ -142,17 +172,75 @@ class PaymentConfig:
     # 合规闸（none / realname / overseas）
     minor_spending_gate: str = MINOR_SPENDING_GATE_NONE
     data_service: str = ""
+    realname_secret_env: str = REALNAME_SECRET_ENV
+    realname_secret: bytes = b""
 
     # 渠道开关与平台渠道清单
     devpay_enabled: bool = True
     devpay_secret_env: str = DEVPAY_SECRET_ENV
     devpay_secret: bytes = b""
+
+    # 微信支付 APIv3
     wechat_pay_enabled: bool = False
+    wechat_pay_app_id: str = ""
+    wechat_pay_mch_id: str = ""
+    wechat_pay_merchant_serial_no: str = ""
+    wechat_pay_private_key_env: str = WECHATPAY_PRIVATE_KEY_ENV
+    wechat_pay_apiv3_key_env: str = WECHATPAY_APIV3_KEY_ENV
+    wechat_pay_platform_key_id: str = ""
+    wechat_pay_platform_key_env: str = WECHATPAY_PUBLIC_KEY_ENV
+    wechat_pay_description: str = "游戏商品"
+    wechat_pay_endpoint: str = ""
+
+    # 支付宝 RSA2
     alipay_enabled: bool = False
+    alipay_app_id: str = ""
+    alipay_private_key_env: str = ALIPAY_PRIVATE_KEY_ENV
+    alipay_public_key_env: str = ALIPAY_PUBLIC_KEY_ENV
+    alipay_seller_id: str = ""
+    alipay_gateway: str = ""
+    alipay_subject: str = "游戏商品"
+
+    # 微信小游戏虚拟支付 2.0
     wechat_minigame_enabled: bool = False
+    wechat_minigame_app_id: str = ""
+    wechat_minigame_app_secret_env: str = WECHAT_MINIGAME_APP_SECRET_ENV
+    wechat_minigame_offer_id: str = ""
+    wechat_minigame_app_key_env: str = WECHAT_MINIGAME_APP_KEY_ENV
+    wechat_minigame_env: int = 0
+    wechat_minigame_zone_id: str = "1"
+    wechat_minigame_push_token_env: str = WECHAT_MINIGAME_PUSH_TOKEN_ENV
+    wechat_minigame_encoding_aes_key_env: str = ""
+    wechat_minigame_api_base: str = ""
+
+    # 抖音小游戏
     douyin_minigame_enabled: bool = False
+    douyin_minigame_app_id: str = ""
+    douyin_minigame_push_token_env: str = DOUYIN_PUSH_TOKEN_ENV
+    douyin_minigame_zone_id: str = "1"
+    douyin_minigame_good_name: str = ""
+
+    # App Store StoreKit 2
     apple_enabled: bool = False
+    apple_bundle_id: str = ""
+    apple_app_apple_id: int = 0
+    apple_issuer_id: str = ""
+    apple_key_id: str = ""
+    apple_private_key_env: str = APPLE_PRIVATE_KEY_ENV
+    apple_root_certificates_env: str = APPLE_ROOT_CERTIFICATES_ENV
+    apple_allow_sandbox: bool = False
+    apple_production_api: str = ""
+    apple_sandbox_api: str = ""
+
+    # Google Play Billing
     google_enabled: bool = False
+    google_package_name: str = ""
+    google_service_account_env: str = GOOGLE_SERVICE_ACCOUNT_ENV
+    google_push_audience: str = ""
+    google_push_service_account: str = ""
+    google_api_base: str = ""
+    google_token_url: str = ""
+    google_certs_url: str = ""
 
     platforms: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("android_app", (CHANNEL_DEVPAY,)),
@@ -240,11 +328,18 @@ class PaymentConfig:
         mall_secret_env = str(raw.get("mall_payment_secret_env", MALL_PAYMENT_SECRET_ENV))
         devpay_enabled = bool(raw.get("devpay_enabled", True))
         devpay_secret_env = str(raw.get("devpay_secret_env", DEVPAY_SECRET_ENV))
+        minor_gate = str(raw.get("minor_spending_gate", MINOR_SPENDING_GATE_NONE))
+        realname_secret_env = str(raw.get("realname_secret_env", REALNAME_SECRET_ENV))
 
         mall_secret = load_env_secret(environ, "mall_payment_secret_env", mall_secret_env, MIN_SECRET_BYTES)
         devpay_secret = (
             load_env_secret(environ, "devpay_secret_env", devpay_secret_env, MIN_SECRET_BYTES)
             if devpay_enabled
+            else b""
+        )
+        realname_secret = (
+            load_env_secret(environ, "realname_secret_env", realname_secret_env, MIN_SECRET_BYTES)
+            if minor_gate == MINOR_SPENDING_GATE_REALNAME
             else b""
         )
 
@@ -253,6 +348,7 @@ class PaymentConfig:
             mysql_password=environ.get(MYSQL_PASSWORD_ENV, ""),
             mall_payment_secret=mall_secret,
             devpay_secret=devpay_secret,
+            realname_secret=realname_secret,
         )
         config.validate(settings=settings)
         return config
@@ -288,6 +384,12 @@ class PaymentConfig:
 
         if self.wechat_pay_enabled or self.alipay_enabled:
             validate_base_url("notify_base_url", self.notify_base_url, allow_http=relaxed, allow_path=True)
+        if (self.wechat_pay_endpoint or self.alipay_gateway) and not relaxed:
+            raise ValueError(
+                "payment overriding wechat_pay_endpoint or alipay_gateway is only allowed in mode=dev or mode=test"
+            )
+        if self.wechat_minigame_enabled and self.wechat_minigame_env == 1 and not relaxed:
+            raise ValueError("payment wechat_minigame sandbox (env=1) is only allowed in mode=dev or mode=test")
         if self.devpay_enabled:
             if not relaxed:
                 raise ValueError("payment devpay is only allowed in mode=dev or mode=test")
@@ -297,6 +399,8 @@ class PaymentConfig:
         if self.minor_spending_gate == MINOR_SPENDING_GATE_REALNAME:
             if not self.data_service:
                 raise ValueError("payment minor_spending_gate=realname requires data_service endpoint")
+            if self.realname_secret and len(self.realname_secret) < MIN_SECRET_BYTES:
+                raise ValueError(f"payment realname_secret must be at least {MIN_SECRET_BYTES} bytes")
         elif self.minor_spending_gate == MINOR_SPENDING_GATE_OVERSEAS:
             pass
         elif self.minor_spending_gate == MINOR_SPENDING_GATE_NONE:

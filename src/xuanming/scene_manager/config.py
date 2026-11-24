@@ -18,6 +18,18 @@ DEFAULT_ETCD_LEASE_TTL_SEC = 60
 DEFAULT_WORLD_CHANNEL_COUNT = 1
 DEFAULT_CHANNEL_MAX_PLAYERS = 2000
 DEFAULT_CHANNEL_SWITCH_COOLDOWN_SEC = 10
+DEFAULT_CHANNEL_BUSY_PERCENT = 60
+DEFAULT_CHANNEL_DIRECTORY_REFRESH_SEC = 2.0
+DEFAULT_CHANNEL_DIRECTORY_TTL_ROUNDS = 3
+DEFAULT_LEADER_CAMPAIGN_INTERVAL_SEC = 2
+DEFAULT_INSTANCE_IDLE_TIMEOUT_SEC = 300
+DEFAULT_MIRROR_IDLE_TIMEOUT_SEC = 30
+DEFAULT_INSTANCE_CHECK_INTERVAL_SEC = 30.0
+DEFAULT_TEARDOWN_SWEEP_INTERVAL_SEC = 15.0
+DEFAULT_TEARDOWN_JOB_LEASE_SEC = 90
+DEFAULT_TEARDOWN_SWEEP_BATCH = 100
+DEFAULT_DEAD_NODE_SWEEP_INTERVAL_SEC = 5.0
+DEFAULT_DEAD_NODE_GIVE_UP_SEC = 600
 DEFAULT_LEAVE_RELEASE_WAIT_SEC = 600
 DEFAULT_REENTRY_BARRIER_SEC = 20
 DEFAULT_HOME_ZONE_TIMEOUT_SEC = 1.5
@@ -96,6 +108,19 @@ class SceneManagerConfig:
     channel_switch_disabled: bool = False
     channel_switch_cooldown_sec: int = DEFAULT_CHANNEL_SWITCH_COOLDOWN_SEC
     channel_max_players: int = DEFAULT_CHANNEL_MAX_PLAYERS
+    channel_busy_percent: int = DEFAULT_CHANNEL_BUSY_PERCENT
+    channel_directory_refresh_sec: float = DEFAULT_CHANNEL_DIRECTORY_REFRESH_SEC
+    channel_directory_ttl_rounds: int = DEFAULT_CHANNEL_DIRECTORY_TTL_ROUNDS
+    leader_campaign_interval_sec: int = DEFAULT_LEADER_CAMPAIGN_INTERVAL_SEC
+    instance_idle_timeout_sec: int = DEFAULT_INSTANCE_IDLE_TIMEOUT_SEC
+    mirror_idle_timeout_sec: int = DEFAULT_MIRROR_IDLE_TIMEOUT_SEC
+    instance_check_interval_sec: float = DEFAULT_INSTANCE_CHECK_INTERVAL_SEC
+    teardown_sweep_interval_sec: float = DEFAULT_TEARDOWN_SWEEP_INTERVAL_SEC
+    teardown_job_lease_sec: int = DEFAULT_TEARDOWN_JOB_LEASE_SEC
+    teardown_sweep_batch: int = DEFAULT_TEARDOWN_SWEEP_BATCH
+    dead_node_sweep_interval_sec: float = DEFAULT_DEAD_NODE_SWEEP_INTERVAL_SEC
+    dead_node_give_up_sec: int = DEFAULT_DEAD_NODE_GIVE_UP_SEC
+    enable_dead_holder_release: bool = True
     leave_holder_release_wait_sec: int = DEFAULT_LEAVE_RELEASE_WAIT_SEC
     reentry_barrier_sec: int = DEFAULT_REENTRY_BARRIER_SEC
     world_table_path: Path = DEFAULT_WORLD_JSON_PATH
@@ -123,6 +148,33 @@ class SceneManagerConfig:
         if self.channel_max_players <= 0:
             return DEFAULT_CHANNEL_MAX_PLAYERS
         return min(self.channel_max_players, 0xFFFFFFFF)
+
+    def effective_channel_busy_percent(self) -> int:
+        if self.channel_busy_percent == 0:
+            return DEFAULT_CHANNEL_BUSY_PERCENT
+        if self.channel_busy_percent < 1:
+            return 1
+        return min(self.channel_busy_percent, 100)
+
+    def effective_channel_directory_refresh_sec(self) -> float:
+        if self.channel_directory_refresh_sec < 0:
+            return 0.0
+        if self.channel_directory_refresh_sec == 0:
+            return DEFAULT_CHANNEL_DIRECTORY_REFRESH_SEC
+        return min(float(self.channel_directory_refresh_sec), 86400.0)
+
+    def effective_channel_directory_ttl_sec(self) -> int:
+        refresh = self.effective_channel_directory_refresh_sec()
+        if refresh <= 0:
+            return 0
+        rounds = max(1, int(self.channel_directory_ttl_rounds))
+        campaign = max(0, int(self.leader_campaign_interval_sec))
+        return max(1, int(refresh * rounds) + campaign)
+
+    def effective_mirror_idle_timeout_sec(self) -> int:
+        if self.mirror_idle_timeout_sec > 0:
+            return self.mirror_idle_timeout_sec
+        return self.instance_idle_timeout_sec
 
     def effective_leave_release_wait_sec(self) -> int:
         return self.leave_holder_release_wait_sec if self.leave_holder_release_wait_sec > 0 else DEFAULT_LEAVE_RELEASE_WAIT_SEC
@@ -192,6 +244,17 @@ class SceneManagerConfig:
             channel_switch_disabled=bool(raw.get("channel_switch_disabled", False)),
             channel_switch_cooldown_sec=int(raw.get("channel_switch_cooldown_sec", DEFAULT_CHANNEL_SWITCH_COOLDOWN_SEC)),
             channel_max_players=int(raw.get("channel_max_players", DEFAULT_CHANNEL_MAX_PLAYERS)),
+            channel_busy_percent=int(raw.get("channel_busy_percent", DEFAULT_CHANNEL_BUSY_PERCENT)),
+            channel_directory_refresh_sec=float(raw.get("channel_directory_refresh_sec", DEFAULT_CHANNEL_DIRECTORY_REFRESH_SEC)),
+            instance_idle_timeout_sec=int(raw.get("instance_idle_timeout_sec", DEFAULT_INSTANCE_IDLE_TIMEOUT_SEC)),
+            mirror_idle_timeout_sec=int(raw.get("mirror_idle_timeout_sec", DEFAULT_MIRROR_IDLE_TIMEOUT_SEC)),
+            instance_check_interval_sec=float(raw.get("instance_check_interval_sec", DEFAULT_INSTANCE_CHECK_INTERVAL_SEC)),
+            teardown_sweep_interval_sec=float(raw.get("teardown_sweep_interval_sec", DEFAULT_TEARDOWN_SWEEP_INTERVAL_SEC)),
+            teardown_job_lease_sec=int(raw.get("teardown_job_lease_sec", DEFAULT_TEARDOWN_JOB_LEASE_SEC)),
+            teardown_sweep_batch=int(raw.get("teardown_sweep_batch", DEFAULT_TEARDOWN_SWEEP_BATCH)),
+            dead_node_sweep_interval_sec=float(raw.get("dead_node_sweep_interval_sec", DEFAULT_DEAD_NODE_SWEEP_INTERVAL_SEC)),
+            dead_node_give_up_sec=int(raw.get("dead_node_give_up_sec", DEFAULT_DEAD_NODE_GIVE_UP_SEC)),
+            enable_dead_holder_release=bool(raw.get("enable_dead_holder_release", True)),
             leave_holder_release_wait_sec=int(raw.get("leave_holder_release_wait_sec", DEFAULT_LEAVE_RELEASE_WAIT_SEC)),
             reentry_barrier_sec=int(raw.get("reentry_barrier_sec", DEFAULT_REENTRY_BARRIER_SEC)),
             world_table_path=world_path,

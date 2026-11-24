@@ -20,6 +20,7 @@ from google.protobuf.message import DecodeError, Message
 from ..grpc_runtime import verify_service_call
 from ..login.caller_auth import AuthError, CallerVerifier, SESSION_DETAIL, parse_details
 from ..protocol import Protocol
+from .asset_loop import GuildAssetOpLoop
 from .errors import (
     ERR_ASSET_CURRENCY_INSUFFICIENT,
     ERR_GUILD_ACTIVITY_NOT_OPEN,
@@ -77,6 +78,7 @@ from .model import (
     COUNTER_KIND_DONATE,
     COUNTER_KIND_SHOP,
     DEFAULT_RANK_PAGE_SIZE,
+    FinalizedAssetOp,
     GuildData,
     MAX_APPLIED_OPS_PAGE_LIMIT,
     MAX_APPLIED_OPS_PLAYER_IDS,
@@ -84,6 +86,7 @@ from .model import (
     MY_APPLICATIONS_LIMIT,
     OP_KIND_DONATE,
     OP_KIND_SHOP,
+    OP_STATUS_APPLIED,
     ORDER_STATUS_REJECTED,
     RANK_OFFICER,
     RECENT_RESULT_LIMIT,
@@ -130,6 +133,7 @@ from .store import (
     OnlineStatusResolver,
     PlayerNameResolver,
 )
+from .trials import GuildTrialCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -148,9 +152,11 @@ CHANGE_LEADER_TRANSFERRED = 5
 CHANGE_DISBANDED = 6
 CHANGE_APPLICATION_RECEIVED = 7
 CHANGE_APPLICATION_REJECTED = 8
+CHANGE_FUNDS_CHANGED = 9
 CHANGE_LEVEL_UP = 10
 CHANGE_ANNOUNCEMENT_CHANGED = 11
 CHANGE_ACTIVITY_CHANGED = 12
+CHANGE_DELIVERY_DONE = 13
 CHANGE_RENAMED = 14
 
 
@@ -197,6 +203,8 @@ class GuildService:
         online_resolver: OnlineStatusResolver | None = None,
         content_guard: ContentGuardChecker | None = None,
         notifier: GuildNotifier | None = None,
+        asset_loop: GuildAssetOpLoop | None = None,
+        trials: GuildTrialCoordinator | None = None,
         asset_op_enabled: bool = False,
         asset_op_lease_ms: int = 10_000,
         terminal_retention_days: int = 30,
@@ -217,6 +225,8 @@ class GuildService:
         self._online: OnlineStatusResolver = online_resolver or NullOnlineStatusResolver()
         self._content_guard: ContentGuardChecker = content_guard or NullContentGuardChecker()
         self._notifier: GuildNotifier = notifier or NullGuildNotifier()
+        self._asset_loop = asset_loop
+        self._trials = trials
         self._asset_op_enabled = bool(asset_op_enabled)
         self._asset_op_lease_ms = int(asset_op_lease_ms)
         self._terminal_retention_days = int(terminal_retention_days)
@@ -224,6 +234,17 @@ class GuildService:
         self._quota = _SlidingQuota(application_quota_per_minute)
         self._budget_sec = float(request_budget_sec)
         self._clock_ms = clock_ms
+        if self.store.on_asset_finalized is None:
+            self.store.on_asset_finalized = self._on_asset_finalized
+
+    async def _on_asset_finalized(self, ev: FinalizedAssetOp) -> None:
+        await self._notify_best_effort(CHANGE_DELIVERY_DONE, ev.guild_id, ev.player_id, 0, [ev.player_id])
+        if ev.kind == OP_KIND_DONATE and ev.status == OP_STATUS_APPLIED and ev.guild_id != 0:
+            guild = await self.store.get_guild(ev.guild_id)
+            if guild is not None:
+                others = [m.player_id for m in guild.members if m.player_id != ev.player_id]
+                if others:
+                    await self._notify_best_effort(CHANGE_FUNDS_CHANGED, ev.guild_id, ev.player_id, 0, others)
 
     def services(self) -> dict[str, dict[str, Callable]]:
         return {
@@ -1398,9 +1419,27 @@ class GuildService:
                 "guildpb.DonateToGuildResponse", error_message=tip_for_error(self.protocol, exc)
             )
 
+        if self._asset_loop is not None:
+            try:
+                await self._asset_loop.process_one(self.store.op_to_pending(op))
+            except Exception as exc:
+                logger.warning("guild donate sync asset delivery failed op_id=%d err=%s", op.op_id, exc)
+            refreshed = await self.store.get_asset_op(op.op_id)
+            if refreshed is not None:
+                op = refreshed
+
+        view = self._donation_view(op)
+        err_tip = None
+        if int(view.status) == ORDER_STATUS_REJECTED:
+            err_tip = (
+                self._tip(ERR_GUILD_CURRENCY_INSUFFICIENT, "currency insufficient")
+                if int(view.reason_tip_id) == ERR_ASSET_CURRENCY_INSUFFICIENT
+                else self._tip(ERR_GUILD_ASSET_REJECTED, "asset op rejected")
+            )
         return self.protocol.message(
             "guildpb.DonateToGuildResponse",
-            donation=self._donation_view(op),
+            error_message=err_tip,
+            donation=view,
             guild=await self._current_guild_info(actor.player_id),
         )
 
@@ -1583,9 +1622,28 @@ class GuildService:
                 "guildpb.BuyGuildShopGoodsResponse", error_message=tip_for_error(self.protocol, exc)
             )
 
+        if self._asset_loop is not None:
+            try:
+                await self._asset_loop.process_one(self.store.op_to_pending(op))
+            except Exception as exc:
+                logger.warning("guild shop sync asset delivery failed op_id=%d err=%s", op.op_id, exc)
+            refreshed = await self.store.get_asset_op(op.op_id)
+            if refreshed is not None:
+                op = refreshed
+            contrib_after = await self.store.get_member_contribution(guild.guild_id, actor.player_id)
+            if contrib_after is not None:
+                balance_after = contrib_after[1]
+
+        view = self._shop_order_view(op)
+        err_tip = (
+            self._tip(ERR_GUILD_ASSET_REJECTED, "asset op rejected")
+            if int(view.status) == ORDER_STATUS_REJECTED
+            else None
+        )
         return self.protocol.message(
             "guildpb.BuyGuildShopGoodsResponse",
-            order=self._shop_order_view(op),
+            error_message=err_tip,
+            order=view,
             contribution_balance=balance_after,
         )
 
@@ -1601,6 +1659,8 @@ class GuildService:
         progress: ActivityProgress,
         reunion_online: int,
         reward_status: ActivityRewardStatus,
+        owed_count: int = 0,
+        trial_lobby: Message | None = None,
         now_ms: int,
     ) -> Message:
         rule = self.store.catalog.rule
@@ -1660,12 +1720,16 @@ class GuildService:
             dungeon_id=row.dungeon_id,
             team_size_min=row.team_size_min,
             team_size_max=row.team_size_max,
-            my_pending_reward_count=reward_status.pending_count,
+            my_pending_reward_count=reward_status.pending_count + owed_count,
             my_pending_reason_tip_id=reward_status.pending_reason_tip_id,
             my_last_reward_reject_tip_id=reward_status.last_reject_tip_id,
             join_min_hours=rule.activity_join_min_hours,
             guild_period_key=guild_period_key(row, now_ms),
         )
+        if trial_lobby is not None:
+            view.trial_lobby.CopyFrom(trial_lobby)
+            if int(trial_lobby.battle_id) != 0:
+                view.my_trial_battle_id = int(trial_lobby.battle_id)
         for item_id, count in self.store.catalog.reward_items(row.reward_id):
             view.reward_items.add(item_id=item_id, count=count)
         return view
@@ -1703,6 +1767,7 @@ class GuildService:
             p_keys = [(r.activity_id, guild_period_key(r, now_ms)) for r in rows]
             progress_map = await self.store.get_activity_progress(guild.guild_id, p_keys)
             reward_map = await self.store.get_activity_reward_statuses(actor.player_id, now_ms)
+            owed_map = await self.store.count_trial_rewards_owed_by_player(actor.player_id)
             reunion_online = 0
             for r in rows:
                 if r.activity_type == ACTIVITY_TYPE_REUNION and activity_state_of(r, now_ms) == ACTIVITY_STATE_OPEN:
@@ -1720,6 +1785,11 @@ class GuildService:
         resp = self.protocol.message("guildpb.GetGuildActivitiesResponse")
         for r in rows:
             g_pk = guild_period_key(r, now_ms)
+            lobby_view = None
+            if r.activity_type == ACTIVITY_TYPE_TRIAL and self._trials_enabled and self._trials is not None:
+                lobby_view = await self._trials.get_lobby_view_for_player(
+                    actor.player_id, guild.guild_id, r.activity_id, now_ms
+                )
             view = self._build_activity_view(
                 r,
                 guild=guild,
@@ -1728,6 +1798,8 @@ class GuildService:
                 progress=progress_map.get((r.activity_id, g_pk), ActivityProgress()),
                 reunion_online=reunion_online,
                 reward_status=reward_map.get(r.activity_id, ActivityRewardStatus()),
+                owed_count=owed_map.get(r.activity_id, 0),
+                trial_lobby=lobby_view,
                 now_ms=now_ms,
             )
             resp.activities.add().CopyFrom(view)
@@ -1825,6 +1897,12 @@ class GuildService:
         except Exception as exc:
             return self.protocol.message(resp_type, error_message=tip_for_error(self.protocol, exc))
 
+        if res.op is not None and self._asset_loop is not None:
+            try:
+                await self._asset_loop.process_one(self.store.op_to_pending(res.op))
+            except Exception as exc:
+                logger.warning("guild activity reward sync delivery failed op_id=%d err=%s", res.op.op_id, exc)
+
         if res.reached_now:
             await self._notify_best_effort(
                 CHANGE_ACTIVITY_CHANGED,
@@ -1835,6 +1913,7 @@ class GuildService:
             )
         usage_after = await self.store.get_counter_usage(actor.player_id, COUNTER_KIND_ACTIVITY, (res.day_key_val,))
         reward_after = await self.store.get_activity_reward_statuses(actor.player_id, now_ms)
+        owed_after = await self.store.count_trial_rewards_owed_by_player(actor.player_id)
         view = self._build_activity_view(
             row,
             guild=guild,
@@ -1843,6 +1922,7 @@ class GuildService:
             progress=res.progress,
             reunion_online=online,
             reward_status=reward_after.get(row.activity_id, ActivityRewardStatus()),
+            owed_count=owed_after.get(row.activity_id, 0),
             now_ms=now_ms,
         )
         return self.protocol.message(resp_type, activity=view)
@@ -1859,19 +1939,123 @@ class GuildService:
             actor, ACTIVITY_TYPE_REUNION, int(request.activity_id), "guildpb.ClaimGuildReunionResponse"
         )
 
-    async def start_guild_trial(self, request: Message, context, path: str) -> Message:
-        await self._admit_client(context, path)
-        return self.protocol.message(
-            "guildpb.StartGuildTrialResponse",
-            error_message=self._tip(ERR_GUILD_ACTIVITY_NOT_OPEN, "guild trial not open"),
+    async def _build_trial_activity_view(
+        self, actor: RoleOriginal, guild: GuildData, activity_id: int, now_ms: int
+    ) -> Message | None:
+        row = pick_activity_for_write(self.store.catalog.activities, ACTIVITY_TYPE_TRIAL, activity_id, now_ms)
+        if row is None:
+            row = next(
+                (
+                    r
+                    for r in self.store.catalog.activities
+                    if r.activity_id == activity_id and r.activity_type == ACTIVITY_TYPE_TRIAL
+                ),
+                None,
+            )
+        if row is None:
+            return None
+        me = guild.member(actor.player_id)
+        if me is None:
+            return None
+        d_key = day_key(now_ms)
+        g_pk = guild_period_key(row, now_ms)
+        usage = await self.store.get_counter_usage(actor.player_id, COUNTER_KIND_ACTIVITY, (d_key,))
+        progress_map = await self.store.get_activity_progress(guild.guild_id, ((row.activity_id, g_pk),))
+        reward_map = await self.store.get_activity_reward_statuses(actor.player_id, now_ms)
+        owed_map = await self.store.count_trial_rewards_owed_by_player(actor.player_id)
+        lobby_view = (
+            await self._trials.get_lobby_view_for_player(actor.player_id, guild.guild_id, row.activity_id, now_ms)
+            if self._trials is not None
+            else None
+        )
+        return self._build_activity_view(
+            row,
+            guild=guild,
+            join_time_ms=me.join_time_ms,
+            used_count=usage.get((row.activity_id, d_key), 0),
+            progress=progress_map.get((row.activity_id, g_pk), ActivityProgress()),
+            reunion_online=0,
+            reward_status=reward_map.get(row.activity_id, ActivityRewardStatus()),
+            owed_count=owed_map.get(row.activity_id, 0),
+            trial_lobby=lobby_view,
+            now_ms=now_ms,
         )
 
+    async def start_guild_trial(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        if not self._trials_enabled or self._trials is None:
+            return self.protocol.message(
+                "guildpb.StartGuildTrialResponse",
+                error_message=self._tip(ERR_GUILD_ACTIVITY_NOT_OPEN, "guild trial not open"),
+            )
+        now_ms = self._clock_ms()
+        try:
+            guild = await self.store.get_player_guild(actor.player_id)
+            if guild is None or guild.member(actor.player_id) is None:
+                return self.protocol.message(
+                    "guildpb.StartGuildTrialResponse",
+                    error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not in any guild"),
+                )
+            tip_id, tip_params = await self._trials.start_trial(
+                actor,
+                guild,
+                int(request.activity_id),
+                [int(p) for p in request.member_player_ids],
+            )
+            if tip_id != 0:
+                return self.protocol.message(
+                    "guildpb.StartGuildTrialResponse",
+                    error_message=self._tip(tip_id, *(tip_params or ("guild trial failed",))),
+                )
+            view = await self._build_trial_activity_view(actor, guild, int(request.activity_id), now_ms)
+            return self.protocol.message("guildpb.StartGuildTrialResponse", activity=view)
+        except Exception as exc:
+            return self.protocol.message(
+                "guildpb.StartGuildTrialResponse", error_message=tip_for_error(self.protocol, exc)
+            )
+
     async def respond_guild_trial_invite(self, request: Message, context, path: str) -> Message:
-        await self._admit_client(context, path)
-        return self.protocol.message(
-            "guildpb.RespondGuildTrialInviteResponse",
-            error_message=self._tip(ERR_GUILD_ACTIVITY_NOT_OPEN, "guild trial not open"),
-        )
+        actor = await self._admit_client(context, path)
+        if not self._trials_enabled or self._trials is None:
+            return self.protocol.message(
+                "guildpb.RespondGuildTrialInviteResponse",
+                error_message=self._tip(ERR_GUILD_ACTIVITY_NOT_OPEN, "guild trial not open"),
+            )
+        now_ms = self._clock_ms()
+        lobby_id = int(request.lobby_id)
+        try:
+            guild = await self.store.get_player_guild(actor.player_id)
+            if guild is None or guild.member(actor.player_id) is None:
+                return self.protocol.message(
+                    "guildpb.RespondGuildTrialInviteResponse",
+                    error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not in any guild"),
+                )
+            pre = await self.store.get_trial_lobby(lobby_id)
+            activity_id = pre.activity_id if pre is not None else 0
+            tip_id, tip_params = await self._trials.respond_invite(
+                actor, guild, lobby_id, bool(request.accept)
+            )
+            if tip_id != 0:
+                return self.protocol.message(
+                    "guildpb.RespondGuildTrialInviteResponse",
+                    error_message=self._tip(tip_id, *(tip_params or ("guild trial respond failed",))),
+                )
+            view = (
+                await self._build_trial_activity_view(actor, guild, activity_id, now_ms)
+                if activity_id != 0
+                else None
+            )
+            return self.protocol.message("guildpb.RespondGuildTrialInviteResponse", activity=view)
+        except Exception as exc:
+            return self.protocol.message(
+                "guildpb.RespondGuildTrialInviteResponse", error_message=tip_for_error(self.protocol, exc)
+            )
+
+    async def handle_battle_result_event(self, event: Message):
+        """消费战斗结果事件（仅在启用 trials 协调器时处理同道历练结算）。"""
+        if self._trials is None:
+            return None
+        return await self._trials.handle_battle_result_event(event)
 
     # -- GuildInternal.ListAppliedAssetOpsSince -------------------------------------------------
 

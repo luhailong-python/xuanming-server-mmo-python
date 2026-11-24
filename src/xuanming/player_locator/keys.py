@@ -60,6 +60,16 @@ def afk_pass_key(player_id: int) -> str:
     return f"player:afk_pass:{{{player_id}}}"
 
 
+def hosted_presence_key(player_id: int) -> str:
+    """离线托管角色在场心跳键（与 Go redisslot.HostedPresenceKey 逐字一致）。"""
+    return f"player:{{{player_id}}}:hosted_presence"
+
+
+def hosted_return_key(player_id: int) -> str:
+    """离线托管归位信息键（与 Go redisslot.HostedReturnKey 逐字一致）。"""
+    return f"player:{{{player_id}}}:hosted_return"
+
+
 def lease_keys_for_slot(slot: int) -> LeaseKeys:
     ready = LEASE_KEY_PREFIX + slot_index_tag(slot)
     return LeaseKeys(
@@ -151,3 +161,11 @@ def renew_lease_claims_keys(slot: int) -> tuple[str, str]:
 def enqueue_offline_cleanup_keys(player_id: int) -> tuple[str, str, str]:
     lease = lease_keys_for_player(player_id)
     return (session_key(player_id), lease.ready, lease.claim_payloads)
+
+
+def prune_gate_index_member_keys(player_id: int, gate: str) -> tuple[str, str]:
+    return (session_key(player_id), gate_session_index_key(player_slot(player_id), gate))
+
+
+def release_gate_index_keys(slot: int, gate: str) -> tuple[str, str]:
+    return (gate_session_index_key(slot, gate), gate_registry_key(slot))

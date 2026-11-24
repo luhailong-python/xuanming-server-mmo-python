@@ -23,7 +23,10 @@ from .asset_loop import (
 )
 from .commerce_engine import CommerceEngine
 from .config import TradeConfig
+from .mall_adapter import MallAdapter, MallPoller
 from .model import MergedZones, TRADE_NODE_TYPE
+from .rmb import RmbConsignments
+from .role_trade import GrpcContentGuardChecker, GrpcRoleSealer, GrpcRoleTradeDirectory, RmbIdentity
 from .service import TradeService
 from .sql_store import SqlTradeStore, open_pool
 from .store import (
@@ -49,6 +52,34 @@ async def _run_commerce_loop(engine: CommerceEngine, interval_sec: float, stop_e
             raise
         except Exception:
             logger.error("trade commerce engine tick failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _run_mall_loop(
+    poller: MallPoller | None,
+    rmb: RmbConsignments | None,
+    interval_sec: float,
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        if poller is not None:
+            try:
+                await poller.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("trade mall poller tick failed", exc_info=True)
+        if rmb is not None:
+            try:
+                await rmb.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("trade rmb poller tick failed", exc_info=True)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
             return
@@ -141,6 +172,17 @@ async def open_service(
             )
 
     commerce_engine: CommerceEngine | None = None
+    mall_adapter: MallAdapter | None = None
+    mall_poller: MallPoller | None = None
+    rmb_consignments: RmbConsignments | None = None
+    rmb_identity: RmbIdentity | None = None
+    content_guard_checker: GrpcContentGuardChecker | None = None
+
+    if config.content_guard:
+        cg_client = GrpcClient(config.content_guard, timeout=config.request_budget_sec)
+        stack.push_async_callback(cg_client.close)
+        content_guard_checker = GrpcContentGuardChecker(protocol, cg_client.call)
+
     if config.asset_op_enabled:
         commerce_engine = CommerceEngine(
             protocol,
@@ -151,6 +193,30 @@ async def open_service(
             asset_caller=asset_caller,
             ledger_reader=ledger_reader,
         )
+        if config.mall_url:
+            mall_adapter = MallAdapter(
+                protocol,
+                config.mall_url,
+                config.mall_gateway_secret,
+                config.mall_delivery_secret,
+            )
+            stack.push_async_callback(mall_adapter.close)
+            mall_poller = MallPoller(mall_adapter, commerce_engine)
+        if len(config.account_directory_secret) >= 32:
+            role_trade_dir = GrpcRoleTradeDirectory(protocol, ds_client.call, config.account_directory_secret)
+            rmb_identity = RmbIdentity(role_trade_dir)
+            if config.rmb_enabled and mall_adapter is not None:
+                sealer = GrpcRoleSealer(protocol, etcd_directory, config.account_directory_secret)
+                stack.push_async_callback(sealer.close)
+                rmb_consignments = RmbConsignments(
+                    protocol,
+                    commerce_engine,
+                    mall_adapter,
+                    role_trade_dir,
+                    sealer,
+                    currency_types=config.rmb_currencies,
+                )
+                commerce_engine.rmb = rmb_consignments
 
     caller_verifier = CallerVerifier.from_env(environ, allowed_callers=("gate",))
     service = TradeService(
@@ -166,10 +232,15 @@ async def open_service(
         mode=config.mode,
         mall_url=config.mall_url,
         rmb_enabled=config.rmb_enabled,
+        mall=mall_adapter,
+        rmb=rmb_consignments,
+        rmb_identity=rmb_identity,
+        content_guard=content_guard_checker,
         manual_resolution_secret=config.manual_resolution_secret,
         manual_resolution_environment=config.manual_resolution_environment,
         request_budget_sec=config.request_budget_sec,
     )
+    service.mall_poller = mall_poller
     return service, store, asset_loop, commerce_engine, merged_zones_dir, zones_holder
 
 
@@ -226,6 +297,13 @@ async def run(settings: Settings) -> None:
                         name="trade-commerce-loop",
                     )
                     stack.callback(t_comm.cancel)
+                    mall_poller = getattr(service, "mall_poller", None)
+                    if mall_poller is not None or commerce_engine.rmb is not None:
+                        t_mall = asyncio.create_task(
+                            _run_mall_loop(mall_poller, commerce_engine.rmb, config.mall_poll_interval_sec, stop),
+                            name="trade-mall-loop",
+                        )
+                        stack.callback(t_mall.cancel)
                 t_zones = asyncio.create_task(
                     _run_merged_zones_loop(merged_zones_dir, zones_holder, config.merged_zones_refresh_sec, stop),
                     name="trade-merged-zones-loop",

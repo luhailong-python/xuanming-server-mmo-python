@@ -433,6 +433,20 @@ class TokenManager:
             raise RefreshRejected(f"refresh rejected (code={code})")
         raise RuntimeError("token family state damaged")
 
+    async def revoke_all(self, account: str) -> int:
+        """原子吊销该账号全部令牌家族，使已有 access/refresh 立即失效（Go ``Manager.RevokeAll``）。"""
+        tag = keys.account_tag(account)
+        count = int(await self._eval(
+            RETIRE_REFRESH,
+            [keys.account_refresh_key(account)],
+            account, 0,
+            keys.refresh_token_key_prefix(tag),
+            keys.refresh_family_key_prefix(tag),
+            "",
+        ))
+        logger.info("Revoked refresh token families account=%s count=%d", account, count)
+        return count
+
     async def _trim(self, account: str, protect: str) -> None:
         tag = keys.account_tag(account)
         try:

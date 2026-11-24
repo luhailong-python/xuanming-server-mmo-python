@@ -26,6 +26,10 @@ _REMOVED_APPEARANCE = "06_thunder_caster_boy"
 _SENSITIVE_SUBSTRINGS = ("管理员", "客服", "官方", "系统", "运营")
 _ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 _DELAYED_RELEASE = 10
+_TEXT_SCENE_ROLE_NAME = 1
+_TEXT_VERDICT_PASS = 1
+_CONTENT_GUARD_PATH = "/content_guard.ContentGuard/CheckText"
+_CONTENT_GUARD_TIMEOUT = 1.5
 
 
 def _allowed(char: str) -> bool:
@@ -75,6 +79,9 @@ async def run(ctx, request, details):
         account = None
     if account is None:
         return fail(tips.SESSION_NOT_FOUND)
+    if config.create_role_closed:
+        logger.info("CreatePlayer rejected: zone=%d create_role_closed account=%s", config.zone_id, account)
+        return fail(tips.ZONE_CREATE_ROLE_CLOSED)
     lock = RedisLock(ctx.login_redis, keys.account_create_lock_key(account), config.account_lock_ttl_ms)
     try:
         locked = await lock.acquire()
@@ -92,12 +99,40 @@ async def run(ctx, request, details):
             logger.exception("CreatePlayer 锁释放失败 account=%s", account)
 
 
+async def _check_role_name_content(ctx, requested: str, account: str) -> int:
+    """将玩家自定义角色名送内容安全服务核验；通过返回 0，否则返回提示 tip 码（fail-closed）。"""
+    if not requested or ctx.content_guard_call is None:
+        return 0
+    req = ctx.protocol.message(
+        "content_guard.CheckTextRequest",
+        scene=_TEXT_SCENE_ROLE_NAME,
+        text=requested,
+        player_id=0,
+        account=account,
+    )
+    try:
+        raw = await ctx.content_guard_call(
+            _CONTENT_GUARD_PATH, req.SerializeToString(), timeout=_CONTENT_GUARD_TIMEOUT,
+        )
+        reply = ctx.protocol.parse("content_guard.CheckTextResponse", raw)
+    except Exception as error:
+        logger.error("CreatePlayer rejected: content guard unavailable account=%s err=%s", account, error)
+        return tips.ROLE_NAME_CHECK_UNAVAILABLE
+    if int(reply.verdict) == _TEXT_VERDICT_PASS:
+        return 0
+    logger.info("CreatePlayer rejected: role name refused by content guard verdict=%d account=%s",
+                int(reply.verdict), account)
+    return tips.ROLE_NAME_SENSITIVE
+
+
 async def _create_locked(ctx, request, response, fail, account, lock):
     protocol, config = ctx.protocol, ctx.config
     try:
-        players = await ctx.data.read_account(account, False)
+        players, _pi, lifecycle = await ctx.data.read_account_with_lifecycle(account, False)
     except DirectoryError:
         return fail(tips.DATA_SERIALIZE_FAILED)
+    if int(lifecycle.deletion_state) != 0:
+        return fail(tips.ACCOUNT_DELETION_PENDING)
     tables = _tables()
     class_id = request.class_id
     if class_id == 0:
@@ -126,6 +161,10 @@ async def _create_locked(ctx, request, response, fail, account, lock):
         return fail(tips.ROLE_NAME_SENSITIVE)
     if verdict == "invalid":
         return fail(tips.ROLE_NAME_INVALID, str(rule.min_chars), str(rule.max_chars))
+    if verdict == "ok":
+        content_tip = await _check_role_name_content(ctx, display, account)
+        if content_tip:
+            return fail(content_tip)
     try:
         player_id = await ctx.data.mint_player_id()
     except Exception:
@@ -157,14 +196,15 @@ async def _create_locked(ctx, request, response, fail, account, lock):
     if not name:
         return fail(tips.DATA_SERIALIZE_FAILED)
 
+    target_zone = ctx.resolve_target_zone(config.zone_id)
     try:
-        await ctx.data.register_player_zone(player_id, config.zone_id, config.storage_id_for(player_id))
+        await ctx.data.register_player_zone(player_id, target_zone, config.storage_id_for(player_id))
     except Exception:
-        logger.exception("player_route 登记失败，拒绝建角 player_id=%s", player_id)
+        logger.exception("CreatePlayer register_player_zone failed player_id=%s zone=%d", player_id, target_zone)
         await _release(ctx, account, player_id, name, uncertain=False)
         return fail(tips.DATA_SERIALIZE_FAILED)
     role = protocol.message("AccountSimplePlayer", player_id=player_id, class_id=class_id, gender=gender,
-                            zone_id=config.zone_id, name=name, appearance_id=appearance)
+                            zone_id=target_zone, name=name, appearance_id=appearance)
     try:
         held = await lock.still_held()
     except Exception:
