@@ -55,6 +55,12 @@ class Settings:
     db_node: dict = field(default_factory=dict)  # raw [db_node], parsed by db.config
     player_locator_node: dict = field(default_factory=dict)  # raw [player_locator_node], parsed by player_locator.config
     player_inbox_node: dict = field(default_factory=dict)  # raw [player_inbox_node], parsed by player_inbox.config
+    scene_manager_node: dict = field(default_factory=dict)  # raw [scene_manager_node], parsed by scene_manager.config
+    match_node: dict = field(default_factory=dict)  # raw [match_node], parsed by match.config
+    content_guard_node: dict = field(default_factory=dict)  # raw [content_guard_node], parsed by content_guard.config
+    chat_node: dict = field(default_factory=dict)  # raw [chat_node], parsed by chat.config
+    mail_node: dict = field(default_factory=dict)  # raw [mail_node], parsed by mail.config
+    rank_node: dict = field(default_factory=dict)  # raw [rank_node], parsed by rank.config
 
     @classmethod
     def load(cls, path: Path | None):

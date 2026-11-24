@@ -57,7 +57,13 @@ message BattleEndS2C {
   uint64 battle_id = 1;
   eBattleOutcome outcome = 2;
   BattleSettlementData settlement = 3;    // 收信玩家本人视角
-  bool items_mailed = 4; // 本局掉落改由邮件发放
+  // 本局掉落放不进人物背包与临时背包,整批改由邮件发放(docs/design/battle-overflow-mail.md):结算屏提示去邮箱领取。
+  // 与 PlayerBattleResult.items_mailed 同一个事实,取自这一局的近期结果。
+  bool items_mailed = 4;
+  // 本局实际新增的装备材料可领额度(0 或 10;日额度已满或不合格局为 0),与 PlayerBattleResult.material_credit_units_added 同源。
+  uint32 material_credit_units_added = 5;
+  // 论剑排位赛季编号(非排位为 0)。
+  uint32 season_id = 6;
 }
 
 // 重连提示:scene 在换会话(RECONNECT / REPLACE)或登录重建出 FIGHTING 冻结时经大厅推送;
@@ -96,6 +102,8 @@ message SpectateEndS2C {
 message SubmitBattleActionRequest {
   uint64 battle_id = 1;
   BattleAction action = 2;
+  uint64 actor_id = 3; // 0 兼容人物指令；宝宝填局内 actor_id，服务端复核主人。
+  uint32 round_index = 4; // 新客户端必须填写，拒绝上一回合迟到指令；旧人物指令 0 兼容。
 }
 
 message SubmitBattleActionResponse {
@@ -159,12 +167,15 @@ message BattleTokenVerifyRequest {
 }
 
 // 握手应答(battle 节点 → 客户端)。失败时 battle 节点随后主动断开。
+// 心跳两项与 gate 的 ClientTokenVerifyResponse 同义同值(docs/design/gate-client-heartbeat.md §14):成功时填,
+// 客户端收到非 0 的间隔就要在这条直连上立即发第一条 ClientHeartbeatRequest、之后每个间隔一条;
+// battle 从发出本应答起,连续 heartbeat_timeout_ms 收不到这条直连的任何一帧就断开它。
 message BattleTokenVerifyResponse {
   bool success = 1;
   string error = 2;       // 失败原因(非敏感,可直接展示 / 记日志)
   uint64 battle_id = 3;   // 成功时回填,客户端据此把连接与本地战斗状态机对上
-  uint32 heartbeat_interval_ms = 4;
-  uint32 heartbeat_timeout_ms = 5;
+  uint32 heartbeat_interval_ms = 4;  // 客户端在本直连上每隔这么久发一条 ClientHeartbeatRequest;0 = 这台 battle 不支持心跳,不发
+  uint32 heartbeat_timeout_ms = 5;   // battle 连续这么久收不到本直连任何一帧就断开;客户端同样按它判 battle 已死
 }
 
 // 落点分配(battle 节点 → 客户端,大厅公告:无直连时经大厅通道 Kafka gate-cmd 推送;D26):
@@ -181,6 +192,9 @@ message BattleAssignedS2C {
   bytes token_signature = 5;   // 原样放进 BattleTokenVerifyRequest.signature
   uint64 expire_at_ms = 6;     // 票据 / 房间作废期限(Unix 毫秒)
   eBattleTicketRole role = 7;
+  // 同一台 battle 给小游戏客户端的 WebSocket 地址(NodeInfo.client_ws_url):小游戏客户端连它,原生客户端仍连 host / port;
+  // 空串 = 这台 battle 不接小游戏(docs/design/minigame-websocket-gate.md W7、W9)。
+  string ws_url = 8;
 }
 
 // 客户端丢票(冷启动 / 换设备)时经大厅通道补签(D25)。请求 / 响应由 MatchService.RequestBattleTicket

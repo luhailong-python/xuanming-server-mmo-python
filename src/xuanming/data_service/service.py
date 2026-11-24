@@ -99,8 +99,11 @@ class DataService:
             "GetPlayerRoute": self.get_player_route,
             "GetRoleFenceState": self.get_role_fence_state,
             "VerifyRoleAdmission": self.verify_role_admission,
+            "GetPlayerAssetOpLedger": self.get_player_asset_op_ledger,
             "GetPlayerInboxLedger": self.get_player_inbox_ledger,
             "GetPlayerItemGainBlock": self.get_player_item_gain_block,
+            "BatchGetPlayerDisplay": self.batch_get_player_display,
+            "GetPlayerChannelIdentity": self.get_player_channel_identity,
             "ReservePlayerName": self.reserve_player_name,
             "ReleasePlayerName": self.release_player_name, "BatchGetPlayerName": self.batch_get_player_name,
             "AllocateIdSegment": self.allocate_id_segment,
@@ -254,7 +257,7 @@ class DataService:
         )
 
     async def get_role_fence_state(self, request, context, path):
-        await self._admit(context, request, path, ("player_inbox", "match", "mail", "guild", "trade", "friend", "db"))
+        await self._admit(context, request, path, ("player_inbox", "match", "mail", "guild", "trade", "friend", "chat", "db"))
         if not request.player_id:
             await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
         try:
@@ -277,6 +280,56 @@ class DataService:
             logger.error("VerifyRoleAdmission failed player=%d", identity.player_id, exc_info=error)
             return self.protocol.message("data_service.VerifyRoleAdmissionResponse", retry=True)
         return self.protocol.message("data_service.VerifyRoleAdmissionResponse", valid=ok)
+
+    async def get_player_asset_op_ledger(self, request, context, path):
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            found, released, raw = await self.store.read_store_row_with_release(request.player_id, 7)
+        except Exception as error:
+            logger.error("GetPlayerAssetOpLedger failed player=%d", request.player_id, exc_info=error)
+            await context.abort(CODE.INTERNAL, str(error))
+        if not found:
+            return self.protocol.message("data_service.GetPlayerAssetOpLedgerResponse", found=False)
+        resp = self.protocol.message(
+            "data_service.GetPlayerAssetOpLedgerResponse", found=True, player_released=released,
+        )
+        if raw:
+            db_msg = self.protocol.parse("player_database", raw)
+            if db_msg.HasField("asset_op_ledger"):
+                resp.ledger.CopyFrom(db_msg.asset_op_ledger)
+        return resp
+
+    async def batch_get_player_display(self, request, context, path):
+        ids = list(dict.fromkeys(pid for pid in request.player_ids if pid))
+        if len(ids) > 1024:
+            await context.abort(CODE.INVALID_ARGUMENT, f"too many player_ids: {len(ids)}")
+        try:
+            found = await self.store.player_displays(ids)
+        except Exception as error:
+            logger.error("BatchGetPlayerDisplay failed count=%d", len(ids), exc_info=error)
+            await context.abort(CODE.UNAVAILABLE, str(error))
+        resp = self.protocol.message("data_service.BatchGetPlayerDisplayResponse")
+        for pid, item in found.items():
+            entry = resp.players[pid]
+            entry.name = item["name"]
+            entry.level = item["level"]
+            entry.class_id = item["class_id"]
+            entry.gender = item["gender"]
+            entry.appearance_id = item["appearance_id"]
+        return resp
+
+    async def get_player_channel_identity(self, request, context, path):
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            info = await self.store.player_channel_identity(request.player_id)
+        except Exception as error:
+            logger.error("GetPlayerChannelIdentity failed player=%d", request.player_id, exc_info=error)
+            return self.protocol.message("data_service.GetPlayerChannelIdentityResponse", retry=True)
+        if info is None:
+            return self.protocol.message("data_service.GetPlayerChannelIdentityResponse", found=False)
+        return self.protocol.message("data_service.GetPlayerChannelIdentityResponse", found=True, **info)
 
     async def get_player_inbox_ledger(self, request, context, path):
         if not request.player_id:

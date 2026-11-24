@@ -11,7 +11,11 @@ logger = logging.getLogger(__name__)
 class WorldChatFanout:
     def __init__(self, protocol, deliver, *, clock=monotonic):
         self._protocol = protocol
-        self._message_id = protocol.message_ids["ClientPlayerChatNotifyWorldChat"]
+        self._allowed_ids = frozenset(
+            protocol.message_ids[name]
+            for name in ("ClientPlayerChatNotifyWorldChat", "ClientPlayerChatNotifyWorldChatRetracted")
+            if name in protocol.message_ids
+        )
         self._deliver = deliver
         self._clock = clock
         self._tokens = 20.0
@@ -25,7 +29,7 @@ class WorldChatFanout:
             logger.warning("无法解析世界频道广播")
             return
         content = event.message_content
-        if content.message_id != self._message_id:
+        if content.message_id not in self._allowed_ids:
             logger.error("世界频道广播拒绝非聊天推送 message_id=%d", content.message_id)
             return
 

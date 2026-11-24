@@ -616,23 +616,70 @@ class SqlStore:
 
     async def read_store_row(self, player_id: int, kind: int) -> tuple[bool, bytes]:
         """读取玩家落盘表 player_store 的指定 kind payload，用于收件箱账本与物品封禁查询。"""
+        found, _released, payload = await self.read_store_row_with_release(player_id, kind)
+        return found, payload
+
+    async def read_store_row_with_release(self, player_id: int, kind: int) -> tuple[bool, bool, bytes]:
+        """读取玩家写权行释放状态及指定 kind payload。"""
         route = await self.route_detail(player_id)
         if route is None:
-            return False, b""
+            return False, False, b""
         pool = self.storage_pools.get(route[1])
         if pool is None:
             raise RuntimeError(f"storage pool unavailable: {route[1]}")
         _, owner_rows = await self._one(
-            "SELECT 1 FROM player_store WHERE player_id=%s AND kind=0", (player_id,), pool=pool,
+            "SELECT released FROM player_store WHERE player_id=%s AND kind=0", (player_id,), pool=pool,
         )
         if not owner_rows:
-            return False, b""
+            return False, False, b""
+        released = bool(owner_rows[0][0])
         _, rows = await self._one(
             "SELECT payload FROM player_store WHERE player_id=%s AND kind=%s", (player_id, kind), pool=pool,
         )
         if not rows or rows[0][0] is None:
-            return True, b""
-        return True, bytes(rows[0][0])
+            return True, released, b""
+        return True, released, bytes(rows[0][0])
+
+    async def player_displays(self, player_ids: list[int]) -> dict[int, dict]:
+        """批量查询角色基础展示信息（名字/职业/性别/外观及默认等级）。"""
+        if not player_ids:
+            return {}
+        _, rows = await self._one(
+            f"SELECT player_id, {OWNERSHIP_COLUMNS} FROM account_role WHERE player_id IN ({_marks(len(player_ids))})",
+            player_ids,
+        )
+        result: dict[int, dict] = {}
+        for row in rows:
+            pid = int(row[0])
+            owned = self._decode(*row, self.role_type)
+            if not owned.account:
+                continue
+            role = self.role_type.FromString(owned.role)
+            result[pid] = {
+                "name": role.name,
+                "level": 0,
+                "class_id": int(role.class_id),
+                "gender": int(role.gender),
+                "appearance_id": role.appearance_id,
+            }
+        return result
+
+    async def player_channel_identity(self, player_id: int) -> dict | None:
+        """读取角色所属账号及建号时间，用于聊天与内容审核画像。"""
+        owned = await self._read_owner(player_id)
+        if owned is None or not owned.account:
+            return None
+        _, rows = await self._one(
+            "SELECT created_ms FROM account_directory WHERE account=%s", (owned.account,),
+        )
+        created_ms = int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        return {
+            "account": owned.account,
+            "channel": "",
+            "open_id": "",
+            "account_created_ms": created_ms,
+            "player_level": 0,
+        }
 
     # -- names ---------------------------------------------------------------------------------------
     async def _owned_norm(self, player_id: int):

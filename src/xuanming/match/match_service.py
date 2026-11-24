@@ -1,0 +1,917 @@
+"""match gRPC 服务层：match.MatchService、match.MatchInternal 与 rolefence.RoleFenceParticipant。
+
+并与 TeamGrpcService 聚合为单一 gRPC 服务表（MatchServer），挂载全部 5 组服务到同一端口。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import socket
+import time
+import uuid
+from collections.abc import Callable
+
+import grpc
+from google.protobuf.message import Message
+
+from ..login.caller_auth import AuthError, CallerVerifier
+from ..protocol import Protocol
+from .config import MatchConfig
+from .errors import (
+    BattleOutcomeOriginalError,
+    ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
+    ERR_MATCH_CHALLENGE_SELF,
+    ERR_MATCH_CHALLENGE_TARGET_OFFLINE,
+    ERR_MATCH_IN_BATTLE,
+    ERR_MATCH_INTERNAL,
+    ERR_MATCH_MODE_NOT_OPEN,
+    ERR_MATCH_NOT_IN_SCENE,
+    ERR_MATCH_NO_REGION_WITHIN_LATENCY,
+    ERR_MATCH_PROBE_REQUIRED,
+    ERR_MATCH_TEAM_SIZE_NOT_CONFIGURED,
+    InvalidRoleFenceStateError,
+    MatchBusinessError,
+    OriginalRoleError,
+    TeamBusinessError,
+    set_tip,
+)
+from .gather import BattleNodeResolver, GatherPipeline, Matchmaker, PresenceProvider, select_battle_node
+from .model import (
+    COMPLETION_SOURCE_MANUAL_ABORT,
+    MAX_OPERATOR_BYTES,
+    MAX_PROBE_REGIONS,
+    MAX_REASON_BYTES,
+    MAX_TEAM_SIZE,
+    MODE_1V1,
+    MODE_5V5,
+    MODE_PVE_SOLO,
+    MODE_PVE_TEAM,
+    MODE_PVP_TEAM,
+    OUTCOME_DECISION_ABORT,
+    OUTCOME_DECISION_COMPLETE,
+    OUTCOME_DECISION_UNKNOWN,
+    PROBE_GRANT_DOMAIN,
+    PROBE_RECEIPT_DOMAIN,
+    QUEUE_STATE_ENTERING,
+    QUEUE_STATE_MATCHED,
+    QUEUE_STATE_NOT_QUEUED,
+    QUEUE_STATE_QUEUED,
+    QUEUE_STATE_READY,
+    TICKET_STATE_FORMING,
+    TICKET_STATE_QUEUED,
+    TICKET_STATE_READY,
+    CallerIdentity,
+    authenticate_gate_caller,
+    has_session_metadata,
+    preferred_region,
+    probe_latencies,
+    session_binding,
+    sign_internal_reply,
+    sign_probe_message,
+    valid_operator_text,
+    verify_internal_hmac,
+    verify_probe_message,
+)
+from .outbox import OutcomeOutboxWorker
+from .spectate import SpectateManager
+from .store import MatchStore, StrandedFormationEntry
+from .team_service import TeamGrpcService
+
+logger = logging.getLogger(__name__)
+
+SERVICE_MATCH = "match.MatchService"
+SERVICE_MATCH_INTERNAL = "match.MatchInternal"
+SERVICE_ROLE_FENCE = "rolefence.RoleFenceParticipant"
+CODE = grpc.StatusCode
+
+
+class MatchGrpcService:
+    """承载 MatchService、MatchInternal 与 RoleFenceParticipant 三组 gRPC 服务。"""
+
+    def __init__(
+        self,
+        protocol: Protocol,
+        store: MatchStore,
+        config: MatchConfig,
+        *,
+        gate_verifier: CallerVerifier | None,
+        presence: PresenceProvider,
+        battle_nodes: BattleNodeResolver,
+        gather: GatherPipeline,
+        spectate: SpectateManager,
+        inline_gather: bool = False,
+        clock_ms: Callable[[], int] | None = None,
+    ) -> None:
+        self.protocol = protocol
+        self.store = store
+        self.config = config
+        self._gate_verifier = gate_verifier
+        self.presence = presence
+        self.battle_nodes = battle_nodes
+        self.gather = gather
+        self.spectate = spectate
+        self._inline_gather = inline_gather
+        self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def services(self) -> dict[str, dict[str, Callable]]:
+        return {
+            SERVICE_MATCH: {
+                "GetNetworkProbePlan": self.get_network_probe_plan,
+                "CommitNetworkProbe": self.commit_network_probe,
+                "JoinQueue": self.join_queue,
+                "CancelQueue": self.cancel_queue,
+                "GetQueueStatus": self.get_queue_status,
+                "ChallengePlayer": self.challenge_player,
+                "RespondChallenge": self.respond_challenge,
+                "NotifyChallengeInvite": self.push_noop,
+                "NotifyChallengeResult": self.push_noop,
+                "WatchBattle": self.watch_battle,
+                "ListWatchableBattles": self.list_watchable_battles,
+                "RequestBattleTicket": self.request_battle_ticket,
+                "ListBattleReports": self.list_battle_reports,
+                "GetBattleReport": self.get_battle_report,
+                "ListBattleScripts": self.unimplemented_rpc,
+                "SubmitBattleScript": self.unimplemented_rpc,
+                "DeleteBattleScript": self.unimplemented_rpc,
+                "SetBattleScriptLoadout": self.unimplemented_rpc,
+                "GetRankedProfile": self.unimplemented_rpc,
+                "SaveRankedPreset": self.unimplemented_rpc,
+                "UpdateRankedCosmetic": self.unimplemented_rpc,
+                "GetRankedBattleResult": self.unimplemented_rpc,
+            },
+            SERVICE_MATCH_INTERNAL: {
+                "CommitBattleOutcome": self.commit_battle_outcome,
+                "GetBattleTerminalDecision": self.get_battle_terminal_decision,
+                "StartActivityBattle": self.start_activity_battle,
+                "CancelActivityBattle": self.cancel_activity_battle,
+                "SetSpectateFeatured": self.set_spectate_featured,
+                "AcquireTrialOccupancy": self.acquire_trial_occupancy,
+                "ReleaseTrialOccupancy": self.release_trial_occupancy,
+                "GetBattleCompletion": self.get_battle_completion,
+                "ListStrandedFormations": self.list_stranded_formations,
+                "ResolveStrandedFormation": self.resolve_stranded_formation,
+                "ListPendingBattleScripts": self.list_pending_battle_scripts,
+                "ReviewBattleScript": self.review_battle_script,
+            },
+            SERVICE_ROLE_FENCE: {
+                "PrepareRoleFreeze": self.prepare_role_freeze,
+                "ApplyRoleFence": self.apply_role_fence,
+                "PurgeRemovedRole": self.purge_removed_role,
+            },
+        }
+
+    async def close(self) -> None:
+        tasks = tuple(self._bg_tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _spawn(self, coro, *, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    # -- 鉴权门禁（fail-closed）-----------------------------------------------------------------------
+
+    async def _admit_client(self, context, path: str) -> CallerIdentity:
+        try:
+            caller = authenticate_gate_caller(self.protocol, self._gate_verifier, context, path)
+        except AuthError as exc:
+            await context.abort(CODE.PERMISSION_DENIED, f"gate identity rejected: {exc}")
+        try:
+            await self.store.verify_original_owner(caller.player_id, caller.account, caller.owner_revision)
+        except OriginalRoleError as exc:
+            await context.abort(CODE.PERMISSION_DENIED, f"role ownership rejected: {exc}")
+        return caller
+
+    async def _reject_client_on_internal(self, context, path: str) -> None:
+        if has_session_metadata(context):
+            await context.abort(CODE.PERMISSION_DENIED, f"{path} allows internal service calls only")
+
+    async def _admit_internal(self, context, request: Message, path: str, caller: str, secret: bytes) -> None:
+        await self._reject_client_on_internal(context, path)
+        if not secret:
+            await context.abort(CODE.PERMISSION_DENIED, f"{path} internal caller secret is not configured")
+        if not verify_internal_hmac(path, request, caller, secret, int(self._clock_ms())):
+            await context.abort(CODE.PERMISSION_DENIED, f"invalid {caller} service call signature")
+
+    # -- MatchService RPCs ----------------------------------------------------------------------------
+
+    async def push_noop(self, request: Message, context, path: str) -> Message:
+        return self.protocol.message("Empty")
+
+    async def unimplemented_rpc(self, request: Message, context, path: str) -> Message:
+        await self._admit_client(context, path)
+        await context.abort(CODE.UNIMPLEMENTED, f"{path} is not enabled on this server")
+
+    async def get_network_probe_plan(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        if len(self.config.probe_secret) < 32:
+            await context.abort(CODE.UNAVAILABLE, "network probe secret not configured")
+        binding = session_binding(caller)
+        if not binding:
+            await context.abort(CODE.PERMISSION_DENIED, "incomplete session binding for network probe")
+        now_ms = await self.store.now_ms()
+        expires_ms = now_ms + self.config.probe_ttl_sec * 1000
+        plan_id = str(uuid.uuid4())
+        resp = self.protocol.message(
+            "match.GetNetworkProbePlanResponse",
+            plan_id=plan_id,
+            expires_at_ms=expires_ms,
+            required=self.config.require_network_probe,
+        )
+        nodes = await self.battle_nodes.list_nodes(release_track=caller.release_track)
+        # 每个机房挑一台可探测节点，最多 MAX_PROBE_REGIONS 个机房
+        by_region: dict[int, list] = {}
+        for n in sorted(nodes, key=lambda item: item.node_id):
+            if n.physical_region <= 0 or not n.client_host or not 0 < n.client_port <= 65535 or not n.node_uuid:
+                continue
+            if n.physical_region not in by_region and len(by_region) >= MAX_PROBE_REGIONS:
+                continue
+            by_region.setdefault(n.physical_region, []).append(n)
+        for region, candidates in sorted(by_region.items()):
+            node = candidates[caller.player_id % len(candidates)]
+            grant = self.protocol.message(
+                "match.NetworkProbeGrant",
+                plan_id=plan_id,
+                player_id=caller.player_id,
+                session_binding=binding,
+                physical_region=region,
+                target_node_id=node.node_id,
+                target_instance_id=node.node_uuid,
+                expires_at_ms=expires_ms,
+            )
+            payload, sig = sign_probe_message(self.config.probe_secret, PROBE_GRANT_DOMAIN, grant)
+            target = resp.targets.add(
+                physical_region=region,
+                host=node.client_host,
+                port=node.client_port,
+                ws_url=node.client_ws_url,
+            )
+            target.grant.payload = payload
+            target.grant.signature = sig
+
+        if not resp.targets:
+            return set_tip(resp, ERR_MATCH_NO_REGION_WITHIN_LATENCY)
+
+        profile = self.protocol.message(
+            "match.MatchNetworkProfile",
+            plan_id=plan_id,
+            session_binding=binding,
+            owner_account=caller.account,
+            owner_revision=caller.owner_revision,
+            release_track=caller.release_track,
+        )
+        await self.store.save_network_plan(caller.player_id, profile, expires_ms)
+        return resp
+
+    async def commit_network_probe(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        if len(self.config.probe_secret) < 32:
+            await context.abort(CODE.UNAVAILABLE, "network probe secret not configured")
+        binding = session_binding(caller)
+        if not binding or not request.plan_id or not 1 <= len(request.receipts) <= MAX_PROBE_REGIONS:
+            await context.abort(CODE.INVALID_ARGUMENT, "invalid network probe receipt arguments")
+        now_ms = await self.store.now_ms()
+        seen_regions: set[int] = set()
+        verified: list[Message] = []
+        min_expires = (1 << 64) - 1
+        for signed in request.receipts:
+            try:
+                receipt = verify_probe_message(
+                    self.protocol, self.config.probe_secret, PROBE_RECEIPT_DOMAIN, signed, "match.NetworkProbeReceipt"
+                )
+            except ValueError as exc:
+                await context.abort(CODE.INVALID_ARGUMENT, str(exc))
+            grant = receipt.grant
+            region = int(grant.physical_region)
+            if (
+                grant.plan_id != request.plan_id
+                or int(grant.player_id) != caller.player_id
+                or grant.session_binding != binding
+                or region == 0
+                or region in seen_regions
+                or int(receipt.sample_count) != 3
+                or int(receipt.rtt_ms) == 0
+                or int(receipt.measured_at_ms) > now_ms
+                or int(receipt.expires_at_ms) <= now_ms
+                or int(receipt.expires_at_ms) > int(grant.expires_at_ms)
+            ):
+                await context.abort(CODE.INVALID_ARGUMENT, "probe receipt identity or freshness invalid")
+            seen_regions.add(region)
+            verified.append(receipt)
+            min_expires = min(min_expires, int(receipt.expires_at_ms))
+
+        try:
+            await self.store.commit_network_profile(caller.player_id, request.plan_id, binding, verified, min_expires)
+        except OriginalRoleError as exc:
+            await context.abort(CODE.FAILED_PRECONDITION, str(exc))
+        return self.protocol.message("match.CommitNetworkProbeResponse", expires_at_ms=min_expires)
+
+    async def join_queue(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        resp = self.protocol.message("match.JoinQueueResponse")
+
+        def fail(code: int) -> Message:
+            resp.error_code = code
+            return set_tip(resp, code)
+
+        mode = int(request.mode)
+        if mode not in (MODE_PVE_SOLO, MODE_PVE_TEAM, MODE_1V1, MODE_5V5, MODE_PVP_TEAM):
+            return fail(ERR_MATCH_MODE_NOT_OPEN)
+        config_id = int(request.battle_config_id)
+        team_size = int(request.team_size)
+        if mode == MODE_PVE_TEAM:
+            max_sz = self.config.pve_team_sizes.get(config_id, 0)
+            if max_sz <= 0:
+                return fail(ERR_MATCH_TEAM_SIZE_NOT_CONFIGURED)
+            if team_size == 0:
+                team_size = min(max_sz, MAX_TEAM_SIZE)
+            elif team_size > min(max_sz, MAX_TEAM_SIZE):
+                return fail(ERR_MATCH_MODE_NOT_OPEN)
+        elif mode == MODE_PVP_TEAM:
+            if team_size == 0:
+                team_size = 1
+            elif team_size > MAX_TEAM_SIZE:
+                return fail(ERR_MATCH_MODE_NOT_OPEN)
+        elif mode == MODE_1V1:
+            team_size = 1
+        elif mode == MODE_5V5:
+            team_size = MAX_TEAM_SIZE
+        else:
+            team_size = 1
+
+        pres = await self.presence.get_presence(caller.player_id)
+        if pres.in_battle:
+            return fail(ERR_MATCH_IN_BATTLE)
+        if not pres.scene_grpc_endpoint:
+            return fail(ERR_MATCH_NOT_IN_SCENE)
+
+        now_ms = await self.store.now_ms()
+        profile_bytes = b""
+        pool_reg = 0
+        profile, exp = await self.store.get_network_profile(caller.player_id)
+        if self.config.require_network_probe:
+            if profile is None or exp <= now_ms or (request.network_plan_id and profile.plan_id != request.network_plan_id):
+                return fail(ERR_MATCH_PROBE_REQUIRED)
+            lats = probe_latencies(profile, now_ms, self.config.hard_latency_ms)
+            if not lats:
+                return fail(ERR_MATCH_NO_REGION_WITHIN_LATENCY)
+            pool_reg = preferred_region(profile, now_ms, self.config.hard_latency_ms)
+            profile_bytes = profile.SerializeToString(deterministic=True)
+        elif profile is not None and exp > now_ms:
+            pool_reg = preferred_region(profile, now_ms, self.config.hard_latency_ms)
+            profile_bytes = profile.SerializeToString(deterministic=True)
+
+        try:
+            ticket = await self.store.join_queue(
+                caller,
+                mode=mode,
+                config_id=config_id,
+                team_size=team_size,
+                zone_id=int(request.zone_id) or pres.zone_id or self.config.zone_id,
+                request_id=request.request_id,
+                request_payload=request.SerializeToString(deterministic=True),
+                network_profile=profile_bytes,
+                pool_region=pool_reg,
+                queue_ttl_ms=self.config.queue_ttl_sec * 1000,
+            )
+        except MatchBusinessError as exc:
+            return fail(exc.code)
+        except OriginalRoleError as exc:
+            await context.abort(CODE.PERMISSION_DENIED, str(exc))
+
+        resp.queue_ticket = ticket.ticket
+        return resp
+
+    async def cancel_queue(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        try:
+            await self.store.cancel_queue(caller, request.queue_ticket, request.request_id)
+        except MatchBusinessError as exc:
+            await context.abort(CODE.FAILED_PRECONDITION, f"cancel rejected code={exc.code}")
+        except OriginalRoleError as exc:
+            await context.abort(CODE.PERMISSION_DENIED, str(exc))
+        return self.protocol.message("Empty")
+
+    async def get_queue_status(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        info = await self.store.get_queue_status(caller, request.request_id)
+        resp = self.protocol.message(
+            "match.GetQueueStatusResponse",
+            state=QUEUE_STATE_NOT_QUEUED,
+            request_cancelled=info.request_cancelled,
+        )
+        tk = info.ticket
+        if tk is None:
+            return resp
+        st = int(tk.state)
+        if st == TICKET_STATE_QUEUED:
+            resp.state = QUEUE_STATE_QUEUED
+            resp.queued_seconds = max(0, (info.now_ms - int(tk.enqueued_ms)) // 1000)
+            resp.queue_ticket = tk.ticket
+            resp.team_size = int(tk.team_size)
+        elif st == TICKET_STATE_FORMING:
+            resp.state = QUEUE_STATE_MATCHED
+            resp.queue_ticket = tk.ticket
+            resp.battle_id = int(tk.formation_id)
+            resp.selected_region = int(tk.selected_region)
+        elif st == TICKET_STATE_READY:
+            resp.state = QUEUE_STATE_READY
+            resp.queue_ticket = tk.ticket
+            resp.battle_id = int(tk.formation_id)
+            resp.selected_region = int(tk.selected_region)
+        return resp
+
+    async def challenge_player(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        resp = self.protocol.message("match.ChallengePlayerResponse")
+        target_id = int(request.target_player_id)
+        if target_id == 0 or target_id == caller.player_id:
+            return set_tip(resp, ERR_MATCH_CHALLENGE_SELF)
+        target_pres = await self.presence.get_presence(target_id)
+        if not target_pres.online:
+            return set_tip(resp, ERR_MATCH_CHALLENGE_TARGET_OFFLINE)
+        try:
+            inv = await self.store.create_challenge(
+                caller, target_id, int(request.battle_config_id) or 1, self.config.challenge_ttl_sec * 1000
+            )
+            resp.challenge_id = int(inv.challenge_id)
+            return resp
+        except MatchBusinessError as exc:
+            return set_tip(resp, exc.code, *exc.params)
+
+    async def respond_challenge(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        resp = self.protocol.message("match.RespondChallengeResponse")
+        battle_node = None
+        if request.accept:
+            nodes = await self.battle_nodes.list_nodes(release_track=caller.release_track)
+            node = select_battle_node(nodes, release_track=caller.release_track)
+            if node is None:
+                return set_tip(resp, ERR_MATCH_INTERNAL)
+            battle_node = (node.node_id, node.node_uuid, node.grpc_endpoint, node.physical_region, node.release_track)
+        try:
+            _, formation = await self.store.respond_challenge(
+                caller,
+                int(request.challenge_id),
+                bool(request.accept),
+                battle_node=battle_node,
+                battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+            )
+        except MatchBusinessError as exc:
+            return set_tip(resp, exc.code, *exc.params)
+        if formation is not None:
+            if self._inline_gather:
+                await self.gather.run_formation(formation)
+            else:
+                self._spawn(self.gather.run_formation(formation), name=f"challenge-gather-{formation.battle_id}")
+        return resp
+
+    async def watch_battle(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.spectate.watch_battle(caller, request)
+
+    async def list_watchable_battles(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.spectate.list_watchable_battles(caller, int(request.limit))
+
+    async def request_battle_ticket(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.spectate.request_battle_ticket(caller, int(request.battle_id))
+
+    async def list_battle_reports(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        resp = self.protocol.message("match.ListBattleReportsResponse")
+        for summary in await self.store.list_battle_reports(caller.player_id):
+            resp.reports.add().CopyFrom(summary)
+        return resp
+
+    async def get_battle_report(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        resp = self.protocol.message("match.GetBattleReportResponse")
+        try:
+            env = await self.store.get_battle_report(caller.player_id, int(request.battle_id))
+            resp.replay.CopyFrom(env)
+            return resp
+        except MatchBusinessError as exc:
+            return set_tip(resp, exc.code, *exc.params)
+
+    # -- MatchInternal RPCs ---------------------------------------------------------------------------
+
+    async def commit_battle_outcome(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "battle", self.config.battle_outcome_secret)
+        try:
+            decision = await self.store.commit_battle_outcome(request)
+        except BattleOutcomeOriginalError as exc:
+            logger.error("match CommitBattleOutcome original rejected battle_id=%d err=%s", int(request.battle_id), exc)
+            await context.abort(CODE.FAILED_PRECONDITION, str(exc))
+        except Exception:
+            logger.error("match CommitBattleOutcome failed battle_id=%d", int(request.battle_id), exc_info=True)
+            await context.abort(CODE.UNAVAILABLE, "battle outcome commit unavailable")
+
+        reply = self.protocol.message("match.CommitBattleOutcomeResponse", decision=decision)
+        sign_internal_reply(path, request, reply, "match", self.config.battle_outcome_secret, int(self._clock_ms()))
+        return reply
+
+    async def get_battle_terminal_decision(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "scene", self.config.scene_secret)
+        battle_id = int(request.battle_id)
+        if battle_id == 0:
+            await context.abort(CODE.INVALID_ARGUMENT, "battle_id is required")
+
+        reply = self.protocol.message("match.GetBattleTerminalDecisionResponse")
+        try:
+            decision, terminal_expected = await self.store.get_battle_terminal_state(battle_id)
+            if decision not in (OUTCOME_DECISION_UNKNOWN, OUTCOME_DECISION_COMPLETE, OUTCOME_DECISION_ABORT):
+                reply.retry = True
+            else:
+                reply.decision = decision
+                reply.terminal_expected = terminal_expected
+        except Exception:
+            logger.error("match GetBattleTerminalDecision failed battle_id=%d", battle_id, exc_info=True)
+            reply.retry = True
+
+        sign_internal_reply(path, request, reply, "match", self.config.scene_secret, int(self._clock_ms()))
+        return reply
+
+    async def start_activity_battle(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "guild", self.config.guild_secret)
+        resp = self.protocol.message("match.StartActivityBattleResponse")
+        mids = [int(x) for x in request.member_player_ids]
+        act = request.activity_context
+        if (
+            int(request.battle_config_id) == 0
+            or not 1 <= len(mids) <= MAX_TEAM_SIZE
+            or len(set(mids)) != len(mids)
+            or any(pid == 0 for pid in mids)
+            or int(request.request_id) == 0
+            or int(act.kind) == 0
+            or int(act.guild_id) == 0
+            or int(act.activity_id) == 0
+            or int(act.initiator_player_id) != mids[0]
+        ):
+            resp.reject = 1  # INVALID_ARGUMENT
+            return resp
+        for pid in mids:
+            pres = await self.presence.get_presence(pid)
+            if not pres.online:
+                resp.reject = 2  # MEMBER_OFFLINE
+                resp.offender_player_id = pid
+                return resp
+            if pres.in_battle:
+                resp.reject = 3  # MEMBER_IN_BATTLE
+                resp.offender_player_id = pid
+                return resp
+            if not pres.scene_grpc_endpoint:
+                resp.reject = 4  # MEMBER_NOT_READY
+                resp.offender_player_id = pid
+                return resp
+
+        nodes = await self.battle_nodes.list_nodes(release_track="stable")
+        node = select_battle_node(nodes, release_track="stable")
+        if node is None:
+            resp.reject = 5  # INTERNAL
+            return resp
+        try:
+            formation, created = await self.store.start_activity_battle(
+                request_id=int(request.request_id),
+                battle_config_id=int(request.battle_config_id),
+                member_player_ids=mids,
+                activity_context_bytes=act.SerializeToString(deterministic=True),
+                battle_node=(node.node_id, node.node_uuid, node.grpc_endpoint, node.physical_region, "stable"),
+                battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+            )
+        except TeamBusinessError as exc:
+            resp.reject = 4  # MEMBER_NOT_READY
+            resp.offender_player_id = int(exc.params[0]) if exc.params else 0
+            return resp
+        except MatchBusinessError:
+            resp.reject = 4
+            return resp
+        except Exception:
+            logger.error("match StartActivityBattle failed request_id=%d", int(request.request_id), exc_info=True)
+            resp.reject = 5
+            return resp
+
+        if created:
+            if self._inline_gather:
+                await self.gather.run_formation(formation)
+            else:
+                self._spawn(self.gather.run_formation(formation), name=f"activity-gather-{formation.battle_id}")
+        resp.battle_id = int(formation.battle_id)
+        resp.formation_state = int(formation.state)
+        return resp
+
+    async def cancel_activity_battle(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "guild", self.config.guild_secret)
+        req_id = int(request.original.request_id)
+        if req_id == 0:
+            await context.abort(CODE.INVALID_ARGUMENT, "original.request_id is required")
+        battle_id, cancelled, form_state, decision = await self.store.cancel_activity_battle(req_id)
+        reply = self.protocol.message(
+            "match.CancelActivityBattleResponse",
+            battle_id=battle_id,
+            request_cancelled=cancelled,
+            formation_state=form_state,
+            terminal_decision=decision,
+        )
+        sign_internal_reply(path, request, reply, "match", self.config.guild_secret, int(self._clock_ms()))
+        return reply
+
+    async def set_spectate_featured(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.SetSpectateFeaturedResponse")
+        if not self.config.ops_secret or not verify_internal_hmac(
+            path, request, "ops", self.config.ops_secret, int(self._clock_ms())
+        ):
+            resp.reject = 4  # SPECTATE_FEATURED_REJECT_DENIED
+            return resp
+        reject, tier = await self.spectate.set_spectate_featured(int(request.battle_id), bool(request.featured))
+        resp.reject = reject
+        resp.tier = tier
+        return resp
+
+    async def acquire_trial_occupancy(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.AcquireTrialOccupancyResponse")
+        if not self.config.guild_secret or not verify_internal_hmac(
+            path, request, "guild", self.config.guild_secret, int(self._clock_ms())
+        ):
+            resp.reject = 3  # DENIED
+            return resp
+        owner_id = int(request.owner_id)
+        ttl_ms = int(request.ttl_ms)
+        roster = [(int(r.player_id), r.account, int(r.owner_revision)) for r in request.roster]
+        if owner_id == 0 or ttl_ms == 0 or not roster or any(pid == 0 for pid, _, _ in roster):
+            resp.reject = 3
+            return resp
+        try:
+            reject, offender = await self.store.acquire_trial_occupancy(owner_id, roster, ttl_ms)
+            resp.reject = reject
+            resp.offender_player_id = offender
+        except Exception:
+            logger.error("match AcquireTrialOccupancy failed owner_id=%d", owner_id, exc_info=True)
+            resp.reject = 4  # RETRY
+        return resp
+
+    async def release_trial_occupancy(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.ReleaseTrialOccupancyResponse")
+        if not self.config.guild_secret or not verify_internal_hmac(
+            path, request, "guild", self.config.guild_secret, int(self._clock_ms())
+        ):
+            resp.reject = 3
+            return resp
+        try:
+            await self.store.release_trial_occupancy(int(request.owner_id), [int(x) for x in request.player_ids])
+        except Exception:
+            logger.error("match ReleaseTrialOccupancy failed owner_id=%d", int(request.owner_id), exc_info=True)
+            resp.reject = 4
+        return resp
+
+    async def get_battle_completion(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.GetBattleCompletionResponse")
+        if not self.config.guild_secret or not verify_internal_hmac(
+            path, request, "guild", self.config.guild_secret, int(self._clock_ms())
+        ):
+            resp.reject = 3
+            return resp
+        try:
+            decision, raw = await self.store.get_battle_completion(int(request.battle_id))
+            resp.decision = decision
+            resp.raw_payload = raw
+        except Exception:
+            logger.error("match GetBattleCompletion failed battle_id=%d", int(request.battle_id), exc_info=True)
+            resp.reject = 4
+        return resp
+
+    def _fill_stranded_proto(self, entry: StrandedFormationEntry) -> Message:
+        f = entry.formation
+        out = self.protocol.message(
+            "match.StrandedFormation",
+            battle_id=int(f.battle_id),
+            state=int(f.state),
+            operation_id=f.operation_id,
+            target_instance_id=f.target_instance_id,
+            preflight_instance_id=f.preflight_instance_id,
+            match_mode=int(f.mode),
+            config_id=int(f.config_id),
+            member_count=len(f.members),
+            activity=bool(f.activity_context),
+            created_ms=int(f.created_ms),
+            deadline_ms=int(f.deadline_ms),
+            retry_at_ms=int(f.retry_at_ms),
+            outcome_protocol_version=int(f.outcome_protocol_version),
+            preflight_supported_version=int(f.preflight_supported_version),
+            adopted_outcome_protocol_version=int(f.adopted_outcome_protocol_version),
+            adopted_outcome_observed=bool(f.adopted_outcome_observed),
+            create_request_bytes=len(f.create_request),
+            create_decodable=entry.create_req is not None,
+            formation_class=entry.formation_class,
+            failed_check=entry.failed_check,
+            effective_deadline_ms=entry.effective_deadline_ms,
+            has_terminal_row=entry.has_terminal_row,
+            terminal_decision=entry.terminal_decision,
+            terminal_source_kind=entry.terminal_source_kind,
+            digest=entry.digest,
+            refusal=entry.refusal,
+        )
+        if entry.create_req is not None:
+            out.create_created_at_ms = int(entry.create_req.created_at_ms)
+            out.create_deadline_ms = int(entry.create_req.deadline_ms)
+            out.create_admit_before_ms = int(entry.create_req.admit_before_ms)
+            out.create_player_count = len(entry.create_req.players)
+        for tk in entry.tickets:
+            out.tickets.add(
+                player_id=int(tk.player_id),
+                state=int(tk.state),
+                formation_id=int(tk.formation_id),
+                owner_revision=int(tk.owner_revision),
+            )
+        return out
+
+    async def list_stranded_formations(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(
+            context, request, path, "ops-formation", self.config.manual_resolution_secret
+        )
+        if not self.config.manual_resolution_env:
+            await context.abort(CODE.PERMISSION_DENIED, "manual resolution environment not configured")
+        limit = int(request.limit)
+        if not 1 <= limit <= 100:
+            await context.abort(CODE.INVALID_ARGUMENT, "limit must be in 1..100")
+        resp = self.protocol.message("match.ListStrandedFormationsResponse", target=self.config.manual_resolution_env)
+        try:
+            entries, next_bid, now_ms = await self.store.list_stranded_formations(int(request.after_battle_id), limit)
+            resp.next_battle_id = next_bid
+            resp.now_ms = now_ms
+            for entry in entries:
+                resp.formations.add().CopyFrom(self._fill_stranded_proto(entry))
+        except Exception:
+            logger.error("match ListStrandedFormations failed", exc_info=True)
+            resp.retry = True
+        return resp
+
+    async def resolve_stranded_formation(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(
+            context, request, path, "ops-formation", self.config.manual_resolution_secret
+        )
+        if not self.config.manual_resolution_env:
+            await context.abort(CODE.PERMISSION_DENIED, "manual resolution environment not configured")
+        battle_id = int(request.battle_id)
+        mode = int(request.mode)
+        if battle_id == 0 or mode not in (1, 2, 3):  # SHOW / DRY_RUN / ABORT
+            await context.abort(CODE.INVALID_ARGUMENT, "invalid battle_id or mode")
+        replica = socket.gethostname()
+        resp = self.protocol.message(
+            "match.ResolveStrandedFormationResponse",
+            target=self.config.manual_resolution_env,
+            replica=replica,
+        )
+        if mode in (2, 3):
+            if request.expect_target != self.config.manual_resolution_env:
+                resp.verdict = 2  # REFUSED
+                resp.refusal = "target_mismatch"
+                return resp
+            if (
+                not request.expect_digest
+                or not valid_operator_text(request.operator_name, MAX_OPERATOR_BYTES, required=True)
+                or not valid_operator_text(request.reason, MAX_REASON_BYTES, required=True)
+            ):
+                await context.abort(CODE.INVALID_ARGUMENT, "missing or invalid audit parameters")
+
+        entry, now_ms = await self.store.inspect_stranded_formation(battle_id)
+        resp.now_ms = now_ms
+        if entry is None:
+            resp.verdict = 5  # NOT_FOUND
+            return resp
+        resp.formation.CopyFrom(self._fill_stranded_proto(entry))
+        if entry.has_terminal_row and entry.terminal_decision != OUTCOME_DECISION_UNKNOWN:
+            resp.verdict = 4  # RESOLVED
+            return resp
+        if entry.refusal:
+            resp.verdict = 2  # REFUSED
+            resp.refusal = entry.refusal
+            return resp
+        if mode == 1:  # SHOW
+            resp.verdict = 1  # ELIGIBLE
+            return resp
+        if entry.digest != request.expect_digest:
+            resp.verdict = 3  # CHANGED
+            return resp
+        audit_line = (
+            f"[FormationManual] mode={mode} target={self.config.manual_resolution_env} "
+            f"battle_id={battle_id} operator={request.operator_name} reason={request.reason}"
+        )
+        resp.audit_line = audit_line
+        if mode == 2:  # DRY_RUN
+            resp.verdict = 1
+            return resp
+        await self.store.commit_battle_abort(
+            battle_id,
+            COMPLETION_SOURCE_MANUAL_ABORT,
+            manual_audit={
+                "action": 3,
+                "formation_class": entry.formation_class,
+                "failed_check": entry.failed_check,
+                "operator_name": request.operator_name,
+                "reason": request.reason,
+                "formation_digest_before": entry.digest,
+                "formation_before": entry.formation.SerializeToString(deterministic=True),
+                "effective_deadline_ms": entry.effective_deadline_ms,
+                "replica_instance": replica,
+            },
+        )
+        logger.warning("%s", audit_line)
+        resp.verdict = 1  # ELIGIBLE (committed)
+        return resp
+
+    async def list_pending_battle_scripts(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.ListPendingBattleScriptsResponse")
+        if not self.config.ops_secret or not verify_internal_hmac(
+            path, request, "ops", self.config.ops_secret, int(self._clock_ms())
+        ):
+            resp.reject = 1  # DENIED
+        return resp
+
+    async def review_battle_script(self, request: Message, context, path: str) -> Message:
+        await self._reject_client_on_internal(context, path)
+        resp = self.protocol.message("match.ReviewBattleScriptResponse")
+        if not self.config.ops_secret or not verify_internal_hmac(
+            path, request, "ops", self.config.ops_secret, int(self._clock_ms())
+        ):
+            resp.reject = 1  # DENIED
+        return resp
+
+    # -- RoleFenceParticipant RPCs --------------------------------------------------------------------
+
+    async def prepare_role_freeze(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "coordinator", self.config.coordinator_secret)
+        try:
+            return await self.store.prepare_role_freeze(request.state, dry_run=bool(request.dry_run))
+        except InvalidRoleFenceStateError as exc:
+            await context.abort(CODE.INVALID_ARGUMENT, str(exc))
+        except Exception:
+            logger.error("match PrepareRoleFreeze failed player_id=%d", int(request.state.player_id), exc_info=True)
+            return self.protocol.message("rolefence.PrepareRoleFreezeResponse", retry=True)
+
+    async def apply_role_fence(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "coordinator", self.config.coordinator_secret)
+        try:
+            return await self.store.apply_role_fence(request.state)
+        except InvalidRoleFenceStateError as exc:
+            await context.abort(CODE.INVALID_ARGUMENT, str(exc))
+        except Exception:
+            logger.error("match ApplyRoleFence failed player_id=%d", int(request.state.player_id), exc_info=True)
+            return self.protocol.message("rolefence.ApplyRoleFenceResponse", retry=True)
+
+    async def purge_removed_role(self, request: Message, context, path: str) -> Message:
+        await self._admit_internal(context, request, path, "coordinator", self.config.coordinator_secret)
+        try:
+            return await self.store.purge_removed_role(request.state)
+        except InvalidRoleFenceStateError as exc:
+            await context.abort(CODE.INVALID_ARGUMENT, str(exc))
+        except Exception:
+            logger.error("match PurgeRemovedRole failed player_id=%d", int(request.state.player_id), exc_info=True)
+            return self.protocol.message("rolefence.PurgeRemovedRoleResponse", retry=True)
+
+
+class MatchServer:
+    """将全部 5 组 gRPC 服务、撮合循环与发件箱装配为一个统一托管对象。"""
+
+    def __init__(
+        self,
+        *,
+        protocol: Protocol,
+        store: MatchStore,
+        config: MatchConfig,
+        match_service: MatchGrpcService,
+        team_service: TeamGrpcService,
+        gather: GatherPipeline,
+        matchmaker: Matchmaker,
+        outbox: OutcomeOutboxWorker,
+        spectate: SpectateManager,
+    ) -> None:
+        self.protocol = protocol
+        self.store = store
+        self.config = config
+        self.match_service = match_service
+        self.team_service = team_service
+        self.gather = gather
+        self.matchmaker = matchmaker
+        self.outbox = outbox
+        self.spectate = spectate
+
+    def services(self) -> dict[str, dict[str, Callable]]:
+        merged = dict(self.match_service.services())
+        merged.update(self.team_service.services())
+        return merged
+
+    async def close(self) -> None:
+        await self.match_service.close()
+        await self.team_service.close()

@@ -3,6 +3,9 @@ option go_package = "battle";
 
 import "proto/common/component/actor_comp.proto";
 import "proto/common/component/actor_attribute_state_comp.proto";
+import "proto/common/component/equipment_effects.proto";
+import "proto/common/component/support_effects.proto";
+import "proto/common/component/pet_cultivation_effects.proto";
 
 // 回合制战斗共享数据结构(快照/行动/事件/结算)。
 // 设计依据:docs/design/turn-based-battle-server.md §4。
@@ -21,7 +24,10 @@ message BattleRouting {
 
 // ---- 参战 buff(时间维度已换算为回合,见设计文档 §5.1 换算策略) ----
 message BattleBuffEntry {
-  uint64 buff_id = 1;        // buff 实例 SnowFlake id
+  // buff 实例 id,只在所属单位的 buff 列表里用来认出这一条,不跨重启:快照带来的沿用 scene 的进程内临时号
+  // (tlsIdGeneratorManager.buffIdGenerator,[node_id][seq] 拼成),战斗内新加的由引擎在局内自增域里接着往上发
+  // (turn_battle_engine 的 nextBuffInstanceId)。不是 SnowFlake,也不是发号器的永久 ID,不要解析。
+  uint64 buff_id = 1;
   uint32 buff_table_id = 2;  // BuffTable 表 id
   uint32 layer = 3;          // 叠层数
   uint32 remain_rounds = 4;  // 剩余回合(0 = 无限持续)
@@ -32,6 +38,19 @@ message BattleBuffEntry {
   double stat_percent = 6;
   // 施加(或刷新)它的回合号。回合末结算时不扣它这一回合,所以"持续 2 回合"是完整的 2 回合;0 = 老口径(当回合末就扣)。
   uint32 applied_round = 7;
+  uint32 source_skill_id = 8;
+  uint64 snapshot_value = 9; // 施加时的效果快照，催毒仍使用原来源强度。
+  uint64 remaining_capacity = 10;
+  uint32 remaining_hits = 11;
+  uint32 remaining_ticks = 12;
+  uint32 extensions_used = 13;
+  uint32 last_trigger_round = 14;
+  uint32 trigger_count = 15;
+  uint32 tick_round = 16;
+  uint32 stacks = 17;
+  uint32 chosen_stat = 18;
+  uint64 secondary_value = 19;
+  optional double outgoing_heal_snapshot = 20; // 持续恢复施放时快照完整施放方修正，每跳只读受方修正。
 }
 
 // ---- 战斗内道具副本 ----
@@ -70,6 +89,8 @@ message BattlePlayerSnapshot {
   // scene 按职业 / 角色等级夹好再填,引擎再按同一规则复核一次。旧通用技能不进这里。
   // 被动的属性加成 scene 已算进上面的派生属性,引擎只消费战斗专用被动(治疗加成),不重复叠加。
   map<uint32, uint32> skill_ranks = 21;
+  uint32 pet_capture_slots = 22; // scene 核定的本局可捕捉数量；旧快照缺省为0。
+  EquipmentEffects equipment_effects = 23; // 仅人物装备，宝宝不继承。
 }
 
 // ---- 宝宝战斗快照:与主人同队、独立行动的战斗单位(设计文档 player-pet.md §5)----
@@ -91,6 +112,12 @@ message BattlePetSnapshot {
   uint64 magic_attack = 10;
   uint64 defense = 11;
   repeated uint32 skill_table_ids = 12;
+  map<uint32, uint32> skill_ranks = 13; // 公共原型的已学等级，开局再次校验宝宝资格。
+  PetCultivationEffects pet_cultivation = 14;
+  // true = 论剑排位竞技临时宝宝(pet_id 恒为 0),仅在校验通过的排位规则下生成局内单位,不写回场外宠物。
+  bool competitive_temporary = 15;
+  // 排位竞技战斗物种(Pet.id);展示外观仍看 pet_table_id(有出战宝宝时沿用其外观,零宠时与本字段相同)。
+  uint32 combat_pet_table_id = 16;
 }
 
 // ---- 战斗单位运行时状态(玩家与怪物统一;引擎状态用 proto 承载,宪法 §3) ----
@@ -133,6 +160,30 @@ message BattleActorState {
   CombatAttributes combat = 27;
   // 本局职业技能生效等级(来自快照 skill_ranks,引擎复核后的值;怪物 / 宝宝为空)。
   map<uint32, uint32> skill_ranks = 28;
+  uint32 capture_pet_table_id = 29; // 仅可捕捉的普通野怪填写，0表示不可捕捉。
+  uint64 captured_by_player_id = 30; // 成功捕捉者；不计为击杀，不产生怪物掉落。
+  uint32 capture_min_level = 31;
+  map<uint32, uint32> ability_use_counts = 32; // 本场限次；技能表定义上限。
+  repeated uint32 runtime_skills = 33; // 非主动技能也保留，供被动、追击、开场查询。
+  uint32 withdraw_until_round = 34; // 劝退返回边界；与阵亡分开。
+  map<uint32, uint64> round_effect_usage = 35; // 来源技能的全体目标共享回合预算，下一回合清零。
+  EquipmentEffects equipment_effects = 36;
+  repeated BattleArtifactState artifact_states = 37;
+  uint64 entry_max_health = 38; // 入战上限，临时上限变化不放大法宝预算。
+  uint64 entry_max_mana = 39;
+  PetCultivationEffects pet_cultivation = 41; // 宝宝独立条目贡献，开局快照冻结。
+  SupportEffectSummary support_effects = 40; // 仅本人可见；来源及中立预览由本轮真实状态生成。
+  bool competitive_temporary = 42; // true = 论剑排位临时竞技单位,结算不产出永久宠物回写项。
+}
+
+// 法宝按物品实例记录次数；死亡不刷新已用次数，仅清除待用补偿。
+message BattleArtifactState {
+  uint64 item_id = 1;
+  uint32 used_count = 2;
+  uint32 last_trigger_round = 3;
+  uint32 round_trigger_count = 4;
+  uint32 pending_ailment_kind = 5;
+  uint32 pending_round = 6;
 }
 
 // ---- 玩家行动指令 ----
@@ -143,6 +194,8 @@ enum eBattleActionType {
   BATTLE_ACTION_DEFEND = 3;  // 防御:本回合受伤减半
   BATTLE_ACTION_ITEM = 4;    // 使用战斗道具(从快照副本扣,结算回写)
   BATTLE_ACTION_FLEE = 5;    // 逃跑(PVE 可用;成功率基于速度差)
+  BATTLE_ACTION_CAPTURE = 6; // 捕捉消耗本回合行动，由服务端判定。
+  BATTLE_ACTION_RECALL_PET = 7; // 主人消耗正常行动，召回已过劝退等待期的本人宝宝。
 }
 
 message BattleAction {
@@ -170,6 +223,12 @@ enum eBattleEventType {
   BATTLE_EVENT_BLOCK = 13;     // 格挡(预留,一期不产出)
   BATTLE_EVENT_MANA = 14;      // 法力变化:value=变化绝对值,is_negative 由 target_health_after 之外的 mana_after 表达
   BATTLE_EVENT_RESIST = 15;    // 异常状态被抵抗:source=施加者,target=抵抗者,buff_table_id=被抵抗的 buff;老客户端忽略
+  BATTLE_EVENT_CAPTURE = 16; // success为成功结果；成功后目标离场，结算发放宠物。
+  BATTLE_EVENT_REVIVE = 17;
+  BATTLE_EVENT_MAX_HEALTH = 18;
+  BATTLE_EVENT_PET_RETREAT = 19;
+  BATTLE_EVENT_SHIELD = 20;
+  BATTLE_EVENT_ARTIFACT = 21; // 法宝产生实际收益或消耗概率判定次数。
 }
 
 // 一段伤害 / 出手是怎么来的(equipment-attributes.md §4.5)。0 = 普通,老客户端不读也不影响演出。
@@ -178,6 +237,8 @@ enum eBattleHitKind {
   BATTLE_HIT_COMBO = 1;    // 连击追加段(与首段同 group_id,hit_index 递增)
   BATTLE_HIT_COUNTER = 2;  // 反击(受击者还手的 ATTACK / DAMAGE)
   BATTLE_HIT_REFLECT = 3;  // 反震(DAMAGE:source=受击者,target=出手者)
+  BATTLE_HIT_PURSUIT = 4;
+  BATTLE_HIT_MIRROR = 5;
 }
 
 message BattleEventItem {
@@ -199,6 +260,14 @@ message BattleEventItem {
   // 只在法力真的被结算过的事件上带(MANA / ITEM);value 仍是绝对值,老客户端不读本字段照旧。
   // target_mana_after 才是权威终值,客户端演出与它不一致时以它为准。
   optional sint64 mana_delta = 15;
+  uint64 buff_instance_id = 16;
+  uint64 absorbed = 17;
+  uint64 shield_after = 18;
+  uint64 target_max_health_after = 19;
+  uint32 damage_origin = 20; // 直接、持续、反弹、转伤等来源由公共战斗规则定义。
+  uint64 instigator_id = 21; // 催动者与原持续效果施加者分别保留。
+  uint64 artifact_item_id = 22;
+  uint32 artifact_effect_id = 23;
 }
 
 // ---- 胜负 ----
@@ -207,7 +276,10 @@ enum eBattleOutcome {
   BATTLE_OUTCOME_SIDE_A_WIN = 1; // team_index 0 胜
   BATTLE_OUTCOME_SIDE_B_WIN = 2;
   BATTLE_OUTCOME_DRAW = 3;       // 回合打满等平局情形(PVE 中进攻方判负走 SIDE_B_WIN)
-  BATTLE_OUTCOME_VOID = 4;       // Match 作废结算，不能携带任何战斗效果
+  // 作废:Match 为这一局写了唯一的 ABORT(执行进程失效、截止作废、帮会取消、人工处置等),全员没有任何效果。
+  // 只由 Match 在 ABORT 事务里写进「作废结算」,battle 引擎永远不产出;客户端收到后退出战斗、提示本局作废
+  // (docs/design/battle-instance-loss-early-abort.md §5、§6)。
+  BATTLE_OUTCOME_VOID = 4;
 }
 
 // ---- 单个玩家的结算数据(battle -> scene,scene 是唯一应用者) ----
@@ -269,6 +341,14 @@ message BattleSettlementData {
   // scene 写进本人近期战斗结果,供列表展示与按 battle_id 查回放;不参与任何结算判定。0 = 来源没盖。
   uint32 match_mode = 18;
   uint32 battle_config_id = 19;
+  repeated uint32 captured_pet_table_ids = 20; // 本人捕捉的宠物种类，随整笔结算原子落库和去重。
+  // true = 校验通过的论剑排位竞技局:scene 严禁写回血蓝、复活、宠物、经验、货币、道具消耗、掉落或捕捉,
+  // 仅放行装备材料日额度与战绩历史(docs/design/ranked-play-season-ui-candidate.md §6/§9)。
+  bool competitive_ranked = 21;
+  uint32 season_id = 22;           // 冻结的赛季编号(非排位为 0)
+  uint32 ranked_rule_version = 23; // 冻结的排位规则版本(非排位为 0)
+  // 本人是否达成排位有效参与(由 battle 房间在终局前按统一参与事实冻结,非排位恒为 false)。
+  bool participated = 24;
 }
 
 // ---- 出战宝宝的结算数据(随主人的 BattleSettlementData 一起回 scene)----
@@ -291,7 +371,7 @@ enum eBattleActivityKind {
 
 message BattleActivityContext {
   eBattleActivityKind kind = 1;     // 非 NONE 才是活动对局;match 拒绝 NONE(INVALID_ARGUMENT)
-  uint64 guild_id = 2;              // 发起帮会(SnowFlake 17-bit 布局);guild 写、guild 读
+  uint64 guild_id = 2;              // 发起帮会(发号器永久 ID,biz_tag=guild,只当身份用);guild 写、guild 读
   uint32 activity_id = 3;           // GuildActivity 表 id;guild 写、guild 读
   uint32 period_key = 4;            // 确认开战时的游戏日键 YYYYMMDD(gameday.DayKey,UTC+8 05:00 换日),用于个人每日次数
   uint64 initiator_player_id = 5;   // 发起人;match 校验它等于 StartActivityBattleRequest.member_player_ids[0]
@@ -314,4 +394,35 @@ enum eSpectateTier {
   SPECTATE_TIER_DIRECT = 0;     // L0:观众凭票直连 battle(直连席未满)
   SPECTATE_TIER_RELAY = 1;      // L1:直连席已满,battle 每回合给每台挂了观众的 gate 各发一条中继帧
   SPECTATE_TIER_BROADCAST = 2;  // L2:全服广播,battle 每回合只往广播 topic 发一条,所有 gate 都读
+}
+
+// ---- 论剑排位上下文(docs/design/ranked-play-season-ui-candidate.md) ----
+// 由 match 在成局提交点冻结,依次透传至 PrepareBattle / CreateBattle / battle 房间 / BattleResultEvent。
+message RankedPresetSelection {
+  uint32 character_preset_id = 1; // RankedPreset.id(role_kind=1): 101 破阵 / 102 控场 / 103 守心
+  uint32 pet_preset_id = 2;       // RankedPreset.id(role_kind=2): 201 破甲 / 202 灵咒 / 203 护主
+}
+
+message RankedMemberLoadout {
+  uint64 player_id = 1;
+  RankedPresetSelection presets = 2;
+}
+
+message RankedMatchContext {
+  uint32 season_id = 1;               // 赛季编号(从 1 起递增)
+  string season_key = 2;              // 榜 period 键(如 "s1")
+  uint64 rank_generation = 3;         // 排行榜代次(与 season_id 同频递增)
+  uint32 rule_version = 4;            // RankedRule.rule_version
+  uint32 team_size = 5;               // 每侧玩家人数(1..5)
+  string config_fingerprint = 6;      // 竞技规则与预设依赖表指纹
+  repeated RankedMemberLoadout members = 7; // 本局全员冻结预设(PrepareBattle 可只含本人,CreateBattle 含全员)
+}
+
+// 玩家本局有效参与事实(battle 房间在终局前冻结进 BattleResultEvent,重放不重算)。
+message BattleParticipationFact {
+  uint64 player_id = 1;
+  bool entered_room = 2;               // 至少完成一次参战直连握手或 GetBattleState
+  bool manual_action_accepted = 3;     // 服务端至少接受过一次本人人物或宝宝有效手动指令
+  bool explicit_auto_enabled = 4;      // 进房后玩家显式开启过合法自动战斗
+  bool no_action_opportunity = 5;      // 进房后在首次可操作机会前即阵亡/被全控/对局结束
 }

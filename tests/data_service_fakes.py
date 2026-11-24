@@ -178,6 +178,44 @@ class MemoryStore:
         payloads = getattr(self, "store_rows", {})
         return True, payloads.get((player_id, kind), b"")
 
+    async def read_store_row_with_release(self, player_id, kind):
+        self._check("read_store_row_with_release")
+        if player_id not in self.roles:
+            return False, False, b""
+        payloads = getattr(self, "store_rows", {})
+        released = getattr(self, "store_released", {}).get(player_id, True)
+        return True, released, payloads.get((player_id, kind), b"")
+
+    async def player_displays(self, player_ids):
+        self._check("player_displays")
+        result = {}
+        for pid in player_ids:
+            row = self.roles.get(pid)
+            if row is None or not row["account"]:
+                continue
+            role = self.role_type.FromString(row["role"])
+            result[pid] = {
+                "name": role.name,
+                "level": 0,
+                "class_id": int(role.class_id),
+                "gender": int(role.gender),
+                "appearance_id": role.appearance_id,
+            }
+        return result
+
+    async def player_channel_identity(self, player_id):
+        self._check("player_channel_identity")
+        row = self.roles.get(player_id)
+        if row is None or not row["account"]:
+            return None
+        return {
+            "account": row["account"],
+            "channel": "",
+            "open_id": "",
+            "account_created_ms": 1,
+            "player_level": 0,
+        }
+
     # -- names ---------------------------------------------------------------------------------------
     async def reserve_name(self, player_id, name, norm, now_ms):
         self._check("reserve_name")

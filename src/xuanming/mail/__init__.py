@@ -1,0 +1,78 @@
+"""mail 邮件域微服务包（客户端查询/领奖、内部发件、活动冻结名单、资产重投循环与角色护栏）。"""
+
+from .asset_loop import (
+    AssetCallResult,
+    AssetDeliveryLoop,
+    AssetOpCaller,
+    GrpcDataServiceLedgerReader,
+    LoopAction,
+    RedisEtcdSceneResolver,
+    SceneTarget,
+    sign_asset_op,
+)
+from .config import MailConfig
+from .model import (
+    ASSET_STREAM_SYSTEM_CREDIT,
+    CLAIM_CLAIMED,
+    CLAIM_MANUAL,
+    CLAIM_NONE,
+    CLAIM_PENDING,
+    CLAIM_UNCLAIMED,
+    DATABASE_NAME,
+    MAIL_KIND_GUILD,
+    MAIL_KIND_PERSONAL,
+    MAIL_KIND_SYSTEM,
+    MAIL_NODE_TYPE,
+    MailLimits,
+    RoleOriginal,
+    TX_MAIL_ATTACHMENT,
+    manifest_hash,
+    shard_hash,
+)
+from .service import MailService
+from .sql_store import SqlMailStore, open_pool
+from .store import (
+    GrpcGuildDirectory,
+    GrpcRoleFenceDirectory,
+    IdSegmentAllocator,
+    MailStoreCore,
+    MemoryMailStore,
+    NullGuildDirectory,
+)
+
+__all__ = [
+    "ASSET_STREAM_SYSTEM_CREDIT",
+    "AssetCallResult",
+    "AssetDeliveryLoop",
+    "AssetOpCaller",
+    "CLAIM_CLAIMED",
+    "CLAIM_MANUAL",
+    "CLAIM_NONE",
+    "CLAIM_PENDING",
+    "CLAIM_UNCLAIMED",
+    "DATABASE_NAME",
+    "GrpcDataServiceLedgerReader",
+    "GrpcGuildDirectory",
+    "GrpcRoleFenceDirectory",
+    "IdSegmentAllocator",
+    "LoopAction",
+    "MAIL_KIND_GUILD",
+    "MAIL_KIND_PERSONAL",
+    "MAIL_KIND_SYSTEM",
+    "MAIL_NODE_TYPE",
+    "MailConfig",
+    "MailLimits",
+    "MailService",
+    "MailStoreCore",
+    "MemoryMailStore",
+    "NullGuildDirectory",
+    "RedisEtcdSceneResolver",
+    "RoleOriginal",
+    "SceneTarget",
+    "SqlMailStore",
+    "TX_MAIL_ATTACHMENT",
+    "manifest_hash",
+    "open_pool",
+    "shard_hash",
+    "sign_asset_op",
+]

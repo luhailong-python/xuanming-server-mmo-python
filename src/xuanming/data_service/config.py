@@ -17,6 +17,7 @@ SECRET_ENVS = {
     "mail": "MMORPG_ROLE_FENCE_SECRET_MAIL",
     "guild": "MMORPG_ROLE_FENCE_SECRET_GUILD",
     "friend": "MMORPG_ROLE_FENCE_SECRET_FRIEND",
+    "chat": "MMORPG_ROLE_FENCE_SECRET_CHAT",
 }
 REQUIRED_CALLERS = ("login", "scene")  # Go also requires scene_manager and trade; see docs in the package README
 

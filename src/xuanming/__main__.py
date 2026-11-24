@@ -61,6 +61,18 @@ def main() -> None:
     locator_cmd.add_argument("--config", type=Path, required=True)
     inbox_cmd = commands.add_parser("player-inbox", help="启动 player_inbox（玩家可靠收件箱服务）")
     inbox_cmd.add_argument("--config", type=Path, required=True)
+    sm_cmd = commands.add_parser("scene-manager", help="启动 scene_manager（场景生命周期与路由调度服务）")
+    sm_cmd.add_argument("--config", type=Path, required=True)
+    match_cmd = commands.add_parser("match", help="启动 match（组队、匹配、战斗房间分配与结算协调服务）")
+    match_cmd.add_argument("--config", type=Path, required=True)
+    cg_cmd = commands.add_parser("content-guard", help="启动 content_guard（文本敏感词与广告审核服务）")
+    cg_cmd.add_argument("--config", type=Path, required=True)
+    chat_cmd = commands.add_parser("chat", help="启动 chat（世界与私聊权威服务）")
+    chat_cmd.add_argument("--config", type=Path, required=True)
+    mail_cmd = commands.add_parser("mail", help="启动 mail（邮件与附件发放服务）")
+    mail_cmd.add_argument("--config", type=Path, required=True)
+    rank_cmd = commands.add_parser("rank", help="启动 rank（排行榜与结算发奖服务）")
+    rank_cmd.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -105,6 +117,30 @@ def main() -> None:
             from .player_inbox.node import run as run_inbox
 
             asyncio.run(run_inbox(Settings.load(args.config)))
+        elif args.command == "scene-manager":
+            from .scene_manager.node import run as run_scene_manager
+
+            asyncio.run(run_scene_manager(Settings.load(args.config)))
+        elif args.command == "match":
+            from .match.node import run as run_match
+
+            asyncio.run(run_match(Settings.load(args.config)))
+        elif args.command == "content-guard":
+            from .content_guard.node import run as run_content_guard
+
+            asyncio.run(run_content_guard(Settings.load(args.config)))
+        elif args.command == "chat":
+            from .chat.node import run as run_chat
+
+            asyncio.run(run_chat(Settings.load(args.config)))
+        elif args.command == "mail":
+            from .mail.node import run as run_mail
+
+            asyncio.run(run_mail(Settings.load(args.config)))
+        elif args.command == "rank":
+            from .rank.node import run as run_rank
+
+            asyncio.run(run_rank(Settings.load(args.config)))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

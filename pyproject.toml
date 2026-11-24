@@ -18,7 +18,7 @@ dev = ["pytest>=8,<10", "grpcio-tools>=1.75,<2", "aiohttp>=3.11,<4", "aiomysql>=
 xuanming-server = "xuanming.__main__:main"
 
 [tool.setuptools.package-data]
-xuanming = ["contracts/*", "mall_admin/*"]
+xuanming = ["contracts/*", "mall_admin/*", "content_guard/t2s.txt"]
 "xuanming.data" = [
   "_table_descriptors.pb", "tables/*.json", "tables/*.pb", "nav/*.bin",
   "nav/current_maps/village/yuexi-bay-20261115/scene.bin",

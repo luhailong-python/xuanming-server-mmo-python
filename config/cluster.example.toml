@@ -111,3 +111,61 @@ mysql_port = 3306
 mysql_user = "appuser"
 mysql_database = "mmorpg_player_inbox"
 enqueue_types = ["PLAYER_INBOX_MSG_BATTLE_SETTLEMENT"]
+
+[scene_manager_node]
+node_id = 110
+host = "0.0.0.0"
+grpc_port = 60000
+advertise_host = "scene-manager"
+etcd_lease_ttl_sec = 60
+
+[match_node]
+node_id = 115
+host = "0.0.0.0"
+grpc_port = 50500
+advertise_host = "match"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_match"
+
+[content_guard_node]
+node_id = 111
+host = "0.0.0.0"
+grpc_port = 50250
+advertise_host = "content-guard"
+lease_ttl_sec = 60
+require_lexicon = false
+
+[chat_node]
+node_id = 112
+host = "0.0.0.0"
+grpc_port = 50700
+advertise_host = "chat"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_chat"
+content_guard = "content-guard:50250"
+content_guard_optional = true
+
+[mail_node]
+node_id = 113
+host = "0.0.0.0"
+grpc_port = 50900
+advertise_host = "mail"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_mail"
+
+[rank_node]
+node_id = 114
+host = "0.0.0.0"
+grpc_port = 51100
+advertise_host = "rank"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_rank"
+mail_rpc = "mail:50900"
