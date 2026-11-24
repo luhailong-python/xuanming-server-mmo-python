@@ -40,6 +40,7 @@ from .nodes.scene_merchant import SceneMerchant, redis_key
 from .nodes.scene_mission import Missions
 from .nodes.scene_pets import ScenePets
 from .nodes.scene_planned_drain import budget_from_env, planned_drain
+from .nodes.scene_rename import SceneRename
 from .nodes.scene_season import SceneSeason
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_stats import initialize_base
@@ -518,7 +519,7 @@ class Runtime:
         info = self._info("scene", SCENE)
         switch = self._configure_kill_switch(info)
         tables = self._config_tables()
-        audit = anomaly = allocate_tx_id = None
+        audit = anomaly = allocate_tx_id = data_service = None
         if self.local:
             self.settings.database.parent.mkdir(parents=True, exist_ok=True)
             path = self.settings.local_player_store or self.settings.database.with_name("players.json")
@@ -625,6 +626,28 @@ class Runtime:
         scene.trial_journal.register()
         scene.equip_craft = SceneEquipCraft(scene, tables, scene.assets)
         scene.equip_craft.register()
+        scene_cg_call = None
+        if not self.local:
+            cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()
+            if not cg_endpoint and isinstance(self.settings.content_guard_node, dict):
+                cg_host = self.settings.content_guard_node.get("advertise_host") or self.settings.content_guard_node.get("host")
+                cg_port = self.settings.content_guard_node.get("grpc_port")
+                if cg_host and cg_port:
+                    cg_endpoint = f"{cg_host}:{cg_port}"
+            if cg_endpoint:
+                cg_client = GrpcClient(cg_endpoint, timeout=3)
+                self._stack.push_async_callback(cg_client.close)
+                scene_cg_call = cg_client.call
+        scene.rename = SceneRename(
+            scene,
+            tables,
+            scene.assets,
+            data_service_call=None if data_service is None else data_service.call,
+            directory_secret=account_secret,
+            content_guard_call=scene_cg_call,
+        )
+        scene.rename.register()
+        self._stack.push_async_callback(scene.rename.close)
         scene.gm_commands = SceneGmCommands(scene)
         methods.update(scene.gm_commands.grpc_methods())
         Activities(missions).register()

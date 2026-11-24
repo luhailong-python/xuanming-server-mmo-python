@@ -14,7 +14,7 @@ option go_package = "common/rollback";
 //   each via the same module entry point that originally produced them.
 //
 //   Anti-dup invariant: every replayable op MUST carry a unique tx_id
-//   (SnowFlake). PostCrashReplay tracks "applied tx_ids" per player so
+//   (发号器 txlog 号段的号,见 TransactionLogEntry.tx_id). PostCrashReplay tracks "applied tx_ids" per player so
 //   replaying the log twice produces the same end state — see
 //   single_player_rollback.md §"Anti-Duplication" for the broader pattern.
 enum TransactionType
@@ -89,16 +89,59 @@ enum TransactionType
   TX_EQUIP_INLAY = 28;       // 宝石镶嵌:销毁 1 颗宝石物品。correlation_id = 装备 item guid
   TX_EQUIP_GEM_REMOVE = 29;  // 取下宝石:发回 1 颗宝石物品。correlation_id = 装备 item guid
 
-  // 返回玩家本人托管的资产，不计作新增获得。
+  // ── 聚宝斋退回(数据覆写审计 r2-trade#1)──────────────────────────────────
+  //
+  // 交易把玩家自己托管的资产还给他:撤单、过期、整单退款、竞价退回,以及它们的人工补发。
+  // 资产本来就是这名玩家的,不算新增获得,不受获取封禁约束(C++ GainBlockService::CountsAsGain);
+  // 成交所得(交付腿)仍用 TX_AUCTION_BUY,照常判封禁。correlation_id 同其他交易腿。
   TX_AUCTION_RETURN = 30;
+
+  // ── 真钱付款被渠道撤销后的扣回(docs/design/payment-recharge.md §22.6)──────────
+  //
+  // 官方订单的付款被渠道撤销(用户在 App Store / Google Play 退款、渠道作废)之后,交易服务把这张订单发放的物品或货币
+  // 从买家身上扣回(TRADE_DEBIT 流,腿名 official_reverse_<修订号>)。扣不到(已经用掉)由合同转人工,不透支。
+  // correlation_id 同其他交易腿。只追加,不复用旧编号。
   TX_PAYMENT_REVERSAL = 31;
+
+  // ── 挂机月卡开通(docs/design/afk-monthly-card.md §4.1)──────────────────────
+  //
+  // 玩家花灵石开通 / 续费挂机月卡的扣钱流水(scene 内同步扣,不走资产通道)。correlation_id = 那次请求的
+  // 客户端幂等键 client_request_id,同一个键至多出现一条。月卡到期时刻不在流水里,在存档 PlayerUint64Comp。只追加,不复用旧编号。
+  TX_AFK_PASS_BUY = 32;
+
+  // ── 角色改名(docs/design/rename-and-content-safety.md §4.3)────────────────
+  //
+  // 改名成功时销毁改名卡的流水。correlation_id = 那次改名的流水号(PlayerProfileComp.rename_seq)。
+  // 改名不成时卡只是解除占用、没有离开过背包,不记流水。只追加,不复用旧编号。
+  TX_ROLE_RENAME = 33;
+
+  // ── 角色形象永久切换(docs/design/character-appearance-switch.md)────────────
+  //
+  // 消耗角色形象卡(Item 3402)永久切换角色形象的销毁流水。correlation_id = 客户端幂等键 client_request_id。
+  // 1 小时免费试用不消耗道具,不记流水。只追加,不复用旧编号。
+  TX_APPEARANCE_SWITCH = 34;
+
+  // ── 赛季印小额快捷追赶(docs/design/season-skills-and-seal-design.md)──────
+  //
+  // 玩家消耗灵石补齐本季单槽赛季印进度（与免费同封顶上限）的扣款流水。correlation_id = 客户端幂等键 client_request_id。
+  // 只追加,不复用旧编号。
+  TX_SEASON_SEAL_CATCHUP = 35;
+
+  // ── 五行试炼志里程碑领取与拓印兑换(docs/design/long-term-progression-v2.md)───
+  //
+  // 一次性试炼志里程碑发放仅自用重铸砂/仅自用法宝拓印，以及消耗拓印定向兑换仅自用法宝的流水。
+  // correlation_id = 客户端幂等键 client_request_id。只追加,不复用旧编号。
+  TX_TRIAL_JOURNAL_MILESTONE = 36;
+  TX_TRIAL_ARTIFACT_REDEEM = 37;
 }
 
 // A single transaction log entry.  Written to Kafka → Go DB → MySQL.
 // This is the foundation for: rollback diff, precision clawback, audit.
 message TransactionLogEntry
 {
-  uint64 tx_id = 1;              // Unique ID (SnowFlake)
+  // 全服唯一:C++ 从发号器 txlog 号段领的号(GuidKind::kTxLog,经 MixGuid 打散)。不单调、没有位布局,
+  // 不能用 ParseSnowflakeGuid 解析,先后看 timestamp。
+  uint64 tx_id = 1;
   uint64 timestamp = 2;          // Unix seconds
   TransactionType tx_type = 3;
 
@@ -107,7 +150,7 @@ message TransactionLogEntry
   uint64 to_player = 5;          // Destination player (0 = system/NPC)
 
   // Item details (omit if currency-only)
-  uint64 item_uuid = 6;          // Item instance UUID (SnowFlake Guid)
+  uint64 item_uuid = 6;          // 物品实例 guid,与 ItemComp.item_id 同源(发号器 item 号段),只当身份用,不能解析
   uint32 item_config_id = 7;     // Item template/config ID
   uint32 item_quantity = 8;      // Stack count
 
@@ -120,7 +163,9 @@ message TransactionLogEntry
   uint64 balance_after = 12;
 
   // Correlation: links related operations (e.g. both sides of a trade)
-  uint64 correlation_id = 13;    // Shared SnowFlake ID across paired entries
+  // 成对 / 同一次业务操作的几条流水共用的号,取产生它们的那次操作的 id:资产指令 = 指令里的 correlation_id
+  // (帮会即 op_id),战斗结算 = battle_id,神秘商人 = round_id 等。按各自来源解释,不是 SnowFlake,不能解析;0 = 无关联。
+  uint64 correlation_id = 13;
 
   // Free-form metadata (JSON)
   string extra = 14;

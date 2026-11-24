@@ -14,6 +14,20 @@ MAX_ITEM_COUNT = (1 << 32) - 1
 MAX_CURRENCY_AMOUNT = (1 << 63) - 1
 ASSET_BLOCKED = 27005
 BAG_SPACE_DEFERRED = 6006  # Native kBagItemNotStacked executor defer reason.
+_PVE_MODES = frozenset({1, 2})
+_PVP_MODES = frozenset({3, 4, 5})
+
+
+def _has_trial_facts(settlement) -> bool:
+    if not hasattr(settlement, "trial_facts"):
+        return False
+    descriptor = getattr(settlement, "DESCRIPTOR", None)
+    if descriptor is not None and "trial_facts" in descriptor.fields_by_name:
+        return bool(settlement.HasField("trial_facts"))
+    has_field = getattr(settlement, "HasField", None)
+    if callable(has_field):
+        return bool(has_field("trial_facts"))
+    return settlement.trial_facts is not None
 
 
 class BattleSettlement:
@@ -128,8 +142,80 @@ class BattleSettlement:
             gains = []
             await self.missions.battle_defeats(data, settlement.defeated_monsters, stamp, gains=gains)
             self._audit(player, checkpoint, data, 7, audits, gains=gains)
+        self._apply_progression_hooks(player, data, settlement, stamp)
         self._record(data.battle_results, settlement, currencies, gained, consumed, stamp, items_mailed=items_mailed)
         return True
+
+    def _apply_progression_hooks(self, player, data, settlement, stamp: int) -> None:
+        """在战斗终局落盘前，安全推进赛季印、试炼志与装备每日材料自选额度。"""
+        if (
+            settlement.fled
+            or settlement.total_rounds <= 0
+            or settlement.player_team_index > 1
+            or settlement.outcome not in (1, 2, 3)
+        ):
+            return
+        player_won = (
+            (settlement.outcome == 1 and settlement.player_team_index == 0)
+            or (settlement.outcome == 2 and settlement.player_team_index == 1)
+        )
+
+        season = getattr(self.scene, "season", None)
+        if season is not None:
+            try:
+                season.record_battle_progress(
+                    data,
+                    match_mode=settlement.match_mode,
+                    player_won=player_won,
+                    fled=bool(settlement.fled),
+                    total_rounds=settlement.total_rounds,
+                    now_ms_val=stamp,
+                )
+            except Exception:
+                logger.warning(
+                    "Battle settlement season progress hook failed player_id=%s battle_id=%s",
+                    player.player_id, settlement.battle_id, exc_info=True,
+                )
+
+        trial_journal = getattr(self.scene, "trial_journal", None)
+        if trial_journal is not None:
+            try:
+                if _has_trial_facts(settlement):
+                    trial_journal.record_trial_progress(data, settlement=settlement)
+                elif settlement.battle_config_id:
+                    trial_journal.record_trial_progress(
+                        data,
+                        settlement.battle_config_id,
+                        won=player_won,
+                        participated=bool(getattr(settlement, "participated", False)),
+                        total_rounds=settlement.total_rounds,
+                        self_or_pet_ever_died=bool(settlement.is_dead),
+                        achieved_at_ms=settlement.finished_at_ms or stamp,
+                    )
+            except Exception:
+                logger.warning(
+                    "Battle settlement trial journal hook failed player_id=%s battle_id=%s",
+                    player.player_id, settlement.battle_id, exc_info=True,
+                )
+
+        equip_craft = getattr(self.scene, "equip_craft", None)
+        material_eligible = (
+            (settlement.match_mode in _PVE_MODES and player_won)
+            or settlement.match_mode in _PVP_MODES
+        )
+        if equip_craft is not None and material_eligible:
+            try:
+                equip_craft.credit_battle_material_reward(
+                    player.player_id,
+                    now_ms_val=stamp,
+                    eligible=True,
+                    data=data,
+                )
+            except Exception:
+                logger.warning(
+                    "Battle settlement material reward hook failed player_id=%s battle_id=%s",
+                    player.player_id, settlement.battle_id, exc_info=True,
+                )
 
     def _checkpoint(self, data, audits):
         if audits is not None and self.assets.audit_enabled:

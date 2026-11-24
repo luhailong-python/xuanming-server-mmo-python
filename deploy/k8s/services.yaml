@@ -1,0 +1,2216 @@
+# 玄冥纯 Python 全量 23 个业务服务 Kubernetes 清单（Deployment + ClusterIP Service）
+# 全部容器强制非 root（UID/GID 10001）、只读根文件系统、禁用提权、资源配额、健康探针及 SecretKeyRef 注入。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portal
+  namespace: xuanming
+  labels:
+    app: portal
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: portal
+  template:
+    metadata:
+      labels:
+        app: portal
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: portal
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["portal", "--config", "/app/config/portal.example.toml"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: mgmt
+              containerPort: 8082
+          env:
+            - name: XUANMING_PORTAL_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: portal-mysql-password
+            - name: XUANMING_PORTAL_CDN_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: portal-cdn-signing-secret
+            - name: XUANMING_PORTAL_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: portal-admin-api-key
+            - name: COMMERCE_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: commerce-admin-secret
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portal
+  namespace: xuanming
+  labels:
+    app: portal
+spec:
+  type: ClusterIP
+  selector:
+    app: portal
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: mgmt
+      port: 8082
+      targetPort: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-service
+  namespace: xuanming
+  labels:
+    app: data-service
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: data-service
+  template:
+    metadata:
+      labels:
+        app: data-service
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: data-service
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["data-service", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 9000
+          env:
+            - name: DATA_SERVICE_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-login
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-scene
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-payment
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-service
+  namespace: xuanming
+  labels:
+    app: data-service
+spec:
+  type: ClusterIP
+  selector:
+    app: data-service
+  ports:
+    - name: grpc
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: xuanming
+  labels:
+    app: db
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: db
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["db", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 6000
+          env:
+            - name: DB_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_PLAYER_STORE_SECRET_SCENE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: player-store-secret-scene
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 6000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 6000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: xuanming
+  labels:
+    app: db
+spec:
+  type: ClusterIP
+  selector:
+    app: db
+  ports:
+    - name: grpc
+      port: 6000
+      targetPort: 6000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: player-locator
+  namespace: xuanming
+  labels:
+    app: player-locator
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: player-locator
+  template:
+    metadata:
+      labels:
+        app: player-locator
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: player-locator
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["player-locator", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50300
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50300
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50300
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: player-locator
+  namespace: xuanming
+  labels:
+    app: player-locator
+spec:
+  type: ClusterIP
+  selector:
+    app: player-locator
+  ports:
+    - name: grpc
+      port: 50300
+      targetPort: 50300
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: player-inbox
+  namespace: xuanming
+  labels:
+    app: player-inbox
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: player-inbox
+  template:
+    metadata:
+      labels:
+        app: player-inbox
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: player-inbox
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["player-inbox", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50950
+          env:
+            - name: PLAYER_INBOX_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_PLAYER_INBOX_SECRET_MATCH
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: player-inbox-secret-match
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50950
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50950
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: player-inbox
+  namespace: xuanming
+  labels:
+    app: player-inbox
+spec:
+  type: ClusterIP
+  selector:
+    app: player-inbox
+  ports:
+    - name: grpc
+      port: 50950
+      targetPort: 50950
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: router
+  namespace: xuanming
+  labels:
+    app: router
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: router
+  template:
+    metadata:
+      labels:
+        app: router
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: router
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["router", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50600
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50600
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50600
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: router
+  namespace: xuanming
+  labels:
+    app: router
+spec:
+  type: ClusterIP
+  selector:
+    app: router
+  ports:
+    - name: grpc
+      port: 50600
+      targetPort: 50600
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scene-manager
+  namespace: xuanming
+  labels:
+    app: scene-manager
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scene-manager
+  template:
+    metadata:
+      labels:
+        app: scene-manager
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: scene-manager
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["scene-manager", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 60000
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 60000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 60000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scene-manager
+  namespace: xuanming
+  labels:
+    app: scene-manager
+spec:
+  type: ClusterIP
+  selector:
+    app: scene-manager
+  ports:
+    - name: grpc
+      port: 60000
+      targetPort: 60000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match
+  namespace: xuanming
+  labels:
+    app: match
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: match
+  template:
+    metadata:
+      labels:
+        app: match
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: match
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["match", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50500
+          env:
+            - name: MATCH_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: MMORPG_MATCH_OUTCOME_SECRET_BATTLE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: match-outcome-secret-battle
+            - name: MMORPG_MATCH_OPS_CALLER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: match-ops-caller-secret
+            - name: MMORPG_PLAYER_INBOX_SECRET_MATCH
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: player-inbox-secret-match
+            - name: RANK_PRODUCER_SECRET_MATCH
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: rank-producer-secret-match
+            - name: MMORPG_ROLE_FENCE_SECRET_COORDINATOR
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: role-fence-secret-coordinator
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 150m
+              memory: 192Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50500
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50500
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: match
+  namespace: xuanming
+  labels:
+    app: match
+spec:
+  type: ClusterIP
+  selector:
+    app: match
+  ports:
+    - name: grpc
+      port: 50500
+      targetPort: 50500
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: content-guard
+  namespace: xuanming
+  labels:
+    app: content-guard
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: content-guard
+  template:
+    metadata:
+      labels:
+        app: content-guard
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: content-guard
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["content-guard", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50250
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50250
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50250
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: content-guard
+  namespace: xuanming
+  labels:
+    app: content-guard
+spec:
+  type: ClusterIP
+  selector:
+    app: content-guard
+  ports:
+    - name: grpc
+      port: 50250
+      targetPort: 50250
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat
+  namespace: xuanming
+  labels:
+    app: chat
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: chat
+  template:
+    metadata:
+      labels:
+        app: chat
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: chat
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["chat", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50700
+          env:
+            - name: CHAT_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50700
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50700
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat
+  namespace: xuanming
+  labels:
+    app: chat
+spec:
+  type: ClusterIP
+  selector:
+    app: chat
+  ports:
+    - name: grpc
+      port: 50700
+      targetPort: 50700
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail
+  namespace: xuanming
+  labels:
+    app: mail
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mail
+  template:
+    metadata:
+      labels:
+        app: mail
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: mail
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["mail", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50900
+          env:
+            - name: MAIL_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50900
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50900
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mail
+  namespace: xuanming
+  labels:
+    app: mail
+spec:
+  type: ClusterIP
+  selector:
+    app: mail
+  ports:
+    - name: grpc
+      port: 50900
+      targetPort: 50900
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rank
+  namespace: xuanming
+  labels:
+    app: rank
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rank
+  template:
+    metadata:
+      labels:
+        app: rank
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: rank
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["rank", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 51100
+          env:
+            - name: RANK_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: RANK_PRODUCER_SECRET_MATCH
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: rank-producer-secret-match
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 51100
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 51100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rank
+  namespace: xuanming
+  labels:
+    app: rank
+spec:
+  type: ClusterIP
+  selector:
+    app: rank
+  ports:
+    - name: grpc
+      port: 51100
+      targetPort: 51100
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: friend
+  namespace: xuanming
+  labels:
+    app: friend
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: friend
+  template:
+    metadata:
+      labels:
+        app: friend
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: friend
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["friend", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50400
+          env:
+            - name: FRIEND_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50400
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50400
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: friend
+  namespace: xuanming
+  labels:
+    app: friend
+spec:
+  type: ClusterIP
+  selector:
+    app: friend
+  ports:
+    - name: grpc
+      port: 50400
+      targetPort: 50400
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment
+  namespace: xuanming
+  labels:
+    app: payment
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payment
+  template:
+    metadata:
+      labels:
+        app: payment
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: payment
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["payment", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 51200
+            - name: notify
+              containerPort: 18130
+          env:
+            - name: PAYMENT_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: COMMERCE_PAYMENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: commerce-payment-secret
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-payment
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 51200
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 51200
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment
+  namespace: xuanming
+  labels:
+    app: payment
+spec:
+  type: ClusterIP
+  selector:
+    app: payment
+  ports:
+    - name: grpc
+      port: 51200
+      targetPort: 51200
+    - name: notify
+      port: 18130
+      targetPort: 18130
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trade
+  namespace: xuanming
+  labels:
+    app: trade
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trade
+  template:
+    metadata:
+      labels:
+        app: trade
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: trade
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["trade", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50800
+          env:
+            - name: TRADE_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50800
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50800
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trade
+  namespace: xuanming
+  labels:
+    app: trade
+spec:
+  type: ClusterIP
+  selector:
+    app: trade
+  ports:
+    - name: grpc
+      port: 50800
+      targetPort: 50800
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guild
+  namespace: xuanming
+  labels:
+    app: guild
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: guild
+  template:
+    metadata:
+      labels:
+        app: guild
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: guild
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["guild", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 50310
+          env:
+            - name: GUILD_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50310
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50310
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guild
+  namespace: xuanming
+  labels:
+    app: guild
+spec:
+  type: ClusterIP
+  selector:
+    app: guild
+  ports:
+    - name: grpc
+      port: 50310
+      targetPort: 50310
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mall-game
+  namespace: xuanming
+  labels:
+    app: mall-game
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mall-game
+  template:
+    metadata:
+      labels:
+        app: mall-game
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: mall-game
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["mall-game", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: http
+              containerPort: 18120
+          env:
+            - name: MALL_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: COMMERCE_PAYMENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: commerce-payment-secret
+            - name: COMMERCE_ADMIN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: commerce-admin-secret
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 18120
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 18120
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mall-game
+  namespace: xuanming
+  labels:
+    app: mall-game
+spec:
+  type: ClusterIP
+  selector:
+    app: mall-game
+  ports:
+    - name: http
+      port: 18120
+      targetPort: 18120
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gm-admin
+  namespace: xuanming
+  labels:
+    app: gm-admin
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gm-admin
+  template:
+    metadata:
+      labels:
+        app: gm-admin
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: gm-admin
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["gm-admin", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: http
+              containerPort: 8082
+          env:
+            - name: GM_ADMIN_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: GM_ADMIN_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: gm-admin-jwt-secret
+            - name: XUANMING_PORTAL_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: portal-admin-api-key
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8082
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gm-admin
+  namespace: xuanming
+  labels:
+    app: gm-admin
+spec:
+  type: ClusterIP
+  selector:
+    app: gm-admin
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-node
+  namespace: xuanming
+  labels:
+    app: config-node
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: config-node
+  template:
+    metadata:
+      labels:
+        app: config-node
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: config-node
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["config-node", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: http
+              containerPort: 8090
+          env:
+            - name: CONFIG_NODE_RELOAD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: config-node-reload-token
+                  optional: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8090
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-node
+  namespace: xuanming
+  labels:
+    app: config-node
+spec:
+  type: ClusterIP
+  selector:
+    app: config-node
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: login
+  namespace: xuanming
+  labels:
+    app: login
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: login
+  template:
+    metadata:
+      labels:
+        app: login
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: login
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "login", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: grpc
+              containerPort: 53000
+          env:
+            - name: LOGIN_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MMORPG_GATE_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: gate-token-secret
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-login
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            tcpSocket:
+              port: 53000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 53000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: login
+  namespace: xuanming
+  labels:
+    app: login
+spec:
+  type: ClusterIP
+  selector:
+    app: login
+  ports:
+    - name: grpc
+      port: 53000
+      targetPort: 53000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gate
+  namespace: xuanming
+  labels:
+    app: gate
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gate
+  template:
+    metadata:
+      labels:
+        app: gate
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: gate
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "gate", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: tcp
+              containerPort: 8610
+            - name: rpc
+              containerPort: 8615
+            - name: ws
+              containerPort: 8616
+          env:
+            - name: MMORPG_GATE_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: gate-token-secret
+            - name: MMORPG_INTERNAL_AUTH_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-signing-key
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8610
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 8610
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: state
+              mountPath: /var/lib/xuanming
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gate
+  namespace: xuanming
+  labels:
+    app: gate
+spec:
+  type: ClusterIP
+  selector:
+    app: gate
+  ports:
+    - name: tcp
+      port: 8610
+      targetPort: 8610
+    - name: rpc
+      port: 8615
+      targetPort: 8615
+    - name: ws
+      port: 8616
+      targetPort: 8616
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scene
+  namespace: xuanming
+  labels:
+    app: scene
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: scene
+  template:
+    metadata:
+      labels:
+        app: scene
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: scene
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "scene", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: tcp
+              containerPort: 8611
+            - name: grpc
+              containerPort: 8612
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: MMORPG_PLAYER_STORE_SECRET_SCENE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: player-store-secret-scene
+            - name: MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: account-directory-secret-scene
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8612
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 8612
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: state
+              mountPath: /var/lib/xuanming
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scene
+  namespace: xuanming
+  labels:
+    app: scene
+spec:
+  type: ClusterIP
+  selector:
+    app: scene
+  ports:
+    - name: tcp
+      port: 8611
+      targetPort: 8611
+    - name: grpc
+      port: 8612
+      targetPort: 8612
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: battle
+  namespace: xuanming
+  labels:
+    app: battle
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: battle
+  template:
+    metadata:
+      labels:
+        app: battle
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: battle
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args: ["run", "battle", "--config", "/app/config/cluster.example.toml"]
+          ports:
+            - name: tcp
+              containerPort: 8613
+            - name: grpc
+              containerPort: 8614
+            - name: ws
+              containerPort: 8617
+          env:
+            - name: MMORPG_INTERNAL_AUTH_PUBLIC_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: internal-auth-public-keys
+            - name: MMORPG_MATCH_OUTCOME_SECRET_BATTLE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: match-outcome-secret-battle
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            tcpSocket:
+              port: 8614
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 8614
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: state
+              mountPath: /var/lib/xuanming
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: state
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: battle
+  namespace: xuanming
+  labels:
+    app: battle
+spec:
+  type: ClusterIP
+  selector:
+    app: battle
+  ports:
+    - name: tcp
+      port: 8613
+      targetPort: 8613
+    - name: grpc
+      port: 8614
+      targetPort: 8614
+    - name: ws
+      port: 8617
+      targetPort: 8617

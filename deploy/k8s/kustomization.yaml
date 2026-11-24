@@ -1,0 +1,8 @@
+# 玄冥纯 Python 服务端 Kustomize 清单入口
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: xuanming
+resources:
+  - namespace.yaml
+  - schemamigrate-job.yaml
+  - services.yaml

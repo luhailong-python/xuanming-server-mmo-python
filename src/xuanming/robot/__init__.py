@@ -1,0 +1,55 @@
+"""玄冥服务端纯 Python 机器人客户端、冒烟套件与并发压测模块。"""
+
+from .cli import main
+from .client import (
+    BattleRobotClient,
+    GateRobotClient,
+    NetworkProbeResult,
+    PortalHttpClient,
+    RobotError,
+    RobotRpcError,
+    decode_gate_ticket,
+)
+from .scenarios import (
+    SMOKE_SCENARIOS,
+    ScenarioResult,
+    StressReport,
+    run_local_smoke,
+    run_local_stress,
+    run_smoke_suite,
+    run_stress,
+    smoke_afk_pass_and_appearance,
+    smoke_attributes_and_skills,
+    smoke_bag_and_equip_craft,
+    smoke_heartbeat_idle,
+    smoke_mission_and_activity,
+    smoke_monopoly,
+    smoke_pets,
+    smoke_season_and_trial_journal,
+)
+
+__all__ = [
+    "BattleRobotClient",
+    "GateRobotClient",
+    "NetworkProbeResult",
+    "PortalHttpClient",
+    "RobotError",
+    "RobotRpcError",
+    "SMOKE_SCENARIOS",
+    "ScenarioResult",
+    "StressReport",
+    "decode_gate_ticket",
+    "main",
+    "run_local_smoke",
+    "run_local_stress",
+    "run_smoke_suite",
+    "run_stress",
+    "smoke_afk_pass_and_appearance",
+    "smoke_attributes_and_skills",
+    "smoke_bag_and_equip_craft",
+    "smoke_heartbeat_idle",
+    "smoke_mission_and_activity",
+    "smoke_monopoly",
+    "smoke_pets",
+    "smoke_season_and_trial_journal",
+]

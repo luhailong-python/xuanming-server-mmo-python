@@ -1,0 +1,80 @@
+# 玄冥全库 Schema 幂等迁移一次性 Job（覆盖 config/*_schema.sql 全部 15 份库定义）
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schemamigrate
+  namespace: xuanming
+  labels:
+    app.kubernetes.io/name: schemamigrate
+    app.kubernetes.io/part-of: xuanming-python
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: schemamigrate
+        app.kubernetes.io/part-of: xuanming-python
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: schemamigrate
+          image: xuanming-python:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - schemamigrate
+            - --host
+            - mysql
+            - --port
+            - "3306"
+            - --user
+            - $(MYSQL_USER)
+            - --password
+            - $(MYSQL_PASSWORD)
+            - --database
+            - $(MYSQL_DATABASE)
+            - --schema-dir
+            - /app/config
+          env:
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-user
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-password
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: xuanming-secrets
+                  key: mysql-database
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

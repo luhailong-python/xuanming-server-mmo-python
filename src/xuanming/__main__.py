@@ -95,6 +95,10 @@ def main() -> None:
     commands.add_parser("lexicon", help="校验与检查 content_guard 敏感词库", add_help=False)
     commands.add_parser("merge-zone", help="校验并执行合服路由计划（zone_merged_into）", add_help=False)
     commands.add_parser("data-consistency-check", help="只读跨库一致性巡检（路由/角色/邮件/公会排行）", add_help=False)
+    commands.add_parser("kafka-dlq", help="巡检与规划 Kafka 死信队列（DLQ）重放", add_help=False)
+    commands.add_parser("devpay-notify", help="签名并发送本地开发支付回调（devpay）", add_help=False)
+    commands.add_parser("battle-script-review", help="审核待审批战斗脚本（list/approve/reject）", add_help=False)
+    commands.add_parser("robot", help="纯 Python 压测与端到端冒烟机器人客户端", add_help=False)
     args, extra = parser.parse_known_args()
     passthrough_commands = (
         "schemamigrate",
@@ -105,6 +109,10 @@ def main() -> None:
         "lexicon",
         "merge-zone",
         "data-consistency-check",
+        "kafka-dlq",
+        "devpay-notify",
+        "battle-script-review",
+        "robot",
     )
     if args.command not in passthrough_commands and extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
@@ -215,10 +223,23 @@ def main() -> None:
             from .ops.dbcheck import main as run_dbcheck
 
             raise SystemExit(run_dbcheck(extra))
-        elif args.command in ("identitykeygen", "password-admin", "lexicon", "merge-zone", "data-consistency-check"):
+        elif args.command in (
+            "identitykeygen",
+            "password-admin",
+            "lexicon",
+            "merge-zone",
+            "data-consistency-check",
+            "kafka-dlq",
+            "devpay-notify",
+            "battle-script-review",
+        ):
             from .ops.admin_cli import main as run_admin_cli
 
             raise SystemExit(run_admin_cli([args.command, *extra]))
+        elif args.command == "robot":
+            from .robot.cli import main as run_robot
+
+            raise SystemExit(run_robot(extra))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

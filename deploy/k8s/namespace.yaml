@@ -1,0 +1,7 @@
+# 玄冥纯 Python 服务端 Kubernetes 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xuanming
+  labels:
+    app.kubernetes.io/part-of: xuanming-python

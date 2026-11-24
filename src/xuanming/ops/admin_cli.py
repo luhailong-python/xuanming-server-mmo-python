@@ -1,11 +1,14 @@
-"""玄冥服务端运维管理命令行工具集（对应 Go ``identitykeygen``、``password_admin``、``lexicon``、``merge_zone`` 与 ``data_consistency_check``）。
+"""玄冥服务端运维管理命令行工具集（对应 Go ``identitykeygen``、``password_admin``、``lexicon``、``merge_zone``、``data_consistency_check``、``kafka_dlq``、``devpaynotify`` 与 ``battlescriptreview``）。
 
 子命令一览：
 1. ``identitykeygen``：基于 ``cryptography`` 生成/校验 Gate 内部认证 Ed25519 密钥对；
 2. ``password-admin``：``hash`` / ``verify`` / ``set`` / ``disable`` 管理 ``login`` 库的 ``user_accounts``（全程不记录明文口令）；
 3. ``lexicon``：``validate`` / ``check`` / ``stats`` 校验与测试 ``content_guard`` 词库文件；
 4. ``merge-zone``：``plan`` / ``validate`` / ``apply`` 执行不停服合服映射校验与受控写入（支持 ``--dry-run``）；
-5. ``data-consistency-check``：严格只读跨表一致性审计（校验 ``player_route`` / ``account_role`` / ``mail`` / ``guild`` 与帮会榜）。
+5. ``data-consistency-check``：严格只读跨表一致性审计（校验 ``player_route`` / ``account_role`` / ``mail`` / ``guild`` 与帮会榜）；
+6. ``kafka-dlq``：``inspect`` / ``replay-plan`` 校验 JSONL 死信信封并生成无静默丢弃的重放计划；
+7. ``devpay-notify``：按 ``payment/channels.py`` 协议计算 HMAC-SHA256 签名并向 ``PaymentNotifyServer`` 投递开发联调回调；
+8. ``battle-script-review``：``list`` / ``approve`` / ``reject`` 通过真实 gRPC 调用 ``match.MatchInternal`` 审核玩家战斗剧本。
 """
 
 from __future__ import annotations
@@ -21,16 +24,21 @@ import re
 import secrets
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import urlsplit
 
+import grpc
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from google.protobuf import json_format
 
 from xuanming.content_guard.engine import Engine, SceneClass, Verdict
 from xuanming.content_guard.wordlist import (
@@ -41,6 +49,7 @@ from xuanming.content_guard.wordlist import (
     compile_matcher,
     parse_lexicon,
 )
+from xuanming.grpc_runtime import GrpcClient, sign_service_call
 from xuanming.login.password_auth import (
     SqlPasswordAuthStore,
     hash_password,
@@ -49,6 +58,27 @@ from xuanming.login.password_auth import (
     validate_password_account,
     verify_password_hash,
 )
+from xuanming.match.battle_scripts import (
+    MAX_PENDING_BATTLE_SCRIPTS_PAGE,
+    MAX_REVIEW_REASON_BYTES,
+    MAX_REVIEWER_BYTES,
+    REVIEW_REJECT_DENIED,
+    REVIEW_REJECT_INTERNAL,
+    REVIEW_REJECT_INVALID,
+    REVIEW_REJECT_NONE,
+    REVIEW_REJECT_STALE,
+)
+from xuanming.match.config import MIN_HMAC_SECRET_BYTES, OPS_CALLER_SECRET_ENV
+from xuanming.match.model import valid_operator_text
+from xuanming.payment.channels import DEVPAY_SIGNATURE_HEADER, devpay_sign
+from xuanming.payment.config import DEVPAY_SECRET_ENV, MIN_SECRET_BYTES
+from xuanming.payment.errors import InvalidKeyError
+from xuanming.payment.model import (
+    order_id_from_out_trade_no,
+    out_trade_no,
+    valid_transaction_id,
+)
+from xuanming.protocol import Protocol
 
 from .dbcheck import _assert_identifier, _assert_read_only_sql, _decode_str
 
@@ -1079,6 +1109,690 @@ async def run_data_consistency_check(
 
 
 # ---------------------------------------------------------------------------
+# 6. kafka-dlq（对应 Go go/shared/cmd/kafka_dlq，面向 JSONL 死信信封）
+# ---------------------------------------------------------------------------
+
+KAFKA_DLQ_REQUIRED_FIELDS: tuple[str, ...] = (
+    "dlq_offset",
+    "topic",
+    "partition",
+    "offset",
+    "group",
+    "cause",
+    "reason",
+    "dead_lettered_at",
+)
+KAFKA_DLQ_CAUSE_UNPROCESSABLE = "unprocessable"
+
+
+@dataclass(frozen=True, slots=True)
+class KafkaDlqRecord:
+    """单条经信封校验的 Kafka 死信 JSONL 记录。"""
+
+    line_no: int
+    dlq_offset: int
+    topic: str
+    partition: int
+    offset: int
+    group: str
+    cause: str
+    reason: str
+    dead_lettered_at: str
+    attempts: int = 0
+    key: str = ""
+    value_bytes: int = 0
+    headers: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def position(self) -> str:
+        return f"{self.topic}[{self.partition}]@{self.offset}"
+
+    def to_dict(self, *, duplicate_of_dlq_offset: int | None = None) -> dict[str, object]:
+        data: dict[str, object] = {
+            "line_no": self.line_no,
+            "dlq_offset": self.dlq_offset,
+            "topic": self.topic,
+            "partition": self.partition,
+            "offset": self.offset,
+            "original": self.position,
+            "group": self.group,
+            "cause": self.cause,
+            "reason": self.reason,
+            "dead_lettered_at": self.dead_lettered_at,
+            "attempts": self.attempts,
+            "key": self.key,
+            "value_bytes": self.value_bytes,
+            "headers": dict(self.headers),
+        }
+        if duplicate_of_dlq_offset is not None:
+            data["duplicate_of_dlq_offset"] = duplicate_of_dlq_offset
+        return data
+
+
+def _require_non_negative_int(raw: object, field_name: str, where: str) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ValueError(f"{where}: field {field_name!r} must be a non-negative integer")
+    return raw
+
+
+def _require_non_empty_str(raw: object, field_name: str, where: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{where}: field {field_name!r} must be a non-empty string")
+    return raw.strip()
+
+
+def load_kafka_dlq_jsonl(path: Path | str) -> list[KafkaDlqRecord]:
+    """逐行解析并强校验 JSONL 死信文件；任何畸形行或缺失必填信封字段均 fail-closed 报错，绝不静默丢弃。"""
+    file_path = Path(path)
+    text = file_path.read_text(encoding="utf-8")
+    records: list[KafkaDlqRecord] = []
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        where = f"{file_path}:{line_no}"
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{where}: invalid JSON line: {exc.msg}") from exc
+        if not isinstance(obj, dict):
+            raise ValueError(f"{where}: DLQ entry must be a JSON object")
+
+        missing = [field for field in KAFKA_DLQ_REQUIRED_FIELDS if field not in obj]
+        if missing:
+            raise ValueError(
+                f"{where}: missing required DLQ envelope field(s): {', '.join(missing)}"
+            )
+
+        dlq_offset = _require_non_negative_int(obj["dlq_offset"], "dlq_offset", where)
+        topic = _require_non_empty_str(obj["topic"], "topic", where)
+        partition = _require_non_negative_int(obj["partition"], "partition", where)
+        offset = _require_non_negative_int(obj["offset"], "offset", where)
+        group = _require_non_empty_str(obj["group"], "group", where)
+        cause = _require_non_empty_str(obj["cause"], "cause", where)
+        if not isinstance(obj["reason"], str):
+            raise ValueError(f"{where}: field 'reason' must be a string")
+        reason = obj["reason"]
+        dead_lettered_at = _require_non_empty_str(obj["dead_lettered_at"], "dead_lettered_at", where)
+
+        attempts = _require_non_negative_int(obj.get("attempts", 0), "attempts", where)
+        raw_key = obj.get("key", "")
+        if not isinstance(raw_key, str):
+            raise ValueError(f"{where}: field 'key' must be a string")
+
+        if "value_bytes" in obj:
+            value_bytes = _require_non_negative_int(obj["value_bytes"], "value_bytes", where)
+        elif "value" in obj:
+            if not isinstance(obj["value"], str):
+                raise ValueError(f"{where}: field 'value' must be a string")
+            value_bytes = len(obj["value"].encode("utf-8"))
+        elif "value_b64" in obj:
+            if not isinstance(obj["value_b64"], str):
+                raise ValueError(f"{where}: field 'value_b64' must be a string")
+            value_bytes = len(obj["value_b64"].encode("ascii"))
+        else:
+            value_bytes = 0
+
+        raw_headers = obj.get("headers", {})
+        if not isinstance(raw_headers, dict):
+            raise ValueError(f"{where}: field 'headers' must be a JSON object")
+        headers = tuple(sorted((str(k), str(v)) for k, v in raw_headers.items()))
+
+        records.append(
+            KafkaDlqRecord(
+                line_no=line_no,
+                dlq_offset=dlq_offset,
+                topic=topic,
+                partition=partition,
+                offset=offset,
+                group=group,
+                cause=cause,
+                reason=reason,
+                dead_lettered_at=dead_lettered_at,
+                attempts=attempts,
+                key=raw_key,
+                value_bytes=value_bytes,
+                headers=headers,
+            )
+        )
+    return records
+
+
+def inspect_kafka_dlq(
+    path: Path | str,
+    *,
+    topic: str = "",
+    limit: int = 0,
+) -> dict[str, object]:
+    """巡检 JSONL 死信文件：先全量校验信封完整性，再按 topic 过滤、标记重复原位点并输出汇总。"""
+    if limit < 0:
+        raise ValueError("limit must be >= 0")
+    records = load_kafka_dlq_jsonl(path)
+    topic_filter = topic.strip()
+    matched = [rec for rec in records if not topic_filter or rec.topic == topic_filter]
+
+    seen_pos: dict[tuple[str, int, int], int] = {}
+    by_topic: Counter[str] = Counter()
+    by_group: Counter[str] = Counter()
+    by_cause: Counter[str] = Counter()
+    duplicate_count = 0
+    rendered: list[dict[str, object]] = []
+
+    for rec in matched:
+        by_topic[rec.topic] += 1
+        by_group[rec.group] += 1
+        by_cause[rec.cause] += 1
+        pos_key = (rec.topic, rec.partition, rec.offset)
+        dup_of: int | None = None
+        if pos_key in seen_pos:
+            dup_of = seen_pos[pos_key]
+            duplicate_count += 1
+        else:
+            seen_pos[pos_key] = rec.dlq_offset
+        if limit == 0 or len(rendered) < limit:
+            rendered.append(rec.to_dict(duplicate_of_dlq_offset=dup_of))
+
+    truncated = max(0, len(matched) - len(rendered))
+    logger.info(
+        "kafka_dlq inspect finished: file=%s total=%d matched=%d returned=%d duplicates=%d",
+        path,
+        len(records),
+        len(matched),
+        len(rendered),
+        duplicate_count,
+    )
+    return {
+        "file": str(path),
+        "topic_filter": topic_filter,
+        "total_records": len(records),
+        "matched_records": len(matched),
+        "returned_records": len(rendered),
+        "truncated": truncated,
+        "duplicate_count": duplicate_count,
+        "by_topic": dict(sorted(by_topic.items())),
+        "by_group": dict(sorted(by_group.items())),
+        "by_cause": dict(sorted(by_cause.items())),
+        "records": rendered,
+    }
+
+
+def plan_kafka_dlq_replay(
+    path: Path | str,
+    *,
+    topic: str = "",
+    limit: int = 0,
+    allow_unprocessable: bool = False,
+) -> dict[str, object]:
+    """生成死信重放计划：拒绝未放行的 ``unprocessable``，按原位点去重并显式列出每条跳过记录与重放命令。"""
+    if limit < 0:
+        raise ValueError("limit must be >= 0")
+    records = load_kafka_dlq_jsonl(path)
+    topic_filter = topic.strip()
+    matched = [rec for rec in records if not topic_filter or rec.topic == topic_filter]
+
+    seen_pos: dict[tuple[str, int, int], int] = {}
+    unique_selected: list[KafkaDlqRecord] = []
+    skipped_duplicates: list[dict[str, object]] = []
+
+    for rec in matched:
+        if rec.cause == KAFKA_DLQ_CAUSE_UNPROCESSABLE and not allow_unprocessable:
+            raise ValueError(
+                f"dlq_offset={rec.dlq_offset} ({rec.position}) was dead-lettered as "
+                f"{KAFKA_DLQ_CAUSE_UNPROCESSABLE}; fix the decoder or producer first, "
+                f"then rerun with --allow-unprocessable"
+            )
+        pos_key = (rec.topic, rec.partition, rec.offset)
+        if pos_key in seen_pos:
+            skipped_duplicates.append(
+                {
+                    "dlq_offset": rec.dlq_offset,
+                    "original": rec.position,
+                    "duplicate_of_dlq_offset": seen_pos[pos_key],
+                    "reason": "same original (topic, partition, offset) already selected",
+                }
+            )
+            continue
+        seen_pos[pos_key] = rec.dlq_offset
+        unique_selected.append(rec)
+
+    selected = unique_selected[:limit] if limit > 0 else unique_selected
+    deferred_count = max(0, len(unique_selected) - len(selected))
+
+    commands: list[str] = []
+    selected_dicts: list[dict[str, object]] = []
+    for rec in selected:
+        allow_flag = " --allow-unprocessable" if rec.cause == KAFKA_DLQ_CAUSE_UNPROCESSABLE else ""
+        cmd = (
+            f"kafka-dlq replay --group {rec.group} --topic {rec.topic} "
+            f"--partition {rec.partition} --dlq-offset {rec.dlq_offset} "
+            f"--original-offset {rec.offset}{allow_flag}"
+        )
+        commands.append(cmd)
+        item = rec.to_dict()
+        item["replay_command"] = cmd
+        selected_dicts.append(item)
+
+    logger.info(
+        "kafka_dlq replay_plan finished: file=%s matched=%d selected=%d skipped_duplicates=%d deferred=%d",
+        path,
+        len(matched),
+        len(selected_dicts),
+        len(skipped_duplicates),
+        deferred_count,
+    )
+    return {
+        "file": str(path),
+        "topic_filter": topic_filter,
+        "allow_unprocessable": allow_unprocessable,
+        "total_records": len(records),
+        "matched_records": len(matched),
+        "selected_count": len(selected_dicts),
+        "skipped_duplicate_count": len(skipped_duplicates),
+        "deferred_count": deferred_count,
+        "selected": selected_dicts,
+        "skipped_duplicates": skipped_duplicates,
+        "commands": commands,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. devpay-notify（对应 Go go/payment/cmd/devpaynotify 与 payment/notify_http.py）
+# ---------------------------------------------------------------------------
+
+DEVPAY_DEFAULT_URL = "http://127.0.0.1:18130/notify/devpay"
+
+
+@dataclass(frozen=True, slots=True)
+class DevPayNotifyRequest:
+    """已签名的 DevPay 回调 HTTP 请求（与 ``DevPayChannel.parse_notification`` 逐字节对齐）。"""
+
+    url: str
+    out_trade_no: str
+    transaction_id: str
+    requested_transaction_id: str
+    amount_minor: int
+    currency: str
+    seq: int
+    revoke: bool
+    body: bytes
+    signature_hex: str
+    headers: dict[str, str]
+
+
+def _normalize_devpay_trade_no(order_id: str) -> str:
+    cleaned = order_id.strip().lower()
+    try:
+        return out_trade_no(cleaned)
+    except InvalidKeyError:
+        pass
+    try:
+        order_id_from_out_trade_no(cleaned)
+        return cleaned
+    except InvalidKeyError as exc:
+        raise ValueError(
+            f"order_id must be a lowercase UUID or 32-hex out_trade_no, got {order_id!r}"
+        ) from exc
+
+
+def _resolve_devpay_seq(
+    trade_no: str,
+    *,
+    transaction_id: str = "",
+    seq: int | None = None,
+) -> tuple[int, str]:
+    tx_clean = transaction_id.strip()
+    inferred_seq: int | None = None
+    if tx_clean:
+        if not valid_transaction_id(tx_clean):
+            raise ValueError(f"invalid transaction_id format: {tx_clean!r}")
+        prefix = f"devpay-{trade_no}"
+        if tx_clean == prefix:
+            inferred_seq = 0
+        elif tx_clean.startswith(prefix + "-"):
+            suffix = tx_clean[len(prefix) + 1 :]
+            if suffix.isdigit():
+                inferred_seq = int(suffix)
+
+    if seq is not None and inferred_seq is not None and seq != inferred_seq:
+        raise ValueError(
+            f"conflicting --seq ({seq}) and --transaction-id ({tx_clean}, inferred seq={inferred_seq})"
+        )
+    effective_seq = seq if seq is not None else (inferred_seq if inferred_seq is not None else 0)
+    if isinstance(effective_seq, bool) or not isinstance(effective_seq, int) or not (0 <= effective_seq <= 0xFFFFFFFF):
+        raise ValueError(f"seq must be a uint32 (0..{0xFFFFFFFF}), got {effective_seq!r}")
+
+    derived_tx_id = f"devpay-{trade_no}" if effective_seq == 0 else f"devpay-{trade_no}-{effective_seq}"
+    return effective_seq, derived_tx_id
+
+
+def _load_secret_from_env(env_name: str, *, min_bytes: int, environ: Mapping[str, str] | None = None) -> bytes:
+    cleaned_name = env_name.strip()
+    if not cleaned_name:
+        raise ValueError("secret environment variable name must not be empty")
+    env = os.environ if environ is None else environ
+    raw = env.get(cleaned_name, "")
+    if not raw:
+        raise ValueError(f"environment variable {cleaned_name} is unset or empty")
+    if raw != raw.strip():
+        raise ValueError(f"environment variable {cleaned_name} has leading or trailing whitespace")
+    encoded = raw.encode("utf-8")
+    if len(encoded) < min_bytes:
+        raise ValueError(
+            f"environment variable {cleaned_name} must be at least {min_bytes} bytes"
+        )
+    return encoded
+
+
+def build_devpay_notify_request(
+    *,
+    url: str,
+    order_id: str,
+    amount_minor: int,
+    currency: str = "CNY",
+    transaction_id: str = "",
+    seq: int | None = None,
+    revoke: bool = False,
+    secret: bytes | str,
+) -> DevPayNotifyRequest:
+    """构造并签名 DevPay 回调请求；JSON 字段严格限定为 ``DevPayChannel`` 白名单 5 项。"""
+    parsed = urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"devpay notify URL must be http(s) with a hostname, got {url!r}")
+
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    if len(secret_bytes) < MIN_SECRET_BYTES:
+        raise ValueError(f"devpay secret must be at least {MIN_SECRET_BYTES} bytes")
+
+    trade_no = _normalize_devpay_trade_no(order_id)
+    effective_seq, derived_tx_id = _resolve_devpay_seq(
+        trade_no, transaction_id=transaction_id, seq=seq
+    )
+
+    if isinstance(amount_minor, bool) or not isinstance(amount_minor, int) or amount_minor < 0:
+        raise ValueError("amount_minor must be a non-negative integer")
+    currency_clean = currency.strip()
+    if not revoke and (amount_minor <= 0 or not currency_clean):
+        raise ValueError("amount_minor > 0 and non-empty currency are required unless --revoke is set")
+
+    # 字段集必须与 payment/channels.py 的 _DEVPAY_ALLOWED_FIELDS 完全一致，禁止塞入未知键。
+    payload = {
+        "out_trade_no": trade_no,
+        "amount_minor": amount_minor,
+        "currency": currency_clean,
+        "seq": effective_seq,
+        "revoke": bool(revoke),
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    sig_hex = devpay_sign(secret_bytes, body).hex()
+    headers = {
+        "Content-Type": "application/json",
+        DEVPAY_SIGNATURE_HEADER: sig_hex,
+    }
+    return DevPayNotifyRequest(
+        url=url.strip(),
+        out_trade_no=trade_no,
+        transaction_id=derived_tx_id,
+        requested_transaction_id=transaction_id.strip(),
+        amount_minor=amount_minor,
+        currency=currency_clean,
+        seq=effective_seq,
+        revoke=bool(revoke),
+        body=body,
+        signature_hex=sig_hex,
+        headers=headers,
+    )
+
+
+def _post_devpay_sync(req: DevPayNotifyRequest, timeout: float) -> tuple[int, str]:
+    http_req = urllib.request.Request(
+        req.url,
+        data=req.body,
+        headers=req.headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(http_req, timeout=timeout) as resp:
+            status = int(resp.status)
+            raw = resp.read(4096)
+            return status, raw.decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read(4096) if exc.fp is not None else b""
+        return int(exc.code), raw.decode("utf-8", errors="replace").strip()
+
+
+async def send_devpay_notify(
+    *,
+    url: str,
+    order_id: str,
+    amount_minor: int,
+    currency: str = "CNY",
+    transaction_id: str = "",
+    seq: int | None = None,
+    revoke: bool = False,
+    secret: bytes | str,
+    dry_run: bool = False,
+    timeout: float = 10.0,
+) -> dict[str, object]:
+    """构造签名请求并（非 dry-run 时）向 ``PaymentNotifyServer`` 发送 POST 回调。"""
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    req = build_devpay_notify_request(
+        url=url,
+        order_id=order_id,
+        amount_minor=amount_minor,
+        currency=currency,
+        transaction_id=transaction_id,
+        seq=seq,
+        revoke=revoke,
+        secret=secret,
+    )
+    base_result: dict[str, object] = {
+        "url": req.url,
+        "out_trade_no": req.out_trade_no,
+        "transaction_id": req.transaction_id,
+        "requested_transaction_id": req.requested_transaction_id,
+        "amount_minor": req.amount_minor,
+        "currency": req.currency,
+        "seq": req.seq,
+        "revoke": req.revoke,
+        "signature_header": DEVPAY_SIGNATURE_HEADER,
+        "signature_hex": req.signature_hex,
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        logger.info(
+            "devpay_notify dry-run prepared: url=%s out_trade_no=%s seq=%d revoke=%s",
+            req.url,
+            req.out_trade_no,
+            req.seq,
+            req.revoke,
+        )
+        base_result["delivered"] = False
+        base_result["status_code"] = 0
+        base_result["response_body"] = ""
+        return base_result
+
+    status_code, response_body = await asyncio.to_thread(_post_devpay_sync, req, timeout)
+    delivered = status_code == 200
+    logger.info(
+        "devpay_notify finished: url=%s out_trade_no=%s status=%d delivered=%s",
+        req.url,
+        req.out_trade_no,
+        status_code,
+        delivered,
+    )
+    base_result["delivered"] = delivered
+    base_result["status_code"] = status_code
+    base_result["response_body"] = response_body
+    return base_result
+
+
+# ---------------------------------------------------------------------------
+# 8. battle-script-review（对应 Go go/match/cmd/battlescriptreview）
+# ---------------------------------------------------------------------------
+
+MATCH_OPS_CALLER = "ops"
+LIST_PENDING_BATTLE_SCRIPTS_PATH = "/match.MatchInternal/ListPendingBattleScripts"
+REVIEW_BATTLE_SCRIPT_PATH = "/match.MatchInternal/ReviewBattleScript"
+
+_REVIEW_REJECT_NAMES: dict[int, str] = {
+    REVIEW_REJECT_NONE: "NONE",
+    REVIEW_REJECT_DENIED: "DENIED",
+    REVIEW_REJECT_INVALID: "INVALID",
+    REVIEW_REJECT_STALE: "STALE",
+    REVIEW_REJECT_INTERNAL: "INTERNAL",
+}
+
+
+def _reject_name(code: int) -> str:
+    return _REVIEW_REJECT_NAMES.get(int(code), f"UNKNOWN({code})")
+
+
+async def list_pending_battle_scripts_rpc(
+    endpoint: str,
+    *,
+    limit: int = 20,
+    secret: bytes | str,
+    timeout: float = 5.0,
+    clock_ms: Callable[[], int] | None = None,
+) -> dict[str, object]:
+    """以 ``ops`` 内部 HMAC 签名调用 ``/match.MatchInternal/ListPendingBattleScripts``。"""
+    target = endpoint.strip()
+    if not target:
+        raise ValueError("endpoint is required")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not (1 <= limit <= MAX_PENDING_BATTLE_SCRIPTS_PAGE):
+        raise ValueError(f"limit must be in 1..{MAX_PENDING_BATTLE_SCRIPTS_PAGE}")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    if len(secret_bytes) < MIN_HMAC_SECRET_BYTES:
+        raise ValueError(f"admin token must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+
+    protocol = Protocol()
+    req = protocol.message("match.ListPendingBattleScriptsRequest", limit=limit)
+    now_ms = (time.time_ns() // 1_000_000) if clock_ms is None else int(clock_ms())
+    sign_service_call(LIST_PENDING_BATTLE_SCRIPTS_PATH, req, MATCH_OPS_CALLER, now_ms, secret_bytes)
+
+    client = GrpcClient(target, timeout=timeout, enable_retries=False)
+    try:
+        raw_reply = await client.call(
+            LIST_PENDING_BATTLE_SCRIPTS_PATH,
+            req.SerializeToString(),
+            timeout=timeout,
+        )
+    finally:
+        await client.close()
+
+    reply = protocol.parse("match.ListPendingBattleScriptsResponse", raw_reply)
+    reject = int(reply.reject)
+    scripts: list[dict[str, object]] = []
+    for pending in reply.scripts:
+        scripts.append(
+            {
+                "script_id": int(pending.script_id),
+                "owner_player_id": int(pending.owner_player_id),
+                "revision": int(pending.revision),
+                "submitted_ms": int(pending.submitted_ms),
+                "approved_revision": int(pending.approved_revision),
+                "content": json_format.MessageToDict(
+                    pending.content, preserving_proto_field_name=True
+                ),
+            }
+        )
+    logger.info(
+        "battle_script_review list finished: endpoint=%s reject=%s pending=%d",
+        target,
+        _reject_name(reject),
+        len(scripts),
+    )
+    return {
+        "ok": reject == REVIEW_REJECT_NONE,
+        "endpoint": target,
+        "reject": reject,
+        "reject_name": _reject_name(reject),
+        "pending_count": len(scripts),
+        "scripts": scripts,
+    }
+
+
+async def review_battle_script_rpc(
+    endpoint: str,
+    *,
+    script_id: int,
+    revision: int = 1,
+    approve: bool,
+    reviewer: str,
+    note: str = "",
+    secret: bytes | str,
+    timeout: float = 5.0,
+    clock_ms: Callable[[], int] | None = None,
+) -> dict[str, object]:
+    """以 ``ops`` 内部 HMAC 签名调用 ``/match.MatchInternal/ReviewBattleScript``。"""
+    target = endpoint.strip()
+    if not target:
+        raise ValueError("endpoint is required")
+    if isinstance(script_id, bool) or not isinstance(script_id, int) or script_id <= 0:
+        raise ValueError("script_id must be a positive integer")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+        raise ValueError("revision must be a positive integer")
+    if not valid_operator_text(reviewer, MAX_REVIEWER_BYTES, required=True):
+        raise ValueError(f"reviewer is required and must be <= {MAX_REVIEWER_BYTES} UTF-8 bytes without control chars")
+    if not valid_operator_text(note, MAX_REVIEW_REASON_BYTES, required=not approve):
+        if not approve and not note:
+            raise ValueError("rejecting a battle script requires --note (shown to the author)")
+        raise ValueError(f"note must be <= {MAX_REVIEW_REASON_BYTES} UTF-8 bytes without control chars")
+    if timeout <= 0:
+        raise ValueError("timeout must be > 0")
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else bytes(secret)
+    if len(secret_bytes) < MIN_HMAC_SECRET_BYTES:
+        raise ValueError(f"admin token must be at least {MIN_HMAC_SECRET_BYTES} bytes")
+
+    protocol = Protocol()
+    req = protocol.message(
+        "match.ReviewBattleScriptRequest",
+        script_id=script_id,
+        revision=revision,
+        approve=bool(approve),
+        reviewer=reviewer,
+        reason=note,
+    )
+    now_ms = (time.time_ns() // 1_000_000) if clock_ms is None else int(clock_ms())
+    sign_service_call(REVIEW_BATTLE_SCRIPT_PATH, req, MATCH_OPS_CALLER, now_ms, secret_bytes)
+
+    client = GrpcClient(target, timeout=timeout, enable_retries=False)
+    try:
+        raw_reply = await client.call(
+            REVIEW_BATTLE_SCRIPT_PATH,
+            req.SerializeToString(),
+            timeout=timeout,
+        )
+    finally:
+        await client.close()
+
+    reply = protocol.parse("match.ReviewBattleScriptResponse", raw_reply)
+    reject = int(reply.reject)
+    logger.info(
+        "battle_script_review review finished: endpoint=%s script_id=%d revision=%d approve=%s reject=%s",
+        target,
+        script_id,
+        revision,
+        approve,
+        _reject_name(reject),
+    )
+    return {
+        "ok": reject == REVIEW_REJECT_NONE,
+        "endpoint": target,
+        "script_id": script_id,
+        "revision": revision,
+        "approve": bool(approve),
+        "reviewer": reviewer,
+        "note": note,
+        "reject": reject,
+        "reject_name": _reject_name(reject),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 统一 CLI 入口（admin_cli.main）
 # ---------------------------------------------------------------------------
 
@@ -1214,6 +1928,97 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_dcc.add_argument("--live-zones", default="", help="Comma-separated live zone IDs.")
     p_dcc.add_argument("--dry-run", action="store_true", help="Print planned read-only checks without connecting.")
     p_dcc.add_argument("--json", action="store_true", dest="as_json")
+
+    # 6. kafka-dlq
+    p_dlq = sub.add_parser(
+        "kafka-dlq",
+        help="Inspect JSONL dead-letter files and generate deduplicated replay plans.",
+    )
+    dlq_sub = p_dlq.add_subparsers(dest="dlq_action", required=True)
+
+    p_dlq_inspect = dlq_sub.add_parser("inspect", help="Validate and summarize a JSONL DLQ file.")
+    p_dlq_inspect.add_argument("--file", type=Path, required=True, help="Path to JSONL DLQ file.")
+    p_dlq_inspect.add_argument("--topic", default="", help="Filter records by original Kafka topic.")
+    p_dlq_inspect.add_argument("--limit", type=int, default=0, help="Maximum records to display (0 = unlimited).")
+    p_dlq_inspect.add_argument("--json", action="store_true", dest="as_json")
+
+    p_dlq_replay = dlq_sub.add_parser(
+        "replay-plan",
+        help="Generate deduplicated replay commands for a JSONL DLQ file without writing to Kafka.",
+    )
+    p_dlq_replay.add_argument("--file", type=Path, required=True, help="Path to JSONL DLQ file.")
+    p_dlq_replay.add_argument("--topic", default="", help="Filter records by original Kafka topic.")
+    p_dlq_replay.add_argument("--limit", type=int, default=0, help="Maximum unique records to include (0 = unlimited).")
+    p_dlq_replay.add_argument(
+        "--allow-unprocessable",
+        action="store_true",
+        help="Include records dead-lettered with cause=unprocessable (only after fixing decoder/producer).",
+    )
+    p_dlq_replay.add_argument("--json", action="store_true", dest="as_json")
+
+    # 7. devpay-notify
+    p_devpay = sub.add_parser(
+        "devpay-notify",
+        help="Sign and POST a devpay callback to PaymentNotifyServer.",
+    )
+    p_devpay.add_argument("--url", default=DEVPAY_DEFAULT_URL, help="Payment notify endpoint URL.")
+    p_devpay.add_argument("--order-id", required=True, help="Mall order UUID or 32-hex out_trade_no.")
+    p_devpay.add_argument("--transaction-id", default="", help="Optional channel transaction ID (e.g. devpay-<trade>-1).")
+    p_devpay.add_argument("--seq", type=int, default=None, help="Optional uint32 sequence number for duplicate payments.")
+    p_devpay.add_argument("--amount-minor", type=int, default=0, help="Paid amount in minor units.")
+    p_devpay.add_argument("--currency", default="CNY", help="Currency code (default: CNY).")
+    p_devpay.add_argument("--revoke", action="store_true", help="Send a channel revocation notice instead of payment.")
+    p_devpay.add_argument(
+        "--secret-env",
+        default=DEVPAY_SECRET_ENV,
+        help=f"Environment variable holding the devpay HMAC secret (default: {DEVPAY_SECRET_ENV}).",
+    )
+    p_devpay.add_argument("--timeout", type=float, default=10.0, help="HTTP request timeout in seconds.")
+    p_devpay.add_argument("--dry-run", action="store_true", help="Sign and print payload without sending HTTP POST.")
+    p_devpay.add_argument("--json", action="store_true", dest="as_json")
+
+    # 8. battle-script-review
+    p_bsr = sub.add_parser(
+        "battle-script-review",
+        help="List, approve, or reject player battle scripts via match.MatchInternal gRPC.",
+    )
+    bsr_sub = p_bsr.add_subparsers(dest="bsr_action", required=True)
+
+    p_bsr_list = bsr_sub.add_parser("list", help="List pending player battle scripts.")
+    p_bsr_list.add_argument("--endpoint", required=True, help="Match gRPC endpoint (host:port).")
+    p_bsr_list.add_argument("--limit", type=int, default=20, help="Max pending scripts to fetch (1..50).")
+    p_bsr_list.add_argument(
+        "--admin-token-env",
+        default=OPS_CALLER_SECRET_ENV,
+        help=f"Environment variable holding the match ops secret (default: {OPS_CALLER_SECRET_ENV}).",
+    )
+    p_bsr_list.add_argument("--timeout", type=float, default=5.0, help="gRPC call timeout in seconds.")
+    p_bsr_list.add_argument("--json", action="store_true", dest="as_json")
+
+    for action_name, help_text, note_required in (
+        ("approve", "Approve a pending battle script revision.", False),
+        ("reject", "Reject a pending battle script revision (requires --note).", True),
+    ):
+        p_act = bsr_sub.add_parser(action_name, help=help_text)
+        p_act.add_argument("--endpoint", required=True, help="Match gRPC endpoint (host:port).")
+        p_act.add_argument("--script-id", type=int, required=True, help="Target battle script ID.")
+        p_act.add_argument("--revision", type=int, default=1, help="Script revision for CAS review (default: 1).")
+        p_act.add_argument("--reviewer", required=True, help="Reviewer name recorded in audit log.")
+        p_act.add_argument(
+            "--note",
+            "--reason",
+            dest="note",
+            required=note_required,
+            default="",
+            help="Review note or rejection reason shown to the author.",
+        )
+        p_act.add_argument(
+            "--admin-token-env",
+            default=OPS_CALLER_SECRET_ENV,
+            help=f"Environment variable holding the match ops secret (default: {OPS_CALLER_SECRET_ENV}).",
+        )
+        p_act.add_argument("--timeout", type=float, default=5.0, help="gRPC call timeout in seconds.")
+        p_act.add_argument("--json", action="store_true", dest="as_json")
 
     return parser
 
@@ -1472,6 +2277,151 @@ async def _run_data_consistency_check(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+async def _run_kafka_dlq(args: argparse.Namespace) -> int:
+    if args.dlq_action == "inspect":
+        report = inspect_kafka_dlq(args.file, topic=args.topic, limit=args.limit)
+        lines: list[str] = []
+        for rec in report["records"]:
+            dup_suffix = (
+                f" duplicate_of_dlq_offset={rec['duplicate_of_dlq_offset']}"
+                if "duplicate_of_dlq_offset" in rec
+                else ""
+            )
+            lines.append(
+                f"dlq_offset={rec['dlq_offset']} original={rec['original']} group={rec['group']} "
+                f"cause={rec['cause']} attempts={rec['attempts']} dead_lettered_at={rec['dead_lettered_at']} "
+                f"value_bytes={rec['value_bytes']} reason={rec['reason']!r}{dup_suffix}"
+            )
+        lines.append(
+            f"summary: total={report['total_records']} matched={report['matched_records']} "
+            f"returned={report['returned_records']} truncated={report['truncated']} "
+            f"duplicates={report['duplicate_count']}"
+        )
+        _emit_output(report, as_json=args.as_json, text="\n".join(lines))
+        return 0
+
+    if args.dlq_action == "replay-plan":
+        plan = plan_kafka_dlq_replay(
+            args.file,
+            topic=args.topic,
+            limit=args.limit,
+            allow_unprocessable=args.allow_unprocessable,
+        )
+        lines = []
+        for skip in plan["skipped_duplicates"]:
+            lines.append(
+                f"skipped dlq_offset={skip['dlq_offset']} original={skip['original']} "
+                f"duplicate_of_dlq_offset={skip['duplicate_of_dlq_offset']}"
+            )
+        for cmd in plan["commands"]:
+            lines.append(f"plan: {cmd}")
+        lines.append(
+            f"replay-plan: selected={plan['selected_count']} "
+            f"skipped_duplicates={plan['skipped_duplicate_count']} "
+            f"deferred={plan['deferred_count']} matched={plan['matched_records']}"
+        )
+        _emit_output(plan, as_json=args.as_json, text="\n".join(lines))
+        return 0
+
+    raise ValueError(f"unsupported kafka-dlq action: {args.dlq_action}")
+
+
+async def _run_devpay_notify(args: argparse.Namespace) -> int:
+    secret_bytes = _load_secret_from_env(args.secret_env, min_bytes=MIN_SECRET_BYTES)
+    res = await send_devpay_notify(
+        url=args.url,
+        order_id=args.order_id,
+        amount_minor=args.amount_minor,
+        currency=args.currency,
+        transaction_id=args.transaction_id,
+        seq=args.seq,
+        revoke=args.revoke,
+        secret=secret_bytes,
+        dry_run=args.dry_run,
+        timeout=args.timeout,
+    )
+    if res["dry_run"]:
+        text = (
+            f"[DRY-RUN] POST {res['url']} out_trade_no={res['out_trade_no']} "
+            f"tx={res['transaction_id']} seq={res['seq']} revoke={res['revoke']} "
+            f"{res['signature_header']}={res['signature_hex']}"
+        )
+        _emit_output(res, as_json=args.as_json, text=text)
+        return 0
+
+    if res["delivered"]:
+        text = (
+            f"accepted: out_trade_no={res['out_trade_no']} tx={res['transaction_id']} "
+            f"seq={res['seq']} revoke={res['revoke']} status={res['status_code']}"
+        )
+        _emit_output(res, as_json=args.as_json, text=text)
+        return 0
+
+    text = (
+        f"rejected: out_trade_no={res['out_trade_no']} status={res['status_code']} "
+        f"body={res['response_body']!r}"
+    )
+    _emit_output(res, as_json=args.as_json, text=text)
+    print(f"ERROR: payment notify rejected with HTTP {res['status_code']}", file=sys.stderr)
+    return 1
+
+
+async def _run_battle_script_review(args: argparse.Namespace) -> int:
+    secret_bytes = _load_secret_from_env(args.admin_token_env, min_bytes=MIN_HMAC_SECRET_BYTES)
+    if args.bsr_action == "list":
+        res = await list_pending_battle_scripts_rpc(
+            args.endpoint,
+            limit=args.limit,
+            secret=secret_bytes,
+            timeout=args.timeout,
+        )
+        lines: list[str] = []
+        if not res["ok"]:
+            lines.append(f"reject={res['reject_name']}")
+            print(
+                f"ERROR: ListPendingBattleScripts rejected ({res['reject_name']}); "
+                f"check {args.admin_token_env} and match ops_secret",
+                file=sys.stderr,
+            )
+        else:
+            for item in res["scripts"]:
+                lines.append(
+                    f"script={item['script_id']} revision={item['revision']} "
+                    f"owner={item['owner_player_id']} submitted_ms={item['submitted_ms']} "
+                    f"approved_revision={item['approved_revision']}"
+                )
+            lines.append(f"pending={res['pending_count']}")
+        _emit_output(res, as_json=args.as_json, text="\n".join(lines))
+        return 0 if res["ok"] else 1
+
+    if args.bsr_action in ("approve", "reject"):
+        approve = args.bsr_action == "approve"
+        res = await review_battle_script_rpc(
+            args.endpoint,
+            script_id=args.script_id,
+            revision=args.revision,
+            approve=approve,
+            reviewer=args.reviewer,
+            note=args.note,
+            secret=secret_bytes,
+            timeout=args.timeout,
+        )
+        text = (
+            f"script={res['script_id']} revision={res['revision']} "
+            f"approve={res['approve']} reject={res['reject_name']}"
+        )
+        _emit_output(res, as_json=args.as_json, text=text)
+        if not res["ok"]:
+            print(
+                f"ERROR: ReviewBattleScript rejected ({res['reject_name']})",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    raise ValueError(f"unsupported battle-script-review action: {args.bsr_action}")
+
+
 async def _dispatch_async(args: argparse.Namespace) -> int:
     if args.command == "identitykeygen":
         return await _run_identitykeygen(args)
@@ -1483,6 +2433,12 @@ async def _dispatch_async(args: argparse.Namespace) -> int:
         return await _run_merge_zone(args)
     if args.command == "data-consistency-check":
         return await _run_data_consistency_check(args)
+    if args.command == "kafka-dlq":
+        return await _run_kafka_dlq(args)
+    if args.command == "devpay-notify":
+        return await _run_devpay_notify(args)
+    if args.command == "battle-script-review":
+        return await _run_battle_script_review(args)
     raise ValueError(f"unknown admin-cli command: {args.command}")
 
 
@@ -1496,12 +2452,13 @@ def main(argv: list[str] | None = None) -> int:
         ZoneMergeError,
         LexiconFormatError,
         LexiconWordError,
+        InvalidKeyError,
         ValueError,
     ) as exc:
         logger.error("admin_cli rejected command=%s: %s", args.command, exc)
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+    except (OSError, RuntimeError, json.JSONDecodeError, urllib.error.URLError, grpc.aio.AioRpcError) as exc:
         logger.error("admin_cli fatal error command=%s: %s", args.command, exc)
         print(f"FATAL: {exc}", file=sys.stderr)
         return 2

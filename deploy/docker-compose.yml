@@ -1,0 +1,427 @@
+# 玄冥纯 Python 全栈集群 Docker Compose 编排
+# 基础设施：mysql(8.0)、redis(7)、etcd(v3.5)、kafka(KRaft 单节点开发态)
+# 初始化任务：schemamigrate（一次性幂等迁移 config/ 下全部 15 份 *_schema.sql）
+# 业务服务（共 23 个纯 Python 节点，共享由 deploy/Dockerfile 构建的单一镜像 xuanming-python:latest）
+# 所有密钥均通过环境变量占位注入，严禁在编排文件中写入生产明文密钥。
+
+name: xuanming-python
+
+x-python-service: &xuanming-python-service
+  image: xuanming-python:latest
+  user: "10001:10001"
+  restart: unless-stopped
+  networks:
+    - xuanming
+  depends_on:
+    schemamigrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+    etcd:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  # 基础设施层
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+      MYSQL_USER: ${MYSQL_USER:-appuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-mmorpg_global}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - xuanming
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      xuanming:
+        aliases:
+          - redis-player
+          - redis-login
+          - redis-scene-control
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    restart: unless-stopped
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd-0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd-0=http://etcd:2380
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      - xuanming
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/tmp/kraft-combined-logs
+    networks:
+      - xuanming
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  # ---------------------------------------------------------------------------
+  # 一次性 Schema 幂等迁移容器（覆盖 config/*_schema.sql 全部 15 个库定义）
+  # ---------------------------------------------------------------------------
+  schemamigrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: xuanming-python:latest
+    user: "10001:10001"
+    restart: "no"
+    command:
+      - schemamigrate
+      - --host
+      - mysql
+      - --port
+      - "3306"
+      - --user
+      - ${MYSQL_USER:-root}
+      - --password
+      - ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+      - --database
+      - ${MYSQL_DATABASE:-mmorpg_global}
+      - --schema-dir
+      - /app/config
+    networks:
+      - xuanming
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 纯 Python 业务微服务与核心游戏节点（共 23 项）
+  # ---------------------------------------------------------------------------
+  portal:
+    <<: *xuanming-python-service
+    command: ["portal", "--config", "/app/config/portal.example.toml"]
+    ports:
+      - "8080:8080"
+    expose:
+      - "8082"
+    environment:
+      XUANMING_PORTAL_MYSQL_PASSWORD: ${XUANMING_PORTAL_MYSQL_PASSWORD:?set XUANMING_PORTAL_MYSQL_PASSWORD}
+      XUANMING_PORTAL_CDN_SIGNING_SECRET: ${XUANMING_PORTAL_CDN_SIGNING_SECRET:?set XUANMING_PORTAL_CDN_SIGNING_SECRET}
+      XUANMING_PORTAL_ADMIN_API_KEY: ${XUANMING_PORTAL_ADMIN_API_KEY:?set XUANMING_PORTAL_ADMIN_API_KEY}
+      COMMERCE_ADMIN_SECRET: ${COMMERCE_ADMIN_SECRET:?set COMMERCE_ADMIN_SECRET}
+
+  data-service:
+    <<: *xuanming-python-service
+    command: ["data-service", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "9000"
+    environment:
+      DATA_SERVICE_MYSQL_PASSWORD: ${DATA_SERVICE_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT}
+
+  db:
+    <<: *xuanming-python-service
+    command: ["db", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "6000"
+    environment:
+      DB_MYSQL_PASSWORD: ${DB_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_PLAYER_STORE_SECRET_SCENE: ${MMORPG_PLAYER_STORE_SECRET_SCENE:?set MMORPG_PLAYER_STORE_SECRET_SCENE}
+
+  player-locator:
+    <<: *xuanming-python-service
+    command: ["player-locator", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50300"
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  player-inbox:
+    <<: *xuanming-python-service
+    command: ["player-inbox", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50950"
+    environment:
+      PLAYER_INBOX_MYSQL_PASSWORD: ${PLAYER_INBOX_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_PLAYER_INBOX_SECRET_MATCH: ${MMORPG_PLAYER_INBOX_SECRET_MATCH:?set MMORPG_PLAYER_INBOX_SECRET_MATCH}
+
+  router:
+    <<: *xuanming-python-service
+    command: ["router", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50600"
+    networks:
+      xuanming:
+        aliases:
+          - client-rpc-router
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  scene-manager:
+    <<: *xuanming-python-service
+    command: ["scene-manager", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "60000"
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  match:
+    <<: *xuanming-python-service
+    command: ["match", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50500"
+    environment:
+      MATCH_MYSQL_PASSWORD: ${MATCH_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      MMORPG_MATCH_OUTCOME_SECRET_BATTLE: ${MMORPG_MATCH_OUTCOME_SECRET_BATTLE:?set MMORPG_MATCH_OUTCOME_SECRET_BATTLE}
+      MMORPG_MATCH_OPS_CALLER_SECRET: ${MMORPG_MATCH_OPS_CALLER_SECRET:?set MMORPG_MATCH_OPS_CALLER_SECRET}
+      MMORPG_PLAYER_INBOX_SECRET_MATCH: ${MMORPG_PLAYER_INBOX_SECRET_MATCH:?set MMORPG_PLAYER_INBOX_SECRET_MATCH}
+      RANK_PRODUCER_SECRET_MATCH: ${RANK_PRODUCER_SECRET_MATCH:?set RANK_PRODUCER_SECRET_MATCH}
+      MMORPG_ROLE_FENCE_SECRET_COORDINATOR: ${MMORPG_ROLE_FENCE_SECRET_COORDINATOR:?set MMORPG_ROLE_FENCE_SECRET_COORDINATOR}
+
+  content-guard:
+    <<: *xuanming-python-service
+    command: ["content-guard", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50250"
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  chat:
+    <<: *xuanming-python-service
+    command: ["chat", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50700"
+    environment:
+      CHAT_MYSQL_PASSWORD: ${CHAT_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  mail:
+    <<: *xuanming-python-service
+    command: ["mail", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50900"
+    environment:
+      MAIL_MYSQL_PASSWORD: ${MAIL_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  rank:
+    <<: *xuanming-python-service
+    command: ["rank", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "51100"
+    environment:
+      RANK_MYSQL_PASSWORD: ${RANK_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      RANK_PRODUCER_SECRET_MATCH: ${RANK_PRODUCER_SECRET_MATCH:?set RANK_PRODUCER_SECRET_MATCH}
+
+  friend:
+    <<: *xuanming-python-service
+    command: ["friend", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50400"
+    environment:
+      FRIEND_MYSQL_PASSWORD: ${FRIEND_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  payment:
+    <<: *xuanming-python-service
+    command: ["payment", "--config", "/app/config/cluster.example.toml"]
+    ports:
+      - "18130:18130"
+    expose:
+      - "51200"
+    environment:
+      PAYMENT_MYSQL_PASSWORD: ${PAYMENT_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      COMMERCE_PAYMENT_SECRET: ${COMMERCE_PAYMENT_SECRET:?set COMMERCE_PAYMENT_SECRET}
+      PAYMENT_DEVPAY_SECRET: ${PAYMENT_DEVPAY_SECRET:-}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_PAYMENT}
+
+  trade:
+    <<: *xuanming-python-service
+    command: ["trade", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50800"
+    environment:
+      TRADE_MYSQL_PASSWORD: ${TRADE_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  guild:
+    <<: *xuanming-python-service
+    command: ["guild", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "50310"
+    environment:
+      GUILD_MYSQL_PASSWORD: ${GUILD_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  mall-game:
+    <<: *xuanming-python-service
+    command: ["mall-game", "--config", "/app/config/cluster.example.toml"]
+    ports:
+      - "18120:18120"
+    networks:
+      xuanming:
+        aliases:
+          - mall
+    environment:
+      MALL_MYSQL_PASSWORD: ${MALL_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      COMMERCE_PAYMENT_SECRET: ${COMMERCE_PAYMENT_SECRET:?set COMMERCE_PAYMENT_SECRET}
+      COMMERCE_ADMIN_SECRET: ${COMMERCE_ADMIN_SECRET:?set COMMERCE_ADMIN_SECRET}
+
+  gm-admin:
+    <<: *xuanming-python-service
+    command: ["gm-admin", "--config", "/app/config/cluster.example.toml"]
+    ports:
+      - "18082:8082"
+    expose:
+      - "8082"
+    environment:
+      GM_ADMIN_MYSQL_PASSWORD: ${GM_ADMIN_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      GM_ADMIN_JWT_SECRET: ${GM_ADMIN_JWT_SECRET:?set GM_ADMIN_JWT_SECRET}
+      XUANMING_PORTAL_ADMIN_API_KEY: ${XUANMING_PORTAL_ADMIN_API_KEY:?set XUANMING_PORTAL_ADMIN_API_KEY}
+
+  config-node:
+    <<: *xuanming-python-service
+    command: ["config-node", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "8090"
+    environment:
+      CONFIG_NODE_RELOAD_TOKEN: ${CONFIG_NODE_RELOAD_TOKEN:-}
+
+  login:
+    <<: *xuanming-python-service
+    command: ["run", "login", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "53000"
+    networks:
+      xuanming:
+        aliases:
+          - login-104
+    environment:
+      LOGIN_MYSQL_PASSWORD: ${LOGIN_MYSQL_PASSWORD:-${MYSQL_PASSWORD:?set MYSQL_PASSWORD}}
+      MMORPG_GATE_TOKEN_SECRET: ${MMORPG_GATE_TOKEN_SECRET:?set MMORPG_GATE_TOKEN_SECRET}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN}
+
+  gate:
+    <<: *xuanming-python-service
+    command: ["run", "gate", "--config", "/app/config/cluster.example.toml"]
+    ports:
+      - "8610:8610"
+      - "8616:8616"
+    expose:
+      - "8615"
+    networks:
+      xuanming:
+        aliases:
+          - gate-101
+    environment:
+      MMORPG_GATE_TOKEN_SECRET: ${MMORPG_GATE_TOKEN_SECRET:?set MMORPG_GATE_TOKEN_SECRET}
+      MMORPG_INTERNAL_AUTH_SIGNING_KEY: ${MMORPG_INTERNAL_AUTH_SIGNING_KEY:?set MMORPG_INTERNAL_AUTH_SIGNING_KEY}
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+
+  scene:
+    <<: *xuanming-python-service
+    command: ["run", "scene", "--config", "/app/config/cluster.example.toml"]
+    expose:
+      - "8611"
+      - "8612"
+    networks:
+      xuanming:
+        aliases:
+          - scene-102
+    volumes:
+      - scene-state:/var/lib/xuanming
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      MMORPG_PLAYER_STORE_SECRET_SCENE: ${MMORPG_PLAYER_STORE_SECRET_SCENE:?set MMORPG_PLAYER_STORE_SECRET_SCENE}
+      MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE: ${MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE:?set MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE}
+
+  battle:
+    <<: *xuanming-python-service
+    command: ["run", "battle", "--config", "/app/config/cluster.example.toml"]
+    ports:
+      - "8613:8613"
+      - "8617:8617"
+    expose:
+      - "8614"
+    networks:
+      xuanming:
+        aliases:
+          - battle-103
+    volumes:
+      - battle-state:/var/lib/xuanming
+    environment:
+      MMORPG_INTERNAL_AUTH_PUBLIC_KEYS: ${MMORPG_INTERNAL_AUTH_PUBLIC_KEYS:?set MMORPG_INTERNAL_AUTH_PUBLIC_KEYS}
+      MMORPG_MATCH_OUTCOME_SECRET_BATTLE: ${MMORPG_MATCH_OUTCOME_SECRET_BATTLE:?set MMORPG_MATCH_OUTCOME_SECRET_BATTLE}
+
+networks:
+  xuanming:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  redis-data:
+  etcd-data:
+  kafka-data:
+  scene-state:
+  battle-state:

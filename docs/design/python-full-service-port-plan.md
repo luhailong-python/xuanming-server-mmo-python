@@ -112,3 +112,7 @@
   1. 协议同步：补齐 `player_afk_pass`、`player_appearance`、`player_season`、`player_trial_journal`、`player_bag`（装备打造 5 RPC）、`player_pet`（宠物商店/词条洗炼 5 RPC）与 `message_id.txt`（453–458）并重编 `schema.pb`。
   2. Scene 新系统接入 `runtime.py`：`SceneGmCommands`（`SceneNodeGrpc.GmExecutePlayerCommand` 7 类在线 GM 命令与 `gm_admin` 字节级兼容）、`SceneAfkPass`、`SceneAppearance`（含试用自动到期）、`SceneSeason`、`SceneTrialJournal`、`SceneEquipCraft` 与 `ScenePets` 扩展。
   3. 生产加固与运维 CLI：`ops/resilience.py`（`ClockCheck`、`DbGuard`、`LiveViewGate`、`LoopLiveness`）、`grpc_runtime.py`（服务端 `MaxConnectionAge=15m` + 客户端 Keepalive）、`ops/dbcheck.py` 与 `ops/admin_cli.py`（`identitykeygen`、`password-admin`、`lexicon`、`merge-zone`、`data-consistency-check`），全部接入 `__main__.py`。
+- **阶段六（角色改名、结算联动、纯 Python 压测机器人与容器/K8s 编排，已完成）**：
+  1. `SceneRename`（`src/xuanming/nodes/scene_rename.py`）与 `BattleSettlement` 成长联动（`season` / `trial_journal` / `equip_craft`）全部接入 `runtime.py`；同步 `client_player_common.proto` 与 `transaction_log.proto` 并重编 `schema.pb`。
+  2. 纯 Python `robot` 客户端（`src/xuanming/robot/`，支持 Portal HTTP + Gate TCP/WebSocket + Battle TCP、8 组全功能冒烟场景与并发压测器），已接入 `xuanming robot`。
+  3. 纯 Python 容器与编排清单（`deploy/Dockerfile` 非 root UID 10001、`deploy/docker-compose.yml` 全 23 服务零 Go/Java、`deploy/k8s/` Kustomize 清单）与最后 3 项运维小工具（`kafka-dlq`、`devpay-notify`、`battle-script-review`）。
