@@ -44,7 +44,7 @@ from xuanming.settings import Settings
 
 
 def test_cluster_example_toml_loads_all_python_service_sections():
-    """校验 config/cluster.example.toml 可一次性加载全部 18 个纯 Python 微服务配置段且端口互不冲突。"""
+    """校验 config/cluster.example.toml 可一次性加载全部 19 个纯 Python 微服务配置段且端口互不冲突。"""
     settings = Settings.load(Path(__file__).parents[1] / "config" / "cluster.example.toml")
     grpc_sections = (
         "data_service_node", "router_node", "db_node", "player_locator_node",
@@ -52,7 +52,7 @@ def test_cluster_example_toml_loads_all_python_service_sections():
         "chat_node", "mail_node", "rank_node", "friend_node", "payment_node",
         "trade_node", "guild_node",
     )
-    http_sections = ("mall_game_node", "gm_admin_node", "config_node")
+    http_sections = ("mall_game_node", "gm_admin_node", "config_node", "satoken_auth_node")
     ports = []
     for name in grpc_sections:
         section = getattr(settings, name)

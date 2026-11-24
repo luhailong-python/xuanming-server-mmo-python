@@ -94,6 +94,10 @@ from .schemamigrate import (
     parse_schema_sql,
     plan_migrations,
 )
+from .battle_art_gen import main as battle_art_gen_main
+from .dbmove import main as dbmove_main
+from .navmesh_baker import main as navmesh_baker_main
+from .table_exporter import main as table_exporter_main
 from .table_sync import (
     BUNDLE_MANIFEST_FILENAME,
     DESCRIPTOR_FILENAME,

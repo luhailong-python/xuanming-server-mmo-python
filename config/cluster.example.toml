@@ -240,3 +240,14 @@ login_service = "login-104:53000"
 host = "127.0.0.1"
 port = 8090
 table_format = "json"
+
+[satoken_auth_node]
+host = "127.0.0.1"
+port = 8085
+profile = "prod"
+dev_login_enabled = false
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_auth"
+redis_url = "redis://redis-login:6379/0"

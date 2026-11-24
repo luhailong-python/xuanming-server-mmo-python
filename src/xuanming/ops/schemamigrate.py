@@ -23,7 +23,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 仓库内已登记的 15 份服务 Schema SQL 文件。
+# 仓库内已登记的 16 份服务 Schema SQL 文件。
 KNOWN_SCHEMA_FILES: tuple[str, ...] = (
     "portal_schema.sql",
     "login_schema.sql",
@@ -40,6 +40,7 @@ KNOWN_SCHEMA_FILES: tuple[str, ...] = (
     "guild_schema.sql",
     "mall_game_schema.sql",
     "gm_admin_schema.sql",
+    "satoken_auth_schema.sql",
 )
 
 # MySQL / TiDB 标识符最大长度 64 字符，仅允许字母、数字与下划线。

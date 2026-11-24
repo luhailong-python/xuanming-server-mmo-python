@@ -87,6 +87,8 @@ def main() -> None:
     gm_cmd.add_argument("--config", type=Path, required=True)
     cfg_cmd = commands.add_parser("config-node", help="启动 config_node（配置表只读查询与热重载 HTTP 服务）")
     cfg_cmd.add_argument("--config", type=Path, required=True)
+    satoken_cmd = commands.add_parser("satoken-auth", help="启动 satoken_auth（Sa-Token 登录、OAuth 与 dev 登录门禁服务）")
+    satoken_cmd.add_argument("--config", type=Path, required=True)
     migrate_cmd = commands.add_parser("schemamigrate", help="校验并执行全库 SQL Schema 幂等迁移", add_help=False)
     sync_cmd = commands.add_parser("table-sync", help="打包、校验或解包配置表与指针文件", add_help=False)
     dbcheck_cmd = commands.add_parser("dbcheck", help="只读巡检全库表登记、清理索引、容量、大字段与出箱积压", add_help=False)
@@ -99,6 +101,10 @@ def main() -> None:
     commands.add_parser("devpay-notify", help="签名并发送本地开发支付回调（devpay）", add_help=False)
     commands.add_parser("battle-script-review", help="审核待审批战斗脚本（list/approve/reject）", add_help=False)
     commands.add_parser("robot", help="纯 Python 压测与端到端冒烟机器人客户端", add_help=False)
+    commands.add_parser("table-export", help="纯 Python Excel/CSV/JSON 导表与校验工具", add_help=False)
+    commands.add_parser("dbmove", help="物理分库在线搬迁、分片回填、校验和核对与切流工具", add_help=False)
+    commands.add_parser("navmesh-baker", help="纯 Python 导航网格/手绘平面烘焙、校验与寻路查询工具", add_help=False)
+    commands.add_parser("battle-art-gen", help="纯标准库 PNG 战斗美术与特效素材生成器", add_help=False)
     args, extra = parser.parse_known_args()
     passthrough_commands = (
         "schemamigrate",
@@ -113,6 +119,10 @@ def main() -> None:
         "devpay-notify",
         "battle-script-review",
         "robot",
+        "table-export",
+        "dbmove",
+        "navmesh-baker",
+        "battle-art-gen",
     )
     if args.command not in passthrough_commands and extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
@@ -211,6 +221,10 @@ def main() -> None:
             from .config_node.node import run as run_config_node
 
             asyncio.run(run_config_node(Settings.load(args.config)))
+        elif args.command == "satoken-auth":
+            from .satoken_auth.node import run as run_satoken_auth
+
+            asyncio.run(run_satoken_auth(Settings.load(args.config)))
         elif args.command == "schemamigrate":
             from .ops.schemamigrate import main as run_schemamigrate
 
@@ -240,6 +254,22 @@ def main() -> None:
             from .robot.cli import main as run_robot
 
             raise SystemExit(run_robot(extra))
+        elif args.command == "table-export":
+            from .ops.table_exporter import main as run_table_export
+
+            raise SystemExit(run_table_export(extra))
+        elif args.command == "dbmove":
+            from .ops.dbmove import main as run_dbmove
+
+            raise SystemExit(run_dbmove(extra))
+        elif args.command == "navmesh-baker":
+            from .ops.navmesh_baker import main as run_navmesh_baker
+
+            raise SystemExit(run_navmesh_baker(extra))
+        elif args.command == "battle-art-gen":
+            from .ops.battle_art_gen import main as run_battle_art_gen
+
+            raise SystemExit(run_battle_art_gen(extra))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

@@ -68,6 +68,7 @@ class Settings:
     mall_game_node: dict = field(default_factory=dict)  # raw [mall_game_node], parsed by mall_game.config
     gm_admin_node: dict = field(default_factory=dict)  # raw [gm_admin_node], parsed by gm_admin.config
     config_node: dict = field(default_factory=dict)  # raw [config_node], parsed by config_node.node
+    satoken_auth_node: dict = field(default_factory=dict)  # raw [satoken_auth_node], parsed by satoken_auth.config
 
     @classmethod
     def load(cls, path: Path | None):

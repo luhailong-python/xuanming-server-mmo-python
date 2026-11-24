@@ -40,7 +40,7 @@ CONFIG_DIR = REPO_ROOT / "config"
 TABLES_DIR = REPO_ROOT / "src" / "xuanming" / "data" / "tables"
 DESCRIPTORS_FILE = REPO_ROOT / "src" / "xuanming" / "data" / "_table_descriptors.pb"
 
-# 15 份真实 *_schema.sql 的表数量基线。
+# 16 份真实 *_schema.sql 的表数量基线。
 EXPECTED_DB_TABLE_COUNTS = {
     "chat": 6,
     "data_service": 24,
@@ -56,6 +56,7 @@ EXPECTED_DB_TABLE_COUNTS = {
     "player_inbox": 4,
     "portal": 3,
     "rank": 9,
+    "satoken_auth": 2,
     "trade": 7,
 }
 
@@ -149,9 +150,9 @@ def _write_custom_tar_gz(path: Path, members: list[tuple[tarfile.TarInfo, bytes 
 # ---------------------------------------------------------------------------
 
 
-def test_plan_migrations_all_15_real_schemas() -> None:
+def test_plan_migrations_all_16_real_schemas() -> None:
     plan = plan_migrations(CONFIG_DIR)
-    assert len(plan.databases) == len(KNOWN_SCHEMA_FILES) == 15
+    assert len(plan.databases) == len(KNOWN_SCHEMA_FILES) == 16
     assert {db.source_file for db in plan.databases} == set(KNOWN_SCHEMA_FILES)
 
     counts = {db.db_name: len(db.tables) for db in plan.databases}

@@ -116,3 +116,8 @@
   1. `SceneRename`（`src/xuanming/nodes/scene_rename.py`）与 `BattleSettlement` 成长联动（`season` / `trial_journal` / `equip_craft`）全部接入 `runtime.py`；同步 `client_player_common.proto` 与 `transaction_log.proto` 并重编 `schema.pb`。
   2. 纯 Python `robot` 客户端（`src/xuanming/robot/`，支持 Portal HTTP + Gate TCP/WebSocket + Battle TCP、8 组全功能冒烟场景与并发压测器），已接入 `xuanming robot`。
   3. 纯 Python 容器与编排清单（`deploy/Dockerfile` 非 root UID 10001、`deploy/docker-compose.yml` 全 23 服务零 Go/Java、`deploy/k8s/` Kustomize 清单）与最后 3 项运维小工具（`kafka-dlq`、`devpay-notify`、`battle-script-review`）。
+- **阶段七（全部离线工具、物理搬库与 Sa-Token 认证全量纯 Python 化，已完成）**：
+  1. `table_exporter`（`src/xuanming/ops/table_exporter.py` + `tools/data_table_exporter/run.py`）：纯标准库 `.xlsx`/`.csv`/`.json` 导表器，支持 PK/FK/永久 ID/`bit_index`/`Tip.xlsx` 单轴校验、`_table_descriptors.pb` 编译与 `ConfigTables` 全兼容产物导出，接入 `xuanming table-export`。
+  2. `dbmove`（`src/xuanming/ops/dbmove.py`）：物理分库在线搬迁状态机、分片回填、确定性 SHA-256 校验和核对、延迟/哨兵/防脑裂切流门禁，接入 `xuanming dbmove`。
+  3. `satoken_auth`（`src/xuanming/satoken_auth/` + `config/satoken_auth_schema.sql`）：Sa-Token 兼容 HTTP/Redis/MySQL 认证与 OAuth/dev 门禁服务，接入 `xuanming satoken-auth` 与 `schemamigrate`（16 库 156 表）。
+  4. `navmesh_baker`（`src/xuanming/ops/navmesh_baker.py`）与 `battle_art_gen`（`src/xuanming/ops/battle_art_gen.py`）：纯标准库 Detour MSET v1 导航网格/手绘平面烘焙、SHA-256 配对校验与寻路，以及零 Pillow 7 类 83 张确定性 PNG 战斗美术生成器，接入 `xuanming navmesh-baker` 与 `xuanming battle-art-gen`。
