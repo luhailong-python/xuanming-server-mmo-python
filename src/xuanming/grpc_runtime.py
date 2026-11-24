@@ -108,9 +108,20 @@ class GrpcClient:
         await self.channel.close()
 
 
-async def serve_grpc(protocol: Protocol, address: str, services: dict, *, kill_switch=None, pass_context=False):
+async def serve_grpc(
+    protocol: Protocol,
+    address: str,
+    services: dict,
+    *,
+    kill_switch=None,
+    pass_context=False,
+    max_receive_message_length: int | None = None,
+):
     """Serve unary handlers; with ``pass_context`` they are called as ``handler(request, context, path)``."""
-    server = grpc.aio.server(options=(("grpc.so_reuseport", 0),))
+    options = [("grpc.so_reuseport", 0)]
+    if max_receive_message_length is not None:
+        options.append(("grpc.max_receive_message_length", int(max_receive_message_length)))
+    server = grpc.aio.server(options=tuple(options))
     for service_name, handlers in services.items():
         descriptor = protocol.pool.FindServiceByName(service_name)
         methods = {}

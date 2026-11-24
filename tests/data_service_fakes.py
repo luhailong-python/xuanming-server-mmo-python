@@ -133,6 +133,51 @@ class MemoryStore:
         self._check("merged_zones")
         return dict(self.merged)
 
+    async def route_detail(self, player_id):
+        self._check("route_detail")
+        row = self.routes_.get(player_id)
+        return (int(row[0]), int(row[1])) if row is not None else None
+
+    async def count_zone_roles(self, zones):
+        self._check("count_zone_roles")
+        wanted = set(zones)
+        return sum(1 for home, _ in self.routes_.values() if home in wanted)
+
+    async def role_fence_state(self, player_id):
+        self._check("role_fence_state")
+        role = self.roles.get(player_id)
+        if role is None:
+            return None
+        route = self.routes_.get(player_id)
+        return {
+            "player_id": player_id,
+            "account": role["account"],
+            "owner_revision": role["rev"],
+            "freeze_token": role.get("freeze_token", 0),
+            "version": role.get("fence_version", 1),
+            "home_zone": route[0] if route is not None else 0,
+            "freeze_final": bool(role.get("freeze_final", False)),
+        }
+
+    async def verify_admission(self, identity):
+        self._check("verify_admission")
+        role = self.roles.get(identity.player_id)
+        if role is None or not role["account"] or role["rev"] != identity.owner_revision:
+            return False
+        row = self.admissions.get((identity.player_id, identity.scene_instance_id))
+        if row is None:
+            return False
+        if identity.generation != row["highest"] or identity.generation <= row["closed"]:
+            return False
+        return row["identity"] == identity
+
+    async def read_store_row(self, player_id, kind):
+        self._check("read_store_row")
+        if player_id not in self.roles:
+            return False, b""
+        payloads = getattr(self, "store_rows", {})
+        return True, payloads.get((player_id, kind), b"")
+
     # -- names ---------------------------------------------------------------------------------------
     async def reserve_name(self, player_id, name, norm, now_ms):
         self._check("reserve_name")

@@ -51,6 +51,10 @@ class Settings:
     scene_control_redis: str = ""
     match: str = ""
     data_service_node: dict = field(default_factory=dict)  # raw [data_service_node], parsed by data_service.config
+    router_node: dict = field(default_factory=dict)  # raw [router_node], parsed by client_rpc_router.config
+    db_node: dict = field(default_factory=dict)  # raw [db_node], parsed by db.config
+    player_locator_node: dict = field(default_factory=dict)  # raw [player_locator_node], parsed by player_locator.config
+    player_inbox_node: dict = field(default_factory=dict)  # raw [player_inbox_node], parsed by player_inbox.config
 
     @classmethod
     def load(cls, path: Path | None):

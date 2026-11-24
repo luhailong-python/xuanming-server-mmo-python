@@ -53,6 +53,14 @@ def main() -> None:
     portal.add_argument("--config", type=Path, required=True)
     data_service = commands.add_parser("data-service", help="启动 data_service（账号目录/路由/名字/号段）")
     data_service.add_argument("--config", type=Path, required=True)
+    router = commands.add_parser("router", help="启动 client_rpc_router（Gate 客户端 RPC 路由服务）")
+    router.add_argument("--config", type=Path, required=True)
+    db_cmd = commands.add_parser("db", help="启动 db（PlayerStore 玩家存档服务）")
+    db_cmd.add_argument("--config", type=Path, required=True)
+    locator_cmd = commands.add_parser("player-locator", help="启动 player_locator（玩家在线态与租约定位服务）")
+    locator_cmd.add_argument("--config", type=Path, required=True)
+    inbox_cmd = commands.add_parser("player-inbox", help="启动 player_inbox（玩家可靠收件箱服务）")
+    inbox_cmd.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -81,6 +89,22 @@ def main() -> None:
             from .data_service.node import run as run_data_service
 
             asyncio.run(run_data_service(Settings.load(args.config)))
+        elif args.command == "router":
+            from .client_rpc_router.node import run as run_router
+
+            asyncio.run(run_router(Settings.load(args.config)))
+        elif args.command == "db":
+            from .db.node import run as run_db
+
+            asyncio.run(run_db(Settings.load(args.config)))
+        elif args.command == "player-locator":
+            from .player_locator.node import run as run_locator
+
+            asyncio.run(run_locator(Settings.load(args.config)))
+        elif args.command == "player-inbox":
+            from .player_inbox.node import run as run_inbox
+
+            asyncio.run(run_inbox(Settings.load(args.config)))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

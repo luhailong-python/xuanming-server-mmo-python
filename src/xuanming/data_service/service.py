@@ -92,7 +92,16 @@ class DataService:
             "ReadAccountDirectory": self.read_account_directory, "CreateAccountRole": self.create_account_role,
             "LookupAccountRole": self.lookup_account_role, "RegisterRoleAdmission": self.register_role_admission,
             "CloseRoleAdmissions": self.close_role_admissions, "RegisterPlayerZone": self.register_player_zone,
-            "BatchGetPlayerHomeZone": self.batch_get_player_home_zone, "ReservePlayerName": self.reserve_player_name,
+            "GetPlayerHomeZone": self.get_player_home_zone,
+            "BatchGetPlayerHomeZone": self.batch_get_player_home_zone,
+            "GetMergedZones": self.get_merged_zones,
+            "CountZoneRoles": self.count_zone_roles,
+            "GetPlayerRoute": self.get_player_route,
+            "GetRoleFenceState": self.get_role_fence_state,
+            "VerifyRoleAdmission": self.verify_role_admission,
+            "GetPlayerInboxLedger": self.get_player_inbox_ledger,
+            "GetPlayerItemGainBlock": self.get_player_item_gain_block,
+            "ReservePlayerName": self.reserve_player_name,
             "ReleasePlayerName": self.release_player_name, "BatchGetPlayerName": self.batch_get_player_name,
             "AllocateIdSegment": self.allocate_id_segment,
         }
@@ -194,6 +203,114 @@ class DataService:
             await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: merged zone cache not assembled")
         return self.protocol.message("data_service.BatchGetPlayerHomeZoneResponse", player_zone_map={
             pid: self.zones.final(home) for pid, home in homes.items()})
+
+    async def get_player_home_zone(self, request, context, path):
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, f"error_code={ERR_INVALID_REQUEST}: player_id=0")
+        if self.zones is None:
+            await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: merged zone cache not assembled")
+        try:
+            detail = await self.store.route_detail(request.player_id)
+        except Exception as error:
+            logger.error("GetPlayerHomeZone failed player=%d", request.player_id, exc_info=error)
+            await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: {error}")
+        if detail is None:
+            await context.abort(CODE.NOT_FOUND, "no home zone mapping")
+        return self.protocol.message("data_service.GetPlayerHomeZoneResponse", home_zone_id=self.zones.final(detail[0]))
+
+    async def get_merged_zones(self, request, context, path):
+        if self.zones is None:
+            await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: merged zone cache not assembled")
+        return self.protocol.message("data_service.GetMergedZonesResponse", merged_into=dict(self.zones.mapping))
+
+    async def count_zone_roles(self, request, context, path):
+        zone_id = int(request.zone_id)
+        if not 1 <= zone_id <= ROUTE_HOME_ZONE_MAX:
+            await context.abort(CODE.INVALID_ARGUMENT, f"error_code={ERR_INVALID_REQUEST}: invalid zone_id")
+        if self.zones is None:
+            await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: merged zone cache not assembled")
+        target = self.zones.final(zone_id)
+        sources = [target, *(src for src in self.zones.mapping if self.zones.final(src) == target)]
+        try:
+            total = await self.store.count_zone_roles(sorted(set(sources)))
+        except Exception as error:
+            logger.error("CountZoneRoles failed zone=%d", zone_id, exc_info=error)
+            await context.abort(CODE.UNAVAILABLE, f"error_code={ERR_ROUTE_STORE}: {error}")
+        return self.protocol.message("data_service.CountZoneRolesResponse", roles=total)
+
+    async def get_player_route(self, request, context, path):
+        await self._admit(context, request, path, ("db", "scene_manager", "player_inbox", "login"))
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            detail = await self.store.route_detail(request.player_id)
+        except Exception as error:
+            logger.error("GetPlayerRoute failed player=%d", request.player_id, exc_info=error)
+            return self.protocol.message("data_service.GetPlayerRouteResponse", retry=True)
+        if detail is None:
+            return self.protocol.message("data_service.GetPlayerRouteResponse", found=False)
+        return self.protocol.message(
+            "data_service.GetPlayerRouteResponse", home_zone=detail[0], storage_id=detail[1], found=True,
+        )
+
+    async def get_role_fence_state(self, request, context, path):
+        await self._admit(context, request, path, ("player_inbox", "match", "mail", "guild", "trade", "friend", "db"))
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            state = await self.store.role_fence_state(request.player_id)
+        except Exception as error:
+            logger.error("GetRoleFenceState failed player=%d", request.player_id, exc_info=error)
+            return self.protocol.message("data_service.GetRoleFenceStateResponse", retry=True)
+        if state is None:
+            return self.protocol.message("data_service.GetRoleFenceStateResponse", found=False)
+        return self.protocol.message("data_service.GetRoleFenceStateResponse", found=True, state=state)
+
+    async def verify_role_admission(self, request, context, path):
+        await self._admit(context, request, path, ("player_inbox", "match", "mail", "guild", "trade", "friend"))
+        identity = request.admission
+        if not valid_admission(identity):
+            return self.protocol.message("data_service.VerifyRoleAdmissionResponse", valid=False)
+        try:
+            ok = await self.store.verify_admission(identity)
+        except Exception as error:
+            logger.error("VerifyRoleAdmission failed player=%d", identity.player_id, exc_info=error)
+            return self.protocol.message("data_service.VerifyRoleAdmissionResponse", retry=True)
+        return self.protocol.message("data_service.VerifyRoleAdmissionResponse", valid=ok)
+
+    async def get_player_inbox_ledger(self, request, context, path):
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            found, raw = await self.store.read_store_row(request.player_id, 7)  # PLAYER_STORE_KIND_WALLET
+        except Exception as error:
+            logger.error("GetPlayerInboxLedger failed player=%d", request.player_id, exc_info=error)
+            await context.abort(CODE.UNAVAILABLE, str(error))
+        if not found:
+            return self.protocol.message("data_service.GetPlayerInboxLedgerResponse", found=False)
+        resp = self.protocol.message("data_service.GetPlayerInboxLedgerResponse", found=True)
+        if raw:
+            db_msg = self.protocol.parse("player_database", raw)
+            if db_msg.HasField("inbox_ledger"):
+                resp.ledger.CopyFrom(db_msg.inbox_ledger)
+        return resp
+
+    async def get_player_item_gain_block(self, request, context, path):
+        if not request.player_id:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id=0")
+        try:
+            found, raw = await self.store.read_store_row(request.player_id, 4)  # PLAYER_STORE_KIND_PROFILE
+        except Exception as error:
+            logger.error("GetPlayerItemGainBlock failed player=%d", request.player_id, exc_info=error)
+            await context.abort(CODE.UNAVAILABLE, str(error))
+        if not found:
+            return self.protocol.message("data_service.GetPlayerItemGainBlockResponse", found=False)
+        resp = self.protocol.message("data_service.GetPlayerItemGainBlockResponse", found=True)
+        if raw:
+            db_msg = self.protocol.parse("player_database", raw)
+            if db_msg.HasField("item_gain_block"):
+                resp.block.CopyFrom(db_msg.item_gain_block)
+        return resp
 
     # -- names ---------------------------------------------------------------------------------------
     async def reserve_player_name(self, request, context, path):

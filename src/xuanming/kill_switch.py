@@ -21,7 +21,8 @@ _STALE = 60.0
 _PROTECTED = frozenset({
     "Gate/NodeHandshake", "Scene/NodeHandshake", "Gate/GmGracefulShutdown",
     "SceneScene/GmGracefulShutdown", "Scene/ProcessClientPlayerMessage", "ScenePlayer/ExitGame",
-    "SceneNodeGrpc/ReleasePlayer", "ClientPlayerLogin/LeaveGame", "BattleClientPlayer/StopWatchBattle",
+    "SceneNodeGrpc/ReleasePlayer", "ClientPlayerLogin/LeaveGame", "ClientPlayerLogin/Disconnect",
+    "ClientRpcRouter/Forward", "BattleClientPlayer/StopWatchBattle",
     "GateClientSpectate/UnsubscribeSpectate", "BattleNode/RemoveObserver", "Scene/DestroyScene",
     "SceneNodeGrpc/DestroyScene", "BattleNode/DestroyBattle", "Scene/CancelBattlePrepare",
     "SceneNodeGrpc/CancelBattlePrepare", "SceneNodeGrpc/AssetAbortDebit", "SceneNodeGrpc/AssetAckReceipt",

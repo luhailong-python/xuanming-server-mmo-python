@@ -553,6 +553,87 @@ class SqlStore:
                                   "ORDER BY src_zone")
         return {src: dst for src, dst, *_ in rows}
 
+    async def route_detail(self, player_id: int) -> tuple[int, int] | None:
+        """读取原始 (home_zone, storage_id)，不做合服折叠；缺失任一字段返回 None。"""
+        shard = player_id % ROUTE_SHARDS
+        _, rows = await self._one(ROUTE_READ_ROW, (shard, player_id))
+        if not rows:
+            return None
+        home, storage = rows[0][0], rows[0][1]
+        if home is None or storage is None:
+            return None
+        return int(home), int(storage)
+
+    async def count_zone_roles(self, zones: list[int]) -> int:
+        if not zones:
+            return 0
+        _, rows = await self._one(
+            f"SELECT COUNT(*) FROM player_route WHERE home_zone IN ({_marks(len(zones))})",
+            zones,
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def role_fence_state(self, player_id: int) -> dict | None:
+        """读取角色护栏状态（含已删角墓碑，account 为空串）。"""
+        _, rows = await self._one(
+            "SELECT account, owner_revision, trade_listing_id, prepare_token, fence_version "
+            "FROM account_role WHERE player_id=%s",
+            (player_id,),
+        )
+        if not rows:
+            return None
+        account_raw, owner_rev, listing_id, prepare_token, fence_ver = rows[0]
+        route = await self.route_detail(player_id)
+        home_zone = route[0] if route is not None else 0
+        freeze_token = int(listing_id or prepare_token or 0)
+        return {
+            "player_id": player_id,
+            "account": bytes(account_raw).decode("utf-8"),
+            "owner_revision": int(owner_rev),
+            "freeze_token": freeze_token,
+            "version": int(fence_ver or 1),
+            "home_zone": home_zone,
+            "freeze_final": bool(listing_id),
+        }
+
+    async def verify_admission(self, identity) -> bool:
+        """强读校验该实例入场登记是否为当前未关闭最高世代且原件一致。"""
+        owned = await self._read_owner(identity.player_id)
+        if owned is None or not owned.account or owned.owner_revision != identity.owner_revision:
+            return False
+        _, rows = await self._one(
+            "SELECT highest_generation, closed_through, identity_proto "
+            "FROM account_role_admission WHERE player_id=%s AND scene_instance_id=%s",
+            (identity.player_id, identity.scene_instance_id),
+        )
+        if not rows:
+            return False
+        highest, closed, raw_identity = rows[0]
+        if int(identity.generation) != int(highest) or int(identity.generation) <= int(closed):
+            return False
+        stored = type(identity).FromString(bytes(raw_identity))
+        return stored == identity
+
+    async def read_store_row(self, player_id: int, kind: int) -> tuple[bool, bytes]:
+        """读取玩家落盘表 player_store 的指定 kind payload，用于收件箱账本与物品封禁查询。"""
+        route = await self.route_detail(player_id)
+        if route is None:
+            return False, b""
+        pool = self.storage_pools.get(route[1])
+        if pool is None:
+            raise RuntimeError(f"storage pool unavailable: {route[1]}")
+        _, owner_rows = await self._one(
+            "SELECT 1 FROM player_store WHERE player_id=%s AND kind=0", (player_id,), pool=pool,
+        )
+        if not owner_rows:
+            return False, b""
+        _, rows = await self._one(
+            "SELECT payload FROM player_store WHERE player_id=%s AND kind=%s", (player_id, kind), pool=pool,
+        )
+        if not rows or rows[0][0] is None:
+            return True, b""
+        return True, bytes(rows[0][0])
+
     # -- names ---------------------------------------------------------------------------------------
     async def _owned_norm(self, player_id: int):
         _, rows = await self._one("SELECT name_norm FROM player_name_owner WHERE player_id = %s", (player_id,))

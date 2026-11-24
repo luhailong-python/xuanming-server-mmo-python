@@ -67,3 +67,47 @@ logical_shards = 1
 max_players_per_account = 5
 storage_ids = [1000000]
 merged_zone_refresh_sec = 5
+
+[router_node]
+node_id = 106
+host = "0.0.0.0"
+grpc_port = 50600
+advertise_host = "client-rpc-router"
+lease_ttl_sec = 60
+forward_timeout_ms = 5000
+server_timeout_ms = 6000
+zone_scoped_node_types = ["LoginNodeService"]
+global_target_subset_size = 4
+breaker_failure_threshold = 5
+breaker_open_duration_ms = 10000
+
+[db_node]
+node_id = 107
+host = "0.0.0.0"
+grpc_port = 6000
+advertise_host = "db"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+storage_ids = [1000000]
+sql_timeout_sec = 12.0
+lock_wait_timeout_sec = 10
+
+[player_locator_node]
+node_id = 108
+host = "0.0.0.0"
+grpc_port = 50300
+advertise_host = "player-locator"
+etcd_lease_ttl_sec = 60
+default_disconnect_lease_sec = 30
+
+[player_inbox_node]
+node_id = 109
+host = "0.0.0.0"
+grpc_port = 50950
+advertise_host = "player-inbox"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_player_inbox"
+enqueue_types = ["PLAYER_INBOX_MSG_BATTLE_SETTLEMENT"]

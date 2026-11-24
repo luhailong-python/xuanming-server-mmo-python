@@ -1,0 +1,87 @@
+# Python 全业务服务去 Go 化移植设计方案
+
+> 关联权威参考源：`xuanming-server-mmo-cpp/go/`（只读参照，不修改 C++/Go 仓库任何代码）
+> 目标仓库：`xuanming-server-mmo-python`（全部在 `main` 分支推进，每阶段联调验证通过后提交并推送）
+
+## 1. 需求分析
+
+- **核心目标**：将 `xuanming-server-mmo-python` 集群模式目前仍依赖的外部 Go 业务服务全部移植为纯 Python 服务，使整个业务集群（Gate、Scene、Battle、Portal、Login、DataService 及所有微服务）均由 Python 实现；仅保留 Redis、etcd、Kafka、MySQL/TiDB 等基础设施组件。
+- **兼容性要求**：
+  - 沿用 C++/Go 权威 `proto/` 契约与 `tools/build_protocol.py` 代码/描述符生成机制；
+  - 线协议、gRPC 路径、服务间 HMAC/Ed25519 鉴权、Redis 键与 Lua 脚本、MySQL/TiDB 表结构、etcd 注册键、Kafka 主题分区与 C++/Go 保持对齐，确保单服务独立替换与端到端联调一致；
+  - 战斗玩法保持现有 Python 实现不变。
+- **技术栈约束**：全部基于 Python 标准库与项目既有依赖（`asyncio`、`grpcio`/`grpc.aio`、`protobuf`、`aiomysql`、`redis.asyncio`、`aiokafka`、`cryptography`、`aiohttp`），不引入未经程序确认的新第三方库。
+
+## 2. 思想分析
+
+- **以契约和状态机为中心，不照搬 Go 样板**：
+  - Go 侧因历史演进与 go-zero 脚手架存在大量生成包装、运维子命令与多套历史兼容路径；Python 版严格以**对外 RPC 契约、持久化状态机、并发防错（Fence/CAS/幂等键）**为单一事实源，用 Python `asyncio` + `dataclass(frozen=True)` + `Protocol` 表达同等语义。
+- **Actor / 边界隔离原则**：
+  - 跨服务、跨节点通信全部走不可变 Protobuf 消息（gRPC / Kafka）；服务内部按职责拆分为 `config`（配置校验）、`model`/`errors`（领域值对象与错误码）、`store`（SQL/Redis 持久化）、`service`（gRPC 适配与鉴权）、`node`（生命周期与 etcd 注册）。
+  - 服务内部采用清晰直接的方法调用，避免无意义的内部消息化过度设计。
+- **模式选型说明**：
+  - **Repository / Adapter（仓储与适配器模式）**：将 SQL/Redis 存储抽象为 `Protocol`，在单元测试中注入内存双生体（in-memory twin）并在具备真实 MySQL/Redis 时无缝切换真实存储，解决外部基础设施不可达时无法回归测试的痛点。
+  - **Chain of Responsibility / Decorator（鉴权包装器）**：统一复用于 `grpc_runtime.serve_grpc` 的服务间 HMAC 校验与 Gate Ed25519 会话校验，避免每个 RPC 重复编写验签逻辑且防止漏校验（fail-closed）。
+  - **Strategy（路由与分派策略）**：`client_rpc_router` 与 `match` 房间分配将节点发现、释放轨道过滤与负载均衡策略解耦，便于水平扩展与独立测试。
+
+## 3. 设计分析
+
+### 3.1 服务分层与移植全量清单
+
+| 阶段 | 服务 | 端口 | 核心存储 / 依赖 | 现状 |
+|---|---|---|---|---|
+| 已完成 | `login` | 53000 | LoginRedis / PlayerRedis / Kafka / DataService / PlayerLocator / SceneManager | 已移植主链路（`src/xuanming/login/`） |
+| 已完成 | `data_service` | 9000 | MySQL/TiDB / etcd | 已移植主链路 11 RPC（`src/xuanming/data_service/`） |
+| 阶段 1A | `db` (`player_store`) | 6000 | MySQL/TiDB / etcd | 待移植：玩家数据 Load/Save/CAS 与入场围栏 |
+| 阶段 1A | `player_locator` | 50300 | PlayerRedis (Lua) / etcd | 待移植：玩家在线态、租约、世代与位置路由 |
+| 阶段 1B | `client_rpc_router` | 50600 | etcd / 下游 gRPC | 待移植：Gate ForwardRequest 路由、元数据透传与白名单 |
+| 阶段 1B | `player_inbox` | 50950 | MySQL/TiDB / etcd | 待移植：GM/战斗/邮件/交易收件箱 Enqueue/Fetch/Ack 游标 |
+| 阶段 1C | `scene_manager` | 60000 | SceneControlRedis / etcd / Scene gRPC / Kafka | 待移植：场景注册、EnterScene、跨线/切图与负载调度 |
+| 阶段 1C | `match` | 50500 | Redis / etcd / Battle gRPC / Scene gRPC | 待移植：组队、匹配、战斗房间分配与结算协调 |
+| 阶段 2A | `content_guard` | 50700 | 词库 / 内存 / etcd | 待移植：敏感词检测、替换与限流 |
+| 阶段 2A | `chat` | 50200 | MySQL/TiDB / Redis / Kafka / ContentGuard | 待移植：世界/区服/队伍/私聊发送、窗口与历史查询 |
+| 阶段 2A | `mail` | 50400 | MySQL/TiDB / PlayerInbox / DataService | 待移植：系统与玩家邮件投递、读取、附件领取与删除 |
+| 阶段 2A | `rank` | 50800 | Redis ZSET / MySQL/TiDB / Mail | 待移植：榜单更新、分页查询与结算快照 |
+| 阶段 2B | `friend` | 50100 | MySQL/TiDB / Redis / PlayerLocator | 待移植：好友申请、关系维护、黑名单与在线态 |
+| 阶段 2B | `payment` | 50900 | MySQL/TiDB / PlayerInbox / DataService | 待移植：订单创建、回调核销幂等与发货投递 |
+| 阶段 2B | `trade` | 50920 | MySQL/TiDB / DataService / PlayerInbox | 待移植：上架/购买/撤销/托管与资产一致性围栏 |
+| 阶段 2B | `guild` | 50930 | MySQL/TiDB / Redis / DataService | 待移植：公会创建、审批、权限、仓库与公告 |
+
+### 3.2 统一工程规范
+
+- **包结构**：每个独立服务位于 `src/xuanming/<service_name>/`，包含 `__init__.py`、`config.py`、`errors.py`、`model.py`、`store.py`（及 `sql_store.py`/`redis_store.py`）、`service.py`、`node.py`。
+- **CLI 入口**：统一接入 `python -m xuanming <service-cmd> --config <toml>`（或 `run <role>`），配置段集中在 `config/cluster.example.toml`。
+- **Schema 文件**：每个需要 MySQL/TiDB 的服务在 `config/<service>_schema.sql` 维护与 Go 一致的权威 DDL。
+- **鉴权与协议**：复用 `src/xuanming/grpc_runtime.py` 的 `serve_grpc`、`GrpcClient`、`sign_service_call`、`verify_service_call` 与 `cluster.EtcdDirectory`。若发现 `proto/` 落后于 C++ 权威源，先同步 `.proto` 并通过 `python tools/build_protocol.py` 重新生成 `src/xuanming/contracts/schema.pb`。
+
+## 4. 漏洞分析与风险控制
+
+1. **鉴权与越权风险**：
+   - 所有涉及资产/角色/状态的内部 RPC（`db`、`player_inbox`、`data_service`、`scene_manager`、`match`、`payment`、`trade`）必须强制 fail-closed：未配置密钥或验签失败直接返回 `PERMISSION_DENIED` / `UNAUTHENTICATED`，严禁开发默认放行。
+   - `client_rpc_router` 必须严格校验客户端 `message_id` 是否允许外网路由（`client_protocol=True` 或显式允许的内部消息如 Gate 签名的 `RenewSession`），同时透传并校验 `x-session-detail-bin` 请求/响应头，防止伪造会话身份。
+2. **并发与脏写风险（Fence / Epoch / CAS）**：
+   - `db` 写入必须校验 `owner_epoch` / `version`（CAS），旧 Scene 迟到写包不得覆盖新主人的持久化快照。
+   - `player_locator` 必须使用与 Go 字节级一致的 Redis Lua 原子脚本处理登录世代、租约续期与离线清理，防止并发登录导致的双在线或旧连接误踢新连接。
+   - `player_inbox` 游标确认与 `payment` 回调核销必须使用数据库唯一键 + 事务状态机保证严格幂等，杜绝重复发奖/刷物。
+3. **协议与依赖漂移风险**：
+   - `aiomysql` 0.3.2 与 `PyMySQL` 1.2.4 存在 `bytes` 参数转义缺陷，SQL 二进制字段统一使用 `UNHEX(%s)` 或 `hex()` 安全编码，避免静默写坏 blob。
+   - 任何从 C++ 同步的 proto 变更都需跑全量 `pytest`，确保不破坏已有 Gate/Scene/Battle/Login 测试。
+4. **验证边界风险**：
+   - 单元测试默认以内存双生体 + 真实 `grpc.aio` 环回验证；对 SQL/Redis/etcd 服务提供可选的真实基础设施集成测试，同时构建纯 Python 进程级主链路联调测试（Gate → Router → Login → DataService → PlayerLocator → SceneManager → Scene → DB → PlayerInbox → Match → Battle）。
+
+## 5. 步骤分析
+
+1. **阶段 1A（存储与定位底座）**：移植 `db`（`player_store`）与 `player_locator`，打通玩家数据持久化与在线态围栏；编写单测与全量回归，提交并推送。
+2. **阶段 1B（路由与可靠投递）**：移植 `client_rpc_router` 与 `player_inbox`，打通 Gate 路由转发与 Scene 异步发奖/终局投递；编写单测与全量回归，提交并推送。
+3. **阶段 1C（场景调度与匹配编排）**：移植 `scene_manager` 与 `match`，彻底闭合“登录 → 选区 → 进场景 → 切图 → 组队匹配 → 进战斗 → 结算回写”纯 Python 全集群主链路；补充端到端联调测试，提交并推送。
+4. **阶段 2A（内容安全、聊天、邮件、排行）**：移植 `content_guard`、`chat`、`mail`、`rank`，提交并推送。
+5. **阶段 2B（社交与经济系统）**：移植 `friend`、`payment`、`trade`、`guild`，完成全业务服务去 Go 化并跑通全量验证，最终提交并推送。
+
+## 6. 执行步骤
+
+每个阶段均严格执行以下闭环：
+1. 只读分析 `xuanming-server-mmo-cpp/go/<service>` 契约、鉴权、DDL/Lua/etcd 细节并核对 `proto/` 差异；
+2. 如有协议缺口，同步权威 `.proto` 并运行 `.venv\Scripts\python tools/build_protocol.py`；
+3. 按 `src/xuanming/<service>/` 分层实现服务、配置、Schema、CLI 入口；
+4. 编写面向真实 `serve_grpc` 环回与已有 Python 客户端对接的 `pytest` 回归测试（含异常/越权/并发围栏用例）；
+5. 运行 `.venv\Scripts\python -m pytest -q` 全量通过后，在 `main` 分支按中文提交规范 `git commit` 并 `git push origin main`。

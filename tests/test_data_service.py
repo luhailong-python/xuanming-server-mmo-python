@@ -28,7 +28,8 @@ from xuanming.protocol import Protocol
 from xuanming.settings import Settings
 
 SECRETS = {"login": b"login-directory-secret-0123456789", "scene": b"scene-directory-secret-0123456789",
-           "scene_manager": b"scene-manager-secret-0123456789ab"}
+           "scene_manager": b"scene-manager-secret-0123456789ab", "db": b"db-role-fence-secret-0123456789ab",
+           "player_inbox": b"inbox-role-fence-secret-012345678"}
 STORAGE = 1_000_000
 PATH = "/data_service.DataService/"
 MYSQL = os.environ.get("XUANMING_TEST_MYSQL")
@@ -321,12 +322,83 @@ def test_id_segments_and_unimplemented(kind):
         assert (await allocate("nope")).error_code == 20                 # unknown tag, still an OK status
         assert (await allocate("Bad Tag")).error_code == 14 and (await allocate("")).error_code == 14
         assert (await allocate("item", 10_000_001)).error_code == 14
-        for method in ("RepairAccountRole", "GetPlayerHomeZone", "GetMergedZones", "RenameRole"):
+        for method in ("RepairAccountRole", "RenameRole"):
             with pytest.raises(grpc.aio.AioRpcError) as error:
                 await env.client.call(PATH + method, b"")
             assert code(error.value) == "UNIMPLEMENTED"
 
     exercise(kind, scenario)
+
+
+def test_extended_route_fence_and_ledger_rpcs():
+    async def scenario(env):
+        await env.directory.register_player_zone(9001, 2, 1_000_000)
+        await env.directory.create_role("acc-ext", env.role(9001, zone_id=2, name="Hero"))
+
+        # GetPlayerHomeZone + GetMergedZones + CountZoneRoles
+        raw_home = await env.client.call(
+            PATH + "GetPlayerHomeZone",
+            env.protocol.message("data_service.GetPlayerHomeZoneRequest", player_id=9001).SerializeToString(),
+        )
+        assert env.protocol.parse("data_service.GetPlayerHomeZoneResponse", raw_home).home_zone_id == 2
+        raw_merged = await env.client.call(PATH + "GetMergedZones", b"")
+        assert dict(env.protocol.parse("data_service.GetMergedZonesResponse", raw_merged).merged_into) == {}
+        raw_cnt = await env.client.call(
+            PATH + "CountZoneRoles",
+            env.protocol.message("data_service.CountZoneRolesRequest", zone_id=2).SerializeToString(),
+        )
+        assert env.protocol.parse("data_service.CountZoneRolesResponse", raw_cnt).roles == 1
+
+        # GetPlayerRoute (signed as db)
+        req_route = env.protocol.message("data_service.GetPlayerRouteRequest", player_id=9001)
+        sign_service_call(PATH + "GetPlayerRoute", req_route, "db", int(time.time() * 1000), SECRETS["db"])
+        raw_route = await env.client.call(PATH + "GetPlayerRoute", req_route.SerializeToString(deterministic=True))
+        route_resp = env.protocol.parse("data_service.GetPlayerRouteResponse", raw_route)
+        assert (route_resp.found, route_resp.home_zone, route_resp.storage_id) == (True, 2, 1_000_000)
+
+        # GetRoleFenceState (signed as player_inbox)
+        req_fence = env.protocol.message("data_service.GetRoleFenceStateRequest", player_id=9001)
+        sign_service_call(PATH + "GetRoleFenceState", req_fence, "player_inbox", int(time.time() * 1000), SECRETS["player_inbox"])
+        raw_fence = await env.client.call(PATH + "GetRoleFenceState", req_fence.SerializeToString(deterministic=True))
+        fence_resp = env.protocol.parse("data_service.GetRoleFenceStateResponse", raw_fence)
+        assert fence_resp.found and fence_resp.state.account == "acc-ext" and fence_resp.state.owner_revision == 1
+
+        # RegisterRoleAdmission -> VerifyRoleAdmission (signed as player_inbox)
+        identity = env.protocol.message(
+            "common.base.RoleAdmissionIdentity",
+            player_id=9001,
+            scene_instance_id="11111111-1111-1111-1111-111111111111",
+            generation=1,
+            owner_revision=1,
+            owner_epoch=5,
+            scene_node_id="scene-1",
+            scene_id=100,
+            zone_id=2,
+            session_id=77,
+            login_generation=1,
+        )
+        reg = env.protocol.message("data_service.RegisterRoleAdmissionRequest", identity=identity)
+        sign_service_call(PATH + "RegisterRoleAdmission", reg, "scene", int(time.time() * 1000), SECRETS["scene"])
+        await env.client.call(PATH + "RegisterRoleAdmission", reg.SerializeToString(deterministic=True))
+
+        verify_req = env.protocol.message("data_service.VerifyRoleAdmissionRequest", admission=identity)
+        sign_service_call(PATH + "VerifyRoleAdmission", verify_req, "player_inbox", int(time.time() * 1000), SECRETS["player_inbox"])
+        raw_verify = await env.client.call(PATH + "VerifyRoleAdmission", verify_req.SerializeToString(deterministic=True))
+        assert env.protocol.parse("data_service.VerifyRoleAdmissionResponse", raw_verify).valid is True
+
+        # GetPlayerInboxLedger & GetPlayerItemGainBlock
+        raw_ledger = await env.client.call(
+            PATH + "GetPlayerInboxLedger",
+            env.protocol.message("data_service.GetPlayerInboxLedgerRequest", player_id=9001).SerializeToString(),
+        )
+        assert env.protocol.parse("data_service.GetPlayerInboxLedgerResponse", raw_ledger).found is True
+        raw_block = await env.client.call(
+            PATH + "GetPlayerItemGainBlock",
+            env.protocol.message("data_service.GetPlayerItemGainBlockRequest", player_id=9001).SerializeToString(),
+        )
+        assert env.protocol.parse("data_service.GetPlayerItemGainBlockResponse", raw_block).found is True
+
+    exercise("memory", scenario)
 
 
 def test_name_charset_vectors_shared_with_go():
