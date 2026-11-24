@@ -10,13 +10,13 @@ import uuid
 from contextlib import AsyncExitStack
 
 from ..cluster import EtcdDirectory, KafkaCommands
-from ..grpc_runtime import GrpcClient, serve_grpc
+from ..grpc_runtime import serve_grpc
 from ..kill_switch import EtcdKillSwitch, KillSwitch
 from ..protocol import Protocol
 from ..settings import Settings
 from .config import PLAYER_LOCATOR_NODE_TYPE, PlayerLocatorConfig
 from .gate_sweep import DirectoryLiveGateView, GateSweeper
-from .lease_monitor import GrpcSceneManagerClient, KafkaGatePublisher, LeaseMonitor
+from .lease_monitor import KafkaGatePublisher, LeaseMonitor, RoutingSceneManagerClient
 from .service import PlayerLocatorService
 from .store import RedisSessionStore, open_player_redis
 
@@ -64,13 +64,13 @@ async def run(settings: Settings) -> None:
             await redis_client.ping()
             store = RedisSessionStore(redis_client)
 
-            scene_manager = None
-            if settings.scene_manager:
-                sm_grpc = GrpcClient(settings.scene_manager, timeout=config.scene_manager_timeout_sec)
-                stack.push_async_callback(sm_grpc.close)
-                scene_manager = GrpcSceneManagerClient(
-                    protocol, sm_grpc, timeout_sec=config.scene_manager_timeout_sec,
-                )
+            scene_manager = RoutingSceneManagerClient(
+                protocol,
+                default_endpoint=settings.scene_manager,
+                zone_endpoints=config.scene_manager_endpoint_map(),
+                timeout_sec=config.scene_manager_timeout_sec,
+            )
+            stack.push_async_callback(scene_manager.close)
 
             gate_publisher = None
             if settings.kafka:
@@ -117,6 +117,7 @@ async def run(settings: Settings) -> None:
             info.grpc_endpoint.ip = info.endpoint.ip = config.advertise_host
             info.grpc_endpoint.port = info.endpoint.port = port
             directory = EtcdDirectory(protocol, settings.etcd, ttl=config.etcd_lease_ttl_sec)
+            scene_manager.directory = directory
             # 先注销 etcd 再排空在途 RPC 与租约监控（AsyncExitStack 按 LIFO 逆序回收）
             stack.push_async_callback(directory.close)
             await directory.register(info)

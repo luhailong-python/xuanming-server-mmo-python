@@ -10,9 +10,11 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 
 from google.protobuf.message import DecodeError, Message
 
+from ..data.config_tables import ConfigTableError, ConfigTables
 from ..protocol import Protocol
 from .errors import (
     ERR_INVALID_PARAMETER,
@@ -81,6 +83,17 @@ DAY_MS = 24 * 3_600_000
 # -- 不可变配置与存储行模型 ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=1)
+def _default_config_tables() -> ConfigTables | None:
+    """按需懒加载仓库内置配置表快照；加载异常时返回 None 交由调用方回退内置默认值。"""
+    try:
+        return ConfigTables()
+    except ConfigTableError:
+        logger.warning("Failed to load default ConfigTables for ranked rules; falling back to embedded defaults",
+                       exc_info=True)
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class RankedPresetSpec:
     """单套官方排位预设规格（与 RankedPreset.xlsx / rankedpreset.json 逐项对齐）。"""
@@ -97,6 +110,36 @@ class RankedPresetSpec:
     pet_entry_points: tuple[int, ...] = ()
     sort: int = 0
     desc: str = ""
+
+    @classmethod
+    def from_row(cls, row: Message) -> RankedPresetSpec:
+        """从 ``RankedPreset`` 配置表行构造不可变预设规格。"""
+        return cls(
+            preset_id=int(row.id),
+            role_kind=int(row.role_kind),
+            code=str(row.code),
+            name=str(row.name),
+            role_tag=str(row.role_tag),
+            pet_table_id=int(row.pet_table_id),
+            weights=(int(row.weight_con), int(row.weight_spi), int(row.weight_str), int(row.weight_agi)),
+            skill_ids=tuple(int(x) for x in row.skill_ids),
+            pet_entry_ids=tuple(int(x) for x in row.pet_entry_ids),
+            pet_entry_points=tuple(int(x) for x in row.pet_entry_points),
+            sort=int(row.sort),
+            desc=str(row.desc),
+        )
+
+    @classmethod
+    def load_from_config_tables(cls, tables: ConfigTables | None = None) -> tuple[RankedPresetSpec, ...]:
+        """从 ``ConfigTables`` 的 ``RankedPreset`` 表加载预设列表；缺失或空表时回退内置默认预设。"""
+        snapshot = _default_config_tables() if tables is None else tables
+        if snapshot is None or "RankedPreset" not in snapshot.tables:
+            return OFFICIAL_RANKED_PRESETS
+        rows = snapshot["RankedPreset"].rows()
+        if not rows:
+            return OFFICIAL_RANKED_PRESETS
+        ordered = sorted(rows, key=lambda r: (int(r.role_kind), int(r.sort), int(r.id)))
+        return tuple(cls.from_row(row) for row in ordered)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +166,51 @@ class RankedRuleConfig:
     tier_yunzhang_centi: int = 155_000
     tier_tianshu_centi: int = 170_000
     tier_wushuang_centi: int = 185_000
+
+    @classmethod
+    def from_row(cls, row: Message) -> RankedRuleConfig:
+        """从 ``RankedRule`` 配置表行构造全局规则参数；零值字段回退默认值。"""
+        defaults = cls()
+        return cls(
+            rule_version=int(row.rule_version) or defaults.rule_version,
+            battle_config_id=int(row.battle_config_id) or defaults.battle_config_id,
+            reference_class_id=int(row.reference_class_id) or defaults.reference_class_id,
+            competitive_level=int(row.competitive_level) or defaults.competitive_level,
+            default_character_preset_id=(
+                int(row.default_character_preset_id) or defaults.default_character_preset_id
+            ),
+            default_pet_preset_id=int(row.default_pet_preset_id) or defaults.default_pet_preset_id,
+            season_duration_days=int(row.season_duration_days) or defaults.season_duration_days,
+            wait_prompt_seconds=int(row.wait_prompt_seconds) or defaults.wait_prompt_seconds,
+            spread_tier1_seconds=int(row.spread_tier1_seconds) or defaults.spread_tier1_seconds,
+            spread_tier1_points=int(row.spread_tier1_points) or defaults.spread_tier1_points,
+            spread_tier2_seconds=int(row.spread_tier2_seconds) or defaults.spread_tier2_seconds,
+            spread_tier2_points=int(row.spread_tier2_points) or defaults.spread_tier2_points,
+            spread_tier3_points=int(row.spread_tier3_points) or defaults.spread_tier3_points,
+            milestone_avatar_matches=int(row.milestone_avatar_matches) or defaults.milestone_avatar_matches,
+            milestone_card_matches=int(row.milestone_card_matches) or defaults.milestone_card_matches,
+            milestone_talisman_matches=int(row.milestone_talisman_matches) or defaults.milestone_talisman_matches,
+            tier_qingfeng_centi=int(row.tier_qingfeng_centi) or defaults.tier_qingfeng_centi,
+            tier_yunzhang_centi=int(row.tier_yunzhang_centi) or defaults.tier_yunzhang_centi,
+            tier_tianshu_centi=int(row.tier_tianshu_centi) or defaults.tier_tianshu_centi,
+            tier_wushuang_centi=int(row.tier_wushuang_centi) or defaults.tier_wushuang_centi,
+        )
+
+    @classmethod
+    def from_config_tables(cls, tables: ConfigTables | None = None, *, rule_id: int = 1) -> RankedRuleConfig:
+        """从 ``ConfigTables`` 的 ``RankedRule`` 表加载指定行；缺失时回退内置默认值。"""
+        snapshot = _default_config_tables() if tables is None else tables
+        if snapshot is None or "RankedRule" not in snapshot.tables:
+            return cls()
+        row = snapshot["RankedRule"].get(rule_id)
+        if row is None:
+            return cls()
+        return cls.from_row(row)
+
+
+def load_ranked_presets(tables: ConfigTables | None = None) -> tuple[RankedPresetSpec, ...]:
+    """从配置表加载论剑排位预设目录，缺失时回退内置 ``OFFICIAL_RANKED_PRESETS``。"""
+    return RankedPresetSpec.load_from_config_tables(tables)
 
 
 OFFICIAL_RANKED_PRESETS: tuple[RankedPresetSpec, ...] = (
@@ -325,13 +413,17 @@ class RankedManager:
         store,
         *,
         rule: RankedRuleConfig | None = None,
-        presets: tuple[RankedPresetSpec, ...] = OFFICIAL_RANKED_PRESETS,
+        presets: tuple[RankedPresetSpec, ...] | None = None,
+        tables: ConfigTables | None = None,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
-        self.rule = rule or RankedRuleConfig()
-        self.presets = tuple(presets)
+        self.rule = rule if rule is not None else RankedRuleConfig.from_config_tables(tables)
+        loaded_presets = (
+            tuple(presets) if presets is not None else RankedPresetSpec.load_from_config_tables(tables)
+        )
+        self.presets = loaded_presets
         self._char_preset_ids = frozenset(p.preset_id for p in self.presets if p.role_kind == ROLE_KIND_CHARACTER)
         self._pet_preset_ids = frozenset(p.preset_id for p in self.presets if p.role_kind == ROLE_KIND_PET)
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)

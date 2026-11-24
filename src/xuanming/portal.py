@@ -92,8 +92,10 @@ async def open_deps(settings):
 
 
 def create_app(deps, extra_routes=None):
+    from .portal_account import register_routes as register_account
     from .portal_admin_announcements import register_routes as register_admin_announcements
     from .portal_admin_killswitch import register_routes as register_admin_killswitch
+    from .portal_admin_tables import register_routes as register_admin_tables
     from .portal_admin_zones import register_routes as register_admin_zones
     from .portal_catalog import register_routes as register_catalog
     from .portal_server_list import register_routes as register_server_list
@@ -105,10 +107,12 @@ def create_app(deps, extra_routes=None):
         deps.metrics = Metrics()
     app = web.Application(client_max_size=64 * 1024, middlewares=[deps.metrics.instrument])
     register_login_routes(app, deps)
+    register_account(app, deps)
     register_catalog(app, deps)
     register_server_list(app, deps)
     register_admin_announcements(app, deps)
     register_admin_killswitch(app, deps)
+    register_admin_tables(app, deps)
     register_admin_zones(app, deps)
     register_mall_admin(app, deps)
     register_zone_policy(app, deps)

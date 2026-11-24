@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from ..settings import Settings
 
 PLAYER_LOCATOR_NODE_TYPE = 24  # common.base.eNodeType.PlayerLocatorNodeService
+SCENE_MANAGER_NODE_TYPE = 25   # common.base.eNodeType.SceneManagerNodeService
+SCENE_MANAGER_ENDPOINTS_ENV = "PLAYER_LOCATOR_SCENE_MANAGER_ENDPOINTS"
 DEFAULT_GRPC_PORT = 50300
 DEFAULT_DISCONNECT_LEASE_SEC = 30
 DEFAULT_POLL_INTERVAL_SEC = 1.0
@@ -34,6 +37,56 @@ def parse_release_track(raw: str) -> str | None:
     return None
 
 
+def parse_scene_manager_endpoints(
+    raw: str | Mapping[object, object] | Sequence[tuple[int, str]] | None,
+) -> tuple[tuple[int, str], ...]:
+    """解析多区 SceneManager 覆盖映射（如 ``"1=sm1:60000,2=sm2:60000"`` 或字典）。"""
+    if raw is None:
+        return ()
+    parsed: dict[int, str] = {}
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ()
+        for item in text.split(","):
+            entry = item.strip()
+            if not entry:
+                continue
+            zone_part, sep, endpoint_part = entry.partition("=")
+            if not sep:
+                raise ValueError(f"player_locator scene_manager_endpoints 条目格式无效: {entry!r}")
+            try:
+                zone_id = int(zone_part.strip())
+            except ValueError as exc:
+                raise ValueError(f"player_locator scene_manager_endpoints 区号无效: {zone_part!r}") from exc
+            endpoint = endpoint_part.strip()
+            if zone_id < 1 or not endpoint:
+                raise ValueError(f"player_locator scene_manager_endpoints 条目无效: {entry!r}")
+            parsed[zone_id] = endpoint
+    elif isinstance(raw, Mapping):
+        for raw_zone, raw_endpoint in raw.items():
+            try:
+                zone_id = int(str(raw_zone).strip())
+            except ValueError as exc:
+                raise ValueError(f"player_locator scene_manager_endpoints 区号无效: {raw_zone!r}") from exc
+            endpoint = str(raw_endpoint).strip()
+            if zone_id < 1 or not endpoint:
+                raise ValueError(
+                    f"player_locator scene_manager_endpoints 条目无效: {raw_zone!r}={raw_endpoint!r}"
+                )
+            parsed[zone_id] = endpoint
+    else:
+        for raw_zone, raw_endpoint in raw:
+            zone_id = int(raw_zone)
+            endpoint = str(raw_endpoint).strip()
+            if zone_id < 1 or not endpoint:
+                raise ValueError(
+                    f"player_locator scene_manager_endpoints 条目无效: ({raw_zone!r}, {raw_endpoint!r})"
+                )
+            parsed[zone_id] = endpoint
+    return tuple(sorted(parsed.items()))
+
+
 @dataclass(frozen=True, slots=True)
 class PlayerLocatorConfig:
     node_id: int = 103
@@ -55,6 +108,11 @@ class PlayerLocatorConfig:
     dead_gate_members_per_round: int = DEFAULT_DEAD_GATE_MEMBERS_PER_ROUND
     gate_scan_count: int = DEFAULT_GATE_SCAN_COUNT
     live_view_hold_sec: float = DEFAULT_LIVE_VIEW_HOLD_SEC
+    scene_manager_endpoints: tuple[tuple[int, str], ...] = ()
+
+    def scene_manager_endpoint_map(self) -> dict[int, str]:
+        """返回按区号索引的 SceneManager 覆盖端点映射。"""
+        return dict(self.scene_manager_endpoints)
 
     def validate(self) -> None:
         if not 0 < self.node_id < (1 << 17):
@@ -85,6 +143,13 @@ class PlayerLocatorConfig:
             raise ValueError("player_locator gate_scan_count 必须 > 0")
         if self.live_view_hold_sec < 0:
             raise ValueError("player_locator live_view_hold_sec 必须 >= 0")
+        seen_zones: set[int] = set()
+        for zone_id, endpoint in self.scene_manager_endpoints:
+            if zone_id < 1 or not str(endpoint).strip():
+                raise ValueError(f"player_locator scene_manager_endpoints 无效条目: ({zone_id}, {endpoint!r})")
+            if zone_id in seen_zones:
+                raise ValueError(f"player_locator scene_manager_endpoints 存在重复区号: {zone_id}")
+            seen_zones.add(zone_id)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "PlayerLocatorConfig":
@@ -97,6 +162,10 @@ class PlayerLocatorConfig:
         advertise = os.environ.get("POD_IP") or raw.get("advertise_host") or raw.get("host") or "127.0.0.1"
         if advertise in ("0.0.0.0", "::"):
             advertise = "127.0.0.1"
+        merged_endpoints = dict(parse_scene_manager_endpoints(raw.get("scene_manager_endpoints")))
+        env_endpoints = os.environ.get(SCENE_MANAGER_ENDPOINTS_ENV)
+        if env_endpoints is not None:
+            merged_endpoints.update(parse_scene_manager_endpoints(env_endpoints))
         cfg = cls(
             node_id=int(raw.get("node_id", 103)),
             host=str(raw.get("host", "0.0.0.0")),
@@ -117,6 +186,7 @@ class PlayerLocatorConfig:
             dead_gate_members_per_round=int(raw.get("dead_gate_members_per_round", DEFAULT_DEAD_GATE_MEMBERS_PER_ROUND)),
             gate_scan_count=int(raw.get("gate_scan_count", DEFAULT_GATE_SCAN_COUNT)),
             live_view_hold_sec=float(raw.get("live_view_hold_sec", DEFAULT_LIVE_VIEW_HOLD_SEC)),
+            scene_manager_endpoints=tuple(sorted(merged_endpoints.items())),
         )
         cfg.validate()
         return cfg

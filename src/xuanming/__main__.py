@@ -81,6 +81,12 @@ def main() -> None:
     trade_cmd.add_argument("--config", type=Path, required=True)
     guild_cmd = commands.add_parser("guild", help="启动 guild（公会、成员权限、排行与活动服务）")
     guild_cmd.add_argument("--config", type=Path, required=True)
+    mall_cmd = commands.add_parser("mall-game", help="启动 mall_game（官方固定价商城、交付/退款/扣回与 RMB 寄售服务）")
+    mall_cmd.add_argument("--config", type=Path, required=True)
+    gm_cmd = commands.add_parser("gm-admin", help="启动 gm_admin（GM 后台邮件活动、在线玩家命令与审计服务）")
+    gm_cmd.add_argument("--config", type=Path, required=True)
+    cfg_cmd = commands.add_parser("config-node", help="启动 config_node（配置表只读查询与热重载 HTTP 服务）")
+    cfg_cmd.add_argument("--config", type=Path, required=True)
     migrate_cmd = commands.add_parser("schemamigrate", help="校验并执行全库 SQL Schema 幂等迁移", add_help=False)
     sync_cmd = commands.add_parser("table-sync", help="打包、校验或解包配置表与指针文件", add_help=False)
     args, extra = parser.parse_known_args()
@@ -169,6 +175,18 @@ def main() -> None:
             from .guild.node import run as run_guild
 
             asyncio.run(run_guild(Settings.load(args.config)))
+        elif args.command == "mall-game":
+            from .mall_game.node import run as run_mall_game
+
+            asyncio.run(run_mall_game(Settings.load(args.config)))
+        elif args.command == "gm-admin":
+            from .gm_admin.node import run as run_gm_admin
+
+            asyncio.run(run_gm_admin(Settings.load(args.config)))
+        elif args.command == "config-node":
+            from .config_node.node import run as run_config_node
+
+            asyncio.run(run_config_node(Settings.load(args.config)))
         elif args.command == "schemamigrate":
             from .ops.schemamigrate import main as run_schemamigrate
 

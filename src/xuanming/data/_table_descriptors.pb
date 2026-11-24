@@ -830,6 +830,228 @@ zone_begin (
 ZoneGroupTableData
 data (2.ZoneGroupTableB@
 com.game.tableBZoneGroupTableOuterClassPZgenerated/pb/tablebproto3
+≠
+"table_wire/afkpassrule_table.proto"˚
+AfkPassRuleTable
+id (Rid
+period_days (R
+periodDays.
+price_currency_type (RpriceCurrencyType
+price (Rprice,
+max_remaining_days (RmaxRemainingDays.
+remind_before_hours (RremindBeforeHours
+desc (	Rdesc"=
+AfkPassRuleTableData%
+data (2.AfkPassRuleTableRdataBB
+com.game.tableBAfkPassRuleTableOuterClassPZgenerated/pb/tablebproto3
+Ω
+%table_wire/appearancerule_table.proto"ˇ
+AppearanceRuleTable
+id (Rid 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount4
+trial_duration_seconds (RtrialDurationSeconds
+mall_sku_id (R	mallSkuId$
+mall_price_fen (RmallPriceFen
+desc (	Rdesc"C
+AppearanceRuleTableData(
+data (2.AppearanceRuleTableRdataBE
+com.game.tableBAppearanceRuleTableOuterClassPZgenerated/pb/tablebproto3
+Ì
+'table_wire/appearanceseries_table.proto"ß
+AppearanceSeriesTable
+id (Rid
+
+series_key (	R	seriesKey
+name (	Rname
+
+sort_order (R	sortOrder
+enabled (Renabled
+desc (	Rdesc2
+completion_badge_name (	RcompletionBadgeName%
+epilogue_title (	RepilogueTitle#
+epilogue_body	 (	RepilogueBody"G
+AppearanceSeriesTableData*
+data (2.AppearanceSeriesTableRdataBG
+com.game.tableBAppearanceSeriesTableOuterClassPZgenerated/pb/tablebproto3
+ı
+*table_wire/characterappearance_table.proto"£
+CharacterAppearanceTable
+id (Rid#
+appearance_id (	RappearanceId
+name (	Rname
+enabled (Renabled
+
+sort_order (R	sortOrder
+desc (	Rdesc+
+starter_creatable (RstarterCreatable'
+card_unlockable (RcardUnlockable
+	series_id	 (RseriesId"M
+CharacterAppearanceTableData-
+data (2.CharacterAppearanceTableRdataBJ
+com.game.tableB"CharacterAppearanceTableOuterClassPZgenerated/pb/tablebproto3
+Ï
+$table_wire/equipartifact_table.proto"≤
+EquipArtifactTable
+id (Rid
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit (RperRoundLimit!
+battle_limit (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps
+name (	Rname 
+description	 (	Rdescription"A
+EquipArtifactTableData'
+data (2.EquipArtifactTableRdataBD
+com.game.tableBEquipArtifactTableOuterClassPZgenerated/pb/tablebproto3
+Ó
+#table_wire/equipv1affix_table.proto"∏
+EquipV1AffixTable
+id (Rid
+pool (Rpool
+effect (Reffect!
+effect_param (ReffectParam'
+value_permyriad (RvaluePermyriad
+
+source_cap (R	sourceCap
+name (	Rname 
+description (	Rdescription
+material_id	 (R
+materialId%
+material_count
+ (RmaterialCount"?
+EquipV1AffixTableData&
+data (2.EquipV1AffixTableRdataBC
+com.game.tableBEquipV1AffixTableOuterClassPZgenerated/pb/tablebproto3
+†
+table_wire/petentry_table.proto"˙
+PetEntryTable
+id (Rid
+name (	Rname
+desc (	Rdesc
+category (Rcategory
+channel (Rchannel
+
+state_kind (R	stateKind
+cap (Rcap"
+per_point_bps (RperPointBps
+sort	 (Rsort
+icon
+ (	Ricon"7
+PetEntryTableData"
+data (2.PetEntryTableRdataB?
+com.game.tableBPetEntryTableOuterClassPZgenerated/pb/tablebproto3
+Ä
+table_wire/pettier_table.proto"_
+PetTierTable
+id (Rid
+name (	Rname
+art_key (	RartKey
+desc (	Rdesc"5
+PetTierTableData!
+data (2.PetTierTableRdataB>
+com.game.tableBPetTierTableOuterClassPZgenerated/pb/tablebproto3
+Í
+#table_wire/rankedpreset_table.proto"¥
+RankedPresetTable
+id (Rid
+	role_kind (RroleKind
+code (	Rcode
+name (	Rname
+role_tag (	RroleTag 
+pet_table_id (R
+petTableId
+
+weight_con (R	weightCon
+
+weight_spi (R	weightSpi
+
+weight_str	 (R	weightStr
+
+weight_agi
+ (R	weightAgi
+	skill_ids (RskillIds"
+pet_entry_ids (RpetEntryIds(
+pet_entry_points (RpetEntryPoints
+sort (Rsort
+desc (	Rdesc"?
+RankedPresetTableData&
+data (2.RankedPresetTableRdataBC
+com.game.tableBRankedPresetTableOuterClassPZgenerated/pb/tablebproto3
+ø	
+!table_wire/rankedrule_table.proto"ë
+RankedRuleTable
+id (Rid!
+rule_version (RruleVersion(
+battle_config_id (RbattleConfigId,
+reference_class_id (RreferenceClassId+
+competitive_level (RcompetitiveLevel=
+default_character_preset_id (RdefaultCharacterPresetId1
+default_pet_preset_id (RdefaultPetPresetId0
+season_duration_days (RseasonDurationDays.
+wait_prompt_seconds	 (RwaitPromptSeconds0
+spread_tier1_seconds
+ (RspreadTier1Seconds.
+spread_tier1_points (RspreadTier1Points0
+spread_tier2_seconds (RspreadTier2Seconds.
+spread_tier2_points (RspreadTier2Points.
+spread_tier3_points (RspreadTier3Points8
+milestone_avatar_matches (RmilestoneAvatarMatches4
+milestone_card_matches (RmilestoneCardMatches<
+milestone_talisman_matches (RmilestoneTalismanMatches.
+tier_qingfeng_centi (RtierQingfengCenti.
+tier_yunzhang_centi (RtierYunzhangCenti,
+tier_tianshu_centi (RtierTianshuCenti.
+tier_wushuang_centi (RtierWushuangCenti
+desc (	Rdesc";
+RankedRuleTableData$
+data (2.RankedRuleTableRdataBA
+com.game.tableBRankedRuleTableOuterClassPZgenerated/pb/tablebproto3
+◊
+!table_wire/seasonrule_table.proto"©
+SeasonRuleTable
+id (Rid
+name (	Rname 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+enabled (Renabled&
+seal_max_points (RsealMaxPoints$
+pve_win_points (RpveWinPoints$
+pvp_win_points (RpvpWinPoints(
+pvp_other_points	 (RpvpOtherPoints+
+max_health_bps_cap
+ (RmaxHealthBpsCap&
+defense_bps_cap (RdefenseBpsCap2
+catchup_currency_type (RcatchupCurrencyType5
+catchup_price_per_point (RcatchupPricePerPoint&
+default_seal_id (RdefaultSealId
+desc (	Rdesc";
+SeasonRuleTableData$
+data (2.SeasonRuleTableRdataBA
+com.game.tableBSeasonRuleTableOuterClassPZgenerated/pb/tablebproto3
+≤
+!table_wire/seasonseal_table.proto"Ñ
+SeasonSealTable
+id (Rid
+	season_id (RseasonId
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey
+	effect_id (ReffectId
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit	 (RperRoundLimit!
+battle_limit
+ (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps";
+SeasonSealTableData$
+data (2.SeasonSealTableRdataBA
+com.game.tableBSeasonSealTableOuterClassPZgenerated/pb/tablebproto3
 áj
  google/protobuf/descriptor.protogoogle.protobuf"[
 FileDescriptorSet8
@@ -1217,8 +1439,7 @@ sourceFile
 VISIBILITY_LOCAL
 VISIBILITY_EXPORTB~
 com.google.protobufBDescriptorProtosHZ-google.golang.org/protobuf/types/descriptorpb¯¢GPB™Google.Protobuf.Reflection
-Ã
-
+‰
 cfg_options.protommorpg.cfgtable.v1 google/protobuf/descriptor.proto*ê
 CfgShape
 CFG_SHAPE_UNSPECIFIED 
@@ -1229,7 +1450,9 @@ sourceFile
 CFG_SHAPE_STRUCT_LIST:>
 	cfg_sheet.google.protobuf.MessageOptions·‘ (	RcfgSheet:I
 cfg_source_file.google.protobuf.MessageOptions‚‘ (	RcfgSourceFile:I
-cfg_primary_key.google.protobuf.MessageOptions„‘ (	RcfgPrimaryKey:8
+cfg_primary_key.google.protobuf.MessageOptions„‘ (	RcfgPrimaryKey:M
+cfg_ids_permanent.google.protobuf.MessageOptionsÂ‘ (RcfgIdsPermanent:G
+cfg_hot_reload.google.protobuf.MessageOptionsÊ‘ (RcfgHotReload:8
 cfg_col.google.protobuf.FieldOptions≈’ (	RcfgCol:<
 	cfg_owner.google.protobuf.FieldOptions∆’ (	RcfgOwner:<
 	cfg_slots.google.protobuf.FieldOptions«’ (RcfgSlots:Z
@@ -1938,3 +2161,193 @@ World.xlsxö¶idbproto3
 zone_begin (R	zoneBegin
 zone_end (RzoneEnd!
 name©F (	B≤¨designerRname:%ä¶	ZoneGroupí¶ZoneGroup.xlsxö¶idbproto3
+Ò
+afkpassrule_table.protommorpg.cfgtable.v1cfg_options.proto"¶
+AfkPassRuleTable
+id (Rid
+period_days (R
+periodDays.
+price_currency_type (RpriceCurrencyType
+price (Rprice,
+max_remaining_days (RmaxRemainingDays.
+remind_before_hours (RremindBeforeHours
+desc (	Rdesc:)ä¶AfkPassRuleí¶AfkPassRule.xlsxö¶idbproto3
+à
+appearancerule_table.protommorpg.cfgtable.v1cfg_options.proto"∫
+AppearanceRuleTable
+id (Rid*
+card_item_id (BÚ¨ItemR
+cardItemId&
+card_item_count (RcardItemCount4
+trial_duration_seconds (RtrialDurationSeconds
+mall_sku_id (R	mallSkuId$
+mall_price_fen (RmallPriceFen
+desc (	Rdesc:/ä¶AppearanceRuleí¶AppearanceRule.xlsxö¶idbproto3
+∞
+appearanceseries_table.protommorpg.cfgtable.v1cfg_options.proto"‡
+AppearanceSeriesTable
+id (Rid
+
+series_key (	R	seriesKey
+name (	Rname
+
+sort_order (R	sortOrder
+enabled (Renabled
+desc (	Rdesc2
+completion_badge_name (	RcompletionBadgeName%
+epilogue_title (	RepilogueTitle#
+epilogue_body	 (	RepilogueBody:7ä¶AppearanceSeriesí¶AppearanceSeries.xlsxö¶id®¶bproto3
+—
+characterappearance_table.protommorpg.cfgtable.v1cfg_options.proto"˛
+CharacterAppearanceTable
+id (B‡¨Rid#
+appearance_id (	RappearanceId
+name (	Rname
+enabled (Renabled
+
+sort_order (R	sortOrder
+desc (	Rdesc+
+starter_creatable (RstarterCreatable'
+card_unlockable (RcardUnlockable1
+	series_id	 (BÚ¨AppearanceSeriesRseriesId:=ä¶CharacterAppearanceí¶CharacterAppearance.xlsxö¶id®¶bproto3
+≤
+equipartifact_table.protommorpg.cfgtable.v1cfg_options.proto"Â
+EquipArtifactTable
+id (Rid
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit (RperRoundLimit!
+battle_limit (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps
+name (	Rname 
+description	 (	Rdescription:1ä¶EquipArtifactí¶EquipArtifact.xlsxö¶id®¶bproto3
+≈
+equipv1affix_table.protommorpg.cfgtable.v1cfg_options.proto"˘
+EquipV1AffixTable
+id (Rid
+pool (Bÿ¨Rpool
+effect (Reffect!
+effect_param (ReffectParam'
+value_permyriad (RvaluePermyriad
+
+source_cap (R	sourceCap
+name (	Rname 
+description (	Rdescription)
+material_id	 (BÚ¨ItemR
+materialId%
+material_count
+ (RmaterialCount:/ä¶EquipV1Affixí¶EquipV1Affix.xlsxö¶id®¶bproto3
+Î
+petentry_table.protommorpg.cfgtable.v1cfg_options.proto"£
+PetEntryTable
+id (Rid
+name (	Rname
+desc (	Rdesc
+category (Rcategory
+channel (Rchannel
+
+state_kind (R	stateKind
+cap (Rcap"
+per_point_bps (RperPointBps
+sort	 (Rsort
+icon
+ (	Ricon:'ä¶PetEntryí¶PetEntry.xlsxö¶id®¶bproto3
+Õ
+pettier_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
+PetTierTable
+id (Rid
+name (	Rname
+art_key (	RartKey
+desc (	Rdesc:%ä¶PetTierí¶PetTier.xlsxö¶id®¶bproto3
+›
+rankedpreset_table.protommorpg.cfgtable.v1cfg_options.proto"ë
+RankedPresetTable
+id (Rid
+	role_kind (RroleKind
+code (	Rcode
+name (	Rname
+role_tag (	RroleTag)
+pet_table_id (BÚ¨PetR
+petTableId
+
+weight_con (R	weightCon
+
+weight_spi (R	weightSpi
+
+weight_str	 (R	weightStr
+
+weight_agi
+ (R	weightAgi*
+	skill_ids (B∏¨Ú¨SkillRskillIds4
+pet_entry_ids (B∏¨Ú¨PetEntryRpetEntryIds.
+pet_entry_points (B∏¨RpetEntryPoints
+sort (Rsort
+desc (	Rdesc:+ä¶RankedPresetí¶RankedPreset.xlsxö¶idbproto3
+ú	
+rankedrule_table.protommorpg.cfgtable.v1cfg_options.proto"“
+RankedRuleTable
+id (Rid!
+rule_version (RruleVersion5
+battle_config_id (BÚ¨DungeonRbattleConfigId7
+reference_class_id (B	Ú¨ClassRreferenceClassId+
+competitive_level (RcompetitiveLevel=
+default_character_preset_id (RdefaultCharacterPresetId1
+default_pet_preset_id (RdefaultPetPresetId0
+season_duration_days (RseasonDurationDays.
+wait_prompt_seconds	 (RwaitPromptSeconds0
+spread_tier1_seconds
+ (RspreadTier1Seconds.
+spread_tier1_points (RspreadTier1Points0
+spread_tier2_seconds (RspreadTier2Seconds.
+spread_tier2_points (RspreadTier2Points.
+spread_tier3_points (RspreadTier3Points8
+milestone_avatar_matches (RmilestoneAvatarMatches4
+milestone_card_matches (RmilestoneCardMatches<
+milestone_talisman_matches (RmilestoneTalismanMatches.
+tier_qingfeng_centi (RtierQingfengCenti.
+tier_yunzhang_centi (RtierYunzhangCenti,
+tier_tianshu_centi (RtierTianshuCenti.
+tier_wushuang_centi (RtierWushuangCenti
+desc (	Rdesc:'ä¶
+RankedRuleí¶RankedRule.xlsxö¶idbproto3
+†
+seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"÷
+SeasonRuleTable
+id (Rid
+name (	Rname 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+enabled (Renabled&
+seal_max_points (RsealMaxPoints$
+pve_win_points (RpveWinPoints$
+pvp_win_points (RpvpWinPoints(
+pvp_other_points	 (RpvpOtherPoints+
+max_health_bps_cap
+ (RmaxHealthBpsCap&
+defense_bps_cap (RdefenseBpsCap2
+catchup_currency_type (RcatchupCurrencyType5
+catchup_price_per_point (RcatchupPricePerPoint&
+default_seal_id (RdefaultSealId
+desc (	Rdesc:+ä¶
+SeasonRuleí¶SeasonRule.xlsxö¶id∞¶bproto3
+è
+seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"≈
+SeasonSealTable
+id (Rid/
+	season_id (Bÿ¨Ú¨
+SeasonRuleRseasonId
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey
+	effect_id (ReffectId
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit	 (RperRoundLimit!
+battle_limit
+ (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps:+ä¶
+SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3

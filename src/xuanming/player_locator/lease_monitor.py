@@ -7,7 +7,7 @@ import bisect
 import logging
 import math
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Protocol as TypingProtocol
 
 import grpc
@@ -19,7 +19,9 @@ from . import keys
 from .config import (
     AFK_PASS_LEASE_TTL_SEC,
     AFK_PASS_PROBE_RETRY_SEC,
+    SCENE_MANAGER_NODE_TYPE,
     PlayerLocatorConfig,
+    parse_scene_manager_endpoints,
 )
 from .hosted_resume import resume_hosted_if_lost
 from .store import (
@@ -106,6 +108,147 @@ class GrpcSceneManagerClient:
         return self.protocol.parse("scene_manager.EnterSceneResponse", raw)
 
 
+def _format_node_grpc_address(info) -> str:
+    """从 etcd ``NodeInfo`` 提取 SceneManager 的 gRPC 通信地址。"""
+    endpoint = info.grpc_endpoint if info.HasField("grpc_endpoint") and info.grpc_endpoint.ip else info.endpoint
+    ip = str(endpoint.ip).strip()
+    port = int(endpoint.port)
+    if not ip or port <= 0:
+        return ""
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+class RoutingSceneManagerClient:
+    """按区号路由的多区 SceneManager gRPC 客户端（静态映射 -> etcd 服务发现 -> 默认回退）。"""
+
+    def __init__(
+        self,
+        protocol: Protocol,
+        *,
+        default_endpoint: str = "",
+        zone_endpoints: Mapping[int, str] | Sequence[tuple[int, str]] | str | None = None,
+        directory=None,
+        timeout_sec: float = 5.0,
+        client_factory: Callable[[str, float], object] | None = None,
+    ) -> None:
+        self.protocol = protocol
+        self.default_endpoint = default_endpoint.strip()
+        self._zone_endpoints: dict[int, str] = dict(parse_scene_manager_endpoints(zone_endpoints))
+        self.directory = directory
+        self.timeout_sec = timeout_sec
+        self._client_factory = client_factory or (lambda address, timeout: GrpcClient(address, timeout=timeout))
+        self._clients: dict[str, object] = {}
+
+    async def resolve_endpoint(self, zone_id: int) -> str:
+        """按区号解析目标 SceneManager 地址：静态覆盖 > etcd 发现 > 默认地址。"""
+        if zone_id > 0:
+            override = self._zone_endpoints.get(zone_id)
+            if override:
+                return override
+            if self.directory is not None:
+                try:
+                    candidates = await self.directory.candidates(SCENE_MANAGER_NODE_TYPE, zone_id)
+                except Exception as exc:
+                    logger.warning(
+                        "SceneManager directory lookup failed zone=%d error=%s; falling back to default",
+                        zone_id, exc,
+                    )
+                    candidates = ()
+                valid = [
+                    (int(getattr(info, "launch_time", 0)), addr)
+                    for info in candidates
+                    if (addr := _format_node_grpc_address(info))
+                ]
+                if valid:
+                    valid.sort(key=lambda item: item[0], reverse=True)
+                    return valid[0][1]
+        if self.default_endpoint:
+            return self.default_endpoint
+        raise RuntimeError(f"no SceneManager endpoint configured for zone={zone_id}")
+
+    def _get_client(self, address: str):
+        client = self._clients.get(address)
+        if client is None:
+            client = self._client_factory(address, self.timeout_sec)
+            self._clients[address] = client
+        return client
+
+    async def leave_scene_for_zone(
+        self,
+        *,
+        zone_id: int,
+        player_id: int,
+        scene_id: int,
+        session_id: int,
+        login_generation: int,
+    ) -> None:
+        address = await self.resolve_endpoint(zone_id)
+        request = self.protocol.message(
+            "scene_manager.LeaveSceneRequest",
+            player_id=player_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            login_generation=login_generation,
+        )
+        await self._get_client(address).call(_LEAVE_SCENE_PATH, request.SerializeToString(), timeout=self.timeout_sec)
+
+    async def leave_scene(
+        self,
+        *,
+        player_id: int,
+        scene_id: int,
+        session_id: int,
+        login_generation: int,
+        zone_id: int = 0,
+    ) -> None:
+        await self.leave_scene_for_zone(
+            zone_id=zone_id,
+            player_id=player_id,
+            scene_id=scene_id,
+            session_id=session_id,
+            login_generation=login_generation,
+        )
+
+    async def enter_scene(
+        self,
+        *,
+        player_id: int,
+        session_id: int,
+        login_generation: int,
+        owner_revision: int,
+        gate_zone_id: int,
+        hosted_placement: bool = True,
+    ):
+        address = await self.resolve_endpoint(int(gate_zone_id))
+        request = self.protocol.message(
+            "scene_manager.EnterSceneRequest",
+            player_id=player_id,
+            session_id=session_id,
+            login_generation=login_generation,
+            owner_revision=owner_revision,
+            gate_zone_id=gate_zone_id,
+            hosted_placement=hosted_placement,
+        )
+        raw = await self._get_client(address).call(
+            _ENTER_SCENE_PATH, request.SerializeToString(), timeout=self.timeout_sec,
+        )
+        return self.protocol.parse("scene_manager.EnterSceneResponse", raw)
+
+    async def close(self) -> None:
+        clients = list(self._clients.values())
+        self._clients.clear()
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.warning("close cached SceneManager client failed error=%s", exc)
+
+
 class KafkaGatePublisher:
     """经既有 KafkaCommands 向 gate-cmd_gN 指定分区投递 GateCommand（acks=all 幂等生产者）。"""
 
@@ -121,13 +264,19 @@ def _grpc_status_code(error: Exception):
     return code_fn() if callable(code_fn) else None
 
 
-async def resolve_scene_manager_scene_id(protocol: Protocol, store: SessionStore, player_id: int) -> int:
-    """当会话中 scene_id 为 0 时，回退读取 SceneManager 权威位置键 player:{<pid>}:location。"""
+async def resolve_scene_manager_location(protocol: Protocol, store: SessionStore, player_id: int) -> tuple[int, int]:
+    """读取 SceneManager 权威位置键 ``player:{<pid>}:location``，返回 ``(scene_id, zone_id)``。"""
     raw = await store.get_location_bytes(player_id)
     if not raw:
-        return 0
+        return 0, 0
     location = protocol.parse("storage.PlayerLocation", raw)
-    return int(location.scene_id)
+    return int(location.scene_id), int(location.zone_id)
+
+
+async def resolve_scene_manager_scene_id(protocol: Protocol, store: SessionStore, player_id: int) -> int:
+    """当会话中 scene_id 为 0 时，回退读取 SceneManager 权威位置键 player:{<pid>}:location。"""
+    scene_id, _ = await resolve_scene_manager_location(protocol, store, player_id)
+    return scene_id
 
 
 async def notify_scene_manager_leave(
@@ -138,19 +287,34 @@ async def notify_scene_manager_leave(
 ) -> None:
     """通知 SceneManager.LeaveScene 清理位置与人数；失败时保留清理凭证重试。"""
     scene_id = int(session.scene_id)
-    if scene_id == 0:
-        scene_id = await resolve_scene_manager_scene_id(protocol, store, int(session.player_id))
+    zone_id = int(getattr(session, "gate_zone_id", 0) or 0)
+    leave_for_zone = getattr(scene_manager, "leave_scene_for_zone", None) if scene_manager is not None else None
+    if scene_id == 0 or leave_for_zone is not None:
+        loc_scene_id, loc_zone_id = await resolve_scene_manager_location(protocol, store, int(session.player_id))
+        if scene_id == 0:
+            scene_id = loc_scene_id
+        if loc_zone_id:
+            zone_id = loc_zone_id
     if scene_id == 0:
         return
     if scene_manager is None:
         raise RuntimeError(f"SceneManager client is not configured for player={session.player_id} scene={scene_id}")
     try:
-        await scene_manager.leave_scene(
-            player_id=int(session.player_id),
-            scene_id=scene_id,
-            session_id=int(session.session_id),
-            login_generation=int(session.login_generation),
-        )
+        if leave_for_zone is not None:
+            await leave_for_zone(
+                zone_id=zone_id,
+                player_id=int(session.player_id),
+                scene_id=scene_id,
+                session_id=int(session.session_id),
+                login_generation=int(session.login_generation),
+            )
+        else:
+            await scene_manager.leave_scene(
+                player_id=int(session.player_id),
+                scene_id=scene_id,
+                session_id=int(session.session_id),
+                login_generation=int(session.login_generation),
+            )
     except HolderReleasePendingError:
         raise
     except Exception as exc:
@@ -164,8 +328,8 @@ async def notify_scene_manager_leave(
             f"session={session.session_id} login_generation={session.login_generation}: {exc}"
         ) from exc
     logger.info(
-        "notified SceneManager.LeaveScene player=%d scene=%d session=%d login_generation=%d",
-        session.player_id, scene_id, session.session_id, session.login_generation,
+        "notified SceneManager.LeaveScene player=%d zone=%d scene=%d session=%d login_generation=%d",
+        session.player_id, zone_id, scene_id, session.session_id, session.login_generation,
     )
 
 

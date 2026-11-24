@@ -44,19 +44,24 @@ from xuanming.settings import Settings
 
 
 def test_cluster_example_toml_loads_all_python_service_sections():
-    """校验 config/cluster.example.toml 可一次性加载全部 15 个纯 Python 微服务配置段且端口互不冲突。"""
+    """校验 config/cluster.example.toml 可一次性加载全部 18 个纯 Python 微服务配置段且端口互不冲突。"""
     settings = Settings.load(Path(__file__).parents[1] / "config" / "cluster.example.toml")
-    sections = (
+    grpc_sections = (
         "data_service_node", "router_node", "db_node", "player_locator_node",
         "player_inbox_node", "scene_manager_node", "match_node", "content_guard_node",
         "chat_node", "mail_node", "rank_node", "friend_node", "payment_node",
         "trade_node", "guild_node",
     )
+    http_sections = ("mall_game_node", "gm_admin_node", "config_node")
     ports = []
-    for name in sections:
+    for name in grpc_sections:
         section = getattr(settings, name)
         assert isinstance(section, dict) and section, f"missing [{name}] in cluster.example.toml"
         ports.append((name, int(section["grpc_port"])))
+    for name in http_sections:
+        section = getattr(settings, name)
+        assert isinstance(section, dict) and section, f"missing [{name}] in cluster.example.toml"
+        ports.append((name, int(section["port"])))
     port_values = [port for _, port in ports]
     assert len(port_values) == len(set(port_values)), f"duplicate ports: {ports}"
 

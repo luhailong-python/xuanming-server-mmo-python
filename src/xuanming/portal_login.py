@@ -15,10 +15,39 @@ from .portal_observability import trace_metadata
 from .portal_sql import connection
 
 _LOG = logging.getLogger(__name__)
+# 与 Tip.xlsx fault 列（TipFaults.java）保持一致的服务端内部故障码集合。
 _FAULTS = frozenset((1002, 1003, 1004, 1007, 1009, 1011, 1012, 1016, 1018, 2015, 2018, 2019,
-    2020, 2021, 2022, 2023, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2035, 2036,
-    3003, 3010, 3012, 3016, 3018, 3019, 3023, 3028, 4030, 5003, 6002, 9000, 14008,
-    14041, 16004, 26016, 27004, 27007, 27008, 28010, 29014, 30011))
+    2020, 2021, 2022, 2023, 2025, 2026, 2027, 2028, 2029, 2030, 2031, 2035, 2036, 2047, 2050,
+    3003, 3010, 3012, 3016, 3018, 3019, 3023, 3028, 4030, 5003, 6002, 9000, 14008, 14041,
+    14045, 16004, 18001, 20017, 26016, 27004, 27007, 27008, 28010, 29014, 30011, 32004,
+    33006, 34011))
+
+
+def is_fault_tip(tip_id: int) -> bool:
+    """判断上游 tip 码是否属于服务端内部故障。"""
+    return tip_id in _FAULTS
+
+
+def cooldown_key(value: str) -> str:
+    """将账号或令牌映射为 SHA-256 前 16 字节十六进制冷却键，原文不进限流键与日志。"""
+    if not value or not value.strip():
+        return ""
+    return "tok:" + hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
+def rpc_error_code_and_message(exc: grpc.aio.AioRpcError) -> tuple[int, str]:
+    """将 login gRPC 状态码映射为对外 HTTP 业务码与原因串。"""
+    status = exc.code()
+    message = "login_unavailable" if status in (
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+    ) else status.name
+    code = 401 if status in (
+        grpc.StatusCode.UNAUTHENTICATED,
+        grpc.StatusCode.PERMISSION_DENIED,
+    ) else 500
+    return code, message
 
 # One-key scripts work with Redis Cluster. IP is refunded when the zone bucket is empty.
 _TAKE = """
@@ -342,6 +371,18 @@ def _tokens(response):
             "refresh_token_expire": response.refresh_token_expire}
 
 
+def _anti_addiction(response):
+    """提取防沉迷状态；未携带该字段（未开启防沉迷）时返回 None 以便 JSON 省略。"""
+    if not response.HasField("anti_addiction"):
+        return None
+    status = response.anti_addiction
+    return {
+        "real_name_required": bool(status.real_name_required),
+        "minor": bool(status.minor),
+        "play_deadline_ms": status.play_deadline_ms,
+    }
+
+
 def _tip(response):
     tip = response.error_message
     if tip.id or tip.parameters and tip.parameters[-1]:
@@ -385,10 +426,9 @@ def register_login_routes(app, deps, *, admission=None):
             zone = _zone(body) if path != "refresh-token" else 0
             if path in ("login", "assign-gate"):
                 account = _text(body, "account") if path == "login" else _text(body, "access_token")
-                if path == "login" and not account:
+                if path == "login" and not account.strip():
                     account = _text(body, "auth_token")
-                if account:
-                    account = "tok:" + hashlib.sha256(account.encode()).hexdigest()[:32]
+                account = cooldown_key(account)
                 if path == "assign-gate" and _text(body, "queue_token").strip():
                     account = ""
                 decision = await limiter.check(zone, client_ip(request, limiter.networks), account, path)
@@ -407,9 +447,18 @@ def register_login_routes(app, deps, *, admission=None):
                 response = await rpc.call(zone, "ClientPlayerLogin", "Login", req, "LoginResponse")
                 result = _tip(response)
                 if result is None:
-                    result = {"code": 0, "players": [{"player_id": w.player.player_id,
-                              "name": w.player.name or None, "level": 0, "zone_id": w.player.zone_id}
-                              for w in response.players]} | _tokens(response)
+                    result = {
+                        "code": 0,
+                        "players": [{"player_id": w.player.player_id,
+                                     "name": w.player.name or None, "level": 0, "zone_id": w.player.zone_id}
+                                    for w in response.players],
+                        "account_deletion_state": response.account_deletion_state,
+                        "account_deletion_execute_after": response.account_deletion_execute_after,
+                        "previous_account_deleted_at": response.previous_account_deleted_at,
+                    } | _tokens(response)
+                    anti = _anti_addiction(response)
+                    if anti is not None:
+                        result["anti_addiction"] = anti
             elif path == "refresh-token":
                 token = _text(body, "refresh_token")
                 if not token.strip():
@@ -440,13 +489,68 @@ def register_login_routes(app, deps, *, admission=None):
             return web.json_response({"code": 500, "message": "internal_error"} if request.path.endswith(("login", "refresh-token"))
                                      else {"code": 500, "error": "internal_error", "gate_port": 0, "token_deadline": 0})
         except grpc.aio.AioRpcError as exc:
-            status = exc.code()
-            message = "login_unavailable" if status in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED,
-                                                          grpc.StatusCode.RESOURCE_EXHAUSTED) else status.name
+            code, message = rpc_error_code_and_message(exc)
             if request.path.endswith(("login", "refresh-token")):
-                return web.json_response({"code": 401 if status in (grpc.StatusCode.UNAUTHENTICATED,
-                                          grpc.StatusCode.PERMISSION_DENIED) else 500, "message": message})
+                return web.json_response({"code": code, "message": message})
             return web.json_response({"code": 500, "error": message, "gate_port": 0, "token_deadline": 0})
+
+    async def handle_real_name(request):
+        """实名认证提交入口（POST /api/real-name）；姓名与身份证号仅转发给 login，严禁写入日志。"""
+        try:
+            body = await _body(request)
+            if not isinstance(body, dict):
+                raise ValueError("invalid body")
+            raw_zone = body.get("zone_id", 0)
+            if raw_zone is None:
+                raw_zone = 0
+            if isinstance(raw_zone, bool) or not isinstance(raw_zone, int):
+                raise ValueError("invalid zone_id")
+            access_token = _text(body, "access_token")
+            name = _text(body, "name")
+            id_number = _text(body, "id_number")
+            decision = await limiter.check(
+                raw_zone if raw_zone > 0 else 0,
+                client_ip(request, limiter.networks),
+                cooldown_key(access_token),
+                "real-name",
+            )
+            if decision:
+                kind, value = decision
+                return web.json_response({
+                    "code": 429,
+                    "message": value if kind == "deny" else "rate_limited",
+                })
+            if not 0 < raw_zone < 2**31:
+                return web.json_response({"code": 500, "message": "invalid_zone"})
+            req = p.message(
+                "loginpb.SubmitRealNameRequest",
+                access_token=access_token,
+                name=name,
+                id_number=id_number,
+            )
+            response = await rpc.call(raw_zone, "LoginPreGate", "SubmitRealName", req, "SubmitRealNameResponse")
+            anti = _anti_addiction(response)
+            tip_id = response.error_message.id
+            if not tip_id:
+                result = {"code": 0}
+            elif is_fault_tip(tip_id):
+                _LOG.warning("login.rpc SubmitRealName in-band fault tip=%d", tip_id)
+                result = {"code": 500, "message": f"upstream_err={tip_id}", "tip": tip_id}
+            else:
+                result = {"code": 422, "message": f"upstream_err={tip_id}", "tip": tip_id}
+            if anti is not None:
+                result["anti_addiction"] = anti
+            return web.json_response(result)
+        except grpc.aio.AioRpcError as exc:
+            _LOG.warning("login.rpc SubmitRealName failed: %s", exc.code().name)
+            code, message = rpc_error_code_and_message(exc)
+            return web.json_response({"code": code, "message": message})
+        except (ValueError, TypeError):
+            return web.json_response({"code": 500, "message": "internal_error"})
+        except Exception as exc:
+            _LOG.error("login.rpc SubmitRealName unexpected error: %s", type(exc).__name__)
+            return web.json_response({"code": 500, "message": "internal_error"})
 
     for route in ("login", "refresh-token", "assign-gate", "queue-status"):
         app.router.add_post("/api/" + route, handle)
+    app.router.add_post("/api/real-name", handle_real_name)

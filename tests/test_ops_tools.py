@@ -40,14 +40,17 @@ CONFIG_DIR = REPO_ROOT / "config"
 TABLES_DIR = REPO_ROOT / "src" / "xuanming" / "data" / "tables"
 DESCRIPTORS_FILE = REPO_ROOT / "src" / "xuanming" / "data" / "_table_descriptors.pb"
 
-# 12 份真实 *_schema.sql 的表数量基线。
+# 15 份真实 *_schema.sql 的表数量基线。
 EXPECTED_DB_TABLE_COUNTS = {
     "chat": 6,
     "data_service": 24,
     "db": 2,
     "friend": 5,
+    "gm_admin": 2,
     "guild": 17,
+    "login": 1,
     "mail": 9,
+    "mall_game": 28,
     "match": 33,
     "payment": 4,
     "player_inbox": 4,
@@ -146,9 +149,9 @@ def _write_custom_tar_gz(path: Path, members: list[tuple[tarfile.TarInfo, bytes 
 # ---------------------------------------------------------------------------
 
 
-def test_plan_migrations_all_12_real_schemas() -> None:
+def test_plan_migrations_all_15_real_schemas() -> None:
     plan = plan_migrations(CONFIG_DIR)
-    assert len(plan.databases) == len(KNOWN_SCHEMA_FILES) == 12
+    assert len(plan.databases) == len(KNOWN_SCHEMA_FILES) == 15
     assert {db.source_file for db in plan.databases} == set(KNOWN_SCHEMA_FILES)
 
     counts = {db.db_name: len(db.tables) for db in plan.databases}
@@ -321,11 +324,11 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert res_a.manifest == res_b.manifest
     assert is_lower_hex(res_a.manifest.bundle_sha256, 64)
     assert is_lower_hex(res_a.manifest.content_digest, 64)
-    assert res_a.manifest.version == "34"
+    assert res_a.manifest.version == "56"
 
-    # 99 个 tables/ 文件（49 json + 49 pb + manifest.json）+ 1 个 _table_descriptors.pb = 100。
+    # 124 个 tables/ 文件（61 json + 61 pb + manifest.json + tip_text.json）+ 1 个 _table_descriptors.pb = 125。
     manifest_paths = {entry.path for entry in res_a.manifest.files}
-    assert len(manifest_paths) == 100
+    assert len(manifest_paths) == 125
     assert DESCRIPTOR_FILENAME in manifest_paths
     assert "manifest.json" in manifest_paths
     assert "item.json" in manifest_paths
@@ -336,9 +339,9 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
         f"{res_a.manifest.bundle_sha256}  {bundle_a.name}\n"
     )
     sidecar_manifest = json.loads(res_a.manifest_path.read_text(encoding="utf-8"))
-    assert sidecar_manifest["version"] == "34"
+    assert sidecar_manifest["version"] == "56"
     assert sidecar_manifest["bundle_sha256"] == res_a.manifest.bundle_sha256
-    assert len(sidecar_manifest["files"]) == 100
+    assert len(sidecar_manifest["files"]) == 125
 
     # 只读校验通过。
     verified = verify_bundle(bundle_a, expected_sha256=res_a.manifest.bundle_sha256)
@@ -354,8 +357,8 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert (dest_dir / DESCRIPTOR_FILENAME).read_bytes() == DESCRIPTORS_FILE.read_bytes()
 
     loaded_tables = ConfigTables(dest_dir, fmt="pb", descriptor_set=dest_dir / DESCRIPTOR_FILENAME)
-    assert loaded_tables.version == 34
-    assert len(loaded_tables.tables) == 49
+    assert loaded_tables.version == 56
+    assert len(loaded_tables.tables) == 61
 
 
 def test_unpack_rejects_tampered_bundle_and_preserves_existing_dest(tmp_path: Path) -> None:

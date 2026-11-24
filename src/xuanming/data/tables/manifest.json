@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "version": 34,
-  "content_digest": "637de5f7ae537c41c3947ef874c5da4b3a3ec003fb296e302fb47bc3d9a54916",
+  "version": 56,
+  "content_digest": "9bd9ef2da60675002d97e345a4cf6db837692a243e508e2ca3690ac150a8db48",
   "generated_at": "2026-11-16T02:30:20Z",
   "source_rev": {
     "commit": "d74bbeb17db4e58515df775af250b825c1b719d5",
     "data_dirty": true
   },
-  "table_count": 49,
+  "table_count": 61,
   "tables": [
     {
       "name": "ActivitySchedule",
@@ -121,6 +121,75 @@
           "file": "actoractionstate.pb",
           "size": 58,
           "sha256": "d585219ab1a168f089b170680c53fee1662a69dfb774d5cd8a2b9bc3926c346c"
+        }
+      ]
+    },
+    {
+      "name": "AfkPassRule",
+      "rows": 1,
+      "source": {
+        "file": "AfkPassRule.xlsx",
+        "size": 5302,
+        "sha256": "2f8d64370ef8f74fcf92d4e23faf52488677f215242b518b2df42c9bd402a0c9"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "afkpassrule.json",
+          "size": 211,
+          "sha256": "f0e6556040bbcc3bfa8107371d856110aa9622609c69c130d97db42c019be2fc"
+        },
+        {
+          "kind": "binary",
+          "file": "afkpassrule.pb",
+          "size": 50,
+          "sha256": "5dbd31d065af0c3432da64d94c29c3e2749d27f83888123e9f6c1eaf35c74dd0"
+        }
+      ]
+    },
+    {
+      "name": "AppearanceRule",
+      "rows": 1,
+      "source": {
+        "file": "AppearanceRule.xlsx",
+        "size": 5319,
+        "sha256": "93e74f297616bd3c21e4dd685eb5fd9faf3ba670db1cd679b1cd3f06cfd8e783"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "appearancerule.json",
+          "size": 249,
+          "sha256": "609ea863b032fe4ea04f94f46047b22dfcad6e9b0cd80905cbfdbd5507d414f7"
+        },
+        {
+          "kind": "binary",
+          "file": "appearancerule.pb",
+          "size": 82,
+          "sha256": "7f1c3b4f43e5ca5438fbbb53eec604d67b67042438e2bbc01886b0a7144a1794"
+        }
+      ]
+    },
+    {
+      "name": "AppearanceSeries",
+      "rows": 3,
+      "source": {
+        "file": "AppearanceSeries.xlsx",
+        "size": 6778,
+        "sha256": "3b75eca9b204575c8fa6f9fffd4469677c0d51d50b728e4fd7f18b3638c32084"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "appearanceseries.json",
+          "size": 2458,
+          "sha256": "81acc4b7df4979eb35d50e50bf744500b1086cc182b4c86586608b1d7aebbfcc"
+        },
+        {
+          "kind": "binary",
+          "file": "appearanceseries.pb",
+          "size": 1929,
+          "sha256": "bdea95496dfe3ab1c337475685983fc47a7d7756a3a409065a5074e11d5f69c4"
         }
       ]
     },
@@ -286,6 +355,29 @@
       ]
     },
     {
+      "name": "CharacterAppearance",
+      "rows": 8,
+      "source": {
+        "file": "CharacterAppearance.xlsx",
+        "size": 6184,
+        "sha256": "acf8785c2b8ff5beaf9a697b801f7df2046773a876073a0d2565624e715ac7a6"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "characterappearance.json",
+          "size": 1984,
+          "sha256": "0ec269f0f83b0c2b6805da287d19b677726d8972510c4cb740a498d5f7778651"
+        },
+        {
+          "kind": "binary",
+          "file": "characterappearance.pb",
+          "size": 659,
+          "sha256": "6380b9bb0f7ad81eaee922757dda15dc25e23202fc17e6eb138233718e32b747"
+        }
+      ]
+    },
+    {
       "name": "Class",
       "rows": 9,
       "source": {
@@ -424,6 +516,29 @@
       ]
     },
     {
+      "name": "EquipArtifact",
+      "rows": 8,
+      "source": {
+        "file": "EquipArtifact.xlsx",
+        "size": 5063,
+        "sha256": "6252e4d234a3349e1800c920ed8e87e815061a18d440a22a39dbf15684e0ab4f"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipartifact.json",
+          "size": 2681,
+          "sha256": "d240d5e66dfcd74c56d7af5e4658e49afd2c59fa580ab180bc11b9c5792abea6"
+        },
+        {
+          "kind": "binary",
+          "file": "equipartifact.pb",
+          "size": 1225,
+          "sha256": "8a6e3cb4b9457b20df3a18ef61a765d1db826a1a07936050057676a758a08e2c"
+        }
+      ]
+    },
+    {
       "name": "EquipAttribute",
       "rows": 26,
       "source": {
@@ -558,6 +673,29 @@
           "file": "equipslot.pb",
           "size": 72,
           "sha256": "f29c2bd81b384f32bf1eb391078eb3e29b40e88ed0e172fcce0926351c04308d"
+        }
+      ]
+    },
+    {
+      "name": "EquipV1Affix",
+      "rows": 36,
+      "source": {
+        "file": "EquipV1Affix.xlsx",
+        "size": 6305,
+        "sha256": "2ff43c831dfc7eef95b04de2ae8f7b9442278d68e2cb0ae8b70ce0b1dfb86329"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipv1affix.json",
+          "size": 11071,
+          "sha256": "635f884cc4ffdbc6208a77003db93d243ad7510ad4f32dfeaee4211d86e2767e"
+        },
+        {
+          "kind": "binary",
+          "file": "equipv1affix.pb",
+          "size": 4391,
+          "sha256": "bb8f423852cbaecad0c8b94f541afbdfa713d04a97d2cd7a6384756f52bbdd97"
         }
       ]
     },
@@ -907,6 +1045,29 @@
       ]
     },
     {
+      "name": "PetEntry",
+      "rows": 21,
+      "source": {
+        "file": "PetEntry.xlsx",
+        "size": 5259,
+        "sha256": "d43c6cc9a6e1cdf88affb58beb5c59311fc645166099fa3c1d734b097ef246e9"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "petentry.json",
+          "size": 5510,
+          "sha256": "e48fdde930e09100de26bcc6543c4d18a9685ec51b0f97d93a76c987737efad1"
+        },
+        {
+          "kind": "binary",
+          "file": "petentry.pb",
+          "size": 2291,
+          "sha256": "ee8ec80c9aaa8650ec38b8c8830f501790e786c5166215d9e2c82df39ff9b06f"
+        }
+      ]
+    },
+    {
       "name": "PetRule",
       "rows": 1,
       "source": {
@@ -930,6 +1091,29 @@
       ]
     },
     {
+      "name": "PetTier",
+      "rows": 5,
+      "source": {
+        "file": "PetTier.xlsx",
+        "size": 3745,
+        "sha256": "4b480ee010c859cd9849eb744e834ee2ccea7c07868a4068bacc245bb751a1e1"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "pettier.json",
+          "size": 801,
+          "sha256": "93d8a9e5d7cf1ed317337935d6e7b05a55c6def93b3a6e9e8753777de71cb0cf"
+        },
+        {
+          "kind": "binary",
+          "file": "pettier.pb",
+          "size": 495,
+          "sha256": "77ab1ce81655c2e15086d0c56b854c1e7e0038e2bee22e0cfbc2ba11b6bf2696"
+        }
+      ]
+    },
+    {
       "name": "PlayMode",
       "rows": 6,
       "source": {
@@ -949,6 +1133,52 @@
           "file": "playmode.pb",
           "size": 64,
           "sha256": "b6fa0c5bef946b4ba69e6d31a4185efa2e2f1b5bfda967997e821b2f9b71b986"
+        }
+      ]
+    },
+    {
+      "name": "RankedPreset",
+      "rows": 6,
+      "source": {
+        "file": "RankedPreset.xlsx",
+        "size": 6059,
+        "sha256": "764e8bb801aedbfa22626b097b085d88052e376cb7ee54da81ae17ce1a019c70"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "rankedpreset.json",
+          "size": 2450,
+          "sha256": "56b6d577aaef9f99088eeeaa7eacbec100be37f6b1dd118806d999b0d7ed3d61"
+        },
+        {
+          "kind": "binary",
+          "file": "rankedpreset.pb",
+          "size": 724,
+          "sha256": "d809fc7da84dd65ebc79265cb9f8b32e88ca98f41c1128a9552307eab25b1bb5"
+        }
+      ]
+    },
+    {
+      "name": "RankedRule",
+      "rows": 1,
+      "source": {
+        "file": "RankedRule.xlsx",
+        "size": 5666,
+        "sha256": "c27d010604a1a61732012ba72b290e844afaa1be5c638d522e04fadc6314e58b"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "rankedrule.json",
+          "size": 722,
+          "sha256": "1cc0a561163b6d2203dc4329e886a38dea6115b5ec7d259253a835141aaa065a"
+        },
+        {
+          "kind": "binary",
+          "file": "rankedrule.pb",
+          "size": 104,
+          "sha256": "662d09cfe172e224772db58015f0c2846cafe07d5cbde0a5552e9452e4e30da1"
         }
       ]
     },
@@ -995,6 +1225,52 @@
           "file": "rolenamerule.pb",
           "size": 37,
           "sha256": "bf1490a12a559ce1c219b74280eddddba8163aaef5228553a938d6dbcc295cf3"
+        }
+      ]
+    },
+    {
+      "name": "SeasonRule",
+      "rows": 1,
+      "source": {
+        "file": "SeasonRule.xlsx",
+        "size": 5471,
+        "sha256": "bb04402b3e76a9823f1149e281c2687ead4227e47474f5573bee25f9794fbcb0"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "seasonrule.json",
+          "size": 523,
+          "sha256": "16e8753bab7c07d37e8bda90ad855ffd8af0e54535cd25ce1cedd5f5223eee56"
+        },
+        {
+          "kind": "binary",
+          "file": "seasonrule.pb",
+          "size": 178,
+          "sha256": "9c90b8807ad5fdfc2c1164cb53d5c85c8a28f7d1b72821c9e3654daaae854a89"
+        }
+      ]
+    },
+    {
+      "name": "SeasonSeal",
+      "rows": 4,
+      "source": {
+        "file": "SeasonSeal.xlsx",
+        "size": 5702,
+        "sha256": "618ce19578ae98503ce3a084ac92fa97512e51c0c6b31752cedb478cc7e02b9f"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "seasonseal.json",
+          "size": 1589,
+          "sha256": "8d1fe0ecc47fb9581c6de43f3c8de20a42159df023d11223bf56366bb3441d86"
+        },
+        {
+          "kind": "binary",
+          "file": "seasonseal.pb",
+          "size": 639,
+          "sha256": "3e3fbf0fad6dcf05aa6dac50ae15944bcfacc449074a3d73560742eb716ecdfb"
         }
       ]
     },

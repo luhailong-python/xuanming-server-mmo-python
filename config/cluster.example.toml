@@ -212,3 +212,31 @@ mysql_host = "mysql"
 mysql_port = 3306
 mysql_user = "appuser"
 mysql_database = "mmorpg_guild"
+
+[mall_game_node]
+host = "0.0.0.0"
+port = 18120
+run_mode = "prod"
+require_tidb = true
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_mall"
+
+[gm_admin_node]
+host = "0.0.0.0"
+port = 8082
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_gm_admin"
+gateway_url = "http://portal:8081"
+data_service = "data-service:9000"
+player_locator = "player-locator:50300"
+mail_service = "mail:50900"
+login_service = "login-104:53000"
+
+[config_node]
+host = "127.0.0.1"
+port = 8090
+table_format = "json"

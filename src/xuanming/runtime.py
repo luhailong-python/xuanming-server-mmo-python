@@ -303,18 +303,142 @@ class Runtime:
         else:
             info.client_endpoint.ip, info.client_endpoint.port = address
 
+    @staticmethod
+    def _resolve_login_content_guard_endpoint(settings: Settings, environ=None) -> str:
+        """从环境变量或 ``content_guard_node`` 配置解析可选内容安全 gRPC 地址。"""
+        env = os.environ if environ is None else environ
+        direct = env.get("LOGIN_CONTENT_GUARD", "").strip()
+        if direct:
+            return direct
+        raw = dict(getattr(settings, "content_guard_node", {}) or {})
+        endpoint = str(raw.get("endpoint", "")).strip()
+        if endpoint:
+            return endpoint
+        host = str(raw.get("advertise_host") or raw.get("host") or "").strip()
+        port = raw.get("grpc_port")
+        if host and port:
+            if host in ("0.0.0.0", "::"):
+                host = "127.0.0.1"
+            return grpc_address(host, int(port))
+        return ""
+
+    @staticmethod
+    def _build_login_context(
+        protocol: Protocol,
+        config,
+        *,
+        login_redis,
+        player_redis,
+        locator_call,
+        data_call,
+        scene_manager_call,
+        publish,
+        directory,
+        control_redis=None,
+        content_guard_call=None,
+        password_auth_pool=None,
+        environ=None,
+    ):
+        """装配生产完整版 Login ``ServiceContext``（排队、防沉迷、注销、内容安全与口令认证）。"""
+        from .login.account_deletion import AccountDeletionService
+        from .login.anti_addiction import AntiAddictionService, PlayCalendar, RealNameService, SandboxNppaVerifier
+        from .login.directory import DataService
+        from .login.password_auth import (
+            CompositePasswordProvider,
+            DevPasswordProvider,
+            ProductionPasswordProvider,
+            RedisPasswordFailureQuota,
+            SqlPasswordAuthStore,
+        )
+        from .login.queue import LoginQueue
+        from .login.service import ServiceContext
+        from .login.sessions import PlayerLocator
+        from .login.tokens import TokenManager
+
+        env = os.environ if environ is None else environ
+        tokens = TokenManager(login_redis)
+        locator = PlayerLocator(protocol, locator_call)
+        data = DataService(protocol, data_call, config.directory_secret)
+        queue_redis = control_redis if control_redis is not None else login_redis
+        login_queue = (
+            LoginQueue(
+                queue_redis,
+                config.gate_token_secret,
+                entry_ttl_s=config.queue_entry_ttl_s,
+                admit_ttl_s=config.queue_admit_ttl_s,
+                max_length=config.queue_max_length,
+            )
+            if config.queue_enabled
+            else None
+        )
+        extra_days_raw = env.get("LOGIN_ANTI_ADDICTION_EXTRA_PLAY_DAYS", "").strip()
+        extra_days = tuple(item.strip() for item in extra_days_raw.split(",") if item.strip())
+        platform_raw = env.get("LOGIN_ANTI_ADDICTION_PLATFORM_MANAGED", "").strip()
+        platform_managed = frozenset(item.strip() for item in platform_raw.split(",") if item.strip())
+        real_name = RealNameService(login_redis, SandboxNppaVerifier(), data)
+        anti_addiction = AntiAddictionService(
+            protocol,
+            real_name,
+            calendar=PlayCalendar(extra_days),
+            platform_managed=platform_managed,
+        )
+        account_deletion = AccountDeletionService(protocol, data, tokens, locator, publish)
+        password_provider = None
+        if password_auth_pool is not None:
+            quota = RedisPasswordFailureQuota(queue_redis)
+            production = ProductionPasswordProvider(SqlPasswordAuthStore(password_auth_pool), quota)
+            if config.dev_password_secret:
+                dev = DevPasswordProvider(config.dev_password_secret, config.dev_password_prefixes)
+                password_provider = CompositePasswordProvider(production, dev)
+            else:
+                password_provider = production
+        return ServiceContext(
+            protocol=protocol,
+            config=config,
+            login_redis=login_redis,
+            player_redis=player_redis,
+            tokens=tokens,
+            locator=locator,
+            data=data,
+            scene_manager_call=scene_manager_call,
+            publish=publish,
+            directory=directory,
+            control_redis=control_redis,
+            login_queue=login_queue,
+            password_provider=password_provider,
+            anti_addiction=anti_addiction,
+            account_deletion=account_deletion,
+            content_guard_call=content_guard_call,
+        )
+
+    @staticmethod
+    async def _refresh_merged_zones_once(context) -> bool:
+        """向 ``data_service`` 拉取一次合服映射并原子替换 ``context.merged_zones``；容忍瞬态故障。"""
+        try:
+            mapping = await context.data.get_merged_zones()
+        except Exception as error:
+            logger.warning("Login merged zone refresh failed: %s", error)
+            return False
+        context.merged_zones = {int(src): int(dst) for src, dst in mapping.items() if int(src) > 0 and int(dst) > 0}
+        return True
+
+    async def _refresh_merged_zones_loop(self, context, *, interval_s: float = 30.0) -> None:
+        """后台定时刷新合服归属区映射，单次拉取失败仅记日志不退出任务。"""
+        while True:
+            await self._refresh_merged_zones_once(context)
+            await asyncio.sleep(interval_s)
+
     async def _login(self) -> None:
         from redis.asyncio import Redis, RedisCluster
 
         from .login.caller_auth import CallerVerifier
         from .login.config import LoginConfig
-        from .login.directory import DataService
-        from .login.service import LoginService, ServiceContext
-        from .login.sessions import PlayerLocator
-        from .login.tokens import TokenManager
+        from .login.password_auth import open_password_auth_pool
+        from .login.service import LoginService
 
         info = self._info("login", LOGIN)
         info.protocol_type = 1  # GRPC: gates discover Login by grpc_endpoint
+        switch = self._configure_kill_switch(info)
         config = LoginConfig.from_env(self.settings.zone_id)
         redis_type = RedisCluster if self.settings.redis_cluster else Redis
         redis = {}
@@ -322,22 +446,63 @@ class Runtime:
             redis[name] = redis_type.from_url(url, decode_responses=False, socket_connect_timeout=3, socket_timeout=3)
             self._stack.push_async_callback(redis[name].aclose)
             await redis[name].ping()
+
+        control_redis = None
+        control_url = os.getenv("LOGIN_CONTROL_REDIS", "").strip() or self.settings.scene_control_redis
+        if control_url:
+            control_redis = redis_type.from_url(
+                control_url, decode_responses=False, socket_connect_timeout=3, socket_timeout=3,
+            )
+            self._stack.push_async_callback(control_redis.aclose)
+            await control_redis.ping()
+
         clients = {}
         for name, timeout in (("player_locator", 5), ("scene_manager", 13.5), ("data_service", 3)):
             clients[name] = GrpcClient(getattr(self.settings, name), timeout=timeout)
             self._stack.push_async_callback(clients[name].close)
 
+        content_guard_call = None
+        content_guard_addr = self._resolve_login_content_guard_endpoint(self.settings)
+        if content_guard_addr:
+            cg_client = GrpcClient(content_guard_addr, timeout=2.0)
+            self._stack.push_async_callback(cg_client.close)
+            content_guard_call = cg_client.call
+
+        password_pool = None
+        password_dsn = (
+            os.getenv("LOGIN_PASSWORD_AUTH_DSN", "").strip()
+            or os.getenv("MMORPG_LOGIN_PASSWORD_DSN", "").strip()
+        )
+        if password_dsn:
+            password_pool = await open_password_auth_pool(password_dsn)
+
+            async def _close_password_pool(pool=password_pool) -> None:
+                pool.close()
+                await pool.wait_closed()
+
+            self._stack.push_async_callback(_close_password_pool)
+
         async def publish(gate_node_id, command, key):
             await self.kafka.publish("gate", gate_node_id, command, key=key)
 
-        context = ServiceContext(
-            protocol=self.protocol, config=config, login_redis=redis["login"], player_redis=redis["player"],
-            tokens=TokenManager(redis["login"]), locator=PlayerLocator(self.protocol, clients["player_locator"].call),
-            data=DataService(self.protocol, clients["data_service"].call, config.directory_secret),
-            scene_manager_call=clients["scene_manager"].call, publish=publish, directory=self.directory,
+        context = self._build_login_context(
+            self.protocol,
+            config,
+            login_redis=redis["login"],
+            player_redis=redis["player"],
+            locator_call=clients["player_locator"].call,
+            data_call=clients["data_service"].call,
+            scene_manager_call=clients["scene_manager"].call,
+            publish=publish,
+            directory=self.directory,
+            control_redis=control_redis,
+            content_guard_call=content_guard_call,
+            password_auth_pool=password_pool,
         )
         self._stack.push_async_callback(context.close)
-        service = LoginService(context, CallerVerifier.from_env())
+        await self._refresh_merged_zones_once(context)
+        self._spawn(self._refresh_merged_zones_loop(context), "login-merged-zones")
+        service = LoginService(context, CallerVerifier.from_env(), kill_switch=switch)
         await self._listen_grpc("login", info, service.services(), pass_context=True)
         info.endpoint.CopyFrom(info.grpc_endpoint)
         self.login_info = info

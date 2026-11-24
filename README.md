@@ -32,28 +32,31 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 
 ## 单角色与全 Python 集群微服务启动
 
-安装 `.[cluster]` 后，本项目已实现全套纯 Python 业务服务（无须任何 Go 业务进程，仅保留 MySQL/TiDB、Redis、etcd、Kafka 基础设施），配置模板见 [config/cluster.example.toml](config/cluster.example.toml)，各服务 DDL 位于 `config/*_schema.sql`：
+安装 `.[cluster]` 后，本项目已实现全套纯 Python 业务服务（无须任何 Go 或 Java 业务进程，仅保留 MySQL/TiDB、Redis、etcd、Kafka 基础设施），配置模板见 [config/cluster.example.toml](config/cluster.example.toml)，各服务 DDL 位于 `config/*_schema.sql`：
 
 | 服务 / 节点 | 启动命令 | 默认端口 | 说明 |
 | --- | --- | --- | --- |
 | Gate / Scene / Battle / Login | `xuanming-server run gate\|scene\|battle\|login --config <toml>` | 8610 / 8611 / 8613 / 53000 | 游戏主节点与登录认证会话服务 |
-| Portal | `xuanming-server portal --config <toml>` | 8080 / 8082 | HTTP 门户与管理探针 |
+| Portal | `xuanming-server portal --config <toml>` | 8080 / 8082 | HTTP 门户、实名/注销、配置表指针与管理探针 |
 | DataService | `xuanming-server data-service --config <toml>` | 9000 | 账号目录、角色路由/护栏/入场登记、名字与号段 |
 | DB (PlayerStore) | `xuanming-server db --config <toml>` | 6000 | 玩家存档认领、CAS 存盘与审计出箱 |
-| PlayerLocator | `xuanming-server player-locator --config <toml>` | 50300 | 玩家在线态、断线租约与 Redis Lua 围栏 |
+| PlayerLocator | `xuanming-server player-locator --config <toml>` | 50300 | 玩家在线态、断线租约、多区路由与 Redis Lua 围栏 |
 | ClientRpcRouter | `xuanming-server router --config <toml>` | 50600 | Gate 客户端 RPC 路由、轨道隔离、子集与熔断 |
 | PlayerInbox | `xuanming-server player-inbox --config <toml>` | 50950 | 战斗结算与 GM 制裁可靠收件箱 |
 | SceneManager | `xuanming-server scene-manager --config <toml>` | 60000 | 世界线初始化、场景调度、跨区重定向与 2 步交接 |
-| Match (含 Team) | `xuanming-server match --config <toml>` | 50500 | 组队、网络探测、匹配成局、观战与终局结算出箱 |
-| ContentGuard | `xuanming-server content-guard --config <toml>` | 50250 | 敏感词 Trie、繁简归一、广告检测与词库热更 |
+| Match (含 Team) | `xuanming-server match --config <toml>` | 50500 | 组队、网络探测、匹配成局、观战、排位 V1 与终局结算出箱 |
+| ContentGuard | `xuanming-server content-guard --config <toml>` | 50250 | 敏感词 Trie、繁简归一、广告检测、平台审核与词库热更 |
 | Chat | `xuanming-server chat --config <toml>` | 50700 | 世界 8 分片与私聊纯 SQL 权威服务 |
-| Mail | `xuanming-server mail --config <toml>` | 50900 | 个人/系统/公会邮件与 AssetOp 附件发放 |
+| Mail | `xuanming-server mail --config <toml>` | 50900 | 个人/系统/公会邮件、Kafka 通知与 AssetOp 附件发放 |
 | Rank | `xuanming-server rank --config <toml>` | 51100 | 纯 SQL 排行榜、分页与结算发奖 |
 | Friend | `xuanming-server friend --config <toml>` | 50400 | 好友申请、关系图、黑名单与在线推荐 |
-| Payment | `xuanming-server payment --config <toml>` | 51200 / 18130 | 充值意图、HTTP 渠道回调与退款核销 |
-| Trade | `xuanming-server trade --config <toml>` | 50800 | 聚宝斋目录、寄售/P2P/市集/拍卖与资产交割 |
+| Payment | `xuanming-server payment --config <toml>` | 51200 / 18130 | 充值意图、六大渠道回调、实名限额与退款核销 |
+| Trade | `xuanming-server trade --config <toml>` | 50800 | 聚宝斋目录、官方商城、寄售/RMB/角色交易与资产交割 |
 | Guild | `xuanming-server guild --config <toml>` | 50310 | 公会管理、审批、分区排行、AssetOp 经济与试炼活动 |
-| Ops 运维工具 | `xuanming-server schemamigrate\|table-sync ...` | — | 全 12 库 123 表 Schema 校验迁移与配置表打包同步 |
+| MallGame | `xuanming-server mall-game --config <toml>` | 18120 | 官方固定价商城、交付/退款/扣回、RMB 寄售与人工兜底后台 |
+| GmAdmin | `xuanming-server gm-admin --config <toml>` | 8082 | GM 后台概览、个人/系统/全服活动邮件、在线玩家命令与审计流水 |
+| ConfigNode | `xuanming-server config-node --config <toml>` | 8090 | 61 张配置表只读查询与原子热重载 HTTP 服务 |
+| Ops 运维工具 | `xuanming-server schemamigrate\|table-sync ...` | — | 全 15 库 154 表 Schema 校验迁移与配置表打包同步 |
 
 设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连 Login 和 Match；保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Python `client_rpc_router` 转发全部客户端业务服务。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做控制面操作，神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。
 
@@ -76,7 +79,7 @@ $env:XUANMING_PORTAL_ADMIN_API_KEY = '管理接口密钥'
 .venv/Scripts/xuanming-server.exe portal --config config/portal.example.toml
 ```
 
-门户通过 HTTP 监听，应由可信反向代理提供 TLS；`trusted_proxies` 只填写可信代理网段。`home_zone_ids` 指定本实例负责发布策略、健康状态和检查角色容量的区服。管理接口使用 `X-Admin-Key`，未配置密钥时拒绝访问；商城代理另需配置目标服务及 `COMMERCE_ADMIN_SECRET`。CDN 密钥须与资源校验方一致。门户和游戏节点不需要 Java 运行环境，生产集群仍需要配置中的 Go 服务和中间件。
+门户通过 HTTP 监听，应由可信反向代理提供 TLS；`trusted_proxies` 只填写可信代理网段。`home_zone_ids` 指定本实例负责发布策略、健康状态和检查角色容量的区服。管理接口使用 `X-Admin-Key`，未配置密钥时拒绝访问；商城代理另需配置目标服务（可直连纯 Python `mall-game`）及 `COMMERCE_ADMIN_SECRET`。CDN 密钥须与资源校验方一致。全栈业务服务已全部提供纯 Python 实现，不依赖 Go 或 Java 运行环境，仅需外部 MySQL/TiDB、Redis、etcd、Kafka 基础设施。
 
 健康探针及 Prometheus 指标在独立的管理监听端口提供，默认绑定 `127.0.0.1:8082`；管理端口与业务端口共享同一 asyncio 事件循环。公开 HTTP 请求会生成新的追踪标识，传入的外部追踪头不作为内部调用链的来源。
 

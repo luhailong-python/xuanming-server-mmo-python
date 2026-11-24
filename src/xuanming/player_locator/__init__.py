@@ -1,6 +1,12 @@
 """Python 版 player_locator 服务：玩家会话定位、CAS 栅栏与断线租约清理。"""
 
-from .config import DEFAULT_GRPC_PORT, PLAYER_LOCATOR_NODE_TYPE, PlayerLocatorConfig
+from .config import (
+    DEFAULT_GRPC_PORT,
+    PLAYER_LOCATOR_NODE_TYPE,
+    SCENE_MANAGER_NODE_TYPE,
+    PlayerLocatorConfig,
+    parse_scene_manager_endpoints,
+)
 from .gate_sweep import (
     DirectoryLiveGateView,
     GateSweeper,
@@ -24,6 +30,7 @@ from .lease_monitor import (
     HolderReleasePendingError,
     KafkaGatePublisher,
     LeaseMonitor,
+    RoutingSceneManagerClient,
 )
 from .node import run
 from .service import PlayerLocatorService
@@ -62,11 +69,14 @@ __all__ = [
     "RearmLeaseResult",
     "RedisSessionStore",
     "ReplaceSessionResult",
+    "RoutingSceneManagerClient",
+    "SCENE_MANAGER_NODE_TYPE",
     "SweepRoundReport",
     "classify_indexed_member",
     "decide_hosted_resume",
     "open_player_redis",
     "parse_hosted_return_record",
+    "parse_scene_manager_endpoints",
     "resume_hosted_if_lost",
     "return_record_ttl_alignment",
     "run",

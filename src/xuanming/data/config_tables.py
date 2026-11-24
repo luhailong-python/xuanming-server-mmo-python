@@ -126,7 +126,7 @@ class ConfigTables:
             raise ConfigTableError("配置表格式应为 json 或 pb")
         try:
             manifest = json.loads((self.directory / "manifest.json").read_bytes())
-            if manifest["schema_version"] != 1:
+            if manifest["schema_version"] not in (1, 2):
                 raise ValueError("不支持的清单版本")
             if _content_digest(manifest["tables"]) != manifest["content_digest"]:
                 raise ValueError("配置表清单的内容指纹不一致")

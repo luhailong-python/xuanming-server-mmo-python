@@ -11,9 +11,11 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 from . import keys
 
@@ -293,6 +295,84 @@ class SQLPasswordHashStore:
             rows = cursor.fetchall()
         finally:
             cursor.close()
+        if not rows:
+            return "", "", False
+        if len(rows) > 1:
+            raise RuntimeError(f"duplicate authoritative rows for account {account!r}")
+        canonical, encoded = rows[0][0], rows[0][1]
+        return str(canonical or ""), str(encoded or ""), True
+
+
+_GO_MYSQL_DSN_RE = re.compile(
+    r"^(?:(?P<user>[^:@/]*)(?::(?P<password>[^@/]*))?@)?tcp\((?P<host>[^):]+)(?::(?P<port>\d+))?\)/(?P<database>[^?]+)"
+)
+
+
+def parse_mysql_dsn(dsn: str) -> dict[str, object]:
+    """解析 ``mysql://`` 或 Go 风格 ``user:pass@tcp(host:port)/db`` DSN 为 ``aiomysql`` 连接参数。"""
+    raw = dsn.strip()
+    if not raw:
+        raise ValueError("password auth SQL DSN must not be empty")
+    if raw.startswith(("mysql://", "mysql+pymysql://", "mysql+aiomysql://")):
+        parsed = urlsplit(raw)
+        host = parsed.hostname or ""
+        database = parsed.path.lstrip("/")
+        if not host or not database:
+            raise ValueError(f"invalid mysql URL DSN: missing host or database")
+        return {
+            "host": host,
+            "port": int(parsed.port or 3306),
+            "user": unquote(parsed.username or ""),
+            "password": unquote(parsed.password or ""),
+            "database": unquote(database),
+        }
+    match = _GO_MYSQL_DSN_RE.match(raw)
+    if match:
+        return {
+            "host": match.group("host"),
+            "port": int(match.group("port") or 3306),
+            "user": match.group("user") or "",
+            "password": match.group("password") or "",
+            "database": match.group("database"),
+        }
+    raise ValueError("unsupported password auth SQL DSN format")
+
+
+async def open_password_auth_pool(dsn: str, *, minsize: int = 1, maxsize: int = 8):
+    """打开只读口令凭据库 ``aiomysql`` 连接池（READ-COMMITTED、utf8mb4）。"""
+    import aiomysql
+
+    params = parse_mysql_dsn(dsn)
+    return await aiomysql.create_pool(
+        host=params["host"],
+        port=params["port"],
+        user=params["user"],
+        password=params["password"],
+        db=params["database"],
+        minsize=minsize,
+        maxsize=maxsize,
+        connect_timeout=3,
+        autocommit=True,
+        charset="utf8mb4",
+        init_command="SET SESSION transaction_isolation='READ-COMMITTED'",
+    )
+
+
+class SqlPasswordAuthStore:
+    """基于异步 ``aiomysql.Pool`` 的只读 ``user_accounts(account, password)`` 存储实现。"""
+
+    _QUERY = "SELECT account, password FROM user_accounts WHERE account = %s LIMIT 2"
+
+    def __init__(self, pool) -> None:
+        if pool is None:
+            raise ValueError("SqlPasswordAuthStore requires a non-null async pool")
+        self._pool = pool
+
+    async def lookup_password_hash(self, account: str) -> tuple[str, str, bool]:
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(self._QUERY, (account,))
+                rows = await cursor.fetchall()
         if not rows:
             return "", "", False
         if len(rows) > 1:

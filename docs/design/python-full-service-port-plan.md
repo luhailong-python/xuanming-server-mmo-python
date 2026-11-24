@@ -103,3 +103,8 @@
   9. `scene_manager`：补齐世界分线目录定时发布、空闲实例/拆场/死节点后台清理与死写权释放；
   10. `mail`：补齐 Kafka 邮件变更提醒推送（`event_id=39`, `msg_id=264`）与过期邮件清扫器；
   11. `ops` 运维工具：补齐 Python 版全库 Schema 校验迁移器（对应 Go `schemamigrate`）与配置表打包校验工具（对应 Go `table_sync`）。
+- **阶段四（Java 剩余服务全量移植、门户补齐与运行时接线，已完成）**：
+  1. `mall_game`（`src/xuanming/mall_game/`、`config/mall_game_schema.sql`）：完整移植 46 组官方商城/支付/修订/交付/退款/扣回/RMB 寄售/人工兜底/Mock HTTP 路由与 28 张表 DDL，并与 `portal_mall_admin`、`payment.mall_client`、`trade.mall_adapter` 真回环互通。
+  2. `gm_admin`（`src/xuanming/gm_admin/`、`config/gm_admin_schema.sql`）：完整移植 23 组 GM 路由（概览、玩家查询、个人/系统/三阶段全服邮件活动、7 类在线玩家 GM 命令与审计流水）。
+  3. `portal` 补齐与 `config_node`（`src/xuanming/portal_account.py`、`portal_admin_tables.py`、`config_node/`）：补齐 `/api/real-name`、`/api/account/delete`、`/api/account/delete/cancel` 与 `/admin/tables`（etcd CAS 配置表指针），并移植 `config_node` 只读查询与原子热重载服务。
+  4. 运行时装配与配置表同步：`src/xuanming/runtime.py` `_login()` 接入排队、防沉迷、口令库（`config/login_schema.sql`）、注销、内容风控、合服刷新与 `KillSwitch`；`player_locator` 支持按区路由 `SceneManager`；同步 12 张缺失配置表（总计 61 张，含 `RankedPreset`/`RankedRule`）并接入 `match/ranked.py`；`schemamigrate` 覆盖全部 15 库 154 表。
