@@ -1,6 +1,6 @@
 # 玄冥服务端 · Python
 
-这是一个独立的 Python 项目，移植玄冥 C++ 运行层的 Gate、Scene、Battle。当前对照基线为 C++ 仓库 `main`（`d74bbeb1`）。协议快照、消息号、事件号和启动代码都在本项目内。运行和构建仅需此目录。
+这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 框架）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python。当前已校对的 C++ 仓库对照基线为 `main` 提交 `5676d207a`（完整 SHA：`5676d207a6ab960edff7ce7e54bbff6d93a796c1`，2026-11-24；详见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。后续 C++ 仓新增提交时，仅按需从该基线之后筛选非玩法逻辑的底层与框架改动进行增量移植，保留 Python 侧现有战斗与大富翁玩法实现。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
 
 | 节点 | 当前运行路径 |
 | --- | --- |
@@ -8,7 +8,7 @@
 | Scene | RPC0、场景和角色归属代次、Redis 跨区交接、SQL 入场与封存、导航和组队跟随、断线保留和月卡托管、资产、属性、宠物、任务副本和实时技能 |
 | Battle | gRPC 建房、TCP 票据直连和心跳、战斗自动剧本、原配表的职业技能和 Buff、PvE 奖励、战报和观战、Match SQL 终局、Agones 建房准入 |
 
-原有 muduo 客户端帧与 RPC0 保持各自的二进制格式。Python 使用 `asyncio` 管理连接、时钟和退出，使用 Protobuf 描述符解析原协议，使用 `grpc.aio` 和 `aiokafka` 对接基础设施。配置采用标准库 `tomllib`。本地角色行存档采用带跨进程锁和原子替换的 JSON 文件；SQLite 继续保存本地收件箱与发号器。集群角色数据仍由 Go PlayerStore/DataService 写入现有 SQL/TiDB 路径。运行节点共享协议和引擎代码，玩法状态由各自的场景或房间持有。
+原有 muduo 客户端帧与 RPC0 保持各自的二进制格式。Python 使用 `asyncio` 管理连接、时钟和退出，使用 Protobuf 描述符解析原协议，使用 `grpc.aio`、`aiohttp`、`aiomysql`、`redis.asyncio` 和 `aiokafka` 对接基础设施。配置采用标准库 `tomllib`。本地角色行存档采用带跨进程锁和原子替换的 JSON 文件；SQLite 继续保存本地收件箱与发号器。集群角色数据由纯 Python `db`（PlayerStore）与 `data_service` 写入 SQL/TiDB。运行节点共享协议和引擎代码，玩法状态由各自的场景或房间持有。
 
 ## 本地启动
 

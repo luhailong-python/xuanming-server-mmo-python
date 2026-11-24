@@ -121,3 +121,17 @@
   2. `dbmove`（`src/xuanming/ops/dbmove.py`）：物理分库在线搬迁状态机、分片回填、确定性 SHA-256 校验和核对、延迟/哨兵/防脑裂切流门禁，接入 `xuanming dbmove`。
   3. `satoken_auth`（`src/xuanming/satoken_auth/` + `config/satoken_auth_schema.sql`）：Sa-Token 兼容 HTTP/Redis/MySQL 认证与 OAuth/dev 门禁服务，接入 `xuanming satoken-auth` 与 `schemamigrate`（16 库 156 表）。
   4. `navmesh_baker`（`src/xuanming/ops/navmesh_baker.py`）与 `battle_art_gen`（`src/xuanming/ops/battle_art_gen.py`）：纯标准库 Detour MSET v1 导航网格/手绘平面烘焙、SHA-256 配对校验与寻路，以及零 Pillow 7 类 83 张确定性 PNG 战斗美术生成器，接入 `xuanming navmesh-baker` 与 `xuanming battle-art-gen`。
+
+## C++ 仓库对账基线与后续增量移植约定
+
+- **已校对 C++ 基线提交**：
+  - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
+  - Commit SHA：`5676d207a6ab960edff7ce7e54bbff6d93a796c1`（短哈希 `5676d207a`）
+  - 提交时间：`2026-11-24 04:37:53 -0500`
+  - 提交标题：`新增试炼手札系统、装备交易风控与卖家信用、dbcheck 工具及内容安全增强`
+- **已完成范围**：截至该提交，除按要求保留 Python 既有战斗与大富翁玩法实现外，C++ 运行层非战斗系统、15 个 Go 业务微服务、5 个 Java 服务（`portal`/`mall_game`/`gm_admin`/`config_node`/`satoken_auth`）、全套运维/离线/压测工具及 `deploy/` 容器编排均已完整移植为纯 Python（372 个非战斗 RPC 零遗漏，仓库内 `.go`/`.java`/`.cpp`/`.h` 文件数为 `0`，全量测试 888 passed / 15 skipped）。
+- **后续增量移植流程（仅同步非逻辑性底层与框架改动）**：
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 5676d207a6ab960edff7ce7e54bbff6d93a796c1..HEAD`。
+  2. **优先挑选移植**：通信传输/帧协议、gRPC/HTTP/Redis/Kafka/etcd/TiDB 基础设施加固、停机疏散与故障切换、存储一致性/锁/围栏/安全鉴权、可观测性与运维巡检工具、以及影响跨服务契约的底层框架修复。
+  3. **默认跳过不覆盖**：C++ 侧新增或调整的具体玩法逻辑（如回合战斗技能/数值/剧本玩法、非 Python 目标游戏类型专属业务），避免破坏 Python 侧既有战斗与大富翁玩法及配表基线。
+  4. 每次增量移植验证通过后，同步更新本节与 `README.md` 中的 C++ 基线 Commit SHA。
