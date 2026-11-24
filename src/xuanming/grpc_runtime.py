@@ -16,6 +16,102 @@ from .protocol import Protocol
 
 _SIGNATURE_WINDOW_MS = 300_000
 
+# gRPC 服务端连接轮换与客户端 keepalive 缺省参数（对齐 Go shared/grpckeepalive）
+DEFAULT_GRPC_MAX_CONNECTION_AGE_MS = 15 * 60 * 1000
+DEFAULT_GRPC_MAX_CONNECTION_AGE_GRACE_MS = 30 * 1000
+DEFAULT_GRPC_KEEPALIVE_TIME_MS = 5 * 60 * 1000
+DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS = 20 * 1000
+DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS = 0
+
+
+def _resolve_int_option(explicit: int | None, env_key: str, default: int, environ=None) -> int:
+    if explicit is not None:
+        return int(explicit)
+    env = os.environ if environ is None else environ
+    raw = env.get(env_key, "").strip()
+    if raw:
+        return int(raw)
+    return default
+
+
+def grpc_client_options(
+    *,
+    receive_limit: int = 4 << 20,
+    enable_retries: bool | None = None,
+    keepalive_time_ms: int | None = None,
+    keepalive_timeout_ms: int | None = None,
+    keepalive_permit_without_calls: int | bool | None = None,
+    environ=None,
+) -> tuple[tuple[str, int], ...]:
+    """构造带 keepalive 防半开连接参数的 gRPC 客户端 channel options。"""
+    ka_time = _resolve_int_option(
+        keepalive_time_ms, "MMORPG_GRPC_KEEPALIVE_TIME_MS", DEFAULT_GRPC_KEEPALIVE_TIME_MS, environ
+    )
+    ka_timeout = _resolve_int_option(
+        keepalive_timeout_ms,
+        "MMORPG_GRPC_KEEPALIVE_TIMEOUT_MS",
+        DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
+        environ,
+    )
+    permit = _resolve_int_option(
+        None if keepalive_permit_without_calls is None else int(keepalive_permit_without_calls),
+        "MMORPG_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS",
+        DEFAULT_GRPC_KEEPALIVE_PERMIT_WITHOUT_CALLS,
+        environ,
+    )
+    options: list[tuple[str, int]] = [
+        ("grpc.max_receive_message_length", int(receive_limit)),
+        ("grpc.keepalive_time_ms", ka_time),
+        ("grpc.keepalive_timeout_ms", ka_timeout),
+        ("grpc.keepalive_permit_without_calls", permit),
+    ]
+    if enable_retries is not None:
+        options.append(("grpc.enable_retries", int(enable_retries)))
+    return tuple(options)
+
+
+def grpc_server_options(
+    *,
+    max_receive_message_length: int | None = None,
+    max_connection_age_ms: int | None = None,
+    max_connection_age_grace_ms: int | None = None,
+    keepalive_time_ms: int | None = None,
+    keepalive_timeout_ms: int | None = None,
+    environ=None,
+) -> tuple[tuple[str, int], ...]:
+    """构造带 MaxConnectionAge 优雅连接轮换与 keepalive 的 gRPC 服务端 options。"""
+    max_age = _resolve_int_option(
+        max_connection_age_ms,
+        "MMORPG_GRPC_MAX_CONNECTION_AGE_MS",
+        DEFAULT_GRPC_MAX_CONNECTION_AGE_MS,
+        environ,
+    )
+    max_age_grace = _resolve_int_option(
+        max_connection_age_grace_ms,
+        "MMORPG_GRPC_MAX_CONNECTION_AGE_GRACE_MS",
+        DEFAULT_GRPC_MAX_CONNECTION_AGE_GRACE_MS,
+        environ,
+    )
+    ka_time = _resolve_int_option(
+        keepalive_time_ms, "MMORPG_GRPC_KEEPALIVE_TIME_MS", DEFAULT_GRPC_KEEPALIVE_TIME_MS, environ
+    )
+    ka_timeout = _resolve_int_option(
+        keepalive_timeout_ms,
+        "MMORPG_GRPC_KEEPALIVE_TIMEOUT_MS",
+        DEFAULT_GRPC_KEEPALIVE_TIMEOUT_MS,
+        environ,
+    )
+    options: list[tuple[str, int]] = [
+        ("grpc.so_reuseport", 0),
+        ("grpc.max_connection_age_ms", max_age),
+        ("grpc.max_connection_age_grace_ms", max_age_grace),
+        ("grpc.keepalive_time_ms", ka_time),
+        ("grpc.keepalive_timeout_ms", ka_timeout),
+    ]
+    if max_receive_message_length is not None:
+        options.append(("grpc.max_receive_message_length", int(max_receive_message_length)))
+    return tuple(options)
+
 
 def service_digest(message: Message) -> str:
     canonical = type(message)()
@@ -90,12 +186,27 @@ def session_metadata(subject: bytes, method: str, signer: Ed25519PrivateKey | by
 
 
 class GrpcClient:
-    def __init__(self, endpoint: str, *, timeout: float = 5, receive_limit: int = 4 << 20,
-                 enable_retries: bool | None = None) -> None:
-        options = [("grpc.max_receive_message_length", receive_limit)]
-        if enable_retries is not None:
-            options.append(("grpc.enable_retries", int(enable_retries)))
-        self.channel = grpc.aio.insecure_channel(endpoint, options=options)
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        timeout: float = 5,
+        receive_limit: int = 4 << 20,
+        enable_retries: bool | None = None,
+        keepalive_time_ms: int | None = None,
+        keepalive_timeout_ms: int | None = None,
+        keepalive_permit_without_calls: int | bool | None = None,
+        environ=None,
+    ) -> None:
+        self.options = grpc_client_options(
+            receive_limit=receive_limit,
+            enable_retries=enable_retries,
+            keepalive_time_ms=keepalive_time_ms,
+            keepalive_timeout_ms=keepalive_timeout_ms,
+            keepalive_permit_without_calls=keepalive_permit_without_calls,
+            environ=environ,
+        )
+        self.channel = grpc.aio.insecure_channel(endpoint, options=self.options)
         self.timeout = timeout
 
     def request(self, path: str, data: bytes, *, metadata: tuple = (), timeout: float | None = None):
@@ -116,12 +227,22 @@ async def serve_grpc(
     kill_switch=None,
     pass_context=False,
     max_receive_message_length: int | None = None,
+    max_connection_age_ms: int | None = None,
+    max_connection_age_grace_ms: int | None = None,
+    keepalive_time_ms: int | None = None,
+    keepalive_timeout_ms: int | None = None,
+    environ=None,
 ):
     """Serve unary handlers; with ``pass_context`` they are called as ``handler(request, context, path)``."""
-    options = [("grpc.so_reuseport", 0)]
-    if max_receive_message_length is not None:
-        options.append(("grpc.max_receive_message_length", int(max_receive_message_length)))
-    server = grpc.aio.server(options=tuple(options))
+    options = grpc_server_options(
+        max_receive_message_length=max_receive_message_length,
+        max_connection_age_ms=max_connection_age_ms,
+        max_connection_age_grace_ms=max_connection_age_grace_ms,
+        keepalive_time_ms=keepalive_time_ms,
+        keepalive_timeout_ms=keepalive_timeout_ms,
+        environ=environ,
+    )
+    server = grpc.aio.server(options=options)
     for service_name, handlers in services.items():
         descriptor = protocol.pool.FindServiceByName(service_name)
         methods = {}

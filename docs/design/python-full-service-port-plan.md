@@ -108,3 +108,7 @@
   2. `gm_admin`（`src/xuanming/gm_admin/`、`config/gm_admin_schema.sql`）：完整移植 23 组 GM 路由（概览、玩家查询、个人/系统/三阶段全服邮件活动、7 类在线玩家 GM 命令与审计流水）。
   3. `portal` 补齐与 `config_node`（`src/xuanming/portal_account.py`、`portal_admin_tables.py`、`config_node/`）：补齐 `/api/real-name`、`/api/account/delete`、`/api/account/delete/cancel` 与 `/admin/tables`（etcd CAS 配置表指针），并移植 `config_node` 只读查询与原子热重载服务。
   4. 运行时装配与配置表同步：`src/xuanming/runtime.py` `_login()` 接入排队、防沉迷、口令库（`config/login_schema.sql`）、注销、内容风控、合服刷新与 `KillSwitch`；`player_locator` 支持按区路由 `SceneManager`；同步 12 张缺失配置表（总计 61 张，含 `RankedPreset`/`RankedRule`）并接入 `match/ranked.py`；`schemamigrate` 覆盖全部 15 库 154 表。
+- **阶段五（C++ Scene 新增系统 + Go 运维 CLI & 生产加固原语，已完成）**：
+  1. 协议同步：补齐 `player_afk_pass`、`player_appearance`、`player_season`、`player_trial_journal`、`player_bag`（装备打造 5 RPC）、`player_pet`（宠物商店/词条洗炼 5 RPC）与 `message_id.txt`（453–458）并重编 `schema.pb`。
+  2. Scene 新系统接入 `runtime.py`：`SceneGmCommands`（`SceneNodeGrpc.GmExecutePlayerCommand` 7 类在线 GM 命令与 `gm_admin` 字节级兼容）、`SceneAfkPass`、`SceneAppearance`（含试用自动到期）、`SceneSeason`、`SceneTrialJournal`、`SceneEquipCraft` 与 `ScenePets` 扩展。
+  3. 生产加固与运维 CLI：`ops/resilience.py`（`ClockCheck`、`DbGuard`、`LiveViewGate`、`LoopLiveness`）、`grpc_runtime.py`（服务端 `MaxConnectionAge=15m` + 客户端 Keepalive）、`ops/dbcheck.py` 与 `ops/admin_cli.py`（`identitykeygen`、`password-admin`、`lexicon`、`merge-zone`、`data-consistency-check`），全部接入 `__main__.py`。

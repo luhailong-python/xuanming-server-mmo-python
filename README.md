@@ -56,7 +56,7 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 | MallGame | `xuanming-server mall-game --config <toml>` | 18120 | 官方固定价商城、交付/退款/扣回、RMB 寄售与人工兜底后台 |
 | GmAdmin | `xuanming-server gm-admin --config <toml>` | 8082 | GM 后台概览、个人/系统/全服活动邮件、在线玩家命令与审计流水 |
 | ConfigNode | `xuanming-server config-node --config <toml>` | 8090 | 61 张配置表只读查询与原子热重载 HTTP 服务 |
-| Ops 运维工具 | `xuanming-server schemamigrate\|table-sync ...` | — | 全 15 库 154 表 Schema 校验迁移与配置表打包同步 |
+| Ops 运维工具 | `xuanming-server schemamigrate\|table-sync\|dbcheck\|identitykeygen\|password-admin\|lexicon\|merge-zone\|data-consistency-check ...` | — | 全 15 库 154 表迁移、配置表打包、只读库巡检、密钥/口令/词库/合服与一致性校验 |
 
 设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连 Login 和 Match；保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Python `client_rpc_router` 转发全部客户端业务服务。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做控制面操作，神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。
 

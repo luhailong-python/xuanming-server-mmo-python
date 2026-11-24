@@ -89,8 +89,24 @@ def main() -> None:
     cfg_cmd.add_argument("--config", type=Path, required=True)
     migrate_cmd = commands.add_parser("schemamigrate", help="校验并执行全库 SQL Schema 幂等迁移", add_help=False)
     sync_cmd = commands.add_parser("table-sync", help="打包、校验或解包配置表与指针文件", add_help=False)
+    dbcheck_cmd = commands.add_parser("dbcheck", help="只读巡检全库表登记、清理索引、容量、大字段与出箱积压", add_help=False)
+    commands.add_parser("identitykeygen", help="生成 Ed25519 内部调用身份密钥对", add_help=False)
+    commands.add_parser("password-admin", help="管理 login 口令账号凭据（哈希/校验/设置/禁用）", add_help=False)
+    commands.add_parser("lexicon", help="校验与检查 content_guard 敏感词库", add_help=False)
+    commands.add_parser("merge-zone", help="校验并执行合服路由计划（zone_merged_into）", add_help=False)
+    commands.add_parser("data-consistency-check", help="只读跨库一致性巡检（路由/角色/邮件/公会排行）", add_help=False)
     args, extra = parser.parse_known_args()
-    if args.command not in ("schemamigrate", "table-sync") and extra:
+    passthrough_commands = (
+        "schemamigrate",
+        "table-sync",
+        "dbcheck",
+        "identitykeygen",
+        "password-admin",
+        "lexicon",
+        "merge-zone",
+        "data-consistency-check",
+    )
+    if args.command not in passthrough_commands and extra:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -195,6 +211,14 @@ def main() -> None:
             from .ops.table_sync import main as run_table_sync
 
             raise SystemExit(run_table_sync(extra))
+        elif args.command == "dbcheck":
+            from .ops.dbcheck import main as run_dbcheck
+
+            raise SystemExit(run_dbcheck(extra))
+        elif args.command in ("identitykeygen", "password-admin", "lexicon", "merge-zone", "data-consistency-check"):
+            from .ops.admin_cli import main as run_admin_cli
+
+            raise SystemExit(run_admin_cli([args.command, *extra]))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

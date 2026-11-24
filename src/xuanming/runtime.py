@@ -26,20 +26,26 @@ from .nodes.scene import SceneNode
 from .nodes.scene_agones import SceneAgones
 from .nodes.scene_admin import SceneAdmin
 from .nodes.scene_activity import Activities
+from .nodes.scene_afk_pass import SceneAfkPass
+from .nodes.scene_appearance import SceneAppearance
 from .nodes.scene_assets import SceneAssets
 from .nodes.scene_attributes import SceneAttributes, initialize_attribute_schemes
 from .nodes.scene_battle import SceneBattle
 from .nodes.scene_connection_hold import afk_pass_key
+from .nodes.scene_equip_craft import SceneEquipCraft
+from .nodes.scene_gm_commands import SceneGmCommands
 from .nodes.scene_landing import SceneLanding
 from .nodes.scene_mail_outbox import MailSender, SceneMailOutbox
 from .nodes.scene_merchant import SceneMerchant, redis_key
 from .nodes.scene_mission import Missions
 from .nodes.scene_pets import ScenePets
 from .nodes.scene_planned_drain import budget_from_env, planned_drain
+from .nodes.scene_season import SceneSeason
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_stats import initialize_base
 from .nodes.scene_team import SceneTeam
 from .nodes.scene_travel import create_scene_travel
+from .nodes.scene_trial_journal import SceneTrialJournal
 from .protocol import Protocol
 from .settings import Settings, secret
 from .transport.client_endpoint import ClientEndpointSettings
@@ -609,6 +615,18 @@ class Runtime:
         scene.attributes.register()
         scene.pets = ScenePets(scene, tables)
         scene.pets.register()
+        scene.afk_pass = SceneAfkPass(scene, tables, scene.assets, player_redis=redis)
+        scene.afk_pass.register()
+        scene.appearance = SceneAppearance(scene, tables, scene.assets)
+        scene.appearance.register()
+        scene.season = SceneSeason(scene, tables, scene.assets)
+        scene.season.register()
+        scene.trial_journal = SceneTrialJournal(scene, tables, scene.assets)
+        scene.trial_journal.register()
+        scene.equip_craft = SceneEquipCraft(scene, tables, scene.assets)
+        scene.equip_craft.register()
+        scene.gm_commands = SceneGmCommands(scene)
+        methods.update(scene.gm_commands.grpc_methods())
         Activities(missions).register()
         settlement = BattleSettlement(scene, tables, scene.assets, missions)
         settlement.register()
@@ -649,6 +667,8 @@ class Runtime:
             await asyncio.sleep(self.settings.scene_tick_seconds)
             now = time.monotonic()
             await self.scene.tick(min(now - previous, 0.25))
+            if getattr(self.scene, "appearance", None) is not None and self.scene.appearance._active_trials:
+                await self.scene.appearance.expire_trials()
             if self._scene_agones is not None:
                 self._scene_agones.touch_heartbeat()
             previous = now
