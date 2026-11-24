@@ -73,6 +73,14 @@ def main() -> None:
     mail_cmd.add_argument("--config", type=Path, required=True)
     rank_cmd = commands.add_parser("rank", help="启动 rank（排行榜与结算发奖服务）")
     rank_cmd.add_argument("--config", type=Path, required=True)
+    friend_cmd = commands.add_parser("friend", help="启动 friend（好友关系、黑名单与在线推荐服务）")
+    friend_cmd.add_argument("--config", type=Path, required=True)
+    payment_cmd = commands.add_parser("payment", help="启动 payment（充值意图、渠道回调与退款服务）")
+    payment_cmd.add_argument("--config", type=Path, required=True)
+    trade_cmd = commands.add_parser("trade", help="启动 trade（聚宝斋目录、寄售/市集/拍卖与资产交割服务）")
+    trade_cmd.add_argument("--config", type=Path, required=True)
+    guild_cmd = commands.add_parser("guild", help="启动 guild（公会、成员权限、排行与活动服务）")
+    guild_cmd.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -141,6 +149,22 @@ def main() -> None:
             from .rank.node import run as run_rank
 
             asyncio.run(run_rank(Settings.load(args.config)))
+        elif args.command == "friend":
+            from .friend.node import run as run_friend
+
+            asyncio.run(run_friend(Settings.load(args.config)))
+        elif args.command == "payment":
+            from .payment.node import run as run_payment
+
+            asyncio.run(run_payment(Settings.load(args.config)))
+        elif args.command == "trade":
+            from .trade.node import run as run_trade
+
+            asyncio.run(run_trade(Settings.load(args.config)))
+        elif args.command == "guild":
+            from .guild.node import run as run_guild
+
+            asyncio.run(run_guild(Settings.load(args.config)))
         else:
             asyncio.run(run(args))
     except KeyboardInterrupt:

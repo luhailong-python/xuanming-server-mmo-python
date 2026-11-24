@@ -30,9 +30,31 @@ $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'
 
 开发客户端先取得 Gate 票据，再发送 `ClientTokenVerifyRequest`、`ClientPlayerLogin.Login` 和 `EnterGame`。本机测试可调用 `Runtime.gate.issue_ticket()`。需要从另一终端签票时，在两边配置同一个至少 32 字节的 `MMORPG_GATE_TOKEN_SECRET`，然后执行 `xuanming-server gate-ticket --config config/local.toml`。返回的 `payload_b64` 先做 Base64 解码，`signature_hex` 按 ASCII 原样填入签名字段。开发账号 `local` 的角色 ID 为 1。SQLite 存档保存在 `run/`，自建角色列表保存在进程内。
 
-## 单角色启动
+## 单角色与全 Python 集群微服务启动
 
-安装 `.[cluster]` 后可用 `xuanming-server run gate|scene|battle|login --config <配置文件>` 单独起节点。用 `config/cluster.example.toml` 配置实例地址、原有 Kafka topic 代号和固定分区。设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连 Login（Go 或本仓库的 Python 版）和 Match。保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Router 转发，组队和其他 Go 客户端服务走此模式。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做原有控制面操作。神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。集群的 Match 和其他业务服务仍使用 Go 实现。
+安装 `.[cluster]` 后，本项目已实现全套纯 Python 业务服务（无须任何 Go 业务进程，仅保留 MySQL/TiDB、Redis、etcd、Kafka 基础设施），配置模板见 [config/cluster.example.toml](config/cluster.example.toml)，各服务 DDL 位于 `config/*_schema.sql`：
+
+| 服务 / 节点 | 启动命令 | 默认端口 | 说明 |
+| --- | --- | --- | --- |
+| Gate / Scene / Battle / Login | `xuanming-server run gate\|scene\|battle\|login --config <toml>` | 8610 / 8611 / 8613 / 53000 | 游戏主节点与登录认证会话服务 |
+| Portal | `xuanming-server portal --config <toml>` | 8080 / 8082 | HTTP 门户与管理探针 |
+| DataService | `xuanming-server data-service --config <toml>` | 9000 | 账号目录、角色路由/护栏/入场登记、名字与号段 |
+| DB (PlayerStore) | `xuanming-server db --config <toml>` | 6000 | 玩家存档认领、CAS 存盘与审计出箱 |
+| PlayerLocator | `xuanming-server player-locator --config <toml>` | 50300 | 玩家在线态、断线租约与 Redis Lua 围栏 |
+| ClientRpcRouter | `xuanming-server router --config <toml>` | 50600 | Gate 客户端 RPC 路由、轨道隔离、子集与熔断 |
+| PlayerInbox | `xuanming-server player-inbox --config <toml>` | 50950 | 战斗结算与 GM 制裁可靠收件箱 |
+| SceneManager | `xuanming-server scene-manager --config <toml>` | 60000 | 世界线初始化、场景调度、跨区重定向与 2 步交接 |
+| Match (含 Team) | `xuanming-server match --config <toml>` | 50500 | 组队、网络探测、匹配成局、观战与终局结算出箱 |
+| ContentGuard | `xuanming-server content-guard --config <toml>` | 50250 | 敏感词 Trie、繁简归一、广告检测与词库热更 |
+| Chat | `xuanming-server chat --config <toml>` | 50700 | 世界 8 分片与私聊纯 SQL 权威服务 |
+| Mail | `xuanming-server mail --config <toml>` | 50900 | 个人/系统/公会邮件与 AssetOp 附件发放 |
+| Rank | `xuanming-server rank --config <toml>` | 51100 | 纯 SQL 排行榜、分页与结算发奖 |
+| Friend | `xuanming-server friend --config <toml>` | 50400 | 好友申请、关系图、黑名单与在线推荐 |
+| Payment | `xuanming-server payment --config <toml>` | 51200 / 18130 | 充值意图、HTTP 渠道回调与退款核销 |
+| Trade | `xuanming-server trade --config <toml>` | 50800 | 聚宝斋目录、寄售/P2P/市集/拍卖与资产交割 |
+| Guild | `xuanming-server guild --config <toml>` | 50310 | 公会管理、审批、分区排行、升级与活动 |
+
+设置 `GATE_CLIENT_RPC_ROUTER=0` 后，Gate 根据 etcd 登记直连 Login 和 Match；保留配置中的 `router` 地址或显式设置 `GATE_CLIENT_RPC_ROUTER=1` 可经 Python `client_rpc_router` 转发全部客户端业务服务。Gate 的 `rpc_port` 用于独立的内部 RPC0 监听。Scene 使用玩家域 Redis 做归属、战斗锁和进场同步摘要，使用 DataService、PlayerStore、SceneManager、Match 和 PlayerInbox 做控制面操作，神秘商人和资产补偿唤醒使用独立的 `scene_control_redis`。
 
 Python Login（`src/xuanming/login`）沿用 Go login 的 Redis 键、TTL 和 Lua 脚本，可与 Go login 共用同一套 Redis。它使用 `[login]` 段和 `data_service`、`scene_manager`、`player_locator`、`redis`（玩家域）、`login_redis`（登录域，缺省同 `redis`）地址，并读取环境变量 `MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN`、`MMORPG_GATE_TOKEN_SECRET`、`MMORPG_INTERNAL_AUTH_PUBLIC_KEYS`，开发口令登录读取 `LOGIN_DEV_PASSWORD_SHARED_SECRET`（账号前缀 `robot_`、`dev_`）。
 

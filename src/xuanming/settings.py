@@ -61,6 +61,10 @@ class Settings:
     chat_node: dict = field(default_factory=dict)  # raw [chat_node], parsed by chat.config
     mail_node: dict = field(default_factory=dict)  # raw [mail_node], parsed by mail.config
     rank_node: dict = field(default_factory=dict)  # raw [rank_node], parsed by rank.config
+    friend_node: dict = field(default_factory=dict)  # raw [friend_node], parsed by friend.config
+    payment_node: dict = field(default_factory=dict)  # raw [payment_node], parsed by payment.config
+    trade_node: dict = field(default_factory=dict)  # raw [trade_node], parsed by trade.config
+    guild_node: dict = field(default_factory=dict)  # raw [guild_node], parsed by guild.config
 
     @classmethod
     def load(cls, path: Path | None):

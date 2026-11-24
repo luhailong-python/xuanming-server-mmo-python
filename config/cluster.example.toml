@@ -169,3 +169,46 @@ mysql_port = 3306
 mysql_user = "appuser"
 mysql_database = "mmorpg_rank"
 mail_rpc = "mail:50900"
+
+[friend_node]
+node_id = 116
+host = "0.0.0.0"
+grpc_port = 50400
+advertise_host = "friend"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_friend"
+
+[payment_node]
+node_id = 117
+host = "0.0.0.0"
+grpc_port = 51200
+advertise_host = "payment"
+notify_host = "0.0.0.0"
+notify_port = 18130
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_payment"
+mall_base_url = "http://mall:18120"
+
+[trade_node]
+node_id = 118
+host = "0.0.0.0"
+grpc_port = 50800
+advertise_host = "trade"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_trade"
+
+[guild_node]
+node_id = 119
+host = "0.0.0.0"
+grpc_port = 50310
+advertise_host = "guild"
+mysql_host = "mysql"
+mysql_port = 3306
+mysql_user = "appuser"
+mysql_database = "mmorpg_guild"
