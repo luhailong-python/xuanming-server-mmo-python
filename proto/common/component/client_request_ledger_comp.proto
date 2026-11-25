@@ -32,6 +32,46 @@ message ClientRequestRecord {
   bool enhance_success = 5;      // 强化:那一次掷骰成没成
   uint32 enhance_level = 6;      // 强化:那一次之后的等级
   uint32 created_scheme_id = 7;  // 新建加点方案:那一次建出来的方案号
+  uint64 equipment_item_id = 8; // 装备打造/装条：首次成功对应的实例。
+  uint64 forge_revision = 9;    // 装备打造/装条：首次成功后的业务水位。
+  uint64 material_reward_revision = 10; // 材料自选：首次成功后的独立水位。
+  uint32 crafting_material_count = 11;  // 材料自选首次实际领取的打造材料数。
+  uint32 enhancement_stone_count = 12;  // 材料自选首次实际领取的强化石数。
+  uint32 season_catchup_points = 13;    // 赛季印追赶：首次实际补齐的进度点数。
+  uint64 season_catchup_spent = 14;     // 赛季印追赶：首次实际扣除的货币数。
+  uint32 trial_milestone_id = 15;            // 五行试炼志里程碑领取：首次领取的里程碑 ID。
+  uint32 trial_milestone_sand_count = 16;    // 五行试炼志里程碑领取：首次发放的仅自用重铸砂数量。
+  uint32 trial_milestone_voucher_count = 17; // 五行试炼志里程碑领取：首次发放的仅自用法宝拓印数量。
+  uint64 redeemed_artifact_item_id = 18;     // 五行试炼志拓印兑换：首次产出的仅自用法宝实例 ID。
+  uint32 redeemed_artifact_config_id = 19;   // 五行试炼志拓印兑换：首次兑换的法宝模板 ID。
+  uint32 enhance_pity_count = 20;            // 强化：那一次操作后的保底累计次数（用于 +11 顶格概率强化的幂等重放）。
+  uint32 crafting_tradable_count = 21;       // 材料自选：首次实际发放的可交易打造材料数。
+  uint32 enhancement_tradable_count = 22;    // 材料自选：首次实际发放的可交易百炼石数。
+  uint32 equipment_quality_tier = 23;        // 装备装条/打磨：首次操作后的品相档位（1..5）。
+  uint32 equipment_polish_pity_count = 24;   // 装备打磨：首次操作后的单条保底计数。
+  bool equipment_guaranteed_by_pity = 25;    // 装备打磨：首次是否由硬保底或定星符触发极品。
+  uint64 crafted_skill_book_id = 26;         // 技能制书：首次产出的未学技能书 ID。
+  uint32 crafted_skill_table_id = 27;        // 技能制书：首次产出的技能表 ID。
+  uint64 scroll_craft_revision = 28;         // 技能制书/拆页：首次成功后的水位。
+  uint32 scroll_bonus_fragments = 29;        // 技能制书/拆页：首次额外返还或拆解得到的残页数。
+}
+
+// 与战斗结算、物品和请求回执同属完整玩家存档。未领取余额不随周期重置。
+// 来源防重由战斗收件箱的永久消费水位负责；不能用近期结果列表充当去重账本。
+// 合入 A 两阶段模型（docs/design/season-pvp-pve-economy-unified-v1.md）：
+//   阶段一（lifetime_earned < 660）：无每日/周清打卡，永久累计至 660 份，其中胜局基础含至多 60 份可交易；
+//   阶段二（lifetime_earned >= 660）：开启 +11 顶格周平滑精进池，每周 100 份绑定自选（UTC+8 周一 05:00 重置）。
+message EquipmentMaterialRewardLedger {
+  uint64 day_starts_at_ms = 1; // 历史日账字段（旧档兼容保留）。
+  uint32 earned_today = 2;
+  uint64 available_units = 3;
+  uint64 revision = 4; // 仅成功领取+1；入账不改变领取水位，饱和时拒绝领取，永不回退。
+  uint32 lifetime_earned = 5;           // 阶段一永久首套累计已获份数（上限 660）。
+  uint32 tradable_earned_total = 6;     // 阶段一累计已获可交易份数（上限 60）。
+  uint64 available_tradable_units = 7;  // 当前未领余额中可交易子集（不变量：<= available_units）。
+  uint64 week_starts_at_ms = 8;         // 阶段二当前游戏周起点（UTC+8 周一 05:00）。
+  uint32 earned_this_week = 9;          // 阶段二本周已获绑定份数（上限 100）。
+  bool migrated_to_v2 = 10;             // 标记已进入两阶段新账（旧档历史余额全额保留为自用，不抵扣新 660）。
 }
 
 message ClientRequestLedgerComp {
@@ -39,6 +79,10 @@ message ClientRequestLedgerComp {
   repeated ClientRequestRecord records = 1;
   // 下一条的 seq。0 = 从没记过(旧存档没有这个字段),按 1 处理。
   uint64 next_seq = 2;
+  // 装备打造/首次装词条共用的持久防重水位，初始0，每次成功+1；饱和时拒绝。
+  // 与records的淘汰序号独立；即使旧回执被淘汰，旧水位请求也不能再次扣料或造物。
+  uint64 forge_revision = 3;
+  EquipmentMaterialRewardLedger material_reward = 4;
   // Python 玩法扩展保留最近回执，随 WALLET 行与奖励一起提交。
   monopoly.RollResult monopoly_last_roll = 10000;
   // 地标进度和扣款回执使用独立序号，同一 WALLET 行保存。

@@ -39,9 +39,9 @@ message TrialJournalEntryView {
   uint32 lit_seal_count = 14;
   uint32 total_seal_count = 15;
 
-  bool has_solo_best = 16;
+  bool solo_recorded = 16;
   TrialJournalSoloRecord solo_best = 17;
-  bool has_coop_best = 18;
+  bool coop_recorded = 18;
   TrialJournalCoopRecord coop_best = 19;
   bool has_legacy_record_only = 20; // true = 当前规则版暂无纪录但存在历史版本纪录（UI 提示「本版暂无纪录，战法印已保留」）
 
@@ -107,6 +107,8 @@ message TrialJournalSnapshot {
   repeated TrialJournalChapterView chapters = 11;
   repeated TrialJournalMilestoneView milestones = 12;
   repeated TrialRedeemableArtifactOption redeemable_artifacts = 13;
+  // true = 本角色已通关任意普通难度首领试炼，具备困难难度首领试炼准入资格（组队困难需全员均为 true）。
+  bool hard_boss_trial_unlocked = 14;
 }
 
 message GetTrialJournalRequest {}

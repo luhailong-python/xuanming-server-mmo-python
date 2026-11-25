@@ -16,10 +16,20 @@ from typing import TYPE_CHECKING
 
 from google.protobuf.message import DecodeError, Message
 
+from .battle_dropin_effects import (
+    DungeonMonsterAiProfile,
+    EquipmentBattleEffects,
+    MonsterAiRuntime,
+    PetAndSupportEffects,
+    SeasonBattleRules,
+    TrialContext,
+    TrialFactTracker,
+    choose_monster_action,
+)
 from .battle_effects import FREEZE, STUN, U64_MAX, BattleEffects, landed_damage, landed_heal, rank_factor, scaled
 from .battle_replay import BattleReplayRecorder
 from .battle_script import BattleScriptRuntime
-from .battle_skills import BattleSkills, active as _active, base_stat
+from .battle_skills import BattleSkills, active as _active, base_stat, mana_cost
 from .battle_spectate import END, STATE, TURN, SpectateChannels, SpectateSink
 from .battle_tables import BattleBuff, BattleItem, BattleSkill, BattleTables, _Mt19937_64
 
@@ -102,6 +112,8 @@ class TurnEngine:
         skills: Mapping[int, BattleSkill], items: Mapping[int, BattleItem], max_rounds: int,
         buffs: Mapping[int, BattleBuff] | None = None, silence_permissions: tuple[int, ...] | None = None,
         monster_ids: set[int] | None = None,
+        monster_ai_profiles: Mapping[int, DungeonMonsterAiProfile] | None = None,
+        trial_context: Message | TrialContext | None = None,
     ):
         if not request.battle_id or not request.players:
             raise BattleError("battle needs an identity and players")
@@ -122,6 +134,14 @@ class TurnEngine:
         self.defeated_monsters: list[int] = []
         self.effects = BattleEffects(self, buffs or {})
         self.skills = BattleSkills(self, skills, silence_permissions)
+        self.equipment_effects = EquipmentBattleEffects(self)
+        self.pet_support = PetAndSupportEffects(self)
+        self.season_rules = SeasonBattleRules
+        effective_trial_ctx = trial_context
+        if effective_trial_ctx is None and hasattr(request, "trial_context") and request.HasField("trial_context"):
+            effective_trial_ctx = request.trial_context
+        self.trial_tracker = TrialFactTracker(self, effective_trial_ctx)
+        self.monster_ai = MonsterAiRuntime(self, monster_ai_profiles)
         self._group = 0
         slots = [0, 0]
         for player in request.players:
@@ -138,6 +158,9 @@ class TurnEngine:
                 actor.combat.CopyFrom(player.combat)
             actor.buffs.extend(player.buffs)
             self.skills.initialize(actor, player)
+            if player.HasField("equipment_effects"):
+                if not self.equipment_effects.initialize_equipment(actor, player.equipment_effects):
+                    raise BattleError("invalid equipment effects snapshot")
             self.items[actor_id] = []
             for item in player.items:
                 if item.count:
@@ -156,6 +179,9 @@ class TurnEngine:
                 actor.pet_id = pet.pet_id
                 actor.is_auto = True
                 self.skills.initialize(actor, pet, pet=True)
+                if pet.HasField("pet_cultivation"):
+                    if not self.pet_support.initialize_pet_cultivation(actor, pet.pet_cultivation):
+                        raise BattleError("invalid pet cultivation snapshot")
                 pet_ids.add(pet.pet_id)
         for index, monster in enumerate(monsters):
             actor = self.protocol.message("BattleActorState")
@@ -170,6 +196,17 @@ class TurnEngine:
             raise BattleError("both sides need a unit")
         self.effects.sanitize()
         self.scripts = BattleScriptRuntime(self, request, monster_ids)
+        self.monster_ai.bind_actors()
+        self.trial_tracker.initialize(request)
+
+    def set_monster_ai_profiles(self, profiles: Mapping[int, DungeonMonsterAiProfile]) -> None:
+        """为本场战斗动态挂载副本怪物战术 AI 档案。"""
+        self.monster_ai.set_profiles(profiles)
+
+    def support_summary(self, actor_id: int) -> Message | None:
+        """生成指定单位当前回合的辅助效果只读投影（治疗/护盾）。"""
+        actor = self.actors.get(actor_id)
+        return self.pet_support.build_support_summary(actor, self.round_index) if actor is not None else None
 
     def _actor(self, snapshot: Message, actor_id: int, actor_type: int, team: int,
                slots: list[int], name: str) -> Message:
@@ -205,8 +242,12 @@ class TurnEngine:
     def personalize(self, state: Message, viewer: int) -> None:
         for actor in state.actors:
             actor.ClearField("combat")
+            if actor.HasField("season_seal_state"):
+                actor.ClearField("season_seal_state")
             if not viewer or (actor.actor_id != viewer and actor.owner_player_id != viewer):
                 actor.ClearField("skill_cooldown_rounds")
+            if actor.HasField("support_effects") and (not viewer or actor.actor_id != viewer):
+                actor.ClearField("support_effects")
         state.ClearField("self_items")
         for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
             if item.count:
@@ -223,7 +264,14 @@ class TurnEngine:
         if action_type == _FLEE:
             return 0 if self.pve else _INVALID
         if action_type == _SKILL:
-            return self.skills.validate(actor, action)
+            error = self.skills.validate(actor, action)
+            if error == 7004 and actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
+                rule = self.skills.rules.get(action.skill_table_id)
+                if rule is not None and rule.castable:
+                    discounted = self.equipment_effects.discount_skill_mana(actor, rule, mana_cost(actor, rule))
+                    if discounted <= actor.attributes.mana:
+                        return 0
+            return error
         if action_type == _ITEM:
             return self._validate_item(actor, action.item_table_id, action.target_id)
         return _INVALID
@@ -274,7 +322,9 @@ class TurnEngine:
         for actor in self.actors.values():
             if _active(actor) and actor.buffs:
                 self._group += 1
+                tick_start = len(turn.events)
                 self.effects.tick(actor, turn, self._group)
+                self._post_process_buff_ticks(actor, turn, tick_start)
         for actor in self.actors.values():
             actor.is_defending = False
             for skill_id, remaining in list(actor.skill_cooldown_rounds.items()):
@@ -290,19 +340,45 @@ class TurnEngine:
             self.outcome = 1
         elif self.round_index >= self.max_rounds:
             self.outcome = 2
+        self.trial_tracker.on_round_complete(self.round_index)
         self.pending.clear()
         if not self.outcome:
             self.round_index += 1
         turn.state.CopyFrom(self.snapshot(0, unredacted=True))
         return turn
 
+    def _post_process_buff_ticks(self, target: Message, turn: Message, event_start: int) -> None:
+        """对本回合周期效果事件补充宠物毒伤修炼增幅与怪物护卫回血追踪。"""
+        for event in turn.events[event_start:]:
+            if event.event_type != 7 or not event.value:
+                continue
+            rule = self.effects.rules.get(event.buff_table_id)
+            caster = self.actors.get(event.source_id)
+            if rule is None or caster is None:
+                continue
+            if rule.buff_type == 50 and caster.actor_type == _PET and caster.HasField("pet_cultivation"):
+                bonus = self.pet_support.pet_poison_bonus(caster)
+                if bonus > 0.0 and not target.is_dead:
+                    extra = landed_damage(target, float(event.value) * bonus)
+                    if extra > 0:
+                        target.attributes.health -= extra
+                        event.value += extra
+                        event.target_health_after = target.attributes.health
+                        self._death(turn, event.group_id, target, caster.actor_id)
+            elif rule.buff_type in (40, 42):
+                self.trial_tracker.record_monster_heal(caster, target, event.value)
+
     def _fill_default_actions(self) -> None:
         self.scripts.fill()
+        if self.monster_ai.active:
+            self.monster_ai.fill_actions()
         for actor in self.actors.values():
             if not _active(actor) or actor.actor_id in self.pending:
                 continue
             default = None
-            if actor.actor_type == _PET and actor.skill_table_ids:
+            if actor.actor_type == _MONSTER:
+                default = choose_monster_action(self, actor)
+            elif actor.actor_type == _PET and actor.skill_table_ids:
                 target = next((other for other in self.actors.values() if self._enemy(actor, other)), None)
                 if target is not None:
                     for skill_id in actor.skill_table_ids:
@@ -335,6 +411,8 @@ class TurnEngine:
         if action.action_type == _DEFEND:
             actor.is_defending = True
             self._event(turn, group, 9, actor, actor)
+            if actor.HasField("equipment_effects"):
+                self.equipment_effects.on_defend(actor, self.round_index, turn, group)
             return
         if action.action_type == _FLEE:
             if self.pve:
@@ -348,10 +426,70 @@ class TurnEngine:
             self._use_item(turn, group, actor, action)
             return
         if action.action_type == _SKILL:
-            self.skills.execute(actor, action, turn, group)
+            self._execute_skill_with_dropin(turn, group, actor, action)
             return
         if action.action_type == _ATTACK:
             self._attack_target(turn, group, actor, action.target_id)
+
+    def _execute_skill_with_dropin(self, turn: Message, group: int, actor: Message, action: Message) -> None:
+        """执行技能并接入装备减耗、治疗增幅、法宝触发与试炼志事件追踪。"""
+        event_start = len(turn.events)
+        rule = self.skills.rules.get(action.skill_table_id)
+        discount_saved = 0
+        original_cost = 0
+        borrowed_mana = 0
+        if (
+            rule is not None
+            and actor.HasField("equipment_effects")
+            and actor.equipment_effects.mana_reduction_bps
+        ):
+            original_cost = mana_cost(actor, rule)
+            discounted_cost = self.equipment_effects.discount_skill_mana(actor, rule, original_cost)
+            discount_saved = max(0, original_cost - discounted_cost)
+            if discount_saved > 0 and discounted_cost <= actor.attributes.mana < original_cost:
+                borrowed_mana = original_cost - actor.attributes.mana
+                actor.attributes.mana += borrowed_mana
+
+        self.skills.execute(actor, action, turn, group)
+
+        if discount_saved > 0:
+            mana_events = [
+                ev for ev in turn.events[event_start:]
+                if ev.event_type == 14 and ev.source_id == actor.actor_id and ev.target_id == actor.actor_id and ev.mana_delta < 0
+            ]
+            if mana_events:
+                refund = discount_saved - borrowed_mana
+                if refund > 0:
+                    actor.attributes.mana = min(actor.max_mana, actor.attributes.mana + refund)
+                elif refund < 0:
+                    actor.attributes.mana = max(0, actor.attributes.mana + refund)
+                discounted_actual = max(1, abs(mana_events[0].mana_delta) - discount_saved)
+                mana_events[0].value = discounted_actual
+                mana_events[0].mana_delta = -discounted_actual
+                mana_events[0].target_mana_after = actor.attributes.mana
+            elif borrowed_mana > 0:
+                actor.attributes.mana = max(0, actor.attributes.mana - borrowed_mana)
+
+        new_events = list(turn.events[event_start:])
+        first_heal = True
+        for event in new_events:
+            if event.event_type == 4 and event.value > 0:
+                target = self.actors.get(event.target_id)
+                if target is not None:
+                    self.equipment_effects.amplify_heal_event(
+                        actor, target, event, self.round_index, turn, group, is_primary_first_hit=first_heal,
+                    )
+                    first_heal = False
+                    self.trial_tracker.record_effective_contribution(actor)
+                    self.trial_tracker.record_monster_heal(actor, target, event.value)
+            elif event.event_type == 6:
+                target = self.actors.get(event.target_id)
+                if target is not None:
+                    if target.team_index != actor.team_index and target.actor_type == _MONSTER:
+                        self.trial_tracker.record_guard_stance_dispelled(event.buff_table_id)
+                        self.trial_tracker.record_effective_contribution(actor)
+                    elif target.team_index == actor.team_index and actor.actor_type == _PLAYER:
+                        self.trial_tracker.record_anti_control_or_season_skill(actor)
 
     def _attack_target(self, turn: Message, group: int, actor: Message, target_id: int) -> None:
         target = self._target(actor, target_id)
@@ -408,13 +546,28 @@ class TurnEngine:
         raw = base * (1 + float(actor.attributes.strength) * 0.1) + float(attack) * multiplier
         if not isfinite(raw) or raw <= 0:
             return 0.0
-        return raw * ratio * (1.0 if self.pve else 0.3)
+        damage = raw * ratio
+        if target.HasField("equipment_effects"):
+            damage = self.equipment_effects.apply_equipment_resist(
+                target, damage, damage_kind, self._effective_stat(target, 11),
+            )
+        return damage * (1.0 if self.pve else 0.3)
 
     @staticmethod
     def _critical_chance(actor: Message, rule: BattleSkill) -> float:
         kind = rule.damage_kind
         bonus = actor.combat.physical_crit_rate if kind == 1 else actor.combat.magic_crit_rate if kind == 0 else 0
-        return min(100, actor.attributes.critchance + bonus) / 100
+        base = min(100, actor.attributes.critchance + bonus) / 100
+        if not actor.HasField("equipment_effects"):
+            return base
+        equip_crit = (
+            actor.equipment_effects.physical_crit_bps
+            if kind == 1
+            else actor.equipment_effects.magic_crit_bps
+            if kind == 0
+            else 0
+        )
+        return max(0.0, min(1.0, base + equip_crit / 10_000.0)) if equip_crit else base
 
     def _expected_damage(self, actor: Message, target: Message, rule: BattleSkill, base: float) -> float:
         return self._damage_before_critical(actor, target, rule, base) * (1 + self._critical_chance(actor, rule))
@@ -430,9 +583,38 @@ class TurnEngine:
         damage *= rank_factor(rank)
         if hit_kind == 1:
             damage *= 0.5
+        if actor.actor_type == _PET and actor.HasField("pet_cultivation"):
+            damage = self.pet_support.apply_pet_damage_bonus(
+                actor, damage, rule.damage_kind, is_direct=(hit_kind != 3), hit_kind=hit_kind,
+            )
+        extra_bonus = self.equipment_effects.actor_bonus(actor.actor_id)
+        if extra_bonus is not None and extra_bonus.damage_bonus_bps > 0:
+            damage = self.pet_support.apply_bonus(damage, extra_bonus.damage_bonus_bps / 10_000.0)
         dealt = landed_damage(target, damage)
-        self._apply_damage(turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
-                           hit_kind=hit_kind, hit_index=hit_index)
+        if dealt > 0 and (
+            target.HasField("equipment_effects")
+            or self.equipment_effects.actor_bonus(target.actor_id) is not None
+        ):
+            dealt = self.equipment_effects.reduce_damage(
+                actor, target, dealt, self.round_index, turn, group,
+                direct_or_pursuit_or_mirror=(hit_kind != 3),
+            )
+        original_shields = [entry.buff_id for entry in target.buffs if entry.remaining_capacity > 0]
+        absorbed = 0
+        if dealt > 0 and original_shields:
+            dealt, absorbed = self.equipment_effects.absorb_shields(actor, target, dealt, turn, group)
+            if actor.HasField("equipment_effects") and hit_kind == 0 and hit_index == 0:
+                self.equipment_effects.break_shields(
+                    actor, target, dealt + absorbed, rule.damage_kind,
+                    self.round_index, turn, group, original_shields,
+                )
+        if dealt > 0 or not absorbed:
+            self._apply_damage(turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
+                               hit_kind=hit_kind, hit_index=hit_index)
+        if (dealt + absorbed) > 0 and hit_kind in (0, 1):
+            self.trial_tracker.record_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
+        if dealt > 0:
+            self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
         if not skill_id and hit_kind != 2 and dealt and _active(actor) and _active(target) and self.rng.percent(target.combat.reflect_rate):
             reflected = min(actor.attributes.health, (dealt + 1) // 2)
             self._apply_damage(turn, group, target, actor, reflected, hit_kind=3, hit_index=hit_index)
@@ -456,7 +638,11 @@ class TurnEngine:
             self.defeated_monsters.append(target.monster_table_id)
         target.is_dead = True
         target.is_defending = False
+        if target.artifact_states:
+            self.equipment_effects.clear_pending_echoes_on_death(target)
         target.ClearField("buffs")
+        self.trial_tracker.record_death(target)
+        self.monster_ai.notify_dead(target.actor_id)
         self._event(turn, group, 8, target, target, hit_index=hit)
 
 
@@ -503,6 +689,8 @@ class BattleNode:
         max_rounds: int = _MAX_ROUNDS, tables: ConfigTables | None = None,
         buffs: Mapping[int, BattleBuff] | None = None, fingerprint_mode: str | None = None,
         on_rooms_changed: Callable[[int], None] | None = None,
+        monster_ai_profiles: Mapping[int, DungeonMonsterAiProfile] | None = None,
+        trial_context_resolver: Callable[[Message], TrialContext | Message | None] | None = None,
     ):
         if not 0 < node_id < 1 << 32 or not instance_id or not host or not 0 <= port <= 65535:
             raise ValueError("invalid battle node endpoint or identity")
@@ -528,6 +716,8 @@ class BattleNode:
         self.on_outcome = on_outcome
         self.on_spectate_frame = on_spectate_frame
         self.on_rooms_changed = on_rooms_changed
+        self.monster_ai_profiles = dict(monster_ai_profiles) if monster_ai_profiles else None
+        self.trial_context_resolver = trial_context_resolver
         self.tables = BattleTables(protocol, tables, rewards_path=os.environ.get("BATTLE_REWARD_CONFIG_PATH")) if tables is not None else None
         self.monster_factory = monster_factory or (self.tables.monsters if self.tables else None)
         self.skills = (self.tables.skills if self.tables else {}) | dict(skills or {})
@@ -550,7 +740,13 @@ class BattleNode:
             response.error_message.id = error
         return response
 
-    def create(self, request: Message) -> Message:
+    def create(
+        self,
+        request: Message,
+        *,
+        trial_context: TrialContext | Message | None = None,
+        monster_ai_profiles: Mapping[int, DungeonMonsterAiProfile] | None = None,
+    ) -> Message:
         response = self.protocol.message("CreateBattleResponse", battle_id=request.battle_id)
         if self._draining:
             return self._error(response, _UNAVAILABLE)
@@ -591,10 +787,16 @@ class BattleNode:
                               if self.tables and request.match_mode in _PVE_MODES else None)
             monsters = self.monster_factory(request) if self.monster_factory and request.match_mode in _PVE_MODES else ()
             max_rounds = self.tables.max_rounds(request, self.max_rounds) if self.tables else self.max_rounds
+            resolved_trial_ctx = trial_context
+            if resolved_trial_ctx is None and self.trial_context_resolver is not None:
+                resolved_trial_ctx = self.trial_context_resolver(request)
+            resolved_ai_profiles = monster_ai_profiles if monster_ai_profiles is not None else self.monster_ai_profiles
             engine = TurnEngine(self.protocol, request, monsters=monsters, skills=self.skills, items=self.items,
                                 max_rounds=max_rounds, buffs=self.buffs,
                                 silence_permissions=self.tables.silence_permissions if self.tables else None,
-                                monster_ids={row.id for row in self.tables.tables["Monster"].rows()} if self.tables else None)
+                                monster_ids={row.id for row in self.tables.tables["Monster"].rows()} if self.tables else None,
+                                monster_ai_profiles=resolved_ai_profiles,
+                                trial_context=resolved_trial_ctx)
         except (BattleError, ValueError):
             return self._error(response, _INVALID_TABLE)
         now = self.now_ms()
@@ -1013,6 +1215,7 @@ class BattleNode:
                 return self._error(response, error)
             engine.pending[ticket.player_id] = self.protocol.message("BattleAction")
             engine.pending[ticket.player_id].CopyFrom(request.action)
+            engine.trial_tracker.record_manual_action(ticket.player_id, engine.round_index)
             if not engine.pending_players():
                 self._resolve(room)
         return response
@@ -1112,6 +1315,8 @@ class BattleNode:
                     settlement.defeated_monsters.add(monster_config_id=monster_id, count=1)
                 if self.tables:
                     self.tables.add_rewards(request, settlement, profile=room.reward_profile)
+            if engine.trial_tracker.enabled:
+                engine.trial_tracker.populate_settlement(settlement, player)
         for side, players in sorted(teams.items()):
             event.teams.add(team_index=side, player_ids=players)
         return event

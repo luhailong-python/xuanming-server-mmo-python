@@ -328,6 +328,17 @@ class SceneEquipCraft:
         for row in affixes:
             _fill_affix_info(row, rules.affixes.add())
 
+        if "EquipAffixQuality" in self.tables.tables:
+            for row in sorted(self.tables["EquipAffixQuality"].rows(), key=lambda r: r.id):
+                rules.quality_tiers.add(
+                    quality_tier=row.id,
+                    name=row.name,
+                    ratio_pct=row.ratio_pct,
+                    apprentice_rate_bps=row.apprentice_weight,
+                    artisan_rate_bps=row.artisan_weight,
+                    master_rate_bps=row.master_weight,
+                )
+
         digest = hashlib.sha256()
         for table_name in ("Item", "EquipAttribute", "EquipEnhance", "EquipV1Affix", "EquipArtifact", "EquipSlot"):
             if table_name in self.tables.tables:
@@ -338,7 +349,7 @@ class SceneEquipCraft:
         self._craft_rules_cache = (0, rules)
         return self._craft_rules_cache
 
-    # ── 状态修订号与材料自选状态（优先读 proto 字段，未扩展时走内存托管） ──
+    # ── 状态修订号与材料自选状态（优先读 proto 字段，未扩展或同步入账时协调内存态） ──
 
     def _get_forge_revision(self, player_id: int, data) -> int:
         ledger = data.client_request_ledger
@@ -353,23 +364,39 @@ class SceneEquipCraft:
         else:
             self._forge_revisions[player_id] = revision
 
+    def _online_player_data(self, player_id: int):
+        for location in getattr(self.scene, "locations", {}).values():
+            player = location.players.get(player_id)
+            if player is not None:
+                return self.scene.rows.assemble(player.snapshot)
+        return None
+
     def _get_reward_state(self, player_id: int, data) -> _MaterialRewardState:
         ledger = data.client_request_ledger
+        mem = self._material_rewards.get(player_id)
         if hasattr(ledger, "material_reward"):
             mr = ledger.material_reward
+            if mem is not None and mem.revision >= mr.revision:
+                return _MaterialRewardState(
+                    day_starts_at_ms=mem.day_starts_at_ms,
+                    earned_today=mem.earned_today,
+                    available_units=mem.available_units,
+                    revision=mem.revision,
+                )
             return _MaterialRewardState(
                 day_starts_at_ms=mr.day_starts_at_ms,
                 earned_today=mr.earned_today,
                 available_units=mr.available_units,
                 revision=mr.revision,
             )
-        state = self._material_rewards.get(player_id)
-        if state is None:
-            state = _MaterialRewardState()
-            self._material_rewards[player_id] = state
-        return state
+        if mem is None:
+            mem = _MaterialRewardState()
+            self._material_rewards[player_id] = mem
+        return mem
 
-    def _save_reward_state(self, player_id: int, data, state: _MaterialRewardState) -> None:
+    def _save_reward_state(
+        self, player_id: int, data, state: _MaterialRewardState, *, persisted: bool = False,
+    ) -> None:
         ledger = data.client_request_ledger
         if hasattr(ledger, "material_reward"):
             mr = ledger.material_reward
@@ -377,6 +404,15 @@ class SceneEquipCraft:
             mr.earned_today = state.earned_today
             mr.available_units = state.available_units
             mr.revision = state.revision
+            if persisted:
+                self._material_rewards.pop(player_id, None)
+            elif player_id in self._material_rewards:
+                self._material_rewards[player_id] = _MaterialRewardState(
+                    day_starts_at_ms=state.day_starts_at_ms,
+                    earned_today=state.earned_today,
+                    available_units=state.available_units,
+                    revision=state.revision,
+                )
         else:
             self._material_rewards[player_id] = state
 
@@ -397,11 +433,23 @@ class SceneEquipCraft:
         if day is None:
             return 0
         start_ms, _ = day
-        state = (
-            self._get_reward_state(player_id, data)
-            if data is not None
-            else self._material_rewards.setdefault(player_id, _MaterialRewardState())
-        )
+        if data is not None:
+            state = self._get_reward_state(player_id, data)
+        else:
+            state = self._material_rewards.get(player_id)
+            if state is None:
+                online = self._online_player_data(player_id)
+                if online is not None and hasattr(online.client_request_ledger, "material_reward"):
+                    mr = online.client_request_ledger.material_reward
+                    state = _MaterialRewardState(
+                        day_starts_at_ms=mr.day_starts_at_ms,
+                        earned_today=mr.earned_today,
+                        available_units=mr.available_units,
+                        revision=mr.revision,
+                    )
+                else:
+                    state = _MaterialRewardState()
+                self._material_rewards[player_id] = state
         # 时钟回拨不重新开放旧日额度；向前换日仅重置当日计数，未领余额跨日保留。
         if start_ms < state.day_starts_at_ms:
             return 0
@@ -728,9 +776,14 @@ class SceneEquipCraft:
         if err:
             return reject(err, known=err == INVALID)
         if prior is not None:
-            item_id, result_rev = self._craft_receipts.get(
-                (player.player_id, request.client_request_id),
-                (request.choice.item_id, current_rev),
+            cached = self._craft_receipts.get((player.player_id, request.client_request_id))
+            item_id = (
+                getattr(prior, "equipment_item_id", 0)
+                or (cached[0] if cached is not None else request.choice.item_id)
+            )
+            result_rev = (
+                getattr(prior, "forge_revision", 0)
+                or (cached[1] if cached is not None else current_rev)
             )
             return self._fill_craft_applied(
                 player, data, response, item_id=item_id, result_rev=result_rev, replayed=True,
@@ -788,7 +841,12 @@ class SceneEquipCraft:
         if hasattr(staged.client_request_ledger, "forge_revision"):
             staged.client_request_ledger.forge_revision = next_rev
         client_request.remember(
-            staged.client_request_ledger, request.client_request_id, _CLIENT_REQUEST_KIND_CRAFT, fingerprint,
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_CRAFT,
+            fingerprint,
+            equipment_item_id=target_item_id,
+            forge_revision=next_rev,
         )
         # 若修改的是已穿戴装备，commit 成功后通知属性重算。
         saved = await self.assets._save(
@@ -899,7 +957,10 @@ class SceneEquipCraft:
         if err:
             return reject(err, known=err == INVALID)
         if prior is not None:
-            result_rev = self._reward_receipts.get((player.player_id, request.client_request_id), state.revision)
+            result_rev = (
+                getattr(prior, "material_reward_revision", 0)
+                or self._reward_receipts.get((player.player_id, request.client_request_id), state.revision)
+            )
             return self._fill_reward_applied(player, data, stamp, response, result_rev=result_rev, replayed=True)
 
         if request.expected_revision != state.revision:
@@ -936,7 +997,13 @@ class SceneEquipCraft:
         if hasattr(staged.client_request_ledger, "material_reward"):
             self._save_reward_state(player.player_id, staged, next_state)
         client_request.remember(
-            staged.client_request_ledger, request.client_request_id, _CLIENT_REQUEST_KIND_MATERIAL_REWARD, fingerprint,
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_MATERIAL_REWARD,
+            fingerprint,
+            material_reward_revision=next_state.revision,
+            crafting_material_count=request.crafting_material_count,
+            enhancement_stone_count=request.enhancement_stone_count,
         )
         saved = await self.assets._save(
             player, staged, 8, correlation=request.client_request_id, gains=gains,
@@ -944,7 +1011,7 @@ class SceneEquipCraft:
         )
         if not saved:
             return reject(UNAVAILABLE, known=False)
-        self._save_reward_state(player.player_id, staged, next_state)
+        self._save_reward_state(player.player_id, staged, next_state, persisted=True)
         self._remember_reward(player.player_id, request.client_request_id, next_state.revision)
         logger.info(
             "Equipment material reward claimed player_id=%s craft_mat=%s stone=%s revision=%s",

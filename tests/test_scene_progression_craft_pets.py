@@ -225,9 +225,10 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
             initial = await rpc("SceneTrialJournalClientPlayer", "GetTrialJournal")
             assert not initial.error_message.id
             snap = initial.snapshot
-            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 12
-            assert len(snap.chapters) == 1 and len(snap.chapters[0].entries) == 4
-            assert len(snap.milestones) == 4 and len(snap.redeemable_artifacts) == 8
+            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 24
+            assert len(snap.chapters) == 3 and len(snap.chapters[0].entries) == 4
+            assert len(snap.milestones) == 10 and len(snap.redeemable_artifacts) == 8
+            assert not snap.hard_boss_trial_unlocked
             # 困难条目 103/104 未过普通前不可进入。
             by_entry = {e.entry_id: e for e in snap.chapters[0].entries}
             assert by_entry[101].can_enter and not by_entry[103].can_enter
@@ -269,11 +270,12 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
 
             updated = (await rpc("SceneTrialJournalClientPlayer", "GetTrialJournal")).snapshot
             assert updated.total_permanent_lit_seals == 6 and updated.state_revision == 2
+            assert updated.hard_boss_trial_unlocked
             by_entry = {e.entry_id: e for e in updated.chapters[0].entries}
             assert by_entry[103].can_enter  # 普通通关后困难开启
-            assert by_entry[101].has_solo_best and by_entry[101].solo_best.best_rounds == 5
+            assert by_entry[101].solo_recorded and by_entry[101].solo_best.best_rounds == 5
             assert list(by_entry[101].solo_best.loadout.artifact_effect_ids) == [1, 6]
-            assert by_entry[102].has_coop_best and list(by_entry[102].coop_best.teammate_names) == ["青衣", "赤羽"]
+            assert by_entry[102].coop_recorded and list(by_entry[102].coop_best.teammate_names) == ["青衣", "赤羽"]
 
             # 里程碑边界校验：不存在 / 未达标。
             assert (await rpc(

@@ -6,7 +6,9 @@ import "proto/common/base/tip.proto";
 import "proto/common/component/base_comp.proto";
 import "proto/common/base/empty.proto";
 import "proto/common/component/player_skill_comp.proto";
+import "proto/common/component/player_craft_comp.proto";
 import "proto/common/component/actor_comp.proto";
+import "proto/common/component/support_effects.proto";
 
 option cc_generic_services = true;
 option (OptionFileDefaultNode) = NODE_SCENE;
@@ -42,6 +44,7 @@ message SkillUsedS2C
 
 // List skills request
 message ListSkillsRequest {
+  uint64 pet_id = 1; // 0 查人物；非 0 查会话所属宝宝的完整技能目录。
 }
 
 // List skills response
@@ -54,6 +57,7 @@ message ListSkillsResponse {
   uint32 player_level = 4;
   uint32 class_id = 5;
   uint64 currency_balance = 6;              // 修习货币余额(CurrencySystem kCurrencyGold,客户端称"银两")
+  uint64 pet_id = 7; // 返回本次目录主体，防止切换人物/宝宝后的迟到响应覆盖界面。
 }
 
 // 技能书的一行:配置表的展示投影 + 本角色的等级与可修习性。数值真源是 Skill 表与服务端规则,
@@ -77,6 +81,149 @@ message SkillCatalogEntry {
   uint64 next_rank_cost = 16;     // 再修一重的价格;已满重为 0
   uint32 upgrade_block_tip_id = 17; // 0 = 现在可以修习一重;否则为不能修习的原因(tip 码,skill_error 段)
   uint32 duration_rounds = 18;    // 附带增益 / 减益的持续回合;没有为 0
+  bool allow_dead_target = 19; // 仅复生类配置允许选择倒地单位，普通治疗不能选尸体。
+  uint32 ability_kind = 20; // 1主动、2被动、3追击、4开场。
+  uint32 caster_mask = 21; // 1人物、2宝宝；按施法者资格区分。
+  uint32 action_tags = 22; // 攻击、治疗、辅助、障碍分类位，与 SkillTable 同源。
+  SupportSkillPreview support_preview = 23; // 服务端中立参考值，缺省表示没有权威预览。
+  uint32 season_id = 24; // 0 = 常驻永久技能；> 0 = 本季免费限定技能（无需消耗银两修习，随角色等级自动生效）。
+  uint32 scroll_id = 25; // 所属永久制书卷宗（SkillScrollCraft.id；0 = 非卷宗制书技）。
+  uint32 rarity_tier = 26; // 0 = 常规（90%）；1 = 稀世绝学（<=10%）。
+  bool craft_unlock_required = 27; // true = 当前服开启了制书解锁门槛，需研习技能书后方可修习。
+  bool unlocked_by_book = 28; // true = 已通过技能书永久解锁（跨赛季永不重置）。
+}
+
+// ── 率土式分卷宗技能制书、轻量化手艺熟练度与主城原子代打（docs/design/equipment-quality-and-skill-crafting-v1.md）──
+
+message SkillCraftMasterySnapshot {
+  uint32 tier = 1;                 // 1学徒、2巧匠、3宗师。
+  string tier_name = 2;
+  uint32 exp = 3;
+  uint32 next_tier_exp = 4;        // 满级宗师为 0。
+  uint32 bonus_rate_bps = 5;       // 铸器：极品率（500/700/1000）；制卷：额外返页概率（0/500/1000）。
+}
+
+message SkillScrollCatalogInfo {
+  uint32 scroll_id = 1;
+  string name = 2;
+  string description = 3;
+  uint32 rarity_tier = 4;          // 0 常规卷宗 / 1 稀世绝学卷宗。
+  uint32 fragment_item_id = 5;
+  uint32 random_fragment_count = 6;
+  uint64 random_gold_cost = 7;
+  uint32 targeted_fragment_count = 8;
+  uint64 targeted_gold_cost = 9;
+  uint32 dismantle_fragment_count = 10;
+  uint32 rare_scroll_item_id = 11;
+  uint32 rare_scroll_count = 12;
+  uint32 rare_ink_item_id = 13;
+  uint32 rare_ink_count = 14;
+  uint64 rare_gold_cost = 15;
+  repeated uint32 skill_table_ids = 16; // 本卷宗包含的永久技能列表（按 ID 升序）。
+}
+
+message SkillCraftingStateSnapshot {
+  uint64 scroll_craft_revision = 1;
+  SkillCraftMasterySnapshot forge_mastery = 2;
+  SkillCraftMasterySnapshot scroll_mastery = 3;
+  repeated SkillScrollCatalogInfo scrolls = 4;
+  repeated CraftedSkillBookEntry skill_books = 5;
+  repeated uint32 book_unlocked_skill_ids = 6;
+  uint64 gold_balance = 7;
+  uint64 fragment_owned = 8;       // 3406 悟道残页持有量。
+  uint64 rare_scroll_owned = 9;    // 3407 绝学残卷持有量。
+  uint64 rare_ink_owned = 10;      // 3408 天工秘墨持有量。
+  bool proxy_stall_open = 11;
+  uint64 proxy_forge_fee_gold = 12;
+  uint64 proxy_scroll_fee_gold = 13;
+  bool craft_unlock_gate_enabled = 14; // true = 当前环境已开启“须制书解锁”门槛。
+}
+
+message GetSkillCraftingStateRequest {}
+message GetSkillCraftingStateResponse {
+  TipInfoMessage error_message = 1;
+  SkillCraftingStateSnapshot state = 2;
+}
+
+message CraftSkillBookRequest {
+  enum CraftMode {
+    CRAFT_MODE_UNSPECIFIED = 0;
+    RANDOM_REGULAR = 1;   // 常规卷宗随机拓印（20残页+50银两）。
+    TARGETED_REGULAR = 2; // 常规卷宗定向拓印（40残页+100银两）。
+    TARGETED_RARE = 3;    // 稀世卷宗双轨定向制书（1绝学残卷+1绑定天工秘墨+100银两）。
+  }
+  CraftMode mode = 1;
+  uint32 scroll_id = 2;
+  uint32 target_skill_table_id = 3; // TARGETED_REGULAR / TARGETED_RARE 必填；RANDOM_REGULAR 为 0。
+  uint64 expected_revision = 4;
+  uint64 client_request_id = 5;     // 必须非 0。
+  uint64 proxy_master_player_id = 6; // 可选：主城宗师原子代制摊主 ID（0 = 亲自制书）。
+}
+
+message CraftSkillBookResponse {
+  TipInfoMessage error_message = 1;
+  uint64 client_request_id = 2;
+  bool replayed = 3;
+  CraftedSkillBookEntry crafted_book = 4;
+  uint32 bonus_fragments_granted = 5; // 巧匠/宗师额外返还的绑定悟道残页数。
+  SkillCraftingStateSnapshot state = 6;
+}
+
+message LearnSkillBookRequest {
+  uint64 book_id = 1;
+  uint64 pet_id = 2; // 0 = 人物研习；非 0 = 本人所属宝宝研习。
+  uint64 expected_revision = 3;
+  uint64 client_request_id = 4;
+}
+
+message LearnSkillBookResponse {
+  TipInfoMessage error_message = 1;
+  uint64 client_request_id = 2;
+  bool replayed = 3;
+  uint32 learned_skill_table_id = 4;
+  SkillCraftingStateSnapshot state = 5;
+}
+
+message DismantleSkillBookRequest {
+  uint64 book_id = 1;
+  uint64 expected_revision = 2;
+  uint64 client_request_id = 3;
+}
+
+message DismantleSkillBookResponse {
+  TipInfoMessage error_message = 1;
+  uint64 client_request_id = 2;
+  bool replayed = 3;
+  uint32 refunded_fragments = 4; // 固定返还 16 通用悟道残页（80%）。
+  SkillCraftingStateSnapshot state = 5;
+}
+
+message SetCraftProxyStallRequest {
+  bool open = 1;
+  uint64 proxy_forge_fee_gold = 2;  // 合法范围 50..100 银两（关摊时可填 0）。
+  uint64 proxy_scroll_fee_gold = 3; // 合法范围 50..100 银两（关摊时可填 0）。
+}
+
+message SetCraftProxyStallResponse {
+  TipInfoMessage error_message = 1;
+  SkillCraftingStateSnapshot state = 2;
+}
+
+message CraftProxyStallInfo {
+  uint64 master_player_id = 1;
+  string master_name = 2;
+  uint32 forge_mastery_tier = 3;
+  uint32 scroll_mastery_tier = 4;
+  uint32 top_quality_rate_bps = 5;
+  uint32 scroll_bonus_rate_bps = 6;
+  uint64 proxy_forge_fee_gold = 7;
+  uint64 proxy_scroll_fee_gold = 8;
+}
+
+message ListCraftProxyStallsRequest {}
+message ListCraftProxyStallsResponse {
+  TipInfoMessage error_message = 1;
+  repeated CraftProxyStallInfo stalls = 2;
 }
 
 // 修习(学习 = 从 0 升到 1)。修习者由服务端会话确定,请求里没有角色身份。
@@ -84,6 +231,7 @@ message UpgradeSkillRequest {
   uint32 skill_table_id = 1;
   uint32 expected_rank = 2;       // 客户端看到的当前等级;与服务端不一致整笔拒绝(旧请求重放不会再扣一次)
   uint32 count = 3;               // 只收 1 或 10;10 次在满重 / 等级上限 / 余额不足处提前停
+  uint64 pet_id = 4; // 0 修习人物技能；非 0 必须属于当前会话玩家。
 }
 
 message UpgradeSkillResponse {
@@ -102,4 +250,11 @@ service SceneSkillClientPlayer {
   rpc NotifySkillInterrupted (SkillInterruptedS2C) returns (Empty) { option (OptionClientRpcKind) = CLIENT_RPC_PUSH; }
   rpc ListSkills (ListSkillsRequest) returns (ListSkillsResponse);
   rpc UpgradeSkill (UpgradeSkillRequest) returns (UpgradeSkillResponse);
+  // ── 以下按 method index 顺序追加，不可重排 ──
+  rpc GetSkillCraftingState (GetSkillCraftingStateRequest) returns (GetSkillCraftingStateResponse);
+  rpc CraftSkillBook (CraftSkillBookRequest) returns (CraftSkillBookResponse);
+  rpc LearnSkillBook (LearnSkillBookRequest) returns (LearnSkillBookResponse);
+  rpc DismantleSkillBook (DismantleSkillBookRequest) returns (DismantleSkillBookResponse);
+  rpc SetCraftProxyStall (SetCraftProxyStallRequest) returns (SetCraftProxyStallResponse);
+  rpc ListCraftProxyStalls (ListCraftProxyStallsRequest) returns (ListCraftProxyStallsResponse);
 }

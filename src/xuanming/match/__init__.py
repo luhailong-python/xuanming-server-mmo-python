@@ -35,6 +35,7 @@ from .spectate import SpectateManager
 from .sql_store import SqlMatchStore, open_pool
 from .store import MatchStore, MemoryMatchStore
 from .team_service import KafkaTeamNotifier, NullTeamNotifier, TeamGrpcService
+from .tournament import TournamentCatalog, TournamentManager
 
 __all__ = [
     "BattleNodeEntry",
@@ -73,6 +74,8 @@ __all__ = [
     "StaticBattleNodeResolver",
     "TEAM_NODE_TYPE",
     "TeamGrpcService",
+    "TournamentCatalog",
+    "TournamentManager",
     "apply_battle_result",
     "compute_elo_delta",
     "open_pool",

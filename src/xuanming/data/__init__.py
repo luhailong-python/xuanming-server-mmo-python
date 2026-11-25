@@ -11,6 +11,7 @@ from .player_store import (
     StoreRejected,
     StoreUnavailable,
 )
+from .storage_factory import create_player_store
 
 __all__ = [
     "ConfigTable",
@@ -26,4 +27,5 @@ __all__ = [
     "SqlitePlayerStore",
     "StoreRejected",
     "StoreUnavailable",
+    "create_player_store",
 ]

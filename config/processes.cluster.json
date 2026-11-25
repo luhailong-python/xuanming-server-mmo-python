@@ -1,0 +1,339 @@
+{
+  "_说明": [
+    "纯 Python 多节点集群档：并行拉起全部 24 个微服务与核心节点，端口与 config/cluster.example.toml 及 config/portal.example.toml 对齐且互不冲突。",
+    "requires 仅做启动前外部基础设施（MySQL/Redis/etcd/Kafka）TCP 连通性体检，不负责拉起基础设施进程。",
+    "同机联调时请确保 portal.example.toml 的 management_port 与 gm_admin_node.port 不冲突（示例仅探测 portal 主端口 8080）。"
+  ],
+  "profile": "cluster",
+  "storage": "mysql",
+  "requires": [
+    {
+      "name": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306
+    },
+    {
+      "name": "redis",
+      "host": "127.0.0.1",
+      "port": 6379
+    },
+    {
+      "name": "etcd",
+      "host": "127.0.0.1",
+      "port": 2379
+    },
+    {
+      "name": "kafka",
+      "host": "127.0.0.1",
+      "port": 9092
+    }
+  ],
+  "processes": [
+    {
+      "name": "data-service",
+      "command": [
+        "-m",
+        "xuanming",
+        "data-service",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 9000
+    },
+    {
+      "name": "db",
+      "command": [
+        "-m",
+        "xuanming",
+        "db",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 6000
+    },
+    {
+      "name": "player-locator",
+      "command": [
+        "-m",
+        "xuanming",
+        "player-locator",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50300
+    },
+    {
+      "name": "player-inbox",
+      "command": [
+        "-m",
+        "xuanming",
+        "player-inbox",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50950
+    },
+    {
+      "name": "router",
+      "command": [
+        "-m",
+        "xuanming",
+        "router",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50600
+    },
+    {
+      "name": "scene-manager",
+      "command": [
+        "-m",
+        "xuanming",
+        "scene-manager",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 60000
+    },
+    {
+      "name": "match",
+      "command": [
+        "-m",
+        "xuanming",
+        "match",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50500
+    },
+    {
+      "name": "content-guard",
+      "command": [
+        "-m",
+        "xuanming",
+        "content-guard",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50250
+    },
+    {
+      "name": "chat",
+      "command": [
+        "-m",
+        "xuanming",
+        "chat",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50700
+    },
+    {
+      "name": "mail",
+      "command": [
+        "-m",
+        "xuanming",
+        "mail",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50900
+    },
+    {
+      "name": "rank",
+      "command": [
+        "-m",
+        "xuanming",
+        "rank",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 51100
+    },
+    {
+      "name": "friend",
+      "command": [
+        "-m",
+        "xuanming",
+        "friend",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50400
+    },
+    {
+      "name": "payment",
+      "command": [
+        "-m",
+        "xuanming",
+        "payment",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 51200,
+      "extra_ports": [
+        18130
+      ]
+    },
+    {
+      "name": "trade",
+      "command": [
+        "-m",
+        "xuanming",
+        "trade",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50800
+    },
+    {
+      "name": "guild",
+      "command": [
+        "-m",
+        "xuanming",
+        "guild",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 50310
+    },
+    {
+      "name": "mall-game",
+      "command": [
+        "-m",
+        "xuanming",
+        "mall-game",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 18120
+    },
+    {
+      "name": "gm-admin",
+      "command": [
+        "-m",
+        "xuanming",
+        "gm-admin",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8082
+    },
+    {
+      "name": "config-node",
+      "command": [
+        "-m",
+        "xuanming",
+        "config-node",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8090
+    },
+    {
+      "name": "satoken-auth",
+      "command": [
+        "-m",
+        "xuanming",
+        "satoken-auth",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8085
+    },
+    {
+      "name": "portal",
+      "command": [
+        "-m",
+        "xuanming",
+        "portal",
+        "--config",
+        "config/portal.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8080
+    },
+    {
+      "name": "login",
+      "command": [
+        "-m",
+        "xuanming",
+        "run",
+        "login",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 53000
+    },
+    {
+      "name": "scene",
+      "command": [
+        "-m",
+        "xuanming",
+        "run",
+        "scene",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8611,
+      "extra_ports": [
+        8612
+      ]
+    },
+    {
+      "name": "battle",
+      "command": [
+        "-m",
+        "xuanming",
+        "run",
+        "battle",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8613,
+      "extra_ports": [
+        8614,
+        8617
+      ]
+    },
+    {
+      "name": "gate",
+      "command": [
+        "-m",
+        "xuanming",
+        "run",
+        "gate",
+        "--config",
+        "config/cluster.example.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8610,
+      "extra_ports": [
+        8615,
+        8616
+      ]
+    }
+  ]
+}

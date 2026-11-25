@@ -1,0 +1,34 @@
+{
+  "_说明": [
+    "本地单进程开发档：使用 config/local.toml（JSON/SQLite 本地存档，无需 MySQL/Redis/etcd/Kafka）。",
+    "由 tools/supervisor.py 拉起并探测 Gate TCP 端口 127.0.0.1:8610 就绪，日志输出至 run/logs/xuanming-local.log。",
+    "若调用方未设置 XUANMING_DEV_LOGIN_TOKEN，默认注入 dev-local-token 以便开箱即用。"
+  ],
+  "profile": "local",
+  "storage": "json",
+  "requires": [],
+  "processes": [
+    {
+      "name": "xuanming-local",
+      "command": [
+        "-m",
+        "xuanming",
+        "run",
+        "local",
+        "--config",
+        "config/local.toml"
+      ],
+      "host": "127.0.0.1",
+      "port": 8610,
+      "extra_ports": [
+        8611,
+        8612,
+        8613,
+        8614
+      ],
+      "env_defaults": {
+        "XUANMING_DEV_LOGIN_TOKEN": "dev-local-token"
+      }
+    }
+  ]
+}

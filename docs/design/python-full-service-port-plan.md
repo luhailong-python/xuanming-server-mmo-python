@@ -126,12 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`5676d207a6ab960edff7ce7e54bbff6d93a796c1`（短哈希 `5676d207a`）
-  - 提交时间：`2026-11-24 04:37:53 -0500`
-  - 提交标题：`新增试炼手札系统、装备交易风控与卖家信用、dbcheck 工具及内容安全增强`
-- **已完成范围**：截至该提交，除按要求保留 Python 既有战斗与大富翁玩法实现外，C++ 运行层非战斗系统、15 个 Go 业务微服务、5 个 Java 服务（`portal`/`mall_game`/`gm_admin`/`config_node`/`satoken_auth`）、全套运维/离线/压测工具及 `deploy/` 容器编排均已完整移植为纯 Python（372 个非战斗 RPC 零遗漏，仓库内 `.go`/`.java`/`.cpp`/`.h` 文件数为 `0`，全量测试 888 passed / 15 skipped）。
-- **后续增量移植流程（仅同步非逻辑性底层与框架改动）**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 5676d207a6ab960edff7ce7e54bbff6d93a796c1..HEAD`。
-  2. **优先挑选移植**：通信传输/帧协议、gRPC/HTTP/Redis/Kafka/etcd/TiDB 基础设施加固、停机疏散与故障切换、存储一致性/锁/围栏/安全鉴权、可观测性与运维巡检工具、以及影响跨服务契约的底层框架修复。
-  3. **默认跳过不覆盖**：C++ 侧新增或调整的具体玩法逻辑（如回合战斗技能/数值/剧本玩法、非 Python 目标游戏类型专属业务），避免破坏 Python 侧既有战斗与大富翁玩法及配表基线。
-  4. 每次增量移植验证通过后，同步更新本节与 `README.md` 中的 C++ 基线 Commit SHA。
+  - Commit SHA：`bba38b77cffc99b37f418948d0b64e92add08589`（短哈希 `bba38b77c`）
+  - 追平范围：涵盖 `5676d207a..bba38b77c` 全部 4 笔新提交（11 个赛季战队锦标赛 RPC、6 个技能书打造/代工摊位 RPC、3 个瑞兽迎春 RPC、7 张新增配表至 68 表）以及 C++ 战斗引擎核心逻辑平替对齐（装备/神器 8 类特效、宠物/助战特效、赛季印、试炼手札战斗事实产出 `trial_facts`、HFSM+Utility 副本怪物 AI）。
+- **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
+  - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
+- **后续增量移植流程**：
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline bba38b77cffc99b37f418948d0b64e92add08589..HEAD`。
+  2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

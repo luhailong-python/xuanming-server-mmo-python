@@ -2351,3 +2351,292 @@ SeasonRuleRseasonId
 active_rounds (RactiveRounds0
 health_threshold_bps (RhealthThresholdBps:+ä¶
 SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3
+ú
+(table_wire/equipaffixquality_table.proto"“
+EquipAffixQualityTable
+id (Rid
+name (	Rname
+	ratio_pct (RratioPct+
+apprentice_weight (RapprenticeWeight%
+artisan_weight (RartisanWeight#
+master_weight (RmasterWeight"I
+EquipAffixQualityTableData+
+data (2.EquipAffixQualityTableRdataBH
+com.game.tableB EquipAffixQualityTableOuterClassPZgenerated/pb/tablebproto3
+÷
+'table_wire/skillscrollcraft_table.proto"ê
+SkillScrollCraftTable
+id (Rid
+name (	Rname 
+description (	Rdescription
+rarity_tier (R
+rarityTier(
+fragment_item_id (RfragmentItemId2
+random_fragment_count (RrandomFragmentCount(
+random_gold_cost (RrandomGoldCost6
+targeted_fragment_count (RtargetedFragmentCount,
+targeted_gold_cost	 (RtargetedGoldCost8
+dismantle_fragment_count
+ (RdismantleFragmentCount-
+rare_scroll_item_id (RrareScrollItemId*
+rare_scroll_count (RrareScrollCount'
+rare_ink_item_id (RrareInkItemId$
+rare_ink_count (RrareInkCount$
+rare_gold_cost (RrareGoldCost
+enabled (Renabled"G
+SkillScrollCraftTableData*
+data (2.SkillScrollCraftTableRdataBG
+com.game.tableBSkillScrollCraftTableOuterClassPZgenerated/pb/tablebproto3
+´
+'table_wire/tournamentreward_table.proto"Â
+TournamentRewardTable
+id (Rid
+	tier_kind (RtierKind
+min_rank (RminRank
+max_rank (RmaxRank
+gold_amount (R
+goldAmount
+item_ids (RitemIds
+item_counts (R
+itemCounts
+
+title_code (	R	titleCode
+
+badge_code	 (	R	badgeCode
+
+mail_title
+ (	R	mailTitle
+	mail_body (	RmailBody
+desc (	Rdesc"G
+TournamentRewardTableData*
+data (2.TournamentRewardTableRdataBG
+com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
+°
+%table_wire/tournamentrule_table.proto"„
+TournamentRuleTable
+id (Rid!
+rule_version (RruleVersion
+enabled (Renabled(
+battle_config_id (RbattleConfigId(
+battle_team_size (RbattleTeamSize&
+roster_max_size (RrosterMaxSize
+	min_level (RminLevel+
+registration_days (RregistrationDays%
+qualifier_days	 (RqualifierDays#
+knockout_days
+ (RknockoutDays.
+settle_display_days (RsettleDisplayDays2
+qualifier_max_matches (RqualifierMaxMatches:
+participation_min_matches (RparticipationMinMatches,
+knockout_max_teams (RknockoutMaxTeamsC
+knockout_round_timeout_seconds (RknockoutRoundTimeoutSeconds0
+qualifier_win_points (RqualifierWinPoints2
+qualifier_draw_points (RqualifierDrawPoints2
+qualifier_loss_points (RqualifierLossPoints,
+invite_ttl_seconds (RinviteTtlSeconds
+desc (	Rdesc"C
+TournamentRuleTableData(
+data (2.TournamentRuleTableRdataBE
+com.game.tableBTournamentRuleTableOuterClassPZgenerated/pb/tablebproto3
+œ
+(table_wire/trialjournalentry_table.proto"Ö
+TrialJournalEntryTable
+id (Rid
+
+chapter_id (R	chapterId
+	season_id (RseasonId
+source_kind (R
+sourceKind
+
+difficulty (R
+difficulty
+variant_key (	R
+variantKey!
+rule_version (RruleVersion*
+rule_version_name (	RruleVersionName
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder!
+display_name (	RdisplayName!
+chapter_name (	RchapterName
+icon_key (	RiconKey
+unlock_mode (R
+unlockMode
+jump_target (	R
+jumpTarget
+desc (	Rdesc"I
+TrialJournalEntryTableData+
+data (2.TrialJournalEntryTableRdataBH
+com.game.tableB TrialJournalEntryTableOuterClassPZgenerated/pb/tablebproto3
+ä
+,table_wire/trialjournalmilestone_table.proto"∞
+TrialJournalMilestoneTable
+id (Rid(
+scope_chapter_id (RscopeChapterId
+	season_id (RseasonId%
+required_seals (RrequiredSeals(
+bound_sand_count (RboundSandCount?
+bound_artifact_voucher_count (RboundArtifactVoucherCount
+	badge_key (	RbadgeKey
+
+badge_name (	R	badgeName%
+commentary_key	 (	RcommentaryKey)
+commentary_title
+ (	RcommentaryTitle'
+commentary_body (	RcommentaryBody.
+grant_appearance_id (	RgrantAppearanceId
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc"Q
+TrialJournalMilestoneTableData/
+data (2.TrialJournalMilestoneTableRdataBL
+com.game.tableB$TrialJournalMilestoneTableOuterClassPZgenerated/pb/tablebproto3
+¬
+'table_wire/trialjournalseal_table.proto"¸
+TrialJournalSealTable
+id (Rid
+entry_id (RentryId$
+seal_slot_kind (RsealSlotKind%
+condition_type (RconditionType'
+condition_param (RconditionParam
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc"G
+TrialJournalSealTableData*
+data (2.TrialJournalSealTableRdataBG
+com.game.tableBTrialJournalSealTableOuterClassPZgenerated/pb/tablebproto3
+ﬁ
+equipaffixquality_table.protommorpg.cfgtable.v1cfg_options.proto"ç
+EquipAffixQualityTable
+id (Rid
+name (	Rname
+	ratio_pct (RratioPct+
+apprentice_weight (RapprenticeWeight%
+artisan_weight (RartisanWeight#
+master_weight (RmasterWeight:9ä¶EquipAffixQualityí¶EquipAffixQuality.xlsxö¶id∞¶bproto3
+£
+skillscrollcraft_table.protommorpg.cfgtable.v1cfg_options.proto"”
+SkillScrollCraftTable
+id (Rid
+name (	Rname 
+description (	Rdescription
+rarity_tier (R
+rarityTier2
+fragment_item_id (BÚ¨ItemRfragmentItemId2
+random_fragment_count (RrandomFragmentCount(
+random_gold_cost (RrandomGoldCost6
+targeted_fragment_count (RtargetedFragmentCount,
+targeted_gold_cost	 (RtargetedGoldCost8
+dismantle_fragment_count
+ (RdismantleFragmentCount-
+rare_scroll_item_id (RrareScrollItemId*
+rare_scroll_count (RrareScrollCount'
+rare_ink_item_id (RrareInkItemId$
+rare_ink_count (RrareInkCount$
+rare_gold_cost (RrareGoldCost
+enabled (Renabled:7ä¶SkillScrollCraftí¶SkillScrollCraft.xlsxö¶id∞¶bproto3
+Ñ
+tournamentreward_table.protommorpg.cfgtable.v1cfg_options.proto"¥
+TournamentRewardTable
+id (Rid!
+	tier_kind (Bÿ¨RtierKind
+min_rank (RminRank
+max_rank (RmaxRank
+gold_amount (R
+goldAmount'
+item_ids (B∏¨Ú¨ItemRitemIds%
+item_counts (B∏¨R
+itemCounts
+
+title_code (	R	titleCode
+
+badge_code	 (	R	badgeCode
+
+mail_title
+ (	R	mailTitle
+	mail_body (	RmailBody
+desc (	Rdesc:3ä¶TournamentRewardí¶TournamentReward.xlsxö¶idbproto3
+Ô
+tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"°
+TournamentRuleTable
+id (Rid!
+rule_version (RruleVersion
+enabled (Renabled5
+battle_config_id (BÚ¨DungeonRbattleConfigId(
+battle_team_size (RbattleTeamSize&
+roster_max_size (RrosterMaxSize
+	min_level (RminLevel+
+registration_days (RregistrationDays%
+qualifier_days	 (RqualifierDays#
+knockout_days
+ (RknockoutDays.
+settle_display_days (RsettleDisplayDays2
+qualifier_max_matches (RqualifierMaxMatches:
+participation_min_matches (RparticipationMinMatches,
+knockout_max_teams (RknockoutMaxTeamsC
+knockout_round_timeout_seconds (RknockoutRoundTimeoutSeconds0
+qualifier_win_points (RqualifierWinPoints2
+qualifier_draw_points (RqualifierDrawPoints2
+qualifier_loss_points (RqualifierLossPoints,
+invite_ttl_seconds (RinviteTtlSeconds
+desc (	Rdesc:/ä¶TournamentRuleí¶TournamentRule.xlsxö¶idbproto3
+õ
+trialjournalentry_table.protommorpg.cfgtable.v1cfg_options.proto" 
+TrialJournalEntryTable
+id (Rid#
+
+chapter_id (Bÿ¨R	chapterId
+	season_id (RseasonId
+source_kind (R
+sourceKind
+
+difficulty (R
+difficulty
+variant_key (	R
+variantKey!
+rule_version (RruleVersion*
+rule_version_name (	RruleVersionName
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder!
+display_name (	RdisplayName!
+chapter_name (	RchapterName
+icon_key (	RiconKey
+unlock_mode (R
+unlockMode
+jump_target (	R
+jumpTarget
+desc (	Rdesc:=ä¶TrialJournalEntryí¶TrialJournalEntry.xlsxö¶id®¶∞¶bproto3
+ÿ
+!trialjournalmilestone_table.protommorpg.cfgtable.v1cfg_options.proto"É
+TrialJournalMilestoneTable
+id (B‡¨Rid.
+scope_chapter_id (Bÿ¨RscopeChapterId
+	season_id (RseasonId%
+required_seals (RrequiredSeals(
+bound_sand_count (RboundSandCount?
+bound_artifact_voucher_count (RboundArtifactVoucherCount
+	badge_key (	RbadgeKey
+
+badge_name (	R	badgeName%
+commentary_key	 (	RcommentaryKey)
+commentary_title
+ (	RcommentaryTitle'
+commentary_body (	RcommentaryBody.
+grant_appearance_id (	RgrantAppearanceId
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc:Eä¶TrialJournalMilestoneí¶TrialJournalMilestone.xlsxö¶id®¶∞¶bproto3
+™
+trialjournalseal_table.protommorpg.cfgtable.v1cfg_options.proto"⁄
+TrialJournalSealTable
+id (B‡¨Rid4
+entry_id (Bÿ¨Ú¨TrialJournalEntryRentryId$
+seal_slot_kind (RsealSlotKind%
+condition_type (RconditionType'
+condition_param (RconditionParam
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc:;ä¶TrialJournalSealí¶TrialJournalSeal.xlsxö¶id®¶∞¶bproto3

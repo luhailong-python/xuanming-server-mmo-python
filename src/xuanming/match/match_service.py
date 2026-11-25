@@ -80,6 +80,7 @@ from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
 from .store import MatchStore, StrandedFormationEntry
 from .team_service import TeamGrpcService
+from .tournament import TournamentManager
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,7 @@ class MatchGrpcService:
         spectate: SpectateManager,
         battle_scripts: BattleScriptManager | None = None,
         ranked: RankedManager | None = None,
+        tournament: TournamentManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -120,6 +122,7 @@ class MatchGrpcService:
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.battle_scripts = battle_scripts if battle_scripts is not None else BattleScriptManager(protocol, store)
         self.ranked = ranked if ranked is not None else RankedManager(protocol, store, clock_ms=self._clock_ms)
+        self.tournament = tournament if tournament is not None else TournamentManager(protocol, clock_ms=self._clock_ms)
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -147,6 +150,17 @@ class MatchGrpcService:
                 "SaveRankedPreset": self.save_ranked_preset,
                 "UpdateRankedCosmetic": self.update_ranked_cosmetic,
                 "GetRankedBattleResult": self.get_ranked_battle_result,
+                "GetTournamentOverview": self.get_tournament_overview,
+                "CreateTournamentSquad": self.create_tournament_squad,
+                "InviteTournamentMember": self.invite_tournament_member,
+                "RespondTournamentInvite": self.respond_tournament_invite,
+                "LeaveTournamentSquad": self.leave_tournament_squad,
+                "UpdateTournamentLineup": self.update_tournament_lineup,
+                "RegisterTournamentSquad": self.register_tournament_squad,
+                "ListTournamentStandings": self.list_tournament_standings,
+                "StartTournamentMatch": self.start_tournament_match,
+                "CheerTournamentSquad": self.cheer_tournament_squad,
+                "ClaimTournamentReward": self.claim_tournament_reward,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -542,6 +556,52 @@ class MatchGrpcService:
     async def get_ranked_battle_result(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         return await self.ranked.get_ranked_battle_result(caller, request)
+
+    # -- Season Squad Tournament V1 客户端 RPCs ------------------------------------------------------
+
+    async def get_tournament_overview(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.get_tournament_overview(caller, request)
+
+    async def create_tournament_squad(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.create_tournament_squad(caller, request)
+
+    async def invite_tournament_member(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.invite_tournament_member(caller, request)
+
+    async def respond_tournament_invite(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.respond_tournament_invite(caller, request)
+
+    async def leave_tournament_squad(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.leave_tournament_squad(caller, request)
+
+    async def update_tournament_lineup(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.update_tournament_lineup(caller, request)
+
+    async def register_tournament_squad(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.register_tournament_squad(caller, request)
+
+    async def list_tournament_standings(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.list_tournament_standings(caller, request)
+
+    async def start_tournament_match(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.start_tournament_match(caller, request)
+
+    async def cheer_tournament_squad(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.cheer_tournament_squad(caller, request)
+
+    async def claim_tournament_reward(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.claim_tournament_reward(caller, request)
 
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 

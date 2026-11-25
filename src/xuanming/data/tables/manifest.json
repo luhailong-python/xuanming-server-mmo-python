@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
   "version": 56,
-  "content_digest": "9bd9ef2da60675002d97e345a4cf6db837692a243e508e2ca3690ac150a8db48",
+  "content_digest": "e1a39a47434a686dbff7b95b88c823719237c3dda857f1929a73fdc510f2cd7d",
   "generated_at": "2026-11-16T02:30:20Z",
   "source_rev": {
     "commit": "d74bbeb17db4e58515df775af250b825c1b719d5",
     "data_dirty": true
   },
-  "table_count": 61,
+  "table_count": 68,
   "tables": [
     {
       "name": "ActivitySchedule",
@@ -489,6 +489,29 @@
           "file": "equipaffixpool.pb",
           "size": 319,
           "sha256": "124f1680f09058126d4efa83b328b20f69237ff8aed028bb35d03098bee11d58"
+        }
+      ]
+    },
+    {
+      "name": "EquipAffixQuality",
+      "rows": 5,
+      "source": {
+        "file": "EquipAffixQuality.xlsx",
+        "size": 5257,
+        "sha256": "a52bc7bd747d23d8f666c15a7fdbda0165f51620663bc84b3227a6f0b5ba7d5b"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "equipaffixquality.json",
+          "size": 735,
+          "sha256": "35d259031ec9de722b339c26deb5b155ca62e6c28d0198d78e534156fc563e2f"
+        },
+        {
+          "kind": "binary",
+          "file": "equipaffixquality.pb",
+          "size": 115,
+          "sha256": "b846aa9848971b9e7c74f8a48429a0436e0a92248810060eccc2f55d3e0f0fb8"
         }
       ]
     },
@@ -1321,6 +1344,29 @@
       ]
     },
     {
+      "name": "SkillScrollCraft",
+      "rows": 3,
+      "source": {
+        "file": "SkillScrollCraft.xlsx",
+        "size": 5766,
+        "sha256": "4d055e21a0da202f486b5278d5b2c6a97df660425b15b23d171b5df05abf584f"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "skillscrollcraft.json",
+          "size": 1673,
+          "sha256": "684aa02c18e497f9a22a59658b751f9352653916d11a4f4e6077f693029efa69"
+        },
+        {
+          "kind": "binary",
+          "file": "skillscrollcraft.pb",
+          "size": 499,
+          "sha256": "6292130e9b1e2e920389706fda7db810abfebb37ea6a858092d32e9652c1e11b"
+        }
+      ]
+    },
+    {
       "name": "Test",
       "rows": 6,
       "source": {
@@ -1363,6 +1409,121 @@
           "file": "testmultikey.pb",
           "size": 563,
           "sha256": "01f8898595d6c55d6171ad325263302047a46c0aa83c08d087bf3dd71545401c"
+        }
+      ]
+    },
+    {
+      "name": "TournamentReward",
+      "rows": 7,
+      "source": {
+        "file": "TournamentReward.xlsx",
+        "size": 6154,
+        "sha256": "bd32f3214e5517bd9c6a70b68eeec2d18545324f12e802328e3c867db5a67070"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "tournamentreward.json",
+          "size": 3315,
+          "sha256": "d181dfd5a7a6d86b4c0cd33189ca158f11707c1b2a801dc694fa723786f61e26"
+        },
+        {
+          "kind": "binary",
+          "file": "tournamentreward.pb",
+          "size": 1565,
+          "sha256": "62430b60e76aa98fb3a14443e67339d81c2c27fb73996e90c5f42b91bb2d56af"
+        }
+      ]
+    },
+    {
+      "name": "TournamentRule",
+      "rows": 1,
+      "source": {
+        "file": "TournamentRule.xlsx",
+        "size": 5666,
+        "sha256": "a0e85216305ef4e6509a7aa29684932b743f68b1f097b02011cf5d394f2bc5b4"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "tournamentrule.json",
+          "size": 688,
+          "sha256": "fb4af61e1c5a6e8dd59f3ff7bee7bb6a8deda28df41502caa969953cd212a89e"
+        },
+        {
+          "kind": "binary",
+          "file": "tournamentrule.pb",
+          "size": 180,
+          "sha256": "8bb75dd83eb91ba782f1acf355611515906c39a1dcb8b794e05194586f8ef253"
+        }
+      ]
+    },
+    {
+      "name": "TrialJournalEntry",
+      "rows": 11,
+      "source": {
+        "file": "TrialJournalEntry.xlsx",
+        "size": 7020,
+        "sha256": "3e3cadcb07aa45f22f77df0b21626c4ae629dccb8a8de0c05f52e24281b672dc"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "trialjournalentry.json",
+          "size": 6226,
+          "sha256": "a1871d88f9017bb8b305d65c8b2b58f672a73c8f95f89b3499beaff2bb679d7e"
+        },
+        {
+          "kind": "binary",
+          "file": "trialjournalentry.pb",
+          "size": 2876,
+          "sha256": "fd09bcbaa5e10f0fb2a75e45261d0c1f76fc76da6e874b894d49babec3713867"
+        }
+      ]
+    },
+    {
+      "name": "TrialJournalMilestone",
+      "rows": 10,
+      "source": {
+        "file": "TrialJournalMilestone.xlsx",
+        "size": 7065,
+        "sha256": "0dce19385fc91d0bfac5c98b2e1622622b4a1005f726824edc8d47a2dccef04d"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "trialjournalmilestone.json",
+          "size": 5088,
+          "sha256": "e38d79b797e457a10438efb242066429017731486291cc2ed90b6bc92e593fcc"
+        },
+        {
+          "kind": "binary",
+          "file": "trialjournalmilestone.pb",
+          "size": 2763,
+          "sha256": "949425af4d99921190fd2c4dd8a24fa8b9e26f4716b35b3d5c7a968a004d3d6b"
+        }
+      ]
+    },
+    {
+      "name": "TrialJournalSeal",
+      "rows": 30,
+      "source": {
+        "file": "TrialJournalSeal.xlsx",
+        "size": 6810,
+        "sha256": "edf761921ce0928d94bc0cc9cbbe57ac7337130e7605577aadab3d0149f8e27d"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "trialjournalseal.json",
+          "size": 7069,
+          "sha256": "00c1927842dc12a545efdd0b8bf9ea2ba3f40fe11295d53ab53f0b34ee3ec207"
+        },
+        {
+          "kind": "binary",
+          "file": "trialjournalseal.pb",
+          "size": 2572,
+          "sha256": "78cd4c8b0dc526b16d7a756ed18a4fb92250e01edd9821d7a78ce8643d8bc469"
         }
       ]
     },

@@ -19,6 +19,7 @@ from types import MappingProxyType
 from weakref import WeakValueDictionary
 
 from filelock import FileLock, Timeout as FileLockTimeout
+from google.protobuf import json_format
 from google.protobuf.message import DecodeError, Message
 
 from ..grpc_runtime import sign_service_call
@@ -350,10 +351,13 @@ class JsonPlayerStore(_SnapshotStore):
     """本地角色行存档。跨进程串行化，完整快照通过同目录原子替换提交。"""
 
     _FORMAT_VERSION = 1
+    _PROTOJSON_FORMAT_VERSION = 2
+    _REPLACE_RETRY_COUNT = 12
+    _REPLACE_RETRY_BASE_SECONDS = 0.04
 
     def __init__(
         self, path: str | Path, *, legacy_sqlite: str | Path | None = None,
-        auto_create: bool = True, piggyback_fallback: float = 300.0
+        auto_create: bool = True, piggyback_fallback: float = 300.0, protocol=None,
     ) -> None:
         super().__init__(piggyback_fallback=piggyback_fallback)
         self._path = Path(path)
@@ -361,6 +365,11 @@ class JsonPlayerStore(_SnapshotStore):
             raise ValueError("JSON 玩家存档需要持久化文件路径")
         self._legacy_sqlite = Path(legacy_sqlite) if legacy_sqlite is not None else None
         self._auto_create = auto_create
+        self._protocol = protocol
+
+    @property
+    def _write_format_version(self) -> int:
+        return self._PROTOJSON_FORMAT_VERSION if self._protocol is not None else self._FORMAT_VERSION
 
     def _locked(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -368,13 +377,22 @@ class JsonPlayerStore(_SnapshotStore):
 
     def _read_document(self) -> dict:
         if not self._path.exists():
-            return {"format_version": self._FORMAT_VERSION, "players": {}}
+            return {"format_version": self._write_format_version, "players": {}}
         try:
             document = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise StoreUnavailable("JSON 玩家存档损坏或不可读") from exc
-        if (not isinstance(document, dict) or document.get("format_version") != self._FORMAT_VERSION
-                or not isinstance(document.get("players"), dict)):
+        allowed_versions = (
+            (self._FORMAT_VERSION, self._PROTOJSON_FORMAT_VERSION)
+            if self._protocol is not None
+            else (self._FORMAT_VERSION,)
+        )
+        if (
+            not isinstance(document, dict)
+            or type(document.get("format_version")) is not int
+            or document.get("format_version") not in allowed_versions
+            or not isinstance(document.get("players"), dict)
+        ):
             raise StoreUnavailable("JSON 玩家存档格式版本无效")
         return document
 
@@ -404,13 +422,51 @@ class JsonPlayerStore(_SnapshotStore):
                 int(epoch), bytes(owner), int(save_seq), bool(released), int(schema_gen),
                 _validate_rows(stored_rows.get(str(player_id), {})),
             )
-        document = {"format_version": self._FORMAT_VERSION, "players": players}
+        document = {"format_version": self._write_format_version, "players": players}
         self._write_document(document)
-        logger.info("已将 %s 个角色快照从 SQLite 导入 JSON", len(players))
+        logger.info("Imported %s player snapshots from legacy SQLite to JSON", len(players))
         return document
 
-    @staticmethod
-    def _decode_player(raw: object) -> tuple[int, bytes, int, bool, dict[int, bytes]]:
+    def _decode_rows_v1(self, raw: dict) -> dict[int, bytes]:
+        encoded_rows = raw["rows"]
+        if not isinstance(encoded_rows, dict):
+            raise ValueError("invalid v1 rows")
+        return _validate_rows({
+            int(kind): base64.b64decode(payload, validate=True)
+            for kind, payload in encoded_rows.items()
+        })
+
+    def _decode_rows_v2(self, raw: dict) -> dict[int, bytes]:
+        if self._protocol is None:
+            raise ValueError("protojson requires protocol")
+        encoded_rows = raw["rows_json"]
+        if not isinstance(encoded_rows, dict):
+            raise ValueError("invalid v2 rows_json")
+        raw_fallbacks = raw.get("rows_raw")
+        if raw_fallbacks is not None and (
+            not isinstance(raw_fallbacks, dict) or not set(raw_fallbacks).issubset(encoded_rows)
+        ):
+            raise ValueError("invalid v2 rows_raw")
+        decoded: dict[int, bytes] = {}
+        for kind_name, payload_dict in encoded_rows.items():
+            if (
+                not isinstance(kind_name, str)
+                or kind_name not in PlayerRowKind.__members__
+                or not isinstance(payload_dict, dict)
+            ):
+                raise ValueError(f"invalid protojson row: {kind_name!r}")
+            kind = PlayerRowKind[kind_name]
+            message = self._protocol.message("player_database")
+            json_format.ParseDict(payload_dict, message)
+            if raw_fallbacks is not None and kind_name in raw_fallbacks:
+                decoded[int(kind)] = base64.b64decode(raw_fallbacks[kind_name], validate=True)
+            else:
+                decoded[int(kind)] = message.SerializeToString(deterministic=True)
+        return _validate_rows(decoded)
+
+    def _decode_player(
+        self, raw: object, *, format_version: int | None = None
+    ) -> tuple[int, bytes, int, bool, dict[int, bytes]]:
         if not isinstance(raw, dict):
             raise StoreUnavailable("JSON 玩家记录格式无效")
         try:
@@ -419,40 +475,103 @@ class JsonPlayerStore(_SnapshotStore):
             save_seq = int(raw["save_seq"])
             schema_gen = raw["schema_gen"]
             released = raw["released"]
-            encoded_rows = raw["rows"]
-            if (type(schema_gen) is not int or schema_gen < 1 or type(released) is not bool
-                    or not isinstance(encoded_rows, dict) or not 0 <= epoch <= _MAX_UINT64
-                    or not 0 <= save_seq <= _MAX_UINT64 or not 1 <= len(owner) <= 64):
+            if (
+                type(schema_gen) is not int
+                or schema_gen < 1
+                or type(released) is not bool
+                or not 0 <= epoch <= _MAX_UINT64
+                or not 0 <= save_seq <= _MAX_UINT64
+                or not 1 <= len(owner) <= 64
+            ):
                 raise ValueError("invalid player record")
-            rows = _validate_rows({int(kind): base64.b64decode(payload, validate=True)
-                                   for kind, payload in encoded_rows.items()})
-        except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+            if format_version == self._PROTOJSON_FORMAT_VERSION:
+                rows = self._decode_rows_v2(raw)
+            elif format_version == self._FORMAT_VERSION:
+                rows = self._decode_rows_v1(raw)
+            elif "rows_json" in raw:
+                rows = self._decode_rows_v2(raw)
+            else:
+                rows = self._decode_rows_v1(raw)
+        except (KeyError, TypeError, ValueError, UnicodeError, json_format.ParseError) as exc:
             raise StoreUnavailable("JSON 玩家记录内容无效") from exc
         return epoch, owner, save_seq, released, rows
 
-    @staticmethod
-    def _encode_player(epoch: int, owner: bytes, save_seq: int, released: bool,
-                       schema_gen: int, rows: Mapping[int, bytes]) -> dict:
-        return {
+    def _encode_player(
+        self, epoch: int, owner: bytes, save_seq: int, released: bool,
+        schema_gen: int, rows: Mapping[int, bytes],
+    ) -> dict:
+        record: dict[str, object] = {
             "owner_epoch": str(epoch),
             "holder": base64.b64encode(owner).decode("ascii"),
             "save_seq": str(save_seq),
             "released": released,
             "schema_gen": schema_gen,
-            "rows": {str(kind): base64.b64encode(payload).decode("ascii")
-                     for kind, payload in sorted(rows.items())},
         }
+        if self._protocol is None:
+            record["rows"] = {
+                str(kind): base64.b64encode(payload).decode("ascii")
+                for kind, payload in sorted(rows.items())
+            }
+            return record
+        rows_json: dict[str, dict] = {}
+        rows_raw: dict[str, str] = {}
+        try:
+            for kind, payload in sorted(rows.items()):
+                kind_name = PlayerRowKind(kind).name
+                message = self._protocol.parse("player_database", payload)
+                row_dict = json_format.MessageToDict(message, preserving_proto_field_name=True)
+                rows_json[kind_name] = row_dict
+                # ProtoJSON 会丢弃未知 wire 字段；仅当往返字节不一致时附带原字节保真。
+                roundtrip = self._protocol.message("player_database")
+                json_format.ParseDict(row_dict, roundtrip)
+                if roundtrip.SerializeToString(deterministic=True) != message.SerializeToString(deterministic=True):
+                    rows_raw[kind_name] = base64.b64encode(payload).decode("ascii")
+        except (DecodeError, TypeError, ValueError, json_format.ParseError) as exc:
+            raise StoreUnavailable("JSON 玩家记录编码失败") from exc
+        record["rows_json"] = rows_json
+        if rows_raw:
+            record["rows_raw"] = rows_raw
+        return record
+
+    def _normalize_document_for_write(self, document: dict) -> dict:
+        # 从 v1 升格至 v2 时把同文件其余未改写玩家一并转为 ProtoJSON，避免单文件混存两套行格式。
+        if self._protocol is None or document.get("format_version") == self._PROTOJSON_FORMAT_VERSION:
+            return document
+        upgraded_players = {}
+        for player_key, raw in document["players"].items():
+            if isinstance(raw, dict) and "rows_json" in raw and "rows" not in raw:
+                upgraded_players[player_key] = raw
+                continue
+            epoch, owner, save_seq, released, rows = self._decode_player(
+                raw, format_version=self._FORMAT_VERSION
+            )
+            upgraded_players[player_key] = self._encode_player(
+                epoch, owner, save_seq, released, raw["schema_gen"], rows
+            )
+        return {"format_version": self._PROTOJSON_FORMAT_VERSION, "players": upgraded_players}
 
     def _write_document(self, document: dict) -> None:
+        document = self._normalize_document_for_write(document)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        if self._protocol is not None:
+            encoded = json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        else:
+            encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
         fd, temporary = tempfile.mkstemp(prefix=f".{self._path.name}.", suffix=".tmp", dir=self._path.parent)
         try:
             with os.fdopen(fd, "wb") as output:
                 output.write(encoded)
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary, self._path)
+            # Windows 上杀毒或索引器可能短暂占用目标文件，对原子替换做线性退避重试。
+            for attempt in range(self._REPLACE_RETRY_COUNT):
+                try:
+                    os.replace(temporary, self._path)
+                    break
+                except PermissionError:
+                    if attempt + 1 >= self._REPLACE_RETRY_COUNT:
+                        raise
+                    time.sleep(self._REPLACE_RETRY_BASE_SECONDS * (attempt + 1))
             if os.name != "nt":
                 directory_fd = os.open(self._path.parent, os.O_RDONLY)
                 try:
@@ -462,7 +581,7 @@ class JsonPlayerStore(_SnapshotStore):
         finally:
             try:
                 os.unlink(temporary)
-            except FileNotFoundError:
+            except OSError:
                 pass
 
     async def load_and_claim(
@@ -480,6 +599,7 @@ class JsonPlayerStore(_SnapshotStore):
         key = str(player_id)
         with self._locked():
             document = self._read_or_import_document()
+            doc_version = document["format_version"]
             raw = document["players"].get(key)
             if raw is None:
                 if not self._auto_create:
@@ -488,7 +608,9 @@ class JsonPlayerStore(_SnapshotStore):
                 document["players"][key] = self._encode_player(epoch, owner, 0, False, 1, {})
                 self._write_document(document)
                 return PlayerSnapshot(player_id, owner, epoch, 0, {})
-            stored_epoch, holder, save_seq, _released, rows = self._decode_player(raw)
+            stored_epoch, holder, save_seq, _released, rows = self._decode_player(
+                raw, format_version=doc_version
+            )
             epoch = owner_epoch or (stored_epoch if holder == owner else _next(stored_epoch))
             if epoch < stored_epoch:
                 raise StoreRejected("LOAD_AND_CLAIM_STALE_OWNER")
@@ -512,10 +634,13 @@ class JsonPlayerStore(_SnapshotStore):
         key = str(player_id)
         with self._locked():
             document = self._read_or_import_document()
+            doc_version = document["format_version"]
             raw = document["players"].get(key)
             if raw is None:
                 return True
-            epoch, holder, save_seq, _released, rows = self._decode_player(raw)
+            epoch, holder, save_seq, _released, rows = self._decode_player(
+                raw, format_version=doc_version
+            )
             if owner_epoch < epoch or holder != owner:
                 return True
             if raw["schema_gen"] != 1:
@@ -558,10 +683,13 @@ class JsonPlayerStore(_SnapshotStore):
         key = str(snapshot.player_id)
         with self._locked():
             document = self._read_or_import_document()
+            doc_version = document["format_version"]
             raw = document["players"].get(key)
             if raw is None:
                 raise StoreRejected("SAVE_PLAYER_NO_OWNER")
-            epoch, holder, old_seq, was_released, existing = self._decode_player(raw)
+            epoch, holder, old_seq, was_released, existing = self._decode_player(
+                raw, format_version=doc_version
+            )
             if snapshot.owner_epoch < epoch:
                 raise StoreRejected("SAVE_PLAYER_STALE_OWNER")
             if holder != snapshot.owner:

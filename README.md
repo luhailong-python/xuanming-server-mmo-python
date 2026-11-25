@@ -1,6 +1,6 @@
 # 玄冥服务端 · Python
 
-这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 框架）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python。当前已校对的 C++ 仓库对照基线为 `main` 提交 `5676d207a`（完整 SHA：`5676d207a6ab960edff7ce7e54bbff6d93a796c1`，2026-11-24；详见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。后续 C++ 仓新增提交时，仅按需从该基线之后筛选非玩法逻辑的底层与框架改动进行增量移植，保留 Python 侧现有战斗与大富翁玩法实现。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
+这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `bba38b77c`（完整 SHA：`bba38b77cffc99b37f418948d0b64e92add08589`，2026-11-25；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
 
 | 节点 | 当前运行路径 |
 | --- | --- |
@@ -21,7 +21,12 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pytest -q
 ```
 
-`smoke` 使用临时 JSON 角色存档、临时 SQLite 辅助账本和临时回环端口。持续运行时，设置开发登录令牌后可在同一进程启动三个角色。
+`smoke` 使用临时 PB-to-ProtoJSON 角色存档、临时 SQLite 辅助账本和临时回环端口。Windows 下可直接双击一键启动（详细范式与约束见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)）：
+
+- **单进程本地一键启动**：双击 [启动玄冥服务器.bat](启动玄冥服务器.bat)（或 `启动-本地存档.bat`），仅启一个进程同时托管 Gate + Scene + Battle，玩家 PB 存档直接以可读 ProtoJSON 落盘 `run/players.json`，日志写 `run/logs/server-console.log`，零 MySQL/Redis/etcd/Kafka 依赖。
+- **多节点集群一键极速并行启动**：双击 [启动-多节点集群.bat](启动-多节点集群.bat)（经纯标准库 [tools/supervisor.py](tools/supervisor.py) 并行拉起 [config/processes.cluster.json](config/processes.cluster.json) 全部服务并按真实 TCP 端口探活）。
+
+手动在命令行启动单进程开发模式：
 
 ```powershell
 $env:XUANMING_DEV_LOGIN_TOKEN = '换成自己的本机开发令牌'

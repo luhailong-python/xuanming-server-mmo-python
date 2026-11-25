@@ -91,6 +91,7 @@ message BattlePlayerSnapshot {
   map<uint32, uint32> skill_ranks = 21;
   uint32 pet_capture_slots = 22; // scene 核定的本局可捕捉数量；旧快照缺省为0。
   EquipmentEffects equipment_effects = 23; // 仅人物装备，宝宝不继承。
+  uint32 active_season_id = 24; // 开局由 scene 冻结的当前赛季编号（0 = 无活跃赛季）；引擎据此复核赛季限定技能。
 }
 
 // ---- 宝宝战斗快照:与主人同队、独立行动的战斗单位(设计文档 player-pet.md §5)----
@@ -174,6 +175,8 @@ message BattleActorState {
   PetCultivationEffects pet_cultivation = 41; // 宝宝独立条目贡献，开局快照冻结。
   SupportEffectSummary support_effects = 40; // 仅本人可见；来源及中立预览由本轮真实状态生成。
   bool competitive_temporary = 42; // true = 论剑排位临时竞技单位,结算不产出永久宠物回写项。
+  bool is_boss = 43; // true = 首领单位（来自 MonsterTable.is_boss）；不可被复制技能选中，客户端选目标阶段置灰。
+  BattleArtifactState season_seal_state = 44; // 单槽赛季印的局内次数状态（不占用永久法宝 item_id 列表，下发客户端前清除）。
 }
 
 // 法宝按物品实例记录次数；死亡不刷新已用次数，仅清除待用补偿。
@@ -268,6 +271,7 @@ message BattleEventItem {
   uint64 instigator_id = 21; // 催动者与原持续效果施加者分别保留。
   uint64 artifact_item_id = 22;
   uint32 artifact_effect_id = 23;
+  uint32 season_seal_id = 24; // 非 0 表示本次 BATTLE_EVENT_ARTIFACT 由单槽赛季印触发（artifact_item_id 为 0）。
 }
 
 // ---- 胜负 ----
@@ -349,6 +353,20 @@ message BattleSettlementData {
   uint32 ranked_rule_version = 23; // 冻结的排位规则版本(非排位为 0)
   // 本人是否达成排位有效参与(由 battle 房间在终局前按统一参与事实冻结,非排位恒为 false)。
   bool participated = 24;
+  // 五行试炼志 V2 权威战法事实与轻量阵容快照(由 battle 引擎在终局前按真实事件冻结,非试炼志关联局留空)。
+  BattleTrialJournalFacts trial_facts = 25;
+  // 本局玩家成功提交本人或本人宝宝手动有效指令的独立回合数（用于 PVP 负/平局防挂机门槛判定）。
+  uint32 manual_action_rounds = 26;
+  // 本人或本人宝宝整场是否产生非零有效战斗贡献（有效伤害/治疗/护盾吸收/有效控制或驱散任一项 > 0）。
+  bool effective_combat_contribution = 27;
+  // 开局从 DungeonTable 冻结的试炼难度档（0=常规，1=普通，2=困难；用于困难胜局额外 +5 绑定材料）。
+  uint32 battle_difficulty = 28;
+  // 开局从 DungeonTable 冻结的首领/轮换玩法类型（0=常规，1..6 见 dungeon_table.proto）。
+  uint32 boss_trial_kind = 29;
+  // true = 本局由免费 3×3 预设驱动（仅限轮换娱乐场：护卫救援 / 物法易势 5V5），战后严格不回写场外资产。
+  bool use_free_preset = 30;
+  // 瑞兽迎春限时活动开局冻结上下文（由 TurnBattleEngine::BuildSettlement 原样回传，供 scene 离线/跨期结算）。
+  FestivalBeastBattleContext festival_beast = 31;
 }
 
 // ---- 出战宝宝的结算数据(随主人的 BattleSettlementData 一起回 scene)----
@@ -365,8 +383,36 @@ message BattlePetSettlementData {
 // battle / scene 不解释其中任何业务字段(只看 kind 是否为 NONE 来决定是否走持久化结果通道,§6.19)。
 // 本段只在文件末尾追加(属性会话也在改本文件)。
 enum eBattleActivityKind {
-  BATTLE_ACTIVITY_KIND_NONE = 0;          // 普通对局:不回显上下文,结果事件照旧只发一次
-  BATTLE_ACTIVITY_KIND_GUILD_TRIAL = 1;   // 帮会同道历练:go/guild 以消费组 guild-trial 消费 match-results 结算
+  BATTLE_ACTIVITY_KIND_NONE = 0;            // 普通对局:不回显上下文,结果事件照旧只发一次
+  BATTLE_ACTIVITY_KIND_GUILD_TRIAL = 1;     // 帮会同道历练:go/guild 以消费组 guild-trial 消费 match-results 结算
+  BATTLE_ACTIVITY_KIND_FESTIVAL_BEAST = 2;  // 瑞兽迎春限时单人神兽挑战:scene 发起、match 准入、battle 执行、scene 收件箱结算
+}
+
+// 瑞兽迎春开局冻结上下文（由 scene 组装、match 时间窗校验后随成局原件持久化并透传至 PrepareBattle / CreateBattle / Settlement）。
+message FestivalBeastBattleContext {
+  uint32 activity_instance_id = 1;
+  uint32 config_revision = 2;
+  string reward_identity = 3;
+  uint32 reward_definition_version = 4;
+  uint32 reward_pet_table_id = 5;
+  uint32 required_wins = 6;
+  uint64 locked_pet_id = 7;          // 开局意图锁定的出战宝宝 pet_id，PrepareBattle 强制复核
+  uint32 locked_owner_level = 8;     // 开局锁定的人物生效等级（选档唯一依据）
+  uint32 tier_id = 9;                // 匹配的固定等级档 ID
+  uint32 round_limit = 10;           // 冻结回合上限（默认 12）
+  uint32 cycle_rounds = 11;          // 行动周期（默认 3）
+  uint32 first_heavy_round = 12;     // 首次重击回合（默认 3）
+  uint32 telegraph_lead_rounds = 13; // 预告提前回合数（默认 1，即 R2/5/8/11）
+  uint32 heavy_damage_percent = 14;  // 重击倍率百分比（默认 180）
+  string boss_name = 15;             // 冻结首领展示名
+  uint64 boss_health = 16;           // 冻结档位首领气血上限
+  uint64 boss_physical_attack = 17;  // 冻结档位首领物理攻击
+  uint64 boss_defense = 18;          // 冻结档位首领防御
+  uint64 boss_resistance = 19;       // 冻结档位首领抗性%
+  uint64 boss_speed = 20;            // 冻结档位首领速度
+  uint64 effective_start_at_ms = 21; // 活动开放开始 UTC 毫秒（Match SQL 提交点复核）
+  uint64 effective_end_at_ms = 22;   // 活动开放结束 UTC 毫秒（Match SQL 提交点复核）
+  string client_request_id = 23;     // 客户端原请求 UUID
 }
 
 message BattleActivityContext {
@@ -377,6 +423,7 @@ message BattleActivityContext {
   uint64 initiator_player_id = 5;   // 发起人;match 校验它等于 StartActivityBattleRequest.member_player_ids[0]
   uint32 guild_period_key = 6;      // 确认开战时的帮会期键(activity.GuildPeriodKey;历练即游戏日),用于每日计资金胜场上限
   uint64 launch_request_id = 7;     // 同道历练开战前持久原件；match/battle原样复制回结果，不包含账号
+  FestivalBeastBattleContext festival_beast = 8; // kind == BATTLE_ACTIVITY_KIND_FESTIVAL_BEAST 时必填
 }
 
 // 观战可见性(docs/design/battle-spectate-tiered-fanout.md §10 第 6 条 / §10.2):战斗创建时由 match 按
@@ -415,7 +462,10 @@ message RankedMatchContext {
   uint32 rule_version = 4;            // RankedRule.rule_version
   uint32 team_size = 5;               // 每侧玩家人数(1..5)
   string config_fingerprint = 6;      // 竞技规则与预设依赖表指纹
-  repeated RankedMemberLoadout members = 7; // 本局全员冻结预设(PrepareBattle 可只含本人,CreateBattle 含全员)
+  repeated RankedMemberLoadout members = 7; // 本局全员冻结预设(仅 use_free_preset=true 生效;PrepareBattle 可只含本人,CreateBattle 含全员)
+  // true = 本局使用 6 套免费人宠预设(仅限轮换娱乐场：护卫救援 / 物法易势 5V5);
+  // false = 正式自养人宠会武(PVP_TEAM),携带本人真实装备、词条、法宝、技能与出战宝宝。
+  bool use_free_preset = 8;
 }
 
 // 玩家本局有效参与事实(battle 房间在终局前冻结进 BattleResultEvent,重放不重算)。
@@ -425,4 +475,36 @@ message BattleParticipationFact {
   bool manual_action_accepted = 3;     // 服务端至少接受过一次本人人物或宝宝有效手动指令
   bool explicit_auto_enabled = 4;      // 进房后玩家显式开启过合法自动战斗
   bool no_action_opportunity = 5;      // 进房后在首次可操作机会前即阵亡/被全控/对局结束
+}
+
+// ---- 五行试炼志 V2 开局冻结上下文与终局权威事实(docs/design/long-term-progression-v2.md) ----
+message TrialBattleContext {
+  uint32 journal_entry_id = 1;       // TrialJournalEntry.id（0 = 非试炼志格）
+  uint32 trial_rule_version = 2;     // 开局冻结的可比规则版本
+  uint32 season_id = 3;              // 赛季卷对应赛季号（永久卷为 0）
+  uint32 guard_monster_table_id = 4; // 可选：回春/护势等特殊护卫怪物表 ID（0 = 任意非首领怪物）
+  uint32 guard_stance_buff_id = 5;   // 可选：护势护卫状态 Buff 表 ID（0 = 任意敌方增益驱散均视为有效驱散）
+}
+
+message BattleTrialJournalFacts {
+  uint32 journal_entry_id = 1;
+  uint32 trial_rule_version = 2;
+  uint32 initial_human_count = 3;
+  uint32 season_id = 4;
+  bool self_or_pet_ever_died = 5;              // 本人或本人出战宝宝本场任一时刻触发过死亡（复活不清除）
+  uint64 boss_guard_heal_total = 6;            // 敌方护卫对首领实际造成的有效气血恢复总量
+  bool guard_stance_dispelled = 7;             // 己方本场成功驱散过敌方护势状态
+  bool team_dealt_physical_direct_damage = 8;  // 己方本场对敌方造成过 >0 物理直接伤害
+  bool team_dealt_magic_direct_damage = 9;     // 己方本场对敌方造成过 >0 法术直接伤害
+  bool guard_survived = 10;                    // 终局时敌方护卫仍存活（供护卫救援卷三判定）
+  bool self_triggered_shield_break = 11;       // 本人触发破盾法宝/赛季印产生 >0 实际削盾
+  bool self_triggered_anti_control_or_season_skill = 12; // 本人触发清心符、成功净化或施放当季免费赛季技能
+  uint32 used_pet_table_id = 13;               // 本人开局出战宝宝种类（0=无宠）
+  repeated uint32 used_artifact_effect_ids = 14; // 本人开局佩戴的法宝效果 ID（至多 2 个，升序）
+  uint32 used_season_seal_id = 15;             // 本人开局生效的赛季印 ID（0=无）
+  repeated string teammate_names = 16;         // 入场冻结的同队其他真人展示名（至多 4 名）
+  bool boss_wind_hit_unprotected_death = 17;   // 卷二八仙岛风击倒地标记
+  bool dealt_yang_bell_physical_damage = 18;   // 卷二碧渊水宫阳钟阶段物理击伤标记
+  bool dealt_yin_drum_magic_damage = 19;       // 卷二碧渊水宫阴鼓阶段法术击伤标记
+  bool finished_in_ebb_tide = 20;              // 卷二月汐湾退潮窗口终结标记
 }

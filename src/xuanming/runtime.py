@@ -7,7 +7,7 @@ import uuid
 from contextlib import AsyncExitStack
 
 from .cluster import BATTLE, GATE, LOGIN, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
-from .data import ConfigTables, DataServicePlayerStore, JsonPlayerStore, PlayerRowCodec
+from .data import ConfigTables, PlayerRowCodec, create_player_store
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
 from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc
@@ -33,6 +33,7 @@ from .nodes.scene_attributes import SceneAttributes, initialize_attribute_scheme
 from .nodes.scene_battle import SceneBattle
 from .nodes.scene_connection_hold import afk_pass_key
 from .nodes.scene_equip_craft import SceneEquipCraft
+from .nodes.scene_festival_beast import SceneFestivalBeast
 from .nodes.scene_gm_commands import SceneGmCommands
 from .nodes.scene_landing import SceneLanding
 from .nodes.scene_mail_outbox import MailSender, SceneMailOutbox
@@ -42,6 +43,7 @@ from .nodes.scene_pets import ScenePets
 from .nodes.scene_planned_drain import budget_from_env, planned_drain
 from .nodes.scene_rename import SceneRename
 from .nodes.scene_season import SceneSeason
+from .nodes.scene_skill_craft import SceneSkillCraft
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_stats import initialize_base
 from .nodes.scene_team import SceneTeam
@@ -520,15 +522,19 @@ class Runtime:
         switch = self._configure_kill_switch(info)
         tables = self._config_tables()
         audit = anomaly = allocate_tx_id = data_service = None
+        store, store_closer = create_player_store(
+            self.settings,
+            self.protocol,
+            local=self.local,
+            grpc_client_factory=lambda target: GrpcClient(target, timeout=5, receive_limit=8 << 20),
+            secret_resolver=secret,
+        )
+        if store_closer is not None:
+            self._stack.push_async_callback(store_closer)
         if self.local:
             self.settings.database.parent.mkdir(parents=True, exist_ok=True)
-            path = self.settings.local_player_store or self.settings.database.with_name("players.json")
-            store = JsonPlayerStore(path, legacy_sqlite=self.settings.database)
             allocate_item_id = IdSegments.local(self.settings.database, "item")
         else:
-            client = GrpcClient(self.settings.player_store, timeout=5, receive_limit=8 << 20)
-            self._stack.push_async_callback(client.close)
-            store = DataServicePlayerStore(self.protocol, client.call, secret("MMORPG_PLAYER_STORE_SECRET_SCENE"))
             data_service = GrpcClient(self.settings.data_service)
             self._stack.push_async_callback(data_service.close)
             allocate_item_id = IdSegments.remote(self.protocol, data_service.call, "item")
@@ -626,6 +632,10 @@ class Runtime:
         scene.trial_journal.register()
         scene.equip_craft = SceneEquipCraft(scene, tables, scene.assets)
         scene.equip_craft.register()
+        scene.skill_craft = SceneSkillCraft(scene, tables, scene.assets)
+        scene.skill_craft.register()
+        scene.festival_beast = SceneFestivalBeast(scene, tables, scene.assets)
+        scene.festival_beast.register()
         scene_cg_call = None
         if not self.local:
             cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()

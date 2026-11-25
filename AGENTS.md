@@ -17,6 +17,7 @@
 | 工程设计与编码原则 | SOLID、KISS/YAGNI、**系统/模块间 Actor 消息通信（不可变消息、禁过度拆内部函数）**、**23 种设计模式主动采用并说明原因**、**高 Star 开源库（门槛按语言与领域生态浮动）交程序决定并说明原因**、实例与布局分层 | [docs/rules/engineering-principles.md](docs/rules/engineering-principles.md) |
 | 位图（Bit）与删表 ID | 纯布尔完成/领取状态优先 bit 存储、领取归属业务表、删表 ID 策划与程序红线 | [docs/rules/bit-storage-and-table-ids.md](docs/rules/bit-storage-and-table-ids.md) |
 | 命名与权限边界 | 命名清晰准确带单位、关联 GitHub 仓库清单、硬禁令 | [docs/rules/naming-and-boundaries.md](docs/rules/naming-and-boundaries.md) |
+| 运行模式与启动规范 | 平替 C++ 服务端定位、Windows 单进程一键启动、PB 直转 ProtoJSON 存档、条件路由严禁静默降级、多节点并行启动器 | [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md) |
 | AI 协作与模型档位 | 分工约定、无证据禁称通过、强制高低档模型切换、设计方案强制落盘 `.md` | [docs/rules/ai-workflow.md](docs/rules/ai-workflow.md) |
 
 ## 1. 开发分支与通用工程原则
@@ -57,6 +58,6 @@ pytest tests/test_battle.py
 
 当用户在本仓库触发「继续移植」等增量同步指令时，固定按以下闭环执行（只读对照 `../xuanming-server-mmo-cpp`，严禁修改 C++ 仓）：
 
-1. 读取 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md) 末尾记录的已校对 C++ 基线 Commit SHA（当前为 `5676d207a6ab960edff7ce7e54bbff6d93a796c1`）；
-2. 在 C++ 仓执行 `git log --oneline <baseline>..HEAD`，仅筛选**非玩法逻辑的底层与框架改动**（传输/协议、存储/锁/围栏、鉴权/安全、停机疏散/故障切换、弹性加固、运维/离线工具及跨服务契约修复）进行纯 Python 移植；默认保留 Python 侧现有战斗与大富翁玩法实现不覆写；
-3. 跑完回归测试并验证通过后，将最新已校对的 C++ `HEAD` Commit SHA 同步更新到本节、[README.md](README.md) 与 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md)，供下一次增量移植衔接。
+1. 读取 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md) 末尾记录的已校对 C++ 基线 Commit SHA（当前为 `bba38b77cffc99b37f418948d0b64e92add08589`）；
+2. 在 C++ 仓执行 `git log --oneline <baseline>..HEAD`，面向客户端可无缝平替 C++ 服务端的目标，对全协议、全配置表、全微服务及核心玩法/战斗逻辑（含传输/协议、存储/锁/围栏、鉴权/安全、停机疏散/故障切换、弹性加固、玩法与战斗结算逻辑及运维/离线工具）逐项纯 Python 增量对齐，确保契约与行为与 C++ 仓一致；
+3. 跑完回归测试并验证通过后，将最新已校对的 C++ `HEAD` Commit SHA 同步更新到本节、[docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)、[README.md](README.md) 与 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md)，供下一次增量移植衔接。

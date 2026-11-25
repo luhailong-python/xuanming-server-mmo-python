@@ -775,6 +775,11 @@ class SceneTrialJournal:
                     delta["new_coop_best"] = True
                     delta["changed"] = True
 
+        if won and entry.chapter_id in (CHAPTER_BREAKTHROUGH, CHAPTER_THREE_REALMS) and entry.difficulty == 1:
+            if hasattr(comp, "normal_boss_trial_cleared") and not comp.normal_boss_trial_cleared:
+                comp.normal_boss_trial_cleared = True
+                delta["changed"] = True
+
         if delta["changed"]:
             _bump_revision(comp)
         return delta
@@ -799,6 +804,9 @@ class SceneTrialJournal:
         out.total_permanent_seals = counts["permanent_total"]
         out.voucher_balance = self._removable_count(data, BOUND_ARTIFACT_VOUCHER_ITEM_ID)
         out.bound_sand_balance = self._removable_count(data, BOUND_REFORGE_SAND_ITEM_ID)
+        hard_unlocked = bool(counts["any_normal_clear"] or getattr(comp, "normal_boss_trial_cleared", False))
+        if hasattr(out, "hard_boss_trial_unlocked"):
+            out.hard_boss_trial_unlocked = hard_unlocked
 
         writable_err = self._writable_error(player)
         out.can_operate = writable_err == 0
@@ -859,10 +867,10 @@ class SceneTrialJournal:
                 record = _find_entry_record(comp, entry.id, entry.rule_version)
                 has_solo = record is not None and record.solo_best.best_rounds > 0
                 has_coop = record is not None and record.coop_best.best_rounds > 0
-                entry_view.has_solo_best = has_solo
+                entry_view.solo_recorded = has_solo
                 if has_solo:
                     entry_view.solo_best.CopyFrom(record.solo_best)
-                entry_view.has_coop_best = has_coop
+                entry_view.coop_recorded = has_coop
                 if has_coop:
                     entry_view.coop_best.CopyFrom(record.coop_best)
                 entry_view.has_legacy_record_only = (
@@ -872,7 +880,7 @@ class SceneTrialJournal:
                 if writable_err == TRIAL_JOURNAL_IN_BATTLE:
                     entry_view.can_enter = False
                     entry_view.enter_blocked_reason = "当前正在战斗中，暂不能前往试炼"
-                elif entry.unlock_mode == UNLOCK_MODE_REQUIRE_NORMAL_CLEAR and not counts["any_normal_clear"]:
+                elif entry.unlock_mode == UNLOCK_MODE_REQUIRE_NORMAL_CLEAR and not hard_unlocked:
                     entry_view.can_enter = False
                     entry_view.enter_blocked_reason = "本人普通首领试炼通关一次后开启困难"
                 else:
@@ -955,13 +963,18 @@ class SceneTrialJournal:
         if err:
             return self._finish(response, player, data, stamp, err)
         if prior is not None:
-            row = self._milestone_by_id(request.milestone_id)
+            row = self._milestone_by_id(getattr(prior, "trial_milestone_id", 0) or request.milestone_id)
             response.replayed = True
-            if row is not None:
-                response.granted_sand_count = row.bound_sand_count
-                response.granted_voucher_count = row.bound_artifact_voucher_count
-                if row.grant_appearance_id:
-                    response.granted_appearance_id = row.grant_appearance_id
+            response.granted_sand_count = (
+                getattr(prior, "trial_milestone_sand_count", 0)
+                or (row.bound_sand_count if row is not None else 0)
+            )
+            response.granted_voucher_count = (
+                getattr(prior, "trial_milestone_voucher_count", 0)
+                or (row.bound_artifact_voucher_count if row is not None else 0)
+            )
+            if row is not None and row.grant_appearance_id:
+                response.granted_appearance_id = row.grant_appearance_id
             return self._finish(response, player, data, stamp)
 
         if self.assets is None:
@@ -1023,7 +1036,13 @@ class SceneTrialJournal:
             self._grant_appearance(data, milestone.grant_appearance_id)
         _bump_revision(data.trial_journal_component)
         client_request.remember(
-            data.client_request_ledger, request.client_request_id, _CLIENT_REQUEST_KIND_CLAIM_MILESTONE, fingerprint,
+            data.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_CLAIM_MILESTONE,
+            fingerprint,
+            trial_milestone_id=milestone.id,
+            trial_milestone_sand_count=milestone.bound_sand_count,
+            trial_milestone_voucher_count=milestone.bound_artifact_voucher_count,
         )
 
         audit = (
@@ -1068,8 +1087,14 @@ class SceneTrialJournal:
         if prior is not None:
             cached = self._redeem_receipts.get((player.player_id, request.client_request_id))
             response.replayed = True
-            response.created_item_id = cached[0] if cached is not None else 0
-            response.artifact_item_config_id = cached[1] if cached is not None else request.artifact_item_config_id
+            response.created_item_id = (
+                getattr(prior, "redeemed_artifact_item_id", 0)
+                or (cached[0] if cached is not None else 0)
+            )
+            response.artifact_item_config_id = (
+                getattr(prior, "redeemed_artifact_config_id", 0)
+                or (cached[1] if cached is not None else request.artifact_item_config_id)
+            )
             return self._finish(response, player, data, stamp)
 
         if self.assets is None:
@@ -1118,7 +1143,12 @@ class SceneTrialJournal:
 
         _bump_revision(staged.trial_journal_component)
         client_request.remember(
-            staged.client_request_ledger, request.client_request_id, _CLIENT_REQUEST_KIND_REDEEM_VOUCHER, fingerprint,
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_REDEEM_VOUCHER,
+            fingerprint,
+            redeemed_artifact_item_id=created_guid,
+            redeemed_artifact_config_id=item_config_id,
         )
         audit = (
             self.assets.make_audit_callback(
