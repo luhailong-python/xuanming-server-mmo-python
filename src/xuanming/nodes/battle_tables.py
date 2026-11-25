@@ -128,6 +128,7 @@ class BattleSkill:
     damage_type: int | None = None
     target_team: int = 0
     max_targets: int = 1
+    pet_max_targets: int = 0
     mana_percent: float = 0.0
     heal_multiplier: float = 0.0
     heal_per_level: float = 0.0
@@ -177,6 +178,11 @@ class BattleBuff:
     health_regeneration: Callable[[float, float], float] | None = None
     sub_buffs: tuple[int, ...] = ()
     target_sub_buffs: tuple[int, ...] = ()
+    battle_op: int = 0
+    damage_filter: int = 0
+    modifier_stat: int = 0
+    ratio: float = 0.0
+    state_kind: int = 0
 
 
 class BattleTables:
@@ -198,6 +204,11 @@ class BattleTables:
                 interval_count=row.interval_count, interval_damage=next(iter(row.interval_effect), None),
                 health_regeneration=_expression(row.health_regeneration), sub_buffs=tuple(row.sub_buff),
                 target_sub_buffs=tuple(row.target_sub_buff),
+                battle_op=int(getattr(row, "battle_op", 0)),
+                damage_filter=int(getattr(row, "damage_filter", 0)),
+                modifier_stat=int(getattr(row, "modifier_stat", 0)),
+                ratio=float(getattr(row, "ratio", 0.0)),
+                state_kind=int(getattr(row, "state_kind", 0)),
             ) for row in tables["Buff"].rows()
         }
         self.silence_permissions = {
@@ -254,6 +265,7 @@ class BattleTables:
                 class_id=row.class_id, unlock_level=row.unlock_level, max_rank=row.max_rank,
                 skill_types=tuple(row.skill_type), target_modes=tuple(row.targeting_mode), effects=tuple(row.effect),
                 damage_type=row.damage_type, target_team=row.target_team, max_targets=row.max_targets,
+                pet_max_targets=int(getattr(row, "pet_max_targets", 0)),
                 mana_percent=row.mana_percent, heal_multiplier=row.heal_multiplier, heal_per_level=row.heal_per_level,
                 execute_heal_threshold=row.execute_heal_threshold, execute_heal_bonus=row.execute_heal_bonus,
                 restore_mana_percent=row.restore_mana_percent, dispel_count=row.dispel_count,
@@ -262,31 +274,74 @@ class BattleTables:
             )
         return result
 
+    def dungeon_meta(self, battle_config_id: int) -> tuple[int, int, int]:
+        """返回副本表 `(boss_trial_kind, difficulty, round_limit)`。"""
+        dungeon = self.tables["Dungeon"].get(battle_config_id)
+        if dungeon is None:
+            return 0, 0, 0
+        return (
+            int(getattr(dungeon, "boss_trial_kind", 0)),
+            int(getattr(dungeon, "difficulty", 0)),
+            int(getattr(dungeon, "round_limit", 0)),
+        )
+
     def monsters(self, request: Message) -> Iterable[Message]:
         dungeon = self.tables["Dungeon"].get(request.battle_config_id)
+        boss_trial_kind = int(getattr(dungeon, "boss_trial_kind", 0)) if dungeon is not None else 0
+        is_boss_trial = (1 <= boss_trial_kind <= 4) or boss_trial_kind == 8
+        is_boss_trial_or_rescue = is_boss_trial or boss_trial_kind == 5
+        is_festival_beast = boss_trial_kind == 7
+        attackers = sum(player.team_index == 0 for player in request.players)
         ids = [monster for monster in dungeon.monster if monster] if dungeon is not None else []
         if not ids:
             ids = [0] * len(request.players)
-        elif not request.activity_context.kind:
-            attackers = sum(player.team_index == 0 for player in request.players)
+        elif not is_boss_trial_or_rescue and not is_festival_beast and not request.activity_context.kind:
             count = min(10, len(ids) * attackers)
             ids = [ids[index % len(ids)] for index in range(count)]
+        # 首领试炼 V2 精简精英阵：单卫 2..3 人加破军卫(109)、4..5 人加鼓噪卫(110)；双卫 3..5 人加破军卫(109)。
+        if is_boss_trial:
+            if boss_trial_kind == 8:
+                if attackers >= 3 and self.tables["Monster"].get(109) is not None:
+                    ids.append(109)
+            else:
+                if attackers >= 2 and self.tables["Monster"].get(109) is not None:
+                    ids.append(109)
+                if attackers >= 4 and self.tables["Monster"].get(110) is not None:
+                    ids.append(110)
+        hp_scale = max(1, attackers) if is_boss_trial_or_rescue else 1
         level = max(1, max(player.level for player in request.players))
         for monster_id in ids:
             row = self.tables["Monster"].get(monster_id)
             attributes = self.protocol.message("BaseAttributesComp", health=300, strength=5, armor=24, speed=60)
+            is_boss = False
             if row is not None and row.health:
                 for field_name in ("health", "strength", "armor", "resistance", "critchance"):
                     setattr(attributes, field_name, getattr(row, field_name))
                 attributes.speed = row.speed or 60
+                is_boss = bool(getattr(row, "is_boss", 0))
+            base_hp = attributes.health
+            is_support_guard = monster_id in (109, 110)
+            if not is_festival_beast:
+                if boss_trial_kind == 8 and not is_boss and not is_support_guard:
+                    base_hp = max(1, (base_hp * 75) // 100)
+                unit_hp_scale = max(1, (attackers + 1) // 2) if is_support_guard else hp_scale
+                scaled_hp = base_hp * unit_hp_scale
+                if scaled_hp != attributes.health:
+                    attributes.health = scaled_hp
             actor = self.protocol.message("BattleActorState", level=level, monster_table_id=monster_id,
-                                          attributes=attributes, max_health=attributes.health)
+                                          is_boss=is_boss, attributes=attributes, max_health=attributes.health)
             actor.name = "野怪"
             yield actor
 
     def max_rounds(self, request: Message, default: int) -> int:
         dungeon = self.tables["Dungeon"].get(request.battle_config_id)
-        return ceil(dungeon.time_limit * 1000 / _ROUND_MS) if dungeon is not None and dungeon.time_limit else default
+        if dungeon is not None:
+            round_limit = int(getattr(dungeon, "round_limit", 0))
+            if round_limit > 0:
+                return round_limit
+            if dungeon.time_limit:
+                return ceil(dungeon.time_limit * 1000 / _ROUND_MS)
+        return default
 
     def reward_profile(self, battle_config_id: int) -> Message:
         profile = self.rewards.get(battle_config_id, self.rewards.get(0))

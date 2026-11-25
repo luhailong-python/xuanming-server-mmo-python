@@ -653,7 +653,7 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             )
             assert prof.error_message.id == 0
             assert prof.current_season.season_id == 1 and prof.current_season.season_key == "s1"
-            assert prof.current_season.rule_version == 1 and prof.current_season.battle_config_id == 5
+            assert prof.current_season.rule_version == 2 and prof.current_season.battle_config_id == 5
             assert prof.current_season.wait_prompt_seconds == 120
             assert (
                 prof.current_season.spread_tier1_points,
@@ -668,7 +668,7 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             # 2) SaveRankedPreset 边界校验与成功落库
             r_bad_preset = await _call(
                 c, p, save_path,
-                p.message("match.SaveRankedPresetRequest", character_preset_id=999, pet_preset_id=201, rule_version=1),
+                p.message("match.SaveRankedPresetRequest", character_preset_id=999, pet_preset_id=201, rule_version=2),
                 "match.SaveRankedPresetResponse", metadata=md(1001, save_path),
             )
             assert r_bad_preset.error_message.id == ERR_MATCH_RANKED_PRESET_INVALID
@@ -682,7 +682,7 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
 
             r_saved = await _call(
                 c, p, save_path,
-                p.message("match.SaveRankedPresetRequest", character_preset_id=102, pet_preset_id=201, rule_version=1),
+                p.message("match.SaveRankedPresetRequest", character_preset_id=102, pet_preset_id=201, rule_version=2),
                 "match.SaveRankedPresetResponse", metadata=md(1001, save_path),
             )
             assert r_saved.error_message.id == 0
@@ -703,12 +703,12 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             )
             assert r_no_res.error_message.id == ERR_MATCH_BATTLE_REPORT_NOT_FOUND
 
-            # 4) 落账 4 场有效排位：首场亮段、跨 155000 进云章、第 4 场解锁头像纹样且保持最高段位云章
+            # 4) 落账 4 场有效排位：首场亮段、跨 160000 进云章、第 4 场解锁头像纹样且保持最高段位云章
             matches = [
                 (8001, 150_000, 151_600, 1),
-                (8002, 151_600, 154_000, 1),
-                (8003, 154_000, 155_600, 1),  # 进云章
-                (8004, 155_600, 154_000, 2),  # 回青锋，但 peak_tier 保留云章 + 解锁 4 场头像纹样
+                (8002, 151_600, 156_000, 1),
+                (8003, 156_000, 161_000, 1),  # 进云章 (V2 >= 160000)
+                (8004, 161_000, 154_000, 2),  # 回青锋 (V2 >= 152000)，但 peak_tier 保留云章 + 解锁 4 场头像纹样
             ]
             for bid, before, after, outcome in matches:
                 clock.advance(1000)
@@ -782,7 +782,7 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             # 无队成员确认被拒
             r_noteam = await _call(
                 c, p, confirm_path,
-                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=1, character_preset_id=101, pet_preset_id=203, rule_version=1, request_id=str(uuid.uuid4())),
+                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=1, character_preset_id=101, pet_preset_id=203, rule_version=2, request_id=str(uuid.uuid4())),
                 "teampb.TeamResponse", metadata=md(1001, confirm_path),
             )
             assert r_noteam.error_message.id == ERR_TEAM_NO_TEAM
@@ -796,14 +796,14 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             # 非法预设 / 规则版本不符拒绝
             r_bad_tp = await _call(
                 c, p, confirm_path,
-                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=101, pet_preset_id=999, rule_version=1, request_id=str(uuid.uuid4())),
+                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=101, pet_preset_id=999, rule_version=2, request_id=str(uuid.uuid4())),
                 "teampb.TeamResponse", metadata=md(1001, confirm_path),
             )
             assert r_bad_tp.error_message.id == ERR_TEAM_RANKED_PRESET_INVALID
 
             r_bad_tv = await _call(
                 c, p, confirm_path,
-                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=101, pet_preset_id=203, rule_version=2, request_id=str(uuid.uuid4())),
+                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=101, pet_preset_id=203, rule_version=1, request_id=str(uuid.uuid4())),
                 "teampb.TeamResponse", metadata=md(1001, confirm_path),
             )
             assert r_bad_tv.error_message.id == ERR_TEAM_RANKED_PRESET_INVALID
@@ -812,15 +812,15 @@ def test_ranked_v1_profile_presets_cosmetics_battle_result_and_team_confirm():
             c1_req_id = str(uuid.uuid4())
             r_c1 = await _call(
                 c, p, confirm_path,
-                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=102, pet_preset_id=201, rule_version=1, request_id=c1_req_id),
+                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=102, pet_preset_id=201, rule_version=2, request_id=c1_req_id),
                 "teampb.TeamResponse", metadata=md(1001, confirm_path),
             )
             assert r_c1.error_message.id == 0 and r_c1.team.ranked_presets_all_confirmed is False
-            assert r_c1.team.ranked_season_id == 1 and r_c1.team.ranked_rule_version == 1
+            assert r_c1.team.ranked_season_id == 1 and r_c1.team.ranked_rule_version == 2
 
             r_c2 = await _call(
                 c, p, confirm_path,
-                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=103, pet_preset_id=203, rule_version=1, request_id=str(uuid.uuid4())),
+                p.message("teampb.ConfirmRankedPresetRequest", expected_team_id=tid, character_preset_id=103, pet_preset_id=203, rule_version=2, request_id=str(uuid.uuid4())),
                 "teampb.TeamResponse", metadata=md(1002, confirm_path),
             )
             assert r_c2.error_message.id == 0 and r_c2.team.ranked_presets_all_confirmed is True

@@ -232,6 +232,7 @@ enum eBattleEventType {
   BATTLE_EVENT_PET_RETREAT = 19;
   BATTLE_EVENT_SHIELD = 20;
   BATTLE_EVENT_ARTIFACT = 21; // 法宝产生实际收益或消耗概率判定次数。
+  BATTLE_EVENT_BOSS_MECHANIC = 22; // 首领试炼 V2 破招/阶段/联防/蓄势演出事件（mechanic_kind 标明子类型）。
 }
 
 // 一段伤害 / 出手是怎么来的(equipment-attributes.md §4.5)。0 = 普通,老客户端不读也不影响演出。
@@ -272,6 +273,24 @@ message BattleEventItem {
   uint64 artifact_item_id = 22;
   uint32 artifact_effect_id = 23;
   uint32 season_seal_id = 24; // 非 0 表示本次 BATTLE_EVENT_ARTIFACT 由单槽赛季印触发（artifact_item_id 为 0）。
+  // BATTLE_EVENT_BOSS_MECHANIC 机制子类型：1=化劲破绽，2=断疗反噬，3=崩势破盾，4=阵脚震荡，
+  // 5=决战姿态(破釜)，6=护势蓄势，7=破军破甲，8=回春净益，9=断脉气馁。
+  uint32 mechanic_kind = 25;
+  bool is_splash_reduced = 26; // true = 本次直接伤害触发首领试炼副目标溅射减伤(60%)
+  bool is_primary_focus = 27;  // true = 竞技 PVP 多目标技能显式主目标触发凝锋(+20%)
+}
+
+// PVP 延迟投降投票状态（仅向投票所属队伍可见；对手与观众视图由 battle 节点清空）。
+message BattleSurrenderVoteState {
+  bool active = 1;                       // true = 当前回合存在进行中的本队投降投票
+  uint32 team_index = 2;                 // 发起队伍(0=A方, 1=B方)
+  uint64 initiator_player_id = 3;        // 本轮投票发起人
+  uint32 initiated_round = 4;            // 发起回合号
+  repeated uint64 agreed_player_ids = 5; // 已同意投降的同队玩家 ID（升序）
+  uint32 required_agrees = 6;            // 通过所需活跃同意数（自动排除连续 >=2 回合未手动挂机队友）
+  uint32 next_allowed_round = 7;         // 冷却中下一次允许发起投降的回合号（无冷却为 0）
+  bool rejected = 8;                     // true = 本次通知表示投票被否决或过期关闭
+  bool passed = 9;                       // true = 本次通知表示投票已通过、本方投降生效
 }
 
 // ---- 胜负 ----
@@ -367,6 +386,8 @@ message BattleSettlementData {
   bool use_free_preset = 30;
   // 瑞兽迎春限时活动开局冻结上下文（由 TurnBattleEngine::BuildSettlement 原样回传，供 scene 离线/跨期结算）。
   FestivalBeastBattleContext festival_beast = 31;
+  // true = 本方通过第 5 回合起的 PVP 延迟投降结束本局（与 fled 逃跑区分：体面认输，满足有效对抗门槛照常计场次与绑定材料）。
+  bool surrendered = 32;
 }
 
 // ---- 出战宝宝的结算数据(随主人的 BattleSettlementData 一起回 scene)----
@@ -507,4 +528,9 @@ message BattleTrialJournalFacts {
   bool dealt_yang_bell_physical_damage = 18;   // 卷二碧渊水宫阳钟阶段物理击伤标记
   bool dealt_yin_drum_magic_damage = 19;       // 卷二碧渊水宫阴鼓阶段法术击伤标记
   bool finished_in_ebb_tide = 20;              // 卷二月汐湾退潮窗口终结标记
+  uint32 cleave_parry_count = 21;              // 首领试炼 V2：团队成功化解重劈（含控断）触发破绽次数
+  uint32 heal_interrupt_backlash_count = 22;   // 首领试炼 V2：触发回春断疗反噬次数
+  uint32 stance_break_count = 23;              // 首领试炼 V2：触发驱散/控断护势「崩势」次数
+  bool all_self_cleaves_parried = 24;          // 首领试炼 V2：本人及本人宝宝被重劈点名>=1次且100%合法化解(不含倒地/退出取消)
+  bool self_parried_cleave_at_least_once = 25; // 首领试炼 V2：本人或本人宝宝至少合法化解过 1 次重劈
 }

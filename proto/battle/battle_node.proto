@@ -27,8 +27,9 @@ message ObserverExitOriginal {
 }
 
 // battle 节点内部 gRPC 契约(match 服务调用)。
-// battle_id 由 match 服务用 shared/snowflake(17-bit worker 布局)生产,是该 ID 的唯一生产者
-// (SnowFlake 节点隔离不变量,宪法 §7)。
+// battle_id 只由 match 服务生产:从发号器领号(data_service.AllocateIdSegment,biz_tag=battle,与 challenge_id /
+// team_id 共用一个号段)。它是打散过的计数器值,没有位布局,不能用 ParseSnowflakeGuid 解析,也不能靠大小判先后
+// (AGENTS.md §7 第 1 条)。
 // 设计依据:docs/design/turn-based-battle-server.md §3.1、§5.4。
 
 message CreateBattleRequest {
@@ -59,7 +60,14 @@ message CreateBattleRequest {
   // 缺省 false = 不录,老发送方和漏填一律不录。只有 match 让录,battle 才在终局请求里带 replay:
   // match 把带未知字段的终局请求当永久冲突拒收。
   bool record_replay = 16;
+  // 每队的战斗剧本(docs/design/battle-script.md):match 按「队长 / 单人选用 > 官方绑定」解析后按值冻结,每队至多一份。
+  // 没有 = 该队出手走现行默认。battle 开局按自己的配表再校验,不合法整份忽略并记 ERROR(剧本只影响出招,不碰资产,
+  // 按 AGENTS §11.3 选 fail-open);校验通过的剧本整场不变,回放与按指令流重算的输入都在本原件里。
   repeated BattleTeamScript team_scripts = 17;
+  // 论剑排位冻结上下文(非排位留空)。season_id != 0 时启用排位引擎规则:临时竞技宝宝、同速确定性随机、回合上限判平与参与事实冻结。
+  RankedMatchContext ranked_context = 18;
+  // 五行试炼志 V2 开局冻结上下文(非试炼志关联局留空)。
+  TrialBattleContext trial_context = 19;
 }
 
 // error_message 非零 = 未建房。签不出参战票据时回 kServiceUnavailable(turn-based §22 D70 fail-closed):

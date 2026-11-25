@@ -15,6 +15,17 @@ from google.protobuf.message import DecodeError, Message
 
 from ..grpc_runtime import sign_service_call
 from ..protocol import Protocol
+from .economy_credit import (
+    MAX_DAILY_PLAYER_TRADE_SCAN_ROWS,
+    MAX_REFERENCE_SCAN_ROWS,
+    MarketFillSample,
+    SellerCreditKey,
+    SellerCreditProfile,
+    SellerReviewRecord,
+    SellerViolationRecord,
+    saturating_add_uint64,
+    workflow_currency_outflow,
+)
 from .errors import (
     AssetOpLeaseLostError,
     AssetOpPoisonRowError,
@@ -32,15 +43,20 @@ from .model import (
     ASSET_OP_MAX_SPAN,
     ASSET_STREAM_TRADE_DEBIT,
     COMMERCE_CANCELLED,
+    COMMERCE_DELIVERED,
+    COMMERCE_DELIVERING,
     COMMERCE_ESCROWING,
     COMMERCE_KIND_MARKET_MATCH,
     COMMERCE_KIND_OFFICIAL,
+    COMMERCE_KIND_PLAYER_TRADE,
     COMMERCE_KIND_RMB_CONSIGNMENT,
     COMMERCE_MANUAL,
     COMMERCE_REFUND_PENDING,
     COMMERCE_SETTLED,
+    COMMERCE_WAITING,
     DUE_STATUSES,
     FRESH_ATTEMPT_LIMIT,
+    UINT64_MAX,
     LISTING_SORT_DEFAULT,
     LISTING_SORT_LEVEL_DESC,
     LISTING_SORT_PRICE_ASC,
@@ -535,6 +551,11 @@ class _MemoryState:
         self.commerce_by_req: dict[str, int] = {}  # request_key -> commerce_id
         self.guards: set[int] = set()
         self.role_fences: dict[int, RoleFenceRow] = {}
+        self.credit_profiles: dict[SellerCreditKey, SellerCreditProfile] = {}
+        self.credit_completed_orders: dict[str, SellerCreditKey] = {}
+        self.credit_reviews_by_order: dict[str, SellerReviewRecord] = {}
+        self.credit_reviews: list[SellerReviewRecord] = []
+        self.credit_violations: dict[str, SellerViolationRecord] = {}
 
 
 class _MemoryTx:
@@ -1185,3 +1206,172 @@ class MemoryTradeStore(TradeStoreBase):
         rec = self._state.commerce.get(int(commerce_id))
         if rec is not None:
             rec.workflow_proto = raw
+
+    # -- 卖家信用、近 7 日成交参考价与当面交易单日流出 ---------------------------------------------------
+
+    async def get_credit_profile(self, key: SellerCreditKey) -> SellerCreditProfile | None:
+        async with self._lock:
+            prof = self._state.credit_profiles.get(key)
+            return None if prof is None else replace(prof)
+
+    async def has_prior_credit_epoch(self, seller_player_id: int, current_revision: int) -> bool:
+        pid = int(seller_player_id)
+        rev = int(current_revision)
+        async with self._lock:
+            return any(
+                k.seller_player_id == pid and k.owner_revision < rev
+                for k in self._state.credit_profiles
+            )
+
+    async def save_credit_profile(self, profile: SellerCreditProfile) -> None:
+        key = SellerCreditKey(
+            seller_player_id=int(profile.seller_player_id),
+            owner_revision=int(profile.owner_revision),
+        )
+        async with self._lock:
+            self._state.credit_profiles[key] = replace(profile)
+
+    async def mark_seller_order_completed(self, order_id: str, key: SellerCreditKey) -> bool:
+        async with self._lock:
+            if order_id in self._state.credit_completed_orders:
+                return False
+            self._state.credit_completed_orders[order_id] = key
+            return True
+
+    async def get_seller_review_by_order(self, order_id: str) -> SellerReviewRecord | None:
+        async with self._lock:
+            rec = self._state.credit_reviews_by_order.get(order_id)
+            return None if rec is None else replace(rec)
+
+    async def count_pair_scored_reviews(
+        self,
+        key: SellerCreditKey,
+        buyer_key: str,
+        buyer_ip: str,
+        buyer_device_id: str,
+        since_ms: int,
+        now_ms: int,
+    ) -> int:
+        async with self._lock:
+            count = 0
+            for r in self._state.credit_reviews:
+                if (
+                    r.seller_player_id != key.seller_player_id
+                    or r.seller_owner_revision != key.owner_revision
+                    or not r.counted_for_score
+                    or r.created_at_ms < since_ms
+                    or r.created_at_ms > now_ms
+                ):
+                    continue
+                same_buyer = (
+                    r.buyer_account == buyer_key
+                    or (bool(buyer_ip) and bool(r.buyer_ip) and r.buyer_ip == buyer_ip)
+                    or (bool(buyer_device_id) and bool(r.buyer_device_id) and r.buyer_device_id == buyer_device_id)
+                )
+                if same_buyer:
+                    count += 1
+            return count
+
+    async def save_seller_review(self, rec: SellerReviewRecord) -> None:
+        async with self._lock:
+            cloned = replace(rec)
+            self._state.credit_reviews_by_order[cloned.order_id] = cloned
+            self._state.credit_reviews.append(cloned)
+
+    async def has_seller_violation(self, case_id: str) -> bool:
+        async with self._lock:
+            return case_id in self._state.credit_violations
+
+    async def save_seller_violation(self, rec: SellerViolationRecord) -> None:
+        async with self._lock:
+            self._state.credit_violations[rec.case_id] = replace(rec)
+
+    async def list_settled_market_fills(
+        self,
+        item_config_id: int,
+        currency_type: int,
+        floor_ms: int,
+        now_ms: int,
+        limit: int = MAX_REFERENCE_SCAN_ROWS,
+    ) -> list[MarketFillSample]:
+        item_id = int(item_config_id)
+        cur = int(currency_type)
+        lo = int(floor_ms)
+        hi = int(now_ms)
+        async with self._lock:
+            matched = [
+                rec
+                for rec in self._state.commerce.values()
+                if int(rec.kind) == COMMERCE_KIND_MARKET_MATCH
+                and int(rec.side) == 0
+                and int(rec.status) == COMMERCE_SETTLED
+                and int(rec.item_config_id) == item_id
+                and int(rec.currency_type) == cur
+                and lo <= int(rec.updated_ms) <= hi
+            ]
+            matched.sort(key=lambda r: (int(r.updated_ms), int(r.commerce_id)), reverse=True)
+            samples: list[MarketFillSample] = []
+            for rec in matched[: int(limit)]:
+                seller_acct = ""
+                buyer_acct = ""
+                if rec.workflow_proto:
+                    w = _decode_workflow(self.protocol, bytes(rec.workflow_proto))
+                    if w is not None:
+                        if w.HasField("seller_identity"):
+                            seller_acct = str(w.seller_identity.account)
+                        if w.HasField("buyer_identity"):
+                            buyer_acct = str(w.buyer_identity.account)
+                samples.append(
+                    MarketFillSample(
+                        item_config_id=item_id,
+                        currency_type=cur,
+                        unit_price=int(rec.unit_price),
+                        quantity=int(rec.quantity),
+                        seller_account=seller_acct,
+                        buyer_account=buyer_acct,
+                        settled_at_ms=int(rec.updated_ms),
+                    )
+                )
+            return samples
+
+    async def daily_player_trade_currency_outflow(
+        self,
+        player_id: int,
+        currency_type: int,
+        day_start_ms: int,
+    ) -> int:
+        pid = int(player_id)
+        cur = int(currency_type)
+        since = int(day_start_ms)
+        active_statuses = (
+            COMMERCE_WAITING,
+            COMMERCE_ESCROWING,
+            COMMERCE_DELIVERING,
+            COMMERCE_DELIVERED,
+            COMMERCE_MANUAL,
+            COMMERCE_SETTLED,
+        )
+
+        def _sum_side(as_seller: bool) -> int:
+            rows = [
+                rec
+                for rec in self._state.commerce.values()
+                if int(rec.kind) == COMMERCE_KIND_PLAYER_TRADE
+                and int(rec.status) in active_statuses
+                and int(rec.created_ms) >= since
+                and (int(rec.seller_player_id) == pid if as_seller else int(rec.buyer_player_id) == pid)
+            ]
+            rows.sort(key=lambda r: int(r.commerce_id), reverse=True)
+            rows = rows[:MAX_DAILY_PLAYER_TRADE_SCAN_ROWS]
+            if len(rows) >= MAX_DAILY_PLAYER_TRADE_SCAN_ROWS:
+                return UINT64_MAX
+            total = 0
+            for rec in rows:
+                part = workflow_currency_outflow(
+                    self.protocol, bytes(rec.workflow_proto), cur, as_seller=as_seller
+                )
+                total = saturating_add_uint64(total, part)
+            return total
+
+        async with self._lock:
+            return saturating_add_uint64(_sum_side(True), _sum_side(False))

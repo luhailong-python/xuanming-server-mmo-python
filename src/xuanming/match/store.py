@@ -28,6 +28,8 @@ from .battle_scripts import (
     BattleScriptReviewError,
 )
 from .errors import (
+    ActivityIntentConflictError,
+    ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
@@ -90,6 +92,7 @@ from .model import (
     MAX_BATTLE_REPORTS,
     MAX_INVITES_PER_PLAYER,
     MAX_TEAM_SIZE,
+    MODE_PVE_SOLO,
     MODE_PVE_TEAM,
     MODE_PVP_CHALLENGE,
     MODE_PVP_TEAM,
@@ -421,6 +424,20 @@ class MatchStore(TypingProtocol):
         battle_node: tuple[int, str, str, int, str],
         battle_deadline_ms: int,
     ) -> tuple[Message, bool]: ...
+    async def start_festival_beast_battle(
+        self,
+        *,
+        owner_id: int,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        activity_context_bytes: bytes,
+        effective_start_at_ms: int,
+        effective_end_at_ms: int,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]: ...
     async def cancel_activity_battle(self, request_id: int) -> tuple[int, bool, int, int]: ...
 
     # Battle Outcome, Terminal Decision & Outbox
@@ -568,6 +585,7 @@ class MatchStore(TypingProtocol):
         participated: bool,
         settled_at_ms: int,
         milestones: tuple[tuple[int, int, int, str], ...],
+        win_milestone: tuple[int, int, int, str] | None = None,
     ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]: ...
     async def get_ranked_battle_result(self, player_id: int, battle_id: int = 0) -> bytes | None: ...
 
@@ -679,6 +697,9 @@ class _MemState:
     formations: dict[int, Message] = field(default_factory=dict)
     featured_battles: set[int] = field(default_factory=set)
     activity_intents: dict[int, tuple[int, bool]] = field(default_factory=dict)  # request_id -> (battle_id, cancelled)
+    direct_intents: dict[tuple[int, int, int, int], tuple[int, bytes, bool]] = field(
+        default_factory=dict
+    )  # (kind, owner_id, req_high, req_low) -> (battle_id, payload, cancelled)
 
     completions: dict[int, _MemCompletionRow] = field(default_factory=dict)
     settlements: dict[tuple[int, int], _MemSettlementRow] = field(default_factory=dict)
@@ -2563,6 +2584,92 @@ class MemoryMatchStore:
 
         return await self._run_tx(work)
 
+    async def start_festival_beast_battle(
+        self,
+        *,
+        owner_id: int,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        activity_context_bytes: bytes,
+        effective_start_at_ms: int,
+        effective_end_at_ms: int,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        """瑞兽迎春 Kind=5 持久直入准入：事务提交点复核 [start, end) 窗口与 UUID 正文幂等。"""
+        now = await self.now_ms()
+        key = (5, int(owner_id), int(request_high), int(request_low))
+
+        def work(s: _MemState):
+            prev = s.direct_intents.get(key)
+            if prev is not None:
+                bid, orig_payload, cancelled = prev
+                if orig_payload != payload_bytes:
+                    raise ActivityIntentConflictError("festival beast intent payload mismatch")
+                if cancelled:
+                    raise MatchBusinessError(ERR_MATCH_CANCEL_TOO_LATE)
+                return self._clone_msg(s.formations[bid]), False
+            if (
+                effective_start_at_ms == 0
+                or effective_end_at_ms <= effective_start_at_ms
+                or now < effective_start_at_ms
+                or now >= effective_end_at_ms
+            ):
+                raise ActivityOutsideWindowError("outside festival beast open window")
+            tk = s.tickets.get(owner_id)
+            if tk is not None and int(tk.state) in (TICKET_STATE_QUEUED, TICKET_STATE_FORMING, TICKET_STATE_READY):
+                raise TeamBusinessError(ERR_TEAM_MEMBER_NOT_READY, owner_id)
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            battle_id = self._alloc_id_locked()
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id,
+                operation_id=op_id,
+                state=FORMATION_STATE_PREPARING,
+                physical_region=b_region,
+                target_node_id=b_node_id,
+                target_instance_id=b_uuid,
+                target_endpoint=b_endpoint,
+                mode=MODE_PVE_SOLO,
+                config_id=battle_config_id,
+                created_ms=now,
+                deadline_ms=now + battle_deadline_ms,
+                retry_at_ms=now + 60_000,
+                activity_context=activity_context_bytes,
+                requeue_on_failure=False,
+                release_track=b_track,
+            )
+            tk_id = f"fb-{battle_id}-{owner_id}"
+            formation.members.add(player_id=owner_id, ticket=tk_id, team_index=0, captain=True)
+            occ = s.occupancies.get(owner_id)
+            fence = s.role_fences.get(owner_id)
+            acct = occ.account if occ else (fence.account if fence else f"acct:{owner_id}")
+            rev = occ.owner_revision if occ else (fence.owner_revision if fence else 1)
+            s.tickets[owner_id] = self.protocol.message(
+                "match.MatchAuthorityTicketRecord",
+                player_id=owner_id,
+                ticket=tk_id,
+                request_id=op_id,
+                mode=MODE_PVE_SOLO,
+                config_id=battle_config_id,
+                team_size=1,
+                state=TICKET_STATE_FORMING,
+                enqueued_ms=now,
+                formation_id=battle_id,
+                expires_ms=now + battle_deadline_ms,
+                selected_region=b_region,
+                owner_account=acct,
+                owner_revision=rev,
+            )
+            s.formations[battle_id] = formation
+            s.direct_intents[key] = (battle_id, payload_bytes, False)
+            return self._clone_msg(formation), True
+
+        return await self._run_tx(work)
+
     async def cancel_activity_battle(self, request_id: int) -> tuple[int, bool, int, int]:
         def work(s: _MemState):
             prev = s.activity_intents.get(request_id)
@@ -3582,6 +3689,7 @@ class MemoryMatchStore:
         participated: bool,
         settled_at_ms: int,
         milestones: tuple[tuple[int, int, int, str], ...],
+        win_milestone: tuple[int, int, int, str] | None = None,
     ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
         def work(s: _MemState) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
             existing_battle = s.ranked_battles.get((battle_id, player_id))
@@ -3632,6 +3740,22 @@ class MemoryMatchStore:
                             reward_kind=reward_kind,
                             tier_value=threshold,
                             item_code=item_code,
+                            granted_at_ms=settled_at_ms,
+                        )
+                        s.ranked_rewards[rkey] = rew
+                        unlocked.append(rew)
+            if win_milestone is not None:
+                w_target, w_bit, w_kind, w_code = win_milestone
+                if w_target > 0 and wins >= w_target and not (milestone_bits & w_bit):
+                    milestone_bits |= w_bit
+                    rkey = (player_id, season_id, w_kind)
+                    if rkey not in s.ranked_rewards:
+                        rew = RankedRewardRow(
+                            player_id=player_id,
+                            season_id=season_id,
+                            reward_kind=w_kind,
+                            tier_value=w_target,
+                            item_code=w_code,
                             granted_at_ms=settled_at_ms,
                         )
                         s.ranked_rewards[rkey] = rew

@@ -40,11 +40,13 @@ _ACTION_SKILL = 2
 _ACTION_DEFEND = 3
 
 _EVENT_HEAL = 4
+_EVENT_BUFF_ADD = 5
 _EVENT_BUFF_REMOVE = 6
 _EVENT_MANA = 14
 _EVENT_RESIST = 15
 _EVENT_SHIELD = 20
 _EVENT_ARTIFACT = 21
+EVENT_BOSS_MECHANIC = 22
 
 _HIT_COUNTER = 2
 _HIT_REFLECT = 3
@@ -53,6 +55,113 @@ _DAMAGE_PHYSICAL = 1
 
 _I64_MAX = (1 << 63) - 1
 _ENGINE_ACTOR_FLAG = 1 << 63
+
+# 行动超时与 PVP V2 / 投降 / 首领试炼 V2 常量（与 C++ turn_battle_constants.h 逐项对齐）
+ACTION_TIMEOUT_MS = 25_000
+BOSS_TRIAL_ACTION_TIMEOUT_MS = 18_000
+MATCH_MODE_PVE_SOLO = 4
+MATCH_MODE_PVE_TEAM = 5
+MATCH_MODE_POLARITY_5V5 = 8
+MATCH_MODE_SEASON_TOURNAMENT = 11
+
+PVP_PRIMARY_FOCUS_NUM = 120
+PVP_PRIMARY_FOCUS_DEN = 100
+PVP_ESCALATION_MIN_MAX_ROUNDS = 10
+PVP_ESCALATION_LEAD_ROUNDS = 7
+PVP_ESCALATION_DAMAGE_STEP_PCT = 10
+PVP_ESCALATION_SUPPORT_STEP_PCT = 10
+PVP_ESCALATION_SUPPORT_FLOOR_PCT = 20
+PVP_SURRENDER_UNLOCK_ROUND = 5
+PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS = 3
+PVP_SURRENDER_EXPIRE_COOLDOWN_ROUNDS = 2
+PVP_SURRENDER_IDLE_EXCLUDE_ROUNDS = 2
+
+# 投降错误码（与 match_error_tip.pb.h 对齐）
+ERR_SURRENDER_NOT_ALLOWED = 16052
+ERR_SURRENDER_TOO_EARLY = 16053
+ERR_SURRENDER_COOLDOWN = 16054
+ERR_SURRENDER_ALREADY_VOTED = 16055
+
+# 首领试炼与特殊玩法类型（对应 DungeonTable.boss_trial_kind）
+BOSS_TRIAL_KIND_NONE = 0
+BOSS_TRIAL_KIND_BREAK_REJUV = 1
+BOSS_TRIAL_KIND_BREAK_STANCE = 2
+BOSS_TRIAL_KIND_BARRIER = 3
+BOSS_TRIAL_KIND_VENOM = 4
+BOSS_TRIAL_KIND_GUARDIAN_RESCUE = 5
+BOSS_TRIAL_KIND_POLARITY_5V5 = 6
+BOSS_TRIAL_KIND_FESTIVAL_BEAST = 7
+BOSS_TRIAL_KIND_BREAK_DUAL_GUARD = 8
+
+BOSS_STANCE_NONE = 0
+BOSS_STANCE_PHYSICAL = 1
+BOSS_STANCE_MAGIC = 2
+
+BOSS_TRIAL_MONSTER_GUARD_REJUV = 102
+BOSS_TRIAL_MONSTER_GUARD_STANCE = 103
+BOSS_TRIAL_MONSTER_SUPPORT_BREAKER = 109
+BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER = 110
+
+BOSS_TRIAL_SPLASH_KEEP_PCT = 60
+BOSS_EXPOSED_FULL_PCT = 35
+BOSS_EXPOSED_PARTIAL_PCT = 20
+BOSS_PHASE_TWO_VULN_PCT = 15
+BOSS_MOMENTUM_MAX_STACKS = 3
+BOSS_MOMENTUM_PER_STACK_PCT = 12
+BOSS_HEAL_BACKLASH_PCT = 6
+BOSS_DRUMMER_DEATH_SHOCK_PCT = 4
+BOSS_DUAL_GUARD_HP_KEEP_PCT = 75
+
+BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE = 1
+BOSS_MECHANIC_HEAL_BACKLASH = 2
+BOSS_MECHANIC_STANCE_BREAK = 3
+BOSS_MECHANIC_SUPPORT_SHOCK = 4
+BOSS_MECHANIC_PHASE_TWO_ENRAGE = 5
+BOSS_MECHANIC_MOMENTUM_GAIN = 6
+BOSS_MECHANIC_BREAKER_SUNDER = 7
+BOSS_MECHANIC_REJUV_CLEANSE = 8
+BOSS_MECHANIC_ANTI_HEAL_DISHEARTEN = 9
+
+TELEGRAPH_KIND_SLOW_CLEAVE = 1
+TELEGRAPH_KIND_GUARD_HEAL = 2
+TELEGRAPH_KIND_GUARD_STANCE_PHYS = 3
+TELEGRAPH_KIND_GUARD_STANCE_MAGIC = 4
+TELEGRAPH_KIND_GUARD_SHIELD = 5
+TELEGRAPH_KIND_GUARD_BIND = 6
+TELEGRAPH_KIND_BOSS_MAGIC_STRIKE = 7
+TELEGRAPH_KIND_BOSS_VENOM_AOE = 8
+TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE = 9
+
+TELEGRAPH_STATUS_UPCOMING = 1
+TELEGRAPH_STATUS_EXECUTING = 2
+TELEGRAPH_STATUS_EXECUTED = 3
+TELEGRAPH_STATUS_CANCELLED_BY_CONTROL = 4
+TELEGRAPH_STATUS_CANCELLED_TARGET_INVALID = 5
+
+POLARITY_DEFAULT_MAX_ROUNDS = 16
+POLARITY_DAMAGE_NUM = 115
+POLARITY_DAMAGE_DEN = 100
+RANKED_DEFAULT_MAX_ROUNDS = 20
+
+
+def is_boss_trial_kind(kind: int) -> bool:
+    """判断 boss_trial_kind 是否属于首领试炼（1..4 或 8）。"""
+    return (BOSS_TRIAL_KIND_BREAK_REJUV <= kind <= BOSS_TRIAL_KIND_VENOM) or kind == BOSS_TRIAL_KIND_BREAK_DUAL_GUARD
+
+
+def is_boss_trial_or_rescue_kind(kind: int) -> bool:
+    """判断 boss_trial_kind 是否属于首领试炼或护卫救援。"""
+    return is_boss_trial_kind(kind) or kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+
+
+def is_boss_stance_trial_kind(kind: int) -> bool:
+    """判断是否包含护势联防阵机制（破阵·护势 或 破阵·双卫同阵）。"""
+    return kind in (BOSS_TRIAL_KIND_BREAK_STANCE, BOSS_TRIAL_KIND_BREAK_DUAL_GUARD)
+
+
+def is_boss_rejuv_trial_kind(kind: int) -> bool:
+    """判断是否包含回春护卫机制（破阵·回春 或 破阵·双卫同阵）。"""
+    return kind in (BOSS_TRIAL_KIND_BREAK_REJUV, BOSS_TRIAL_KIND_BREAK_DUAL_GUARD)
 
 # 赛季规则硬安全上限（对照 season_rules.h）
 SEASON_HARD_STAT_CAP_BPS = 500
@@ -130,6 +239,8 @@ class SealConditionType(IntEnum):
     POLARITY_WIN = 10
     ARTIFACT_SHIELD_BREAK = 11
     ANTI_CONTROL_OR_SEASON_SKILL = 12
+    DUAL_GUARD_BREAK = 13
+    PERFECT_CLEAVE_PARRY = 14
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1198,8 @@ class EquipmentBattleEffects:
                         contributions.append(idx)
                     bonus += bps / 10_000.0
             capacity_float = PetAndSupportEffects.apply_bonus(base_capacity, bonus)
+        if getattr(self.engine, "escalation_stacks", 0) > 0:
+            capacity_float *= self.engine.escalation_support_pct / 100.0
         capacity = PetAndSupportEffects.whole(capacity_float)
         if capacity <= 0:
             return 0
@@ -1899,6 +2012,17 @@ def evaluate_seal_condition(condition_type: int, condition_param: int, settlemen
         return (won or settlement.participated) and facts.self_triggered_shield_break
     if cond == SealConditionType.ANTI_CONTROL_OR_SEASON_SKILL:
         return (won or settlement.participated) and facts.self_triggered_anti_control_or_season_skill
+    if cond == SealConditionType.DUAL_GUARD_BREAK:
+        return (
+            won
+            and (
+                facts.guard_stance_dispelled
+                or (facts.team_dealt_physical_direct_damage and facts.team_dealt_magic_direct_damage)
+            )
+            and (facts.boss_guard_heal_total == 0 or facts.heal_interrupt_backlash_count > 0)
+        )
+    if cond == SealConditionType.PERFECT_CLEAVE_PARRY:
+        return won and facts.all_self_cleaves_parried
     return False
 
 
@@ -1932,6 +2056,13 @@ class TrialFactTracker:
         self.dealt_yang_bell_physical_damage: bool = False
         self.dealt_yin_drum_magic_damage: bool = False
         self.finished_in_ebb_tide: bool = False
+
+        # 首领试炼 V2 局内战法事实
+        self.cleave_parry_count: int = 0
+        self.heal_interrupt_backlash_count: int = 0
+        self.stance_break_count: int = 0
+        self.self_cleaves_targeted_by_player: dict[int, int] = {}
+        self.self_cleaves_parried_by_player: dict[int, int] = {}
 
     @staticmethod
     def _normalize_context(ctx: Message | TrialContext | None) -> TrialContext:
@@ -2148,7 +2279,1036 @@ class TrialFactTracker:
         facts.dealt_yang_bell_physical_damage = self.dealt_yang_bell_physical_damage
         facts.dealt_yin_drum_magic_damage = self.dealt_yin_drum_magic_damage
         facts.finished_in_ebb_tide = self.finished_in_ebb_tide
+        facts.cleave_parry_count = self.cleave_parry_count
+        facts.heal_interrupt_backlash_count = self.heal_interrupt_backlash_count
+        facts.stance_break_count = self.stance_break_count
+        self_targeted = self.self_cleaves_targeted_by_player.get(player_id, 0)
+        self_parried = self.self_cleaves_parried_by_player.get(player_id, 0)
+        facts.self_parried_cleave_at_least_once = self_parried > 0
+        facts.all_self_cleaves_parried = self_targeted > 0 and self_parried == self_targeted
 
         settlement.manual_action_rounds = len(self.manual_action_rounds.get(player_id, ()))
         settlement.effective_combat_contribution = player_id in self.effective_contribution_players
         return facts
+
+
+# ---------------------------------------------------------------------------
+# 7. 首领试炼 V2 / 瑞兽迎春 / 物法易势 / 护卫救援局内机制控制器
+# ---------------------------------------------------------------------------
+
+
+class EncounterV2Controller:
+    """承载首领试炼 V2、瑞兽迎春、护卫救援与物法易势 5V5 的确定性机制状态机。"""
+
+    def __init__(
+        self,
+        engine: TurnEngine,
+        request: Message,
+        *,
+        boss_trial_kind: int = BOSS_TRIAL_KIND_NONE,
+        battle_difficulty: int = 0,
+    ):
+        self.engine = engine
+        self.request = request
+        self.boss_trial_kind = boss_trial_kind
+        self.battle_difficulty = battle_difficulty
+        self.initial_attacker_human_count = sum(1 for p in request.players if p.team_index == 0)
+        self.protected_guard_actor_id: int = 0
+        self.initial_polarity: int = 0
+        self.active_polarity: int = 0
+        self.boss_stance_type: int = BOSS_STANCE_NONE
+        self.boss_stance_remain_rounds: int = 0
+        self.last_chosen_stance_type: int = BOSS_STANCE_NONE
+        self.boss_barrier_shield: int = 0
+        self.boss_phase: int = 1 if is_boss_trial_kind(boss_trial_kind) else 0
+        self.next_phase2_cleave_telegraph_round: int = 0
+        self.boss_momentum_stacks: int = 0
+        self.boss_disheartened_until_round: int = 0
+        self.exposed_actors: dict[int, tuple[int, int]] = {}
+        self.sunder_until_round: dict[int, int] = {}
+        self.attacker_triggered_stance_counter_this_round: set[int] = set()
+        self.round_player_direct_damage: dict[int, list[int]] = {}
+        self.active_telegraphs: list[Message] = []
+        self.last_resolved_telegraphs: list[Message] = []
+        self.telegraph_state_version: int = 0
+
+    @property
+    def is_festival_beast(self) -> bool:
+        return (
+            self.boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST
+            and self.request.HasField("activity_context")
+            and self.request.activity_context.kind == 2
+            and self.request.activity_context.HasField("festival_beast")
+        )
+
+    @property
+    def is_boss_trial(self) -> bool:
+        return is_boss_trial_kind(self.boss_trial_kind)
+
+    @property
+    def has_active_damage_modifiers(self) -> bool:
+        return self.active_polarity != 0 or self.is_boss_trial
+
+    def _find_alive_boss(self) -> Message | None:
+        for actor in self.engine.actors.values():
+            if actor.actor_type == _ACTOR_MONSTER and actor.team_index == 1 and actor.is_boss and _active(actor):
+                return actor
+        return None
+
+    def _collect_alive_enemies(self, actor: Message) -> list[int]:
+        return sorted(
+            other.actor_id
+            for other in self.engine.actors.values()
+            if _active(other) and other.team_index != actor.team_index
+        )
+
+    def _rand_index(self, bound: int) -> int:
+        return 0 if bound <= 1 else int(self.engine.rng.next() % bound)
+
+    def init_special_encounter_state(self) -> None:
+        """开局初始化物法易势极性、护卫救援目标或首领试炼/瑞兽首轮预告。"""
+        if self.boss_trial_kind == BOSS_TRIAL_KIND_NONE:
+            return
+        if self.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5 or self.request.match_mode == MATCH_MODE_POLARITY_5V5:
+            self.initial_polarity = _DAMAGE_PHYSICAL if self._rand_index(2) == 0 else _DAMAGE_MAGIC
+            self.update_polarity_for_round()
+            return
+        if self.boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE:
+            for actor in self.engine.actors.values():
+                if actor.actor_type == _ACTOR_MONSTER and actor.team_index == 0 and not actor.is_boss:
+                    self.protected_guard_actor_id = actor.actor_id
+                    break
+        self.refresh_encounter_telegraphs()
+
+    def update_polarity_for_round(self) -> None:
+        if self.boss_trial_kind != BOSS_TRIAL_KIND_POLARITY_5V5 and self.request.match_mode != MATCH_MODE_POLARITY_5V5:
+            self.active_polarity = 0
+            return
+        if self.initial_polarity == 0:
+            self.initial_polarity = _DAMAGE_PHYSICAL
+        block = max(0, self.engine.round_index - 1) // 2
+        if block % 2 == 0:
+            self.active_polarity = self.initial_polarity
+        else:
+            self.active_polarity = _DAMAGE_MAGIC if self.initial_polarity == _DAMAGE_PHYSICAL else _DAMAGE_PHYSICAL
+
+    def next_polarity_switch_round(self) -> int:
+        if self.active_polarity == 0:
+            return 0
+        block = max(0, self.engine.round_index - 1) // 2
+        next_round = (block + 1) * 2 + 1
+        return next_round if next_round <= self.engine.max_rounds else 0
+
+    def is_actor_control_locked(self, actor: Message) -> bool:
+        """判定单位是否处于硬控/封印状态（受控时直接取消蓄力或护卫机制）。"""
+        if self.engine.effects.has(actor, STUN, SILENCE, FREEZE):
+            return True
+        for entry in actor.buffs:
+            rule = self.engine.effects.rules.get(entry.buff_table_id)
+            if rule is not None and rule.battle_op == 13 and rule.state_kind in (1, 2, 3, 4, 5, 6):
+                return True
+        return False
+
+    def incoming_heal_modifier(self, actor: Message) -> float:
+        """汇总目标身上的受疗修正比例（用于识别断脉咒压制回春）。"""
+        total = 0.0
+        for entry in actor.buffs:
+            rule = self.engine.effects.rules.get(entry.buff_table_id)
+            if rule is not None and rule.battle_op == 6 and rule.modifier_stat == 6:
+                total += entry.stat_percent if entry.stat_percent != 0.0 else rule.ratio
+        return total
+
+    def is_slow_phase_actor(self, actor_id: int) -> bool:
+        return any(
+            entry.execute_round == self.engine.round_index and entry.source_actor_id == actor_id
+            for entry in self.active_telegraphs
+        )
+
+    def emit_boss_mechanic_event(
+        self, turn: Message, group: int, mechanic_kind: int, source_id: int, target_id: int, value: int,
+    ) -> Message:
+        return turn.events.add(
+            event_type=EVENT_BOSS_MECHANIC,
+            source_id=source_id,
+            target_id=target_id,
+            group_id=group,
+            mechanic_kind=mechanic_kind,
+            value=value,
+        )
+
+    def apply_boss_exposed(self, actor_id: int, pct: int, until_round: int) -> None:
+        if not actor_id or not pct:
+            return
+        cur_pct, cur_until = self.exposed_actors.get(actor_id, (0, 0))
+        new_pct = pct if pct > cur_pct else cur_pct
+        self.exposed_actors[actor_id] = (new_pct, max(cur_until, until_round))
+
+    def actor_has_boss_cleave_parry_protection(self, target: Message, damage_type: int) -> bool:
+        """判定目标是否持有合法重劈化解保护（无敌/护盾/分摊/反震）。"""
+        for entry in target.buffs:
+            if entry.remaining_capacity > 0:
+                return True
+            rule = self.engine.effects.rules.get(entry.buff_table_id)
+            if rule is None:
+                continue
+            if rule.buff_type == 34 or "Invincibility" in rule.tags:
+                return True
+            if rule.battle_op in (9, 10, 11, 12):
+                flt = rule.damage_filter
+                if flt == 0 or (flt == 1 and damage_type == _DAMAGE_PHYSICAL) or (flt == 2 and damage_type == _DAMAGE_MAGIC):
+                    return True
+        return False
+
+    def effective_physical_attack_multiplier(self, actor: Message) -> float:
+        if actor.is_boss and self.boss_disheartened_until_round >= self.engine.round_index:
+            return 0.85
+        return 1.0
+
+    def effective_defense_multiplier(self, actor: Message) -> float:
+        if self.sunder_until_round.get(actor.actor_id, 0) >= self.engine.round_index:
+            return 0.80
+        return 1.0
+
+    def record_player_direct_damage(self, source: Message, target: Message, damage_kind: int, dealt: int) -> None:
+        if dealt <= 0 or source.team_index != 0 or target.team_index != 1:
+            return
+        tally = self.round_player_direct_damage.setdefault(self.engine.round_index, [0, 0])
+        if damage_kind == _DAMAGE_PHYSICAL:
+            tally[0] = min(U64_MAX, tally[0] + dealt)
+        elif damage_kind == _DAMAGE_MAGIC:
+            tally[1] = min(U64_MAX, tally[1] + dealt)
+
+    def choose_dynamic_stance_type(self, current_round: int) -> int:
+        if current_round <= 1:
+            return BOSS_STANCE_PHYSICAL
+        if self.battle_difficulty < 2:
+            return BOSS_STANCE_PHYSICAL if (((current_round - 1) // 3) % 2 == 0) else BOSS_STANCE_MAGIC
+        phys_total = 0
+        magic_total = 0
+        start_r = max(1, current_round - 2)
+        for r in range(start_r, current_round):
+            tally = self.round_player_direct_damage.get(r)
+            if tally is not None:
+                phys_total = min(U64_MAX, phys_total + tally[0])
+                magic_total = min(U64_MAX, magic_total + tally[1])
+        if phys_total > magic_total:
+            return BOSS_STANCE_PHYSICAL
+        if magic_total > phys_total:
+            return BOSS_STANCE_MAGIC
+        return BOSS_STANCE_MAGIC if self.last_chosen_stance_type == BOSS_STANCE_PHYSICAL else BOSS_STANCE_PHYSICAL
+
+    def apply_encounter_damage_modifiers(
+        self,
+        source: Message,
+        target: Message,
+        damage: int,
+        damage_type: int,
+        is_direct_primary: bool,
+        turn: Message,
+        group: int,
+        *,
+        is_multi_target_skill: bool = False,
+        is_primary_target: bool = True,
+    ) -> tuple[int, bool]:
+        """按 C++ `ApplyEncounterDamageModifiers` 依次结算易势、溅射、联防、破绽/破釜易伤与灵障盾。"""
+        splash_reduced = False
+        if damage <= 0:
+            return 0, False
+        dmg_stance_polarity = (
+            BOSS_STANCE_PHYSICAL if damage_type == _DAMAGE_PHYSICAL
+            else (BOSS_STANCE_MAGIC if damage_type == _DAMAGE_MAGIC else BOSS_STANCE_NONE)
+        )
+        # 1. 物法易势 5V5 同系直伤 ×1.15
+        if is_direct_primary and self.active_polarity != 0 and self.active_polarity == damage_type:
+            damage = (damage * POLARITY_DAMAGE_NUM) // POLARITY_DAMAGE_DEN
+        # 2. 首领试炼 V2 多目标直伤副目标溅射保留 60%
+        if (
+            is_direct_primary
+            and self.is_boss_trial
+            and source.team_index == 0
+            and target.team_index == 1
+            and is_multi_target_skill
+            and not is_primary_target
+        ):
+            damage = (damage * BOSS_TRIAL_SPLASH_KEEP_PCT) // 100
+            splash_reduced = True
+        # 3. 破阵·护势联防阵：同系直伤减免 + 轻反制叠蓄势（每攻方单位每回合至多 1 层）
+        if (
+            is_direct_primary
+            and is_boss_stance_trial_kind(self.boss_trial_kind)
+            and target.team_index == 1
+            and self.boss_stance_type != BOSS_STANCE_NONE
+            and self.boss_stance_remain_rounds > 0
+            and self.boss_stance_type == dmg_stance_polarity
+        ):
+            keep_pct = (
+                65 if self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_DUAL_GUARD
+                else (60 if self.battle_difficulty >= 2 else 65)
+            )
+            damage = (damage * keep_pct) // 100
+            if source.team_index == 0 and source.actor_id not in self.attacker_triggered_stance_counter_this_round:
+                self.attacker_triggered_stance_counter_this_round.add(source.actor_id)
+                if self.boss_momentum_stacks < BOSS_MOMENTUM_MAX_STACKS:
+                    self.boss_momentum_stacks += 1
+                    boss = self._find_alive_boss()
+                    boss_id = boss.actor_id if boss is not None else target.actor_id
+                    self.emit_boss_mechanic_event(
+                        turn, group, BOSS_MECHANIC_MOMENTUM_GAIN, target.actor_id, boss_id, self.boss_momentum_stacks,
+                    )
+        # 4. 破绽 (+35%/+20%) + 二阶段决战姿态 (+15%) 加算易伤（含直伤与持续毒火）
+        if self.is_boss_trial and source.team_index != target.team_index and target.team_index == 1:
+            vuln_pct = 0
+            exp = self.exposed_actors.get(target.actor_id)
+            if exp is not None and exp[1] >= self.engine.round_index:
+                vuln_pct += exp[0]
+            if target.is_boss and self.boss_phase >= 2:
+                vuln_pct += BOSS_PHASE_TWO_VULN_PCT
+            if vuln_pct > 0:
+                damage = (damage * (100 + vuln_pct)) // 100
+        # 5. 灵障首领：灵障护盾吸收
+        if self.boss_trial_kind == BOSS_TRIAL_KIND_BARRIER and target.is_boss and self.boss_barrier_shield > 0 and damage > 0:
+            absorbed = min(damage, self.boss_barrier_shield)
+            self.boss_barrier_shield -= absorbed
+            damage -= absorbed
+            turn.events.add(
+                event_type=_EVENT_SHIELD,
+                source_id=source.actor_id,
+                target_id=target.actor_id,
+                group_id=group,
+                absorbed=absorbed,
+                shield_after=self.boss_barrier_shield,
+            )
+            if self.boss_barrier_shield == 0:
+                self.engine.trial_tracker.record_shield_break(source)
+        return damage, splash_reduced
+
+    def apply_breaker_sunder_on_basic_hit(
+        self, attacker: Message, target: Message, dealt: int, hit_kind: int, turn: Message, group: int,
+    ) -> None:
+        if (
+            dealt > 0
+            and hit_kind == 0
+            and _active(target)
+            and self.is_boss_trial
+            and attacker.actor_type == _ACTOR_MONSTER
+            and attacker.team_index == 1
+            and attacker.monster_table_id == BOSS_TRIAL_MONSTER_SUPPORT_BREAKER
+        ):
+            self.sunder_until_round[target.actor_id] = self.engine.round_index + 2
+            self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_BREAKER_SUNDER, attacker.actor_id, target.actor_id, 20)
+
+    def clear_sunder_on_ally_dispel(self, caster: Message, target: Message) -> None:
+        if self.sunder_until_round.pop(target.actor_id, None) is not None:
+            self.engine.trial_tracker.record_effective_contribution(caster)
+
+    def trigger_rejuv_backlash(self, source_id: int, boss: Message, turn: Message, group: int) -> None:
+        if not _active(boss):
+            return
+        raw_backlash = max(1, (boss.max_health * BOSS_HEAL_BACKLASH_PCT) // 100)
+        dealt = min(boss.attributes.health, raw_backlash)
+        if dealt > 0:
+            boss.attributes.health -= dealt
+        self.engine.trial_tracker.heal_interrupt_backlash_count += 1
+        self.apply_boss_exposed(boss.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+        self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_HEAL_BACKLASH, source_id, boss.actor_id, dealt)
+        turn.events.add(
+            event_type=3,
+            source_id=source_id,
+            target_id=boss.actor_id,
+            group_id=group,
+            value=dealt,
+            target_health_after=boss.attributes.health,
+            target_mana_after=boss.attributes.mana,
+        )
+        if boss.attributes.health == 0:
+            self.engine._death(turn, group, boss, source_id)
+
+    def handle_boss_trial_monster_death(self, dead_monster: Message, turn: Message, group: int) -> None:
+        if not self.is_boss_trial or dead_monster.actor_type != _ACTOR_MONSTER or dead_monster.team_index != 1 or dead_monster.is_boss:
+            return
+        boss = self._find_alive_boss()
+
+        # 1. 护势护卫阵亡：联防阵瓦解
+        if (
+            is_boss_stance_trial_kind(self.boss_trial_kind)
+            and self.boss_stance_type != BOSS_STANCE_NONE
+            and (
+                dead_monster.monster_table_id == BOSS_TRIAL_MONSTER_GUARD_STANCE
+                or (
+                    self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_STANCE
+                    and dead_monster.monster_table_id not in (BOSS_TRIAL_MONSTER_SUPPORT_BREAKER, BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER)
+                )
+            )
+        ):
+            self.boss_stance_type = BOSS_STANCE_NONE
+            self.boss_stance_remain_rounds = 0
+
+        # 2. 回春护卫在已发出治疗预告后、兑现前阵亡 -> 立即触发断疗反噬
+        cancelled_pending_heal = False
+        kept: list[Message] = []
+        for entry in self.active_telegraphs:
+            if (
+                entry.source_actor_id == dead_monster.actor_id
+                and entry.intent_kind == TELEGRAPH_KIND_GUARD_HEAL
+                and entry.execute_round >= self.engine.round_index
+            ):
+                resolved = type(entry)()
+                resolved.CopyFrom(entry)
+                resolved.status = TELEGRAPH_STATUS_CANCELLED_BY_CONTROL
+                self.telegraph_state_version += 1
+                resolved.state_version = self.telegraph_state_version
+                resolved.label = "回春护卫阵亡，治疗中断触发灵力反噬"
+                turn.resolved_telegraphs.add().CopyFrom(resolved)
+                self.last_resolved_telegraphs.append(resolved)
+                cancelled_pending_heal = True
+            else:
+                kept.append(entry)
+        self.active_telegraphs = kept
+        if cancelled_pending_heal and boss is not None and _active(boss):
+            self.trigger_rejuv_backlash(dead_monster.actor_id, boss, turn, group)
+
+        # 3. 策应卫阵亡：破军卫清 1 层蓄势；鼓噪卫清全部蓄势并对首领造成 4% 震荡反噬
+        if dead_monster.monster_table_id == BOSS_TRIAL_MONSTER_SUPPORT_BREAKER and boss is not None and _active(boss):
+            if self.boss_momentum_stacks > 0:
+                self.boss_momentum_stacks -= 1
+                self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_SUPPORT_SHOCK, dead_monster.actor_id, boss.actor_id, 1)
+        elif dead_monster.monster_table_id == BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER and boss is not None and _active(boss):
+            self.boss_momentum_stacks = 0
+            raw_shock = max(1, (boss.max_health * BOSS_DRUMMER_DEATH_SHOCK_PCT) // 100)
+            dealt = min(boss.attributes.health, raw_shock)
+            if dealt > 0:
+                boss.attributes.health -= dealt
+            self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_SUPPORT_SHOCK, dead_monster.actor_id, boss.actor_id, dealt)
+            turn.events.add(
+                event_type=3,
+                source_id=dead_monster.actor_id,
+                target_id=boss.actor_id,
+                group_id=group,
+                value=dealt,
+                target_health_after=boss.attributes.health,
+                target_mana_after=boss.attributes.mana,
+            )
+            if boss.attributes.health == 0:
+                self.engine._death(turn, group, boss, dead_monster.actor_id)
+
+    def process_boss_trial_round_end(self, turn: Message, group: int) -> None:
+        if not self.is_boss_trial:
+            return
+        boss = None
+        any_special_guard_alive = False
+        for actor in self.engine.actors.values():
+            if actor.actor_type != _ACTOR_MONSTER or actor.team_index != 1 or not _active(actor):
+                continue
+            if actor.is_boss:
+                boss = actor
+            elif actor.monster_table_id not in (BOSS_TRIAL_MONSTER_SUPPORT_BREAKER, BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER):
+                any_special_guard_alive = True
+        if boss is None or not _active(boss):
+            return
+
+        # 1. 存活且未受控的鼓噪卫回合末为首领 +1 蓄势（上限 3 层）
+        for actor in self.engine.actors.values():
+            if (
+                actor.actor_type == _ACTOR_MONSTER
+                and actor.team_index == 1
+                and actor.monster_table_id == BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER
+                and _active(actor)
+                and not self.is_actor_control_locked(actor)
+                and self.boss_momentum_stacks < BOSS_MOMENTUM_MAX_STACKS
+            ):
+                self.boss_momentum_stacks += 1
+                self.emit_boss_mechanic_event(
+                    turn, group, BOSS_MECHANIC_MOMENTUM_GAIN, actor.actor_id, boss.actor_id, self.boss_momentum_stacks,
+                )
+
+        # 2. 护势联防剩余回合扣减
+        if self.boss_stance_remain_rounds > 0:
+            self.boss_stance_remain_rounds -= 1
+            if self.boss_stance_remain_rounds == 0:
+                self.boss_stance_type = BOSS_STANCE_NONE
+
+        # 3. 二阶段决战姿态（破釜）：全部特殊护卫阵亡或首领气血 <= 50%，仅触发一次
+        if self.boss_phase < 2 and (not any_special_guard_alive or boss.attributes.health * 2 <= boss.max_health):
+            self.boss_phase = 2
+            has_next_round_cleave = any(
+                e.source_actor_id == boss.actor_id and e.execute_round == self.engine.round_index + 1
+                for e in self.active_telegraphs
+            )
+            self.next_phase2_cleave_telegraph_round = (
+                self.engine.round_index + 2 if has_next_round_cleave else self.engine.round_index + 1
+            )
+            self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_PHASE_TWO_ENRAGE, boss.actor_id, boss.actor_id, 2)
+
+    def refresh_encounter_telegraphs(self) -> None:
+        round_idx = self.engine.round_index
+        kept: list[Message] = []
+        for entry in self.active_telegraphs:
+            if entry.execute_round >= round_idx:
+                next_status = TELEGRAPH_STATUS_EXECUTING if entry.execute_round == round_idx else TELEGRAPH_STATUS_UPCOMING
+                if entry.status != next_status:
+                    entry.status = next_status
+                    self.telegraph_state_version += 1
+                    entry.state_version = self.telegraph_state_version
+                kept.append(entry)
+        self.active_telegraphs = kept
+
+        if not self.is_festival_beast and not is_boss_trial_or_rescue_kind(self.boss_trial_kind):
+            return
+
+        boss = None
+        rejuv_guard = None
+        stance_guard = None
+        other_guard = None
+        for actor in self.engine.actors.values():
+            if actor.actor_type != _ACTOR_MONSTER or actor.team_index != 1 or not _active(actor):
+                continue
+            if actor.is_boss:
+                boss = actor
+                continue
+            mid = actor.monster_table_id
+            if mid in (BOSS_TRIAL_MONSTER_SUPPORT_BREAKER, BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER):
+                continue
+            if self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_DUAL_GUARD:
+                if mid == BOSS_TRIAL_MONSTER_GUARD_REJUV and rejuv_guard is None:
+                    rejuv_guard = actor
+                elif mid == BOSS_TRIAL_MONSTER_GUARD_STANCE and stance_guard is None:
+                    stance_guard = actor
+                elif rejuv_guard is None:
+                    rejuv_guard = actor
+                elif stance_guard is None:
+                    stance_guard = actor
+            elif self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_REJUV:
+                if rejuv_guard is None:
+                    rejuv_guard = actor
+            elif self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_STANCE:
+                if stance_guard is None:
+                    stance_guard = actor
+            elif other_guard is None:
+                other_guard = actor
+
+        def has_entry(src_id: int, exec_round: int) -> bool:
+            return any(e.source_actor_id == src_id and e.execute_round == exec_round for e in self.active_telegraphs)
+
+        def pick_enemy_target(caster: Message) -> int:
+            targets = self._collect_alive_enemies(caster)
+            return targets[self._rand_index(len(targets))] if targets else 0
+
+        def owner_of(aid: int) -> int:
+            a = self.engine.actors.get(aid)
+            if a is None:
+                return 0
+            return a.owner_player_id if a.actor_type == _ACTOR_PET else a.actor_id
+
+        def pick_cleave_targets(caster: Message, dual_target: bool) -> list[int]:
+            targets = self._collect_alive_enemies(caster)
+            if not targets:
+                return []
+            first = pick_enemy_target(caster)
+            chosen = [first] if first else []
+            if not dual_target or len(targets) < 2 or not chosen:
+                return chosen
+            first_owner = owner_of(first)
+            diff_owner = [tid for tid in targets if tid != first and first_owner and owner_of(tid) != first_owner]
+            fallback = [tid for tid in targets if tid != first and tid not in diff_owner]
+            pool = diff_owner or fallback
+            if pool:
+                chosen.append(pool[self._rand_index(len(pool))])
+            return chosen
+
+        def make_entry(**kwargs) -> Message:
+            self.telegraph_state_version += 1
+            return self.engine.protocol.message("BattleTelegraphEntry", state_version=self.telegraph_state_version, **kwargs)
+
+        # 0. 瑞兽迎春 R2/5/8/11 预告 -> R3/6/9/12 慢速重击
+        if self.is_festival_beast:
+            fb = self.request.activity_context.festival_beast
+            exec_round = round_idx + fb.telegraph_lead_rounds
+            if (
+                boss is not None
+                and exec_round <= self.engine.max_rounds
+                and exec_round >= fb.first_heavy_round
+                and (exec_round - fb.first_heavy_round) % fb.cycle_rounds == 0
+                and not has_entry(boss.actor_id, exec_round)
+            ):
+                tid = pick_enemy_target(boss)
+                if tid:
+                    self.active_telegraphs.append(
+                        make_entry(
+                            source_actor_id=boss.actor_id,
+                            target_actor_id=tid,
+                            target_actor_ids=[tid],
+                            telegraph_round=round_idx,
+                            execute_round=exec_round,
+                            intent_kind=TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE,
+                            status=TELEGRAPH_STATUS_UPCOMING,
+                            label="春禧重击蓄力：下回合慢速物理重击锁定目标，防御可减半、控场可打断",
+                        )
+                    )
+            return
+
+        # 1. 首领蓄力重击：一阶段 R1/4/7/10/13；二阶段按 next_phase2_cleave_telegraph_round 每 2 回合循环
+        boss_due = (
+            (self.next_phase2_cleave_telegraph_round != 0 and round_idx == self.next_phase2_cleave_telegraph_round)
+            if self.boss_phase >= 2
+            else (round_idx % 3 == 1)
+        )
+        if boss is not None and boss_due and round_idx + 1 <= self.engine.max_rounds and not has_entry(boss.actor_id, round_idx + 1):
+            if self.boss_trial_kind == BOSS_TRIAL_KIND_BARRIER:
+                tid = pick_enemy_target(boss)
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=boss.actor_id,
+                        target_actor_id=tid,
+                        target_actor_ids=[tid] if tid else [],
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_BOSS_MAGIC_STRIKE,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label="灵障重击：下回合慢速法术重击，防御或护罩化解可触发首领破绽",
+                    )
+                )
+            elif self.boss_trial_kind == BOSS_TRIAL_KIND_VENOM:
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=boss.actor_id,
+                        target_actor_id=0,
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_BOSS_VENOM_AOE,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label="玄毒冲击：下回合慢速群体法术伤害，防御可减半、控场打断触发破绽",
+                    )
+                )
+            else:
+                dual = self.is_boss_trial and self.initial_attacker_human_count >= 3
+                targets = pick_cleave_targets(boss, dual)
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=boss.actor_id,
+                        target_actor_id=targets[0] if targets else 0,
+                        target_actor_ids=targets,
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_SLOW_CLEAVE,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label=(
+                            "裂地双劈：下回合慢速重劈双目标，全员防御/护盾化解触发完整破绽"
+                            if len(targets) >= 2
+                            else "蓄力重劈：下回合慢速物理重劈，防御/护盾/反震化解触发首领破绽"
+                        ),
+                    )
+                )
+            if self.boss_phase >= 2:
+                self.next_phase2_cleave_telegraph_round = round_idx + 2
+
+        # 2. 敌方护卫周期机制预告（支持单卫与双卫同阵并行）
+        if boss is None:
+            return
+        if rejuv_guard is not None and is_boss_rejuv_trial_kind(self.boss_trial_kind):
+            trigger_mod = 1 if (self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_REJUV and self.battle_difficulty >= 2) else 2
+            if round_idx % 3 == trigger_mod and round_idx + 1 <= self.engine.max_rounds and not has_entry(rejuv_guard.actor_id, round_idx + 1):
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=rejuv_guard.actor_id,
+                        target_actor_id=boss.actor_id,
+                        target_actor_ids=[boss.actor_id],
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_GUARD_HEAL,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label=(
+                            "回春祈愈（进阶）：下回合为首领回复10%血并净1减益；打断或击杀触发反噬破绽"
+                            if self.battle_difficulty >= 2
+                            else "回春祈愈：下回合为首领回复8%最大生命；控断或击杀触发反噬破绽"
+                        ),
+                    )
+                )
+        if stance_guard is not None and is_boss_stance_trial_kind(self.boss_trial_kind):
+            if round_idx % 3 == 1 and not has_entry(stance_guard.actor_id, round_idx):
+                chosen_type = self.choose_dynamic_stance_type(round_idx)
+                is_phys = chosen_type == BOSS_STANCE_PHYSICAL
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=stance_guard.actor_id,
+                        target_actor_id=boss.actor_id,
+                        target_actor_ids=[boss.actor_id],
+                        telegraph_round=round_idx,
+                        execute_round=round_idx,
+                        intent_kind=TELEGRAPH_KIND_GUARD_STANCE_PHYS if is_phys else TELEGRAPH_KIND_GUARD_STANCE_MAGIC,
+                        status=TELEGRAPH_STATUS_EXECUTING,
+                        label=(
+                            "物防联防阵：本回合展开全体物理减伤阵（可驱散崩势，物理直伤叠蓄势）"
+                            if is_phys
+                            else "法防联防阵：本回合展开全体法术减伤阵（可驱散崩势，法术直伤叠蓄势）"
+                        ),
+                    )
+                )
+        if other_guard is not None and self.boss_trial_kind == BOSS_TRIAL_KIND_BARRIER:
+            if round_idx % 3 == 1 and not has_entry(other_guard.actor_id, round_idx):
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=other_guard.actor_id,
+                        target_actor_id=boss.actor_id,
+                        target_actor_ids=[boss.actor_id],
+                        telegraph_round=round_idx,
+                        execute_round=round_idx,
+                        intent_kind=TELEGRAPH_KIND_GUARD_SHIELD,
+                        status=TELEGRAPH_STATUS_EXECUTING,
+                        label="灵障护佑：本回合为首领附加灵障护盾",
+                    )
+                )
+        elif other_guard is not None and self.boss_trial_kind == BOSS_TRIAL_KIND_VENOM:
+            if round_idx % 3 == 1 and round_idx + 1 <= self.engine.max_rounds and not has_entry(other_guard.actor_id, round_idx + 1):
+                tid = pick_enemy_target(other_guard)
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=other_guard.actor_id,
+                        target_actor_id=tid,
+                        target_actor_ids=[tid] if tid else [],
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_GUARD_BIND,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label="缚灵锁脉：下回合封控目标并消耗法力",
+                    )
+                )
+
+    def execute_slow_and_guardian_actions(self, turn: Message) -> None:
+        if not self.active_telegraphs:
+            return
+        from .battle_tables import BattleSkill
+
+        due = list(self.active_telegraphs)
+        round_resolved: list[Message] = []
+
+        def record_resolved(base: Message, status: int, label: str) -> None:
+            res = type(base)()
+            res.CopyFrom(base)
+            res.status = status
+            self.telegraph_state_version += 1
+            res.state_version = self.telegraph_state_version
+            if label:
+                res.label = label
+            turn.resolved_telegraphs.add().CopyFrom(res)
+            round_resolved.append(res)
+
+        def deal_boss_strike(source: Message, target: Message, dmg_type: int, scale: float, group: int) -> None:
+            rule = BattleSkill(
+                base_damage=10.0 * scale,
+                physical=(dmg_type == _DAMAGE_PHYSICAL),
+                damage_type=dmg_type,
+                attack_multiplier=scale,
+            )
+            self.engine._damage(turn, group, source, target, rule, hit_kind=0, base=10.0 * scale)
+
+        for entry in due:
+            if entry.execute_round != self.engine.round_index:
+                continue
+            source = self.engine.actors.get(entry.source_actor_id)
+            if source is None or not _active(source):
+                if entry.intent_kind == TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE:
+                    record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "首领已倒地，春禧重击取消")
+                continue
+
+            if self.is_actor_control_locked(source):
+                if entry.intent_kind == TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE:
+                    record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "春禧重击受控取消")
+                elif self.is_boss_trial:
+                    self.engine._group += 1
+                    grp = self.engine._group
+                    if entry.intent_kind in (
+                        TELEGRAPH_KIND_SLOW_CLEAVE,
+                        TELEGRAPH_KIND_BOSS_MAGIC_STRIKE,
+                        TELEGRAPH_KIND_BOSS_VENOM_AOE,
+                    ):
+                        self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                        self.engine.trial_tracker.cleave_parry_count += 1
+                        self.emit_boss_mechanic_event(
+                            turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
+                        )
+                        record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "重击受控取消，首领陷入破绽")
+                    elif entry.intent_kind == TELEGRAPH_KIND_GUARD_HEAL:
+                        boss = self._find_alive_boss()
+                        if boss is not None:
+                            self.trigger_rejuv_backlash(source.actor_id, boss, turn, grp)
+                        record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "回春被控打断，触发灵力反噬")
+                    elif entry.intent_kind in (TELEGRAPH_KIND_GUARD_STANCE_PHYS, TELEGRAPH_KIND_GUARD_STANCE_MAGIC):
+                        self.engine.trial_tracker.stance_break_count += 1
+                        self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                        boss = self._find_alive_boss()
+                        if boss is not None:
+                            self.apply_boss_exposed(boss.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                            self.emit_boss_mechanic_event(
+                                turn, grp, BOSS_MECHANIC_STANCE_BREAK, source.actor_id, boss.actor_id, BOSS_EXPOSED_FULL_PCT,
+                            )
+                        record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "切阵被控打断，触发崩势破绽")
+                continue
+
+            kind = entry.intent_kind
+            if kind == TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE:
+                target = self.engine.actors.get(entry.target_actor_id)
+                if target is None or not _active(target):
+                    record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_TARGET_INVALID, "目标已失效，春禧重击取消")
+                    continue
+                self.engine._group += 1
+                grp = self.engine._group
+                self.engine._event(turn, grp, 1, source, target)
+                scale = (
+                    self.request.activity_context.festival_beast.heavy_damage_percent / 100.0
+                    if self.is_festival_beast
+                    else 1.8
+                )
+                deal_boss_strike(source, target, _DAMAGE_PHYSICAL, scale, grp)
+                record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "春禧重击已发动")
+            elif kind in (TELEGRAPH_KIND_SLOW_CLEAVE, TELEGRAPH_KIND_BOSS_MAGIC_STRIKE):
+                target_ids = list(entry.target_actor_ids) or ([entry.target_actor_id] if entry.target_actor_id else [])
+                if not target_ids:
+                    continue
+                is_magic = kind == TELEGRAPH_KIND_BOSS_MAGIC_STRIKE
+                dmg_type = _DAMAGE_MAGIC if is_magic else _DAMAGE_PHYSICAL
+                scale = (2.0 if self.battle_difficulty >= 2 else 1.7) if is_magic else (2.1 if self.battle_difficulty >= 2 else 1.8)
+                if self.is_boss_trial:
+                    if self.boss_momentum_stacks > 0:
+                        scale *= 1.0 + (self.boss_momentum_stacks * BOSS_MOMENTUM_PER_STACK_PCT) / 100.0
+                    if self.boss_phase >= 2:
+                        scale *= 1.10
+                valid_targets = 0
+                invalid_targets = 0
+                parried_targets = 0
+                for tid in target_ids:
+                    target = self.engine.actors.get(tid)
+                    owner_id = 0
+                    if target is not None:
+                        owner_id = (
+                            target.owner_player_id if target.actor_type == _ACTOR_PET
+                            else (target.actor_id if target.actor_type == _ACTOR_PLAYER else 0)
+                        )
+                    if owner_id and self.is_boss_trial:
+                        self.engine.trial_tracker.self_cleaves_targeted_by_player[owner_id] = (
+                            self.engine.trial_tracker.self_cleaves_targeted_by_player.get(owner_id, 0) + 1
+                        )
+                    if target is None or not _active(target):
+                        invalid_targets += 1
+                        continue
+                    valid_targets += 1
+                    was_defending = bool(target.is_defending)
+                    had_protection = self.actor_has_boss_cleave_parry_protection(target, dmg_type)
+                    ev_before = len(turn.events)
+                    self.engine._group += 1
+                    grp = self.engine._group
+                    self.engine._event(turn, grp, 1, source, target)
+                    deal_boss_strike(source, target, dmg_type, scale, grp)
+                    triggered_shield_or_reflect = any(
+                        (ev.event_type == _EVENT_SHIELD and ev.target_id == target.actor_id and ev.absorbed > 0)
+                        or (ev.event_type == 3 and ev.hit_kind == _HIT_REFLECT and ev.source_id == target.actor_id)
+                        for ev in turn.events[ev_before:]
+                    )
+                    if was_defending or had_protection or triggered_shield_or_reflect:
+                        parried_targets += 1
+                        if owner_id and self.is_boss_trial:
+                            self.engine.trial_tracker.self_cleaves_parried_by_player[owner_id] = (
+                                self.engine.trial_tracker.self_cleaves_parried_by_player.get(owner_id, 0) + 1
+                            )
+                if self.is_boss_trial:
+                    self.boss_momentum_stacks = 0
+                    if valid_targets == 0:
+                        record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_TARGET_INVALID, "目标已失效，重劈取消")
+                    else:
+                        self.engine._group += 1
+                        grp = self.engine._group
+                        if parried_targets == len(target_ids) and invalid_targets == 0:
+                            self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                            self.engine.trial_tracker.cleave_parry_count += 1
+                            self.emit_boss_mechanic_event(
+                                turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
+                            )
+                        elif len(target_ids) >= 2 and parried_targets >= 1:
+                            self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_PARTIAL_PCT, self.engine.round_index + 1)
+                            self.engine.trial_tracker.cleave_parry_count += 1
+                            self.emit_boss_mechanic_event(
+                                turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_PARTIAL_PCT,
+                            )
+                        record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "慢速重劈已发动")
+            elif kind == TELEGRAPH_KIND_BOSS_VENOM_AOE:
+                targets = self._collect_alive_enemies(source)
+                if not targets:
+                    continue
+                self.engine._group += 1
+                grp = self.engine._group
+                scale = 1.05 if self.battle_difficulty >= 2 else 0.85
+                for tid in targets:
+                    target = self.engine.actors.get(tid)
+                    if target is not None and _active(target):
+                        deal_boss_strike(source, target, _DAMAGE_MAGIC, scale, grp)
+                record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "玄毒冲击已发动")
+            elif kind == TELEGRAPH_KIND_GUARD_HEAL:
+                boss = self._find_alive_boss()
+                if boss is None or not _active(boss):
+                    continue
+                inc_mod = self.incoming_heal_modifier(boss)
+                anti_heal_suppressed = inc_mod < 0.0
+                received = max(0.0, 1.0 + inc_mod)
+                self.engine._group += 1
+                grp = self.engine._group
+                healed = 0
+                if received > 0.0:
+                    pct = 10 if self.battle_difficulty >= 2 else 8
+                    raw_heal = max(1, (boss.max_health * pct) // 100)
+                    healed = landed_heal(boss, float(raw_heal) * received)
+                    boss.attributes.health += healed
+                    self.engine.trial_tracker.record_monster_heal(source, boss, healed)
+                    turn.events.add(
+                        event_type=_EVENT_HEAL,
+                        source_id=source.actor_id,
+                        target_id=boss.actor_id,
+                        group_id=grp,
+                        value=healed,
+                        target_health_after=boss.attributes.health,
+                        target_mana_after=boss.attributes.mana,
+                    )
+                if anti_heal_suppressed:
+                    self.boss_disheartened_until_round = self.engine.round_index + 1
+                    self.emit_boss_mechanic_event(turn, grp, BOSS_MECHANIC_ANTI_HEAL_DISHEARTEN, source.actor_id, boss.actor_id, 15)
+                elif self.battle_difficulty >= 2 and healed > 0:
+                    for idx, b in enumerate(boss.buffs):
+                        if self.engine.effects.is_debuff(b):
+                            self.engine.effects._remove(boss, idx, turn, grp, 0)
+                            self.emit_boss_mechanic_event(turn, grp, BOSS_MECHANIC_REJUV_CLEANSE, source.actor_id, boss.actor_id, 1)
+                            break
+                record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "回春祈愈已发动")
+            elif kind in (TELEGRAPH_KIND_GUARD_STANCE_PHYS, TELEGRAPH_KIND_GUARD_STANCE_MAGIC):
+                boss = self._find_alive_boss()
+                if boss is None or not _active(boss):
+                    continue
+                self.engine._group += 1
+                grp = self.engine._group
+                self.boss_stance_type = BOSS_STANCE_PHYSICAL if kind == TELEGRAPH_KIND_GUARD_STANCE_PHYS else BOSS_STANCE_MAGIC
+                self.boss_stance_remain_rounds = 3
+                self.last_chosen_stance_type = self.boss_stance_type
+                turn.events.add(
+                    event_type=_EVENT_BUFF_ADD,
+                    source_id=source.actor_id,
+                    target_id=boss.actor_id,
+                    group_id=grp,
+                    value=self.boss_stance_type,
+                )
+                if (
+                    self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_STANCE
+                    and self.battle_difficulty >= 2
+                    and self.boss_momentum_stacks < BOSS_MOMENTUM_MAX_STACKS
+                ):
+                    self.boss_momentum_stacks += 1
+                    self.emit_boss_mechanic_event(
+                        turn, grp, BOSS_MECHANIC_MOMENTUM_GAIN, source.actor_id, boss.actor_id, self.boss_momentum_stacks,
+                    )
+                record_resolved(
+                    entry,
+                    TELEGRAPH_STATUS_EXECUTED,
+                    "物防联防阵已展开" if self.boss_stance_type == BOSS_STANCE_PHYSICAL else "法防联防阵已展开",
+                )
+            elif kind == TELEGRAPH_KIND_GUARD_SHIELD:
+                boss = self._find_alive_boss()
+                if boss is None or not _active(boss):
+                    continue
+                self.engine._group += 1
+                grp = self.engine._group
+                pct = 18 if self.battle_difficulty >= 2 else 12
+                add_shield = max(1, (boss.max_health * pct) // 100)
+                self.boss_barrier_shield = min(U64_MAX, self.boss_barrier_shield + add_shield)
+                turn.events.add(
+                    event_type=_EVENT_SHIELD,
+                    source_id=source.actor_id,
+                    target_id=boss.actor_id,
+                    group_id=grp,
+                    value=add_shield,
+                    shield_after=self.boss_barrier_shield,
+                )
+                record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "灵障护盾已附加")
+            elif kind == TELEGRAPH_KIND_GUARD_BIND:
+                target = self.engine.actors.get(entry.target_actor_id)
+                if target is None or not _active(target):
+                    continue
+                self.engine._group += 1
+                grp = self.engine._group
+                drain = max(1, (target.max_mana * 15) // 100) if target.max_mana else 0
+                actual = min(target.attributes.mana, drain)
+                if actual > 0:
+                    target.attributes.mana -= actual
+                    turn.events.add(
+                        event_type=_EVENT_MANA,
+                        source_id=source.actor_id,
+                        target_id=target.actor_id,
+                        group_id=grp,
+                        value=actual,
+                        mana_delta=-actual,
+                        target_health_after=target.attributes.health,
+                        target_mana_after=target.attributes.mana,
+                    )
+                record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "缚灵锁脉已发动")
+
+        if round_resolved:
+            self.last_resolved_telegraphs = round_resolved
+
+    def try_dispel_boss_stance(self, source: Message, target: Message, turn: Message, group: int) -> None:
+        if not self.is_boss_trial or source.team_index == target.team_index or target.team_index != 1:
+            return
+        dispelled_any = False
+        if is_boss_stance_trial_kind(self.boss_trial_kind) and self.boss_stance_type != BOSS_STANCE_NONE:
+            self.boss_stance_type = BOSS_STANCE_NONE
+            self.boss_stance_remain_rounds = 0
+            self.engine.trial_tracker.guard_stance_dispelled = True
+            self.engine.trial_tracker.stance_break_count += 1
+            dispelled_any = True
+            for actor in self.engine.actors.values():
+                if actor.actor_type != _ACTOR_MONSTER or actor.team_index != 1 or not _active(actor):
+                    continue
+                if (
+                    actor.is_boss
+                    or actor.monster_table_id == BOSS_TRIAL_MONSTER_GUARD_STANCE
+                    or (
+                        self.boss_trial_kind == BOSS_TRIAL_KIND_BREAK_STANCE
+                        and actor.monster_table_id not in (BOSS_TRIAL_MONSTER_SUPPORT_BREAKER, BOSS_TRIAL_MONSTER_SUPPORT_DRUMMER)
+                    )
+                ):
+                    self.apply_boss_exposed(actor.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+            self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_STANCE_BREAK, source.actor_id, target.actor_id, BOSS_EXPOSED_FULL_PCT)
+        if self.boss_momentum_stacks > 0:
+            self.boss_momentum_stacks = 0
+            dispelled_any = True
+        if dispelled_any:
+            self.engine.trial_tracker.record_effective_contribution(source)
+
+    def advance_round_cleanup(self) -> None:
+        round_idx = self.engine.round_index
+        self.attacker_triggered_stance_counter_this_round.clear()
+        self.exposed_actors = {aid: st for aid, st in self.exposed_actors.items() if st[1] >= round_idx}
+        self.sunder_until_round = {aid: until for aid, until in self.sunder_until_round.items() if until >= round_idx}
+        self.update_polarity_for_round()
+        self.refresh_encounter_telegraphs()
+
+    def fill_state_snapshot(self, state: Message) -> None:
+        if self.active_polarity:
+            state.active_polarity = self.active_polarity
+            state.next_polarity_switch_round = self.next_polarity_switch_round()
+        if self.protected_guard_actor_id:
+            state.protected_guard_actor_id = self.protected_guard_actor_id
+        if self.boss_trial_kind != BOSS_TRIAL_KIND_NONE:
+            state.boss_trial_kind = self.boss_trial_kind
+            state.battle_difficulty = self.battle_difficulty
+        if self.is_boss_trial:
+            state.boss_phase = self.boss_phase
+            state.boss_momentum_stacks = self.boss_momentum_stacks
+            if self.boss_stance_type != BOSS_STANCE_NONE and self.boss_stance_remain_rounds > 0:
+                state.boss_stance_type = self.boss_stance_type
+                state.boss_stance_remain_rounds = self.boss_stance_remain_rounds
+            boss = self._find_alive_boss()
+            if boss is not None:
+                exp = self.exposed_actors.get(boss.actor_id)
+                if exp is not None and exp[1] >= self.engine.round_index:
+                    state.boss_exposed_pct = exp[0]
+                    state.boss_exposed_until_round = exp[1]
+        for resolved in self.last_resolved_telegraphs:
+            state.last_resolved_telegraphs.add().CopyFrom(resolved)
+        if self.engine.outcome == 0:
+            for entry in self.active_telegraphs:
+                state.telegraphs.add().CopyFrom(entry)

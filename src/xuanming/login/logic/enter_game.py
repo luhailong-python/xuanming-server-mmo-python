@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 
 from .. import gate_commands, keys, login_session, session_fence, tips
+from ..cellroute import CellRouteError, check_cell_route_ownership
 from ..directory import REMOVED_APPEARANCE, Conflict, DirectoryError, Missing
 from ..locker import RedisLock
 from ..session_fence import Outcome
@@ -44,6 +45,10 @@ async def run(ctx, request, details):
     if conn is None:
         return fail(tips.SESSION_ID_NOT_FOUND)
     if details.ticket_player_id and details.ticket_player_id != request.player_id:
+        return fail(tips.ENTER_GAME_GUID)
+    try:
+        check_cell_route_ownership(ctx.cell_router, config.cell_route, int(request.player_id))
+    except CellRouteError:
         return fail(tips.ENTER_GAME_GUID)
     try:
         account = await login_session.get_account(ctx.login_redis, conn)

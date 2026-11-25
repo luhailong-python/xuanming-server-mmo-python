@@ -20,6 +20,8 @@ _SERVICE = "ScenePetClientPlayer"
 _NOT_FOUND, _ROW_MISSING, _FULL, _LEVEL_LOW, _ACTIVE, _NOT_ACTIVE = range(26000, 26006)
 _INVALID_NAME, _IN_BATTLE, _POINTS_LOW, _CANNOT_DECREASE, _CAP, _UNKNOWN_DIM = range(26007, 26013)
 _GOLD_LOW, _NO_AUTO_PLAN, _NO_CHANGE, _ID_UNAVAILABLE = range(26013, 26017)
+PET_NOT_TRANSFERABLE = 26018
+PET_NOT_TRANSFERABLE = 26018
 _DEFAULT_ENTRY_CONFIG_VERSION = 1
 _DEFAULT_ENTRY_TOTAL_POINTS = 20
 _DEFAULT_ENTRY_MAX_DIRECTIONS = 0
@@ -59,6 +61,18 @@ def _pet_acquisition_tier(row) -> int:
 
 def _pet_cultivation_tier(row) -> int:
     return getattr(row, "cultivation_tier", 1) or 1
+
+
+def _pet_transfer_policy(row) -> int:
+    return int(getattr(row, "transfer_policy", 0))
+
+
+def _pet_exclusive_gift_slots(row) -> int:
+    return int(getattr(row, "exclusive_gift_slots", 0))
+
+
+def _pet_fixed_initial_aptitude(row) -> bool:
+    return bool(getattr(row, "fixed_initial_aptitude", False))
 
 
 def _pet_data_known(comp) -> bool:
@@ -405,6 +419,74 @@ class ScenePets:
         pet.name = request.name
         return 0
 
+    def is_transferable_species(self, pet_table_id: int) -> bool:
+        """判断宠物种类是否允许流转/交易（transfer_policy == 0）。"""
+        row = self.tables["Pet"].get(pet_table_id)
+        return row is not None and _pet_transfer_policy(row) == 0
+
+    def is_exclusive_gift_species(self, pet_table_id: int) -> bool:
+        """判断宠物种类是否走活动专属赠送位（不占普通 max_pets）。"""
+        row = self.tables["Pet"].get(pet_table_id)
+        return row is not None and _pet_exclusive_gift_slots(row) > 0
+
+    def count_normal_pets(self, comp) -> int:
+        """统计普通携带位中的宠物数量（排除活动专属赠送位种类）。"""
+        return sum(1 for pet in comp.pets if not self.is_exclusive_gift_species(pet.pet_table_id))
+
+    @staticmethod
+    def count_species_pets(comp, pet_table_id: int) -> int:
+        return sum(1 for pet in comp.pets if pet.pet_table_id == pet_table_id)
+
+    def has_normal_pet_slot(self, comp) -> bool:
+        return self.count_normal_pets(comp) < self.max_pets
+
+    def has_exclusive_gift_slot(self, comp, pet_table_id: int) -> bool:
+        row = self.tables["Pet"].get(pet_table_id)
+        if row is None:
+            return False
+        slots = _pet_exclusive_gift_slots(row)
+        return slots > 0 and self.count_species_pets(comp, pet_table_id) < slots
+
+    def available_capture_slots(self, comp) -> int:
+        if not _pet_data_known(comp) or self.pool is None or carries_unknown(self.pool):
+            return 0
+        count = self.count_normal_pets(comp)
+        return self.max_pets - count if count < self.max_pets else 0
+
+    async def prepare_exclusive_activity_pet(self, data, pet_table_id: int):
+        """专属活动神兽发放预备：校验专属赠送位与固定首发资质并分配永久 pet_id，不写组件。"""
+        if not data.HasField("pet_component") or not data.HasField("level_component"):
+            return UNAVAILABLE, None
+        comp = data.pet_component
+        if not _pet_data_known(comp):
+            return UNAVAILABLE, None
+        row = self.tables["Pet"].get(pet_table_id)
+        if row is None:
+            return _ROW_MISSING, None
+        if carries_unknown(row) or self.pool is None or carries_unknown(self.pool):
+            return INVALID_DATA, None
+        if (
+            not row.name
+            or not row.model_id
+            or _pet_acquisition_tier(row) != 2
+            or _pet_cultivation_tier(row) != 4
+            or _pet_transfer_policy(row) != 1
+            or _pet_exclusive_gift_slots(row) == 0
+            or not _pet_fixed_initial_aptitude(row)
+            or len(row.aptitude_min) < 4
+            or len(row.aptitude_max) < 4
+            or any(int(row.aptitude_min[i]) == 0 or int(row.aptitude_min[i]) != int(row.aptitude_max[i]) for i in range(4))
+        ):
+            return INVALID_DATA, None
+        if not self.has_exclusive_gift_slot(comp, pet_table_id):
+            return _FULL, None
+        return await self._prepare_new_pet(comp, row, effective_level(data))
+
+    @staticmethod
+    def commit_prepared_activity_pet(data, candidate) -> None:
+        """将预备好的专属活动神兽同步写入玩家宠物组件（与活动领取回执同帧提交）。"""
+        data.pet_component.pets.add().CopyFrom(candidate)
+
     async def _prepare_new_pet(self, comp, row, owner_level: int):
         if self.assets is None or self.assets.allocate_item_id is None:
             return _ID_UNAVAILABLE, None
@@ -422,11 +504,12 @@ class ScenePets:
             level=pet_level(owner_level, row),
             created_at=int(time()),
         )
+        fixed_apt = _pet_fixed_initial_aptitude(row)
         for i, dim in enumerate(self.dimensions):
             low = row.aptitude_min[i] if i < len(row.aptitude_min) else 10_000
             high = row.aptitude_max[i] if i < len(row.aptitude_max) else 10_000
             low, high = sorted((low or high or 10_000, high or low or 10_000))
-            pet.aptitude[dim.id] = low + randbelow(high - low + 1) if low != high else low
+            pet.aptitude[dim.id] = low if (fixed_apt or low == high) else (low + randbelow(high - low + 1))
         stats = pet_stats(self.tables, pet)
         pet.health, pet.mana = stats["max_health"], stats["max_mana"]
         return 0, pet
@@ -439,13 +522,15 @@ class ScenePets:
         row = self.tables["Pet"].get(request.pet_table_id)
         if row is None:
             return self._reply(route, _ROW_MISSING)
+        if _pet_transfer_policy(row) != 0 or _pet_exclusive_gift_slots(row) > 0:
+            return self._reply(route, FEATURE_UNAVAILABLE)
         if self.pool is None:
             return self._reply(route, INVALID_DATA)
         data = self.scene.rows.assemble(player.snapshot)
         if not data.HasField("pet_component") or not data.HasField("level_component"):
             return self._reply(route, UNAVAILABLE)
         comp = data.pet_component
-        if len(comp.pets) >= self.max_pets:
+        if not self.has_normal_pet_slot(comp):
             return self._reply(route, _FULL)
         error, candidate = await self._prepare_new_pet(comp, row, effective_level(data))
         if error:
@@ -468,7 +553,13 @@ class ScenePets:
             return response
         for row in self.tables["Pet"].rows():
             price = _pet_shop_price(row)
-            if carries_unknown(row) or _pet_acquisition_tier(row) != 0 or not 0 < price <= INT64_MAX:
+            if (
+                carries_unknown(row)
+                or _pet_acquisition_tier(row) != 0
+                or _pet_transfer_policy(row) != 0
+                or _pet_exclusive_gift_slots(row) > 0
+                or not 0 < price <= INT64_MAX
+            ):
                 continue
             response.offers.add(
                 pet_table_id=row.id,
@@ -524,7 +615,12 @@ class ScenePets:
         if carries_unknown(row):
             return finish(INVALID_DATA)
         price = _pet_shop_price(row)
-        if _pet_acquisition_tier(row) != 0 or price == 0:
+        if (
+            _pet_acquisition_tier(row) != 0
+            or _pet_transfer_policy(row) != 0
+            or _pet_exclusive_gift_slots(row) > 0
+            or price == 0
+        ):
             return finish(FEATURE_UNAVAILABLE)
         if request.price_gold != price:
             return finish(INVALID)
@@ -537,7 +633,7 @@ class ScenePets:
         owner_level = effective_level(data)
         if owner_level < row.unlock_level:
             return finish(_LEVEL_LOW)
-        if len(comp.pets) >= self.max_pets:
+        if not self.has_normal_pet_slot(comp):
             return finish(_FULL)
         if balance(data, self.gold) < price:
             return finish(_GOLD_LOW)

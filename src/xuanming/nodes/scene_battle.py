@@ -12,7 +12,13 @@ from google.protobuf.message import DecodeError
 from ..data import PlayerRowKind, StoreRejected, StoreUnavailable
 from ..data.asset_inventory import AssetInventory, release_item_hold
 from .battle_control import service_digest, sign_service_call, verify_service_call
+from .battle_dropin_effects import (
+    BOSS_TRIAL_KIND_FESTIVAL_BEAST,
+    BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
+    is_boss_trial_kind,
+)
 from .battle_tables import battle_table_fingerprint
+from .scene_festival_beast import FESTIVAL_BEAST_PET_CHANGED, FESTIVAL_BEAST_PET_DEAD, SceneFestivalBeast
 from .scene_mission import effective_level
 from .scene_stats import battle_skills, class_id, pet_level, pet_skills, pet_stats, player_stats
 
@@ -342,7 +348,7 @@ class SceneBattle:
             else:
                 try:
                     await self.scene.flush_player_rows(player)
-                    error = self._snapshot(player, response.snapshot)
+                    error = self._snapshot(player, response.snapshot, request=request)
                 except (StoreRejected, StoreUnavailable):
                     error = 1003
                 if not error and deadline <= self._clock():
@@ -400,12 +406,63 @@ class SceneBattle:
                 response.table_fingerprint = response.snapshot.table_fingerprint
         return response
 
-    def _snapshot(self, player, snapshot) -> int:
+    def _snapshot(self, player, snapshot, *, request=None) -> int:
         data = self.scene.rows.assemble(player.snapshot)
         if not data.HasField("derived_attributes_component") or not data.HasField("level_component"):
             return 1003
+
+        dungeon_row = (
+            self.tables["Dungeon"].get(request.battle_config_id)
+            if request is not None and request.battle_config_id and "Dungeon" in self.tables.tables
+            else None
+        )
+        boss_trial_kind = int(getattr(dungeon_row, "boss_trial_kind", 0)) if dungeon_row is not None else 0
+        is_boss_trial = is_boss_trial_kind(boss_trial_kind)
+        is_guard_rescue = boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+        is_festival_beast = bool(
+            request is not None
+            and request.HasField("activity_context")
+            and request.activity_context.kind == 2
+            and request.activity_context.HasField("festival_beast")
+        )
+        is_formal_ranked = bool(
+            request is not None
+            and request.HasField("ranked_context")
+            and request.ranked_context.season_id != 0
+        )
+        use_free_preset = bool(
+            request is not None
+            and request.HasField("ranked_context")
+            and request.ranked_context.use_free_preset
+        )
+
+        # 瑞兽迎春准入硬隔离：boss_trial_kind=7 必须且仅能携带合法 FESTIVAL_BEAST 上下文。
+        if (boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST) != is_festival_beast:
+            logger.warning(
+                "PrepareBattle rejected: festival beast context mismatch player_id=%s battle_config_id=%s",
+                player.player_id, request.battle_config_id if request is not None else 0,
+            )
+            return 1006
+        if is_festival_beast:
+            fb_sys = getattr(self.scene, "festival_beast", None)
+            if fb_sys is not None:
+                pet_err = fb_sys.verify_prepare_battle_pet(data, request.activity_context.festival_beast)
+            else:
+                fb_ctx = request.activity_context.festival_beast
+                active_id = int(data.pet_component.active_pet_id)
+                pet = next((p for p in data.pet_component.pets if p.pet_id == active_id), None)
+                if not fb_ctx.locked_pet_id or active_id != fb_ctx.locked_pet_id or pet is None:
+                    pet_err = FESTIVAL_BEAST_PET_CHANGED
+                elif pet.health == 0:
+                    pet_err = FESTIVAL_BEAST_PET_DEAD
+                else:
+                    pet_err = 0
+            if pet_err:
+                return pet_err
+
+        isolate_temp_state = use_free_preset or is_formal_ranked or is_boss_trial or is_guard_rescue or is_festival_beast
         base = data.derived_attributes_component
-        if not base.health:
+        if not isolate_temp_state and not base.health:
             return 1006
         stats = player_stats(self.protocol, self.tables, data)
         profile = data.profile_component
@@ -413,6 +470,9 @@ class SceneBattle:
         snapshot.appearance_id, snapshot.gender = profile.appearance_id, profile.gender
         snapshot.class_id, snapshot.level = class_id(data), effective_level(data)
         snapshot.base_attributes.CopyFrom(base)
+        if isolate_temp_state:
+            snapshot.base_attributes.health = stats.max_health
+            snapshot.base_attributes.mana = stats.max_mana
         snapshot.base_attributes.speed = stats.speed
         for key in ("max_health", "max_mana", "physical_attack", "magic_attack", "defense"):
             setattr(snapshot, key, getattr(stats, key))
@@ -426,38 +486,43 @@ class SceneBattle:
         buffs = getattr(self.scene, "buffs", None)
         if buffs is not None:
             buffs.snapshot(player, snapshot)
-        items: Counter[int] = Counter()
-        for row in data.bag_component.items:
-            if row.bag_type != 0:
-                continue
-            if row.HasField("instance"):
-                item = row.instance
-                guid, config, amount = item.item_id, item.config_id, item.size
-            else:
-                item = row
-                guid, config, amount = row.item_uuid, row.config_id, row.stack_size
-            rule = self.tables["Item"].get(config)
-            if rule is not None and rule.battle_usable and guid and amount and AssetInventory.countable(item):
-                items[config] += amount
-        for config, amount in sorted(items.items()):
-            available = min(amount, self._inventory.removable_count(data, config))
-            if available:
-                snapshot.items.add(item_table_id=config, count=min((1 << 32) - 1, available))
+        if not isolate_temp_state:
+            items: Counter[int] = Counter()
+            for row in data.bag_component.items:
+                if row.bag_type != 0:
+                    continue
+                if row.HasField("instance"):
+                    item = row.instance
+                    guid, config, amount = item.item_id, item.config_id, item.size
+                else:
+                    item = row
+                    guid, config, amount = row.item_uuid, row.config_id, row.stack_size
+                rule = self.tables["Item"].get(config)
+                if rule is not None and rule.battle_usable and guid and amount and AssetInventory.countable(item):
+                    items[config] += amount
+            for config, amount in sorted(items.items()):
+                available = min(amount, self._inventory.removable_count(data, config))
+                if available:
+                    snapshot.items.add(item_table_id=config, count=min((1 << 32) - 1, available))
         if data.pet_component.active_pet_id:
             pet = next((item for item in data.pet_component.pets if item.pet_id == data.pet_component.active_pet_id), None)
             row = self.tables["Pet"].get(pet.pet_table_id) if pet is not None else None
-            stats = pet_stats(self.tables, pet) if pet is not None else None
-            if row is not None and stats and pet.health and snapshot.level >= pet_level(pet.level, row):
+            pstats = pet_stats(self.tables, pet) if pet is not None else None
+            if row is not None and pstats and pet.health and snapshot.level >= pet_level(pet.level, row):
                 wire = snapshot.pets.add(
                     pet_id=pet.pet_id, owner_player_id=player.player_id, pet_name=pet.name or row.name,
                     pet_table_id=pet.pet_table_id, level=pet_level(pet.level, row),
-                    max_health=stats["max_health"], max_mana=stats["max_mana"], defense=stats["defense"],
-                    physical_attack=stats["physical_attack"], magic_attack=stats["magic_attack"],
+                    max_health=pstats["max_health"], max_mana=pstats["max_mana"], defense=pstats["defense"],
+                    physical_attack=pstats["physical_attack"], magic_attack=pstats["magic_attack"],
                     skill_table_ids=pet_skills(pet, row),
                 )
-                wire.base_attributes.health = min(pet.health, stats["max_health"])
-                wire.base_attributes.mana = min(pet.mana, stats["max_mana"]) if stats["max_mana"] else pet.mana
-                wire.base_attributes.speed = stats["speed"]
+                if isolate_temp_state:
+                    wire.base_attributes.health = pstats["max_health"]
+                    wire.base_attributes.mana = pstats["max_mana"]
+                else:
+                    wire.base_attributes.health = min(pet.health, pstats["max_health"])
+                    wire.base_attributes.mana = min(pet.mana, pstats["max_mana"]) if pstats["max_mana"] else pet.mana
+                wire.base_attributes.speed = pstats["speed"]
         return 0
 
     async def cancel(self, request):
@@ -472,7 +537,10 @@ class SceneBattle:
                 if (player := self._player(player_id)) is not None and self.scene.mutable(player):
                     await self.scene.flush_player_rows(player)
                     data = self.scene.rows.assemble(player.snapshot)
-                    if release_item_hold(data, request.battle_id):
+                    changed = bool(release_item_hold(data, request.battle_id))
+                    if SceneFestivalBeast.on_battle_prepare_cancelled_or_void(data, request.battle_id):
+                        changed = True
+                    if changed:
                         await self.scene.commit_player_data(player, data)
         return self.protocol.message("Empty")
 

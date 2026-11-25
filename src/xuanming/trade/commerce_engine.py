@@ -15,6 +15,12 @@ from google.protobuf.message import DecodeError, Message
 
 from ..protocol import Protocol
 from .asset_loop import AssetOpCaller, SqlCommittedLedgerReader, acknowledge_receipt
+from .economy_credit import (
+    CompletedTradeFact,
+    PlayerTradeGuard,
+    SellerCreditService,
+    settled_trade_fact,
+)
 from .errors import (
     ERR_INVALID_PARAMETER,
     ERR_TRADE_AUCTION_ENDED,
@@ -614,6 +620,8 @@ class CommerceEngine:
         asset_caller: AssetOpCaller | None = None,
         ledger_reader: SqlCommittedLedgerReader | None = None,
         rmb=None,
+        credits: SellerCreditService | None = None,
+        player_trade_guard: PlayerTradeGuard | None = None,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -624,6 +632,8 @@ class CommerceEngine:
         self._asset_caller = asset_caller
         self._ledger_reader = ledger_reader
         self.rmb = rmb
+        self.credits = credits
+        self.player_trade_guard = player_trade_guard
         self._clock_ms = clock_ms
         self._ack_after_op_id = 0
 
@@ -810,8 +820,12 @@ class CommerceEngine:
             raise TradeRejection(ERR_INVALID_PARAMETER, "buyer_player_id required")
         if buyer == me:
             raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot trade with self")
-        self.policy.validate_selection(req.seller_assets if req.HasField("seller_assets") else None)
-        self.policy.validate_selection(req.buyer_assets if req.HasField("buyer_assets") else None)
+        seller_assets = req.seller_assets if req.HasField("seller_assets") else None
+        buyer_assets = req.buyer_assets if req.HasField("buyer_assets") else None
+        self.policy.validate_selection(seller_assets)
+        self.policy.validate_selection(buyer_assets)
+        if self.player_trade_guard is not None:
+            await self.player_trade_guard.evaluate(me, buyer, seller_assets, buyer_assets, self.now_ms())
         rec = self.protocol.message(
             "trade.TradeCommerceRecord",
             kind=COMMERCE_KIND_PLAYER_TRADE,
@@ -833,6 +847,9 @@ class CommerceEngine:
         dur = int(req.duration_ms)
         if not self.policy.valid_price(price, cur) or dur < 60_000 or dur > 30 * 24 * 3600 * 1000:
             raise TradeRejection(ERR_INVALID_PARAMETER, "invalid consignment price or duration")
+        designated = int(req.designated_buyer_player_id)
+        if designated == me:
+            raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot designate self as buyer")
         rec = self.protocol.message(
             "trade.TradeCommerceRecord",
             kind=COMMERCE_KIND_CONSIGNMENT,
@@ -842,7 +859,11 @@ class CommerceEngine:
             currency_type=cur,
             expires_ms=self.now_ms() + dur,
         )
-        w = self.protocol.message("trade.TradeCommerceWorkflow", stage="escrow")
+        w = self.protocol.message(
+            "trade.TradeCommerceWorkflow",
+            stage="escrow",
+            designated_buyer_player_id=designated,
+        )
         w.seller_assets.CopyFrom(req.assets)
         return await self._create(original, me, str(req.client_request_id), req, rec, w)
 
@@ -1018,6 +1039,8 @@ class CommerceEngine:
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "consignment not open")
                 if me == int(rec.seller_player_id):
                     raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot buy own consignment")
+                if int(w.designated_buyer_player_id) != 0 and int(w.designated_buyer_player_id) != me:
+                    raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "consignment reserved for designated buyer")
                 if int(w.quantity_reserved) >= 32:
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "consignment reservation limit")
                 rec.buyer_player_id = me
@@ -1252,11 +1275,13 @@ class CommerceEngine:
 
         parents_to_wake: list[int] = []
         bid_to_wake = 0
+        settled_credit_fact: CompletedTradeFact | None = None
 
         async def _tx(tx: TradeTx) -> None:
-            nonlocal parents_to_wake, bid_to_wake
+            nonlocal parents_to_wake, bid_to_wake, settled_credit_fact
             parents_to_wake = []
             bid_to_wake = 0
+            settled_credit_fact = None
             await self._lock_roles(tx, None, 0, int(old.seller_player_id), int(old.buyer_player_id), int(w0.highest_bidder))
             rec = await tx.lock_commerce(int(old.commerce_id))
             if rec is None:
@@ -1353,6 +1378,8 @@ class CommerceEngine:
                 return
             parents_to_wake = list(_filled_parents_to_wake(locked_rec, rec))
             bid_to_wake = _finished_lot_bid(locked_rec, rec, w)
+            if int(locked_rec.status) != COMMERCE_SETTLED and int(rec.status) == COMMERCE_SETTLED:
+                settled_credit_fact = settled_trade_fact(rec, w, now_proc)
             await tx.save_commerce(rec, w, now_proc)
 
         await self.store.run_role_tx(_tx)
@@ -1361,6 +1388,16 @@ class CommerceEngine:
             await self.store.wake_commerce(parent_id, now)
         if bid_to_wake:
             await self.store.wake_commerce(bid_to_wake, now)
+        if self.credits is not None and settled_credit_fact is not None:
+            try:
+                await self.credits.record_completed_trade(settled_credit_fact)
+            except Exception as credit_exc:
+                logger.error(
+                    "trade record completed trade into seller credit failed order_id=%s seller_id=%d err=%s",
+                    settled_credit_fact.order_id,
+                    settled_credit_fact.seller_player_id,
+                    credit_exc,
+                )
 
     async def _match_market(self, taker_id: int) -> None:
         taker = await self.store.get_commerce(taker_id)

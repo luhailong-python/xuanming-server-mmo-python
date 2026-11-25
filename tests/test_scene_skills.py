@@ -147,8 +147,10 @@ def test_realtime_release_resolves_opaque_target_and_commits_guarded_damage(race
             assert len(writes) == 1 and writes[0][0] == 2 and writes[0][1] < 150
         buffs = [entry.row.id for entry in service.casts.buffs.entries(players[2])]
         assert buffs == ([] if race in ("caster_relocates", "target_relocates") else [15])
-        assert pushes[0][0:2] == (2, "SceneSkillClientPlayerNotifySkillUsed")
-        assert list(pushes[0][2].target_entity) == [101]
+        assert pushes[0][0:2] == (1, "SceneClientPlayerCommonNotifySelfActorStateFlags")
+        assert (pushes[0][2].action_state_mask, pushes[0][2].combat_state_mask, pushes[0][2].state_seq) == (1, 0, 1)
+        skill_used = next(msg for pid, name, msg in pushes if pid == 2 and name == "SceneSkillClientPlayerNotifySkillUsed")
+        assert list(skill_used.target_entity) == [101]
         assert players[1].transform.rotation == (0.0, 0.0, 90.0)
         assert (100, ("transform",)) in dirty
         if race in ("caster_relocates", "target_relocates"):

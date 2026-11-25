@@ -22,7 +22,7 @@ def test_original_maps_snap_spawns_and_share_identical_config_paths():
 
 
 def test_original_main_mesh_blocks_wall_and_routes_around_it():
-    main = load_navigation(ConfigTables())[1]
+    main = NavigationMesh.from_bytes(files("xuanming.data").joinpath("nav", "main_scene.bin").read_bytes())
     start = (133.0, 199.0, 0.0)
     assert main.snap((133.0, 199.0, 2.0)) == start
     assert main.snap((133.0, 199.0, 4.0)) is None

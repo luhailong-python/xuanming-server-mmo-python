@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 
 from ..settings import secret
+from .cellroute import CellRouteConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,8 @@ class LoginConfig:
     # 合服归属区重定向与区创角开关
     redirect_on_enter_enabled: bool = False
     create_role_closed: bool = False
+    # 可选 4096 槽位确定性单元路由（默认 mode="" 停用）
+    cell_route: CellRouteConfig = CellRouteConfig()
 
     @classmethod
     def from_env(cls, zone_id: int, environ=None):

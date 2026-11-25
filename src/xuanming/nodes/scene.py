@@ -545,6 +545,8 @@ class SceneNode:
         self._push(player, "SceneSceneClientPlayerNotifyEnterScene",
                    self.protocol.message("EnterSceneS2C", scene_info=world.info))
         self._push(player, "SceneSceneClientPlayerNotifyActorCreate", self._actor(player))
+        if self.skill_casts is not None:
+            self.skill_casts.sync_self_state_after_entry(player)
 
     def _announce_neighbors(self, world, player) -> None:
         self._announce(world, player)

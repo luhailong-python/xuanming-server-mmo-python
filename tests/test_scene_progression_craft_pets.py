@@ -225,9 +225,9 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
             initial = await rpc("SceneTrialJournalClientPlayer", "GetTrialJournal")
             assert not initial.error_message.id
             snap = initial.snapshot
-            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 24
-            assert len(snap.chapters) == 3 and len(snap.chapters[0].entries) == 4
-            assert len(snap.milestones) == 10 and len(snap.redeemable_artifacts) == 8
+            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 27
+            assert len(snap.chapters) == 3 and len(snap.chapters[0].entries) == 5
+            assert len(snap.milestones) == 11 and len(snap.redeemable_artifacts) == 8
             assert not snap.hard_boss_trial_unlocked
             # 困难条目 103/104 未过普通前不可进入。
             by_entry = {e.entry_id: e for e in snap.chapters[0].entries}
@@ -399,31 +399,31 @@ def test_equip_craft_rules_preview_commit_and_material_reward(tmp_path):
             )
             assert stale_rev.outcome == 0 and stale_rev.error_message.id == 1006
 
-            # 领取第一批 20 份（15 打造材料 + 5 强化石）+ 重放幂等。
+            # 领取第一批 20 份（20 打造材料）+ 重放幂等。
             claim1 = await rpc(
                 "SceneBagClientPlayer", "ClaimEquipmentMaterialReward",
-                client_request_id=403, expected_revision=0, crafting_material_count=15, enhancement_stone_count=5,
+                client_request_id=403, expected_revision=0, crafting_material_count=20, enhancement_stone_count=0,
             )
             assert not claim1.error_message.id and claim1.outcome == 2 and claim1.durable and not claim1.replayed
             assert claim1.result_revision == 1 and claim1.snapshot.available_units == 10
-            assert claim1.snapshot.crafting_material.owned == 15
+            assert claim1.snapshot.crafting_material.owned == 20
 
             claim1_replay = await rpc(
                 "SceneBagClientPlayer", "ClaimEquipmentMaterialReward",
-                client_request_id=403, expected_revision=0, crafting_material_count=15, enhancement_stone_count=5,
+                client_request_id=403, expected_revision=0, crafting_material_count=20, enhancement_stone_count=0,
             )
             assert not claim1_replay.error_message.id and claim1_replay.replayed and claim1_replay.outcome == 2
-            assert claim1_replay.snapshot.crafting_material.owned == 15
+            assert claim1_replay.snapshot.crafting_material.owned == 20
 
-            # 预览打造新手木剑（1101，消耗 10 打造材料 3001）。
-            create_choice = protocol.message("EquipmentCraftChoice", operation=1, config_id=1101)
+            # 预览打造 1级定制武器（3101，消耗 20 打造材料 3001）。
+            create_choice = protocol.message("EquipmentCraftChoice", operation=1, config_id=3101)
             prev_create = await rpc("SceneBagClientPlayer", "PreviewEquipmentCraft", choice=create_choice)
             assert not prev_create.error_message.id
             pview = prev_create.preview
             assert pview.available and pview.rules_fingerprint == rules.rules_fingerprint
             assert pview.expected_forge_revision == 0
-            assert pview.material.config_id == CRAFTING_MATERIAL_ID and pview.material.count == 10 and pview.material.owned == 15
-            assert pview.result.config_id == 1101 and pview.result.equip_profile == 1 and len(pview.result.fixed_affix_slots) == 2
+            assert pview.material.config_id == CRAFTING_MATERIAL_ID and pview.material.count == 20 and pview.material.owned == 20
+            assert pview.result.config_id == 3101 and pview.result.equip_profile == 1 and len(pview.result.fixed_affix_slots) == 2
 
             # 指纹不匹配拒绝；正式打造成功 + 幂等重放 + 旧水位返回 UNKNOWN(28022)。
             bad_fp = await rpc(
@@ -460,7 +460,7 @@ def test_equip_craft_rules_preview_commit_and_material_reward(tmp_path):
                 "SceneBagClientPlayer", "ClaimEquipmentMaterialReward",
                 client_request_id=404, expected_revision=1, crafting_material_count=10, enhancement_stone_count=0,
             )
-            assert not claim2.error_message.id and claim2.snapshot.crafting_material.owned == 15
+            assert not claim2.error_message.id and claim2.snapshot.crafting_material.owned == 10
 
             # 池不匹配（槽 1 选池 2 的 201）拒绝。
             bad_pool = await rpc(

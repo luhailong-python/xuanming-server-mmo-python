@@ -28,6 +28,7 @@ from .dead_holder import (
     DeadHolderReleaser,
     PlayerStoreHolderInfo,
 )
+from .owner_authority import OwnerAuthorityBridge, OwnerAuthorityStore
 from .store import (
     DeadNodeTaskFence,
     PlayerPlacementStore,
@@ -776,6 +777,8 @@ class SceneManagerService:
         clock_ms: Callable[[], int] | None = None,
         rng: random.Random | None = None,
         dead_holder_releaser: DeadHolderReleaser | None = None,
+        owner_authority: OwnerAuthorityStore | None = None,
+        owner_authority_bridge: OwnerAuthorityBridge | None = None,
     ) -> None:
         self.protocol = protocol
         self.config = cfg
@@ -786,6 +789,17 @@ class SceneManagerService:
         self.node_registry = node_registry
         self.publisher = publisher
         self.dead_holder_releaser = dead_holder_releaser
+        if owner_authority_bridge is not None:
+            self.owner_authority_bridge: OwnerAuthorityBridge | None = owner_authority_bridge
+            self.owner_authority: OwnerAuthorityStore | None = owner_authority or owner_authority_bridge.store
+        elif owner_authority is not None:
+            self.owner_authority = owner_authority
+            self.owner_authority_bridge = OwnerAuthorityBridge(
+                owner_authority, mode=cfg.owner_authority.mode or "shadow",
+            )
+        else:
+            self.owner_authority = None
+            self.owner_authority_bridge = None
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self.id_gen = id_gen or SceneIdGenerator(cfg.node_id, clock_ms=self._clock_ms)
         self._rng = rng
@@ -803,6 +817,11 @@ class SceneManagerService:
                 "LeaveScene": self.leave_scene,
             }
         }
+
+    def _owner_authority_mode(self) -> str:
+        if self.owner_authority_bridge is None:
+            return ""
+        return self.owner_authority_bridge.mode
 
     def _now_ms(self) -> int:
         return int(self._clock_ms())
@@ -2306,6 +2325,39 @@ class SceneManagerService:
                     player_id, int(current_loc.scene_id), current_zone_id, current_loc.node_id,
                 )
 
+            # 6d. 可选线性一致 SQL OwnerAuthority 强门禁（必须在 Kafka 路由提交前完成）
+            if self._owner_authority_mode() == "enforce":
+                assert self.owner_authority_bridge is not None
+                try:
+                    await self.owner_authority_bridge.sync_enter(
+                        player_id=player_id,
+                        scene_id=scene_id,
+                        node_id=node_id,
+                        zone_id=target_zone_id,
+                        redis_epoch=placed.epoch,
+                        owner_revision=owner_revision,
+                        enforce=True,
+                    )
+                except Exception as exc:
+                    restored, echo = await self._rollback_placement(
+                        player_id=player_id,
+                        old_loc=current_loc,
+                        old_raw=current_loc_raw,
+                        old_zone_id=current_zone_id,
+                        placed=placed,
+                        required_marker=required_marker,
+                        keep_minted_epoch=same_node_zero_mint,
+                    )
+                    if restored:
+                        await self._release_scene_member_best_effort(player_id, scene_id, target_zone_id, node_id)
+                        if current_loc is not None and int(current_loc.scene_id) != 0:
+                            await self._commit_scene_member(
+                                player_id, int(current_loc.scene_id), current_zone_id, current_loc.node_id,
+                            )
+                    response = self._err_resp(errors.ERR_OWNER_EPOCH_CONFLICT, f"owner authority rejected enter: {exc}")
+                    response.owner_epoch_after_rollback = echo
+                    return response
+
             # 7. Kafka 提交点（broker ACK 之前失败须单调回滚）
             if request.gate_id or request.hosted_placement:
                 try:
@@ -2357,6 +2409,19 @@ class SceneManagerService:
             if taken_over_loc is not None:
                 await self._release_scene_member_best_effort(
                     player_id, int(taken_over_loc.scene_id), taken_over_zone, taken_over_loc.node_id,
+                )
+
+            # 7c. 可选线性一致 SQL OwnerAuthority shadow 双写（非阻塞审计）
+            if self._owner_authority_mode() == "shadow":
+                assert self.owner_authority_bridge is not None
+                await self.owner_authority_bridge.sync_enter(
+                    player_id=player_id,
+                    scene_id=scene_id,
+                    node_id=node_id,
+                    zone_id=target_zone_id,
+                    redis_epoch=placed.epoch,
+                    owner_revision=owner_revision,
+                    enforce=False,
                 )
 
             response = self.protocol.message("scene_manager.EnterSceneResponse", error_code=errors.ERR_OK)
@@ -2809,6 +2874,28 @@ class SceneManagerService:
                 verdict=pending_verdict,
                 req_identity=req_identity,
             )
+
+        if outcome != "deleted":
+            logger.info(
+                "player leave scene location not deleted player=%d scene=%d outcome=%s holder_release=%s",
+                player_id, scene_id, outcome, release_verdict.value,
+            )
+            return self._empty()
+
+        if self.owner_authority_bridge is not None:
+            try:
+                await self.owner_authority_bridge.sync_leave(
+                    player_id=player_id,
+                    scene_id=scene_id,
+                    node_id=current_loc.node_id,
+                    zone_id=int(current_loc.zone_id) or loc_zone,
+                )
+            except Exception as exc:
+                await self._abort(
+                    context,
+                    grpc.StatusCode.UNAVAILABLE,
+                    f"release owner authority for player {player_id}: {exc}",
+                )
 
         logger.info(
             "player left scene player=%d scene=%d node=%s outcome=%s holder_release=%s owner_epoch=%d",

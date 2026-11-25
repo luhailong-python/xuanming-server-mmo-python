@@ -52,7 +52,7 @@ def test_pet_rpc_lifecycle_and_durable_battle_push(tmp_path, monkeypatch):
                 pet_id = granted.pet_id
                 pet = granted.pets.pets[0]
                 assert (pet.pet_id, pet.level, pet.name, pet.total_points, pet.remaining_points) == (pet_id, 1, "灵狐", 5, 5)
-                assert list(pet.skill_table_ids) == [14] and pet.derived.health == pet.derived.max_health
+                assert list(pet.skill_table_ids) == [10006] and pet.derived.health == pet.derived.max_health
                 assert [item.aptitude for item in pet.dimensions] == [8000, 10_000, 7000, 11_000]
 
                 auto = await _rpc(client, calls, "AutoAllocatePetPoints", pet_id=pet_id)
@@ -87,7 +87,7 @@ def test_pet_rpc_lifecycle_and_durable_battle_push(tmp_path, monkeypatch):
 
                 snapshot, deadline = await _prepare(runtime, player_id, 42)
                 assert len(snapshot.pets) == 1 and snapshot.pets[0].pet_id == pet_id
-                assert list(snapshot.pets[0].skill_table_ids) == [14]
+                assert list(snapshot.pets[0].skill_table_ids) == [10006]
                 assert (await _rpc(client, calls, "RecallPet")).error_message.id == 26008
                 protocol = client.protocol
                 await runtime.scene.battle.confirm(protocol.message("BattleConfirmedEvent", player_id=player_id,

@@ -53,6 +53,7 @@ RANKED_REWARD_TALISMAN = 3
 RANKED_REWARD_TIER_BADGE = 4
 RANKED_REWARD_TIER_TITLE = 5
 RANKED_REWARD_CHAMPION_INSCRIPTION = 6
+RANKED_REWARD_WIN_MILESTONE = 7
 
 RANKED_MATCH_RATING_UNSPECIFIED = 0
 RANKED_MATCH_RATING_PENDING = 1
@@ -67,6 +68,7 @@ ROLE_KIND_PET = 2
 MILESTONE_BIT_AVATAR = 1 << 0
 MILESTONE_BIT_CARD = 1 << 1
 MILESTONE_BIT_TALISMAN = 1 << 2
+MILESTONE_BIT_WIN = 1 << 3
 
 HONOR_BIT_TIER_BADGE = 1 << 0
 HONOR_BIT_TIER_TITLE = 1 << 1
@@ -74,10 +76,14 @@ HONOR_BIT_CHAMPION = 1 << 2
 
 DEFAULT_CHARACTER_PRESET_ID = 101
 DEFAULT_PET_PRESET_ID = 203
-DEFAULT_RULE_VERSION = 1
+DEFAULT_RULE_VERSION = 2
 DEFAULT_BATTLE_CONFIG_ID = 5
 DEFAULT_SEASON_DURATION_DAYS = 56
 DAY_MS = 24 * 3_600_000
+
+# 排位负/平局防挂机门槛（与 Go authority/ranked.go 对齐）
+RANKED_MIN_ROUNDS_FOR_LOSS = 3
+RANKED_MIN_MANUAL_ROUNDS_FOR_LOSS = 2
 
 
 # -- 不可变配置与存储行模型 ---------------------------------------------------------------------------
@@ -162,9 +168,10 @@ class RankedRuleConfig:
     milestone_avatar_matches: int = 4
     milestone_card_matches: int = 8
     milestone_talisman_matches: int = 12
-    tier_qingfeng_centi: int = 140_000
-    tier_yunzhang_centi: int = 155_000
-    tier_tianshu_centi: int = 170_000
+    milestone_win_matches: int = 6
+    tier_qingfeng_centi: int = 152_000
+    tier_yunzhang_centi: int = 160_000
+    tier_tianshu_centi: int = 172_000
     tier_wushuang_centi: int = 185_000
 
     @classmethod
@@ -190,6 +197,7 @@ class RankedRuleConfig:
             milestone_avatar_matches=int(row.milestone_avatar_matches) or defaults.milestone_avatar_matches,
             milestone_card_matches=int(row.milestone_card_matches) or defaults.milestone_card_matches,
             milestone_talisman_matches=int(row.milestone_talisman_matches) or defaults.milestone_talisman_matches,
+            milestone_win_matches=int(getattr(row, "milestone_win_matches", 0)) or defaults.milestone_win_matches,
             tier_qingfeng_centi=int(row.tier_qingfeng_centi) or defaults.tier_qingfeng_centi,
             tier_yunzhang_centi=int(row.tier_yunzhang_centi) or defaults.tier_yunzhang_centi,
             tier_tianshu_centi=int(row.tier_tianshu_centi) or defaults.tier_tianshu_centi,
@@ -219,78 +227,78 @@ OFFICIAL_RANKED_PRESETS: tuple[RankedPresetSpec, ...] = (
         role_kind=ROLE_KIND_CHARACTER,
         code="pozhen",
         name="破阵",
-        role_tag="爆发输出",
+        role_tag="爆发破疗",
         pet_table_id=0,
         weights=(1, 0, 3, 1),
-        skill_ids=(10002, 10039, 10025),
+        skill_ids=(10002, 10039, 10025, 10035),
         sort=1,
-        desc="偏物理群体与爆发输出，适合破防后收割",
+        desc="偏物理群体与爆发输出，附带断脉咒压制治疗反制龟阵",
     ),
     RankedPresetSpec(
         preset_id=102,
         role_kind=ROLE_KIND_CHARACTER,
         code="kongchang",
         name="控场",
-        role_tag="先手封控",
+        role_tag="全封映法",
         pet_table_id=0,
         weights=(1, 2, 0, 2),
-        skill_ids=(10006, 10021, 10034),
+        skill_ids=(10006, 10020, 10034, 10041),
         sort=2,
-        desc="偏速度与法术控场，先手封法并驱散增益",
+        desc="偏速度与法术控场，封灵咒通封物法奶并以玄镜映法反制对手招式",
     ),
     RankedPresetSpec(
         preset_id=103,
         role_kind=ROLE_KIND_CHARACTER,
         code="shouxin",
         name="守心",
-        role_tag="治疗护盾",
+        role_tag="奶盾复苏",
         pet_table_id=0,
         weights=(2, 2, 0, 1),
-        skill_ids=(10010, 10033, 10040),
+        skill_ids=(10010, 10033, 10040, 10026),
         sort=3,
-        desc="偏生存、治疗、净化与独立护盾，稳定团队血线",
+        desc="偏生存、治疗、净化、独立护盾与生生不息复活印，攻防拉扯扎实",
     ),
     RankedPresetSpec(
         preset_id=201,
         role_kind=ROLE_KIND_PET,
         code="pojia",
         name="破甲",
-        role_tag="破防追击",
+        role_tag="破甲提速",
         pet_table_id=3,
         weights=(1, 0, 3, 1),
-        skill_ids=(10002, 10018, 13001),
+        skill_ids=(10002, 10018, 10016, 13005),
         pet_entry_ids=(501,),
         pet_entry_points=(20,),
         sort=1,
-        desc="金猊破防物理宝宝，碎甲击降防并触发乘胜追击",
+        desc="金猊破防物理宝宝，碎甲击破防、青羽催行抢先手、裂甲追击稳补破甲",
     ),
     RankedPresetSpec(
         preset_id=202,
         role_kind=ROLE_KIND_PET,
         code="lingzhou",
         name="灵咒",
-        role_tag="群法施毒",
+        role_tag="毒法回响",
         pet_table_id=1,
         weights=(1, 2, 0, 2),
-        skill_ids=(10006, 10019, 10034),
+        skill_ids=(10006, 10019, 10034, 13006),
         pet_entry_ids=(502, 531),
         pet_entry_points=(10, 10),
         sort=2,
-        desc="灵狐群法施毒宝宝，持续压血并驱散敌方增益",
+        desc="灵狐群法施毒宝宝，持续压血、驱散增益并以灵术回响法术追击",
     ),
     RankedPresetSpec(
         preset_id=203,
         role_kind=ROLE_KIND_PET,
         code="huzhu",
         name="护主",
-        role_tag="减伤护主",
+        role_tag="双罩护主",
         pet_table_id=2,
         weights=(2, 2, 0, 1),
-        skill_ids=(10014, 10010, 11006, 12004),
+        skill_ids=(10014, 10010, 11006, 11005),
         pet_entry_ids=(503, 504),
         pet_entry_points=(10, 10),
         sort=3,
-        desc="石灵护主治疗宝宝，强化双防、治疗与物理护盾",
+        desc="石灵护主治疗宝宝，双防治疗配物理神龙护体与法术如意灵环无偏科",
     ),
 )
 
@@ -401,6 +409,55 @@ def milestone_specs(season_key: str, rule: RankedRuleConfig | None = None) -> tu
     )
 
 
+def win_milestone_spec(season_key: str, rule: RankedRuleConfig | None = None) -> tuple[int, int, int, str] | None:
+    """返回本季胜场锋芒称号里程碑定义（V2：默认 6 胜）。"""
+    cfg = rule or RankedRuleConfig()
+    target = int(cfg.milestone_win_matches)
+    if target <= 0:
+        return None
+    return (target, MILESTONE_BIT_WIN, RANKED_REWARD_WIN_MILESTONE, f"{season_key}_win_milestone_{target}")
+
+
+def ranked_honor_tier_code(tier: int) -> tuple[str, bool]:
+    """返回赛季封榜起发永久段位徽章与赛季称号的段位码（V2：云章起发）。"""
+    if tier == RANKED_TIER_YUNZHANG:
+        return "yunzhang", True
+    if tier == RANKED_TIER_TIANSHU:
+        return "tianshu", True
+    if tier == RANKED_TIER_WUSHUANG:
+        return "wushuang", True
+    return "", False
+
+
+def evaluate_ranked_participation(fact, settlement, total_rounds: int, player_won: bool) -> bool:
+    """按 Go authority/ranked.go evaluateRankedParticipation 裁定单局排位是否达成有效参赛。"""
+    if total_rounds <= 0:
+        return False
+    if settlement is not None and bool(getattr(settlement, "fled", False)):
+        return False
+    no_action_opportunity = False
+    if fact is not None:
+        no_action_opportunity = bool(fact.entered_room and fact.no_action_opportunity)
+        base_participated = bool(
+            fact.manual_action_accepted
+            or no_action_opportunity
+            or (fact.entered_room and fact.explicit_auto_enabled)
+        )
+    else:
+        base_participated = bool(settlement is not None and getattr(settlement, "participated", False))
+    if not base_participated:
+        return False
+    if player_won or no_action_opportunity:
+        return True
+    if settlement is None:
+        return False
+    return (
+        total_rounds >= RANKED_MIN_ROUNDS_FOR_LOSS
+        and int(getattr(settlement, "manual_action_rounds", 0)) >= RANKED_MIN_MANUAL_ROUNDS_FOR_LOSS
+        and bool(getattr(settlement, "effective_combat_contribution", False))
+    )
+
+
 # -- 论剑排位业务服务 ---------------------------------------------------------------------------------
 
 
@@ -477,6 +534,15 @@ class RankedManager:
             champion_name=season.champion_name,
             champion_rating_centi=season.champion_rating_centi,
             rank_board_sealed=(season.state == RANKED_SEASON_CLOSED or season.rollover_stage >= 6),
+            allowed_team_sizes=[1, 2, 3, 4, 5],
+            uses_own_progression=True,
+            primary_team_sizes=[1, 3, 5],
+            special_team_sizes=[2, 4],
+            tier_qingfeng_centi=self.rule.tier_qingfeng_centi,
+            tier_yunzhang_centi=self.rule.tier_yunzhang_centi,
+            tier_tianshu_centi=self.rule.tier_tianshu_centi,
+            tier_wushuang_centi=self.rule.tier_wushuang_centi,
+            milestone_win_matches=self.rule.milestone_win_matches,
         )
 
     def _player_season_proto(
@@ -675,8 +741,10 @@ class RankedManager:
                 RANKED_REWARD_CARD_BACKGROUND, set()
             ):
                 return set_tip(resp, ERR_INVALID_PARAMETER)
-            title_owned = owned_by_kind.get(RANKED_REWARD_TIER_TITLE, set()) | owned_by_kind.get(
-                RANKED_REWARD_CHAMPION_INSCRIPTION, set()
+            title_owned = (
+                owned_by_kind.get(RANKED_REWARD_TIER_TITLE, set())
+                | owned_by_kind.get(RANKED_REWARD_CHAMPION_INSCRIPTION, set())
+                | owned_by_kind.get(RANKED_REWARD_WIN_MILESTONE, set())
             )
             if loadout.equipped_title_code and loadout.equipped_title_code not in title_owned:
                 return set_tip(resp, ERR_INVALID_PARAMETER)
@@ -761,6 +829,7 @@ class RankedManager:
         season = await self.ensure_current_season()
         season_key = season.season_key if season.season_id == season_id else f"s{season_id}"
         milestones = milestone_specs(season_key, self.rule)
+        win_milestone = win_milestone_spec(season_key, self.rule)
 
         # outcome_kind: 1 win / 2 loss / 3 draw / 0 none
         outcome_kind = 0
@@ -812,5 +881,6 @@ class RankedManager:
             participated=(status == RANKED_MATCH_RATING_CONFIRMED and participated and total_rounds >= 1),
             settled_at_ms=now_ms,
             milestones=milestones,
+            win_milestone=win_milestone,
         )
         return self.protocol.parse("match.RankedBattleSettlementView", final_bytes)

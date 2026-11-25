@@ -37,9 +37,46 @@ SEASON_IN_BATTLE = 34009
 SEASON_SKILL_NO_UPGRADE = 34010
 SEASON_UNAVAILABLE = 34011
 
-# MatchMode 枚举数值（与 battle_data / match_service 对齐）。
-_PVE_MODES = frozenset({1, 2})  # MATCH_MODE_PVE_SOLO, MATCH_MODE_PVE_TEAM
-_PVP_MODES = frozenset({3, 4, 5})  # MATCH_MODE_1V1, MATCH_MODE_5V5, MATCH_MODE_PVP_TEAM
+# MatchMode 枚举数值（保留既有 scene_season 映射以兼容旧单测；is_eligible_battle 严格按 proto MatchMode 判定）。
+_PVE_MODES = frozenset({1, 2})
+_PVP_MODES = frozenset({3, 4, 5})
+
+# 正式排位败局/平局防挂机门槛（对齐 C++ PlayerEquipmentMaterialRewardSystem::kPvpMin*）。
+PVP_MIN_ROUNDS_FOR_LOSS = 3
+PVP_MIN_MANUAL_ROUNDS_FOR_LOSS = 2
+
+
+def is_eligible_battle(settlement) -> bool:
+    """按 C++ PlayerSeasonSystem::IsEligibleBattle 判定本场结算是否可累计赛季印进度点。"""
+    if (
+        not settlement.battle_id
+        or not settlement.player_id
+        or settlement.fled
+        or settlement.total_rounds <= 0
+        or settlement.player_team_index > 1
+        or settlement.outcome not in (1, 2, 3)
+    ):
+        return False
+    player_won = (
+        (settlement.outcome == 1 and settlement.player_team_index == 0)
+        or (settlement.outcome == 2 and settlement.player_team_index == 1)
+    )
+    mode = int(settlement.match_mode)
+    if mode in (4, 5):  # MATCH_MODE_PVE_SOLO, MATCH_MODE_PVE_TEAM
+        return player_won
+    if mode in (1, 3, 7):  # MATCH_MODE_5V5, MATCH_MODE_1V1, MATCH_MODE_PVP_TEAM
+        if not bool(getattr(settlement, "competitive_ranked", False)):
+            return True
+        if not bool(getattr(settlement, "participated", False)):
+            return False
+        if player_won:
+            return True
+        return (
+            settlement.total_rounds >= PVP_MIN_ROUNDS_FOR_LOSS
+            and int(getattr(settlement, "manual_action_rounds", 0)) >= PVP_MIN_MANUAL_ROUNDS_FOR_LOSS
+            and bool(getattr(settlement, "effective_combat_contribution", False))
+        )
+    return False
 
 
 def valid_artifact_definition(
@@ -262,10 +299,23 @@ class SceneSeason:
         fled: bool = False,
         total_rounds: int = 1,
         now_ms_val: int | None = None,
+        competitive_ranked: bool = False,
+        participated: bool = True,
+        manual_action_rounds: int = 0,
+        effective_combat_contribution: bool = False,
     ) -> int:
         """按权威战斗结果累计当季赛季印进度点，返回实际新增点数。"""
         if fled or total_rounds <= 0:
             return 0
+        if competitive_ranked:
+            if not participated:
+                return 0
+            if not player_won and (
+                total_rounds < PVP_MIN_ROUNDS_FOR_LOSS
+                or manual_action_rounds < PVP_MIN_MANUAL_ROUNDS_FOR_LOSS
+                or not effective_combat_contribution
+            ):
+                return 0
         stamp = self.clock() if now_ms_val is None else now_ms_val
         rule = find_active_season_rule(self.tables, stamp)
         if rule is None:

@@ -23,6 +23,14 @@ from .asset_loop import (
 )
 from .commerce_engine import CommerceEngine
 from .config import TradeConfig
+from .economy_credit import (
+    DirectoryOwnershipLookup,
+    PlayerTradeGuard,
+    SellerCreditService,
+    StoreDailyPlayerTradeTracker,
+    StoreOwnershipLookup,
+    StoreReferencePriceReader,
+)
 from .mall_adapter import MallAdapter, MallPoller
 from .model import MergedZones, TRADE_NODE_TYPE
 from .rmb import RmbConsignments
@@ -136,7 +144,7 @@ async def open_service(
     listing_ids = IdSegmentAllocator(protocol, ds_client.call, "trade_listing")
     op_ids = IdSegmentAllocator(protocol, ds_client.call, "trade_asset_op")
 
-    store = SqlTradeStore(pool, protocol, role_directory=role_directory)
+    store = SqlTradeStore(pool, protocol, role_directory=role_directory, id_allocator=listing_ids)
     if config.bootstrap_schema:
         await store.bootstrap()
     await store.verify_schema()
@@ -177,6 +185,13 @@ async def open_service(
     rmb_consignments: RmbConsignments | None = None
     rmb_identity: RmbIdentity | None = None
     content_guard_checker: GrpcContentGuardChecker | None = None
+    reference_prices = StoreReferencePriceReader(store)
+    daily_outflow = StoreDailyPlayerTradeTracker(store)
+    seller_credits: SellerCreditService | None = SellerCreditService(
+        store=store,
+        ownership=StoreOwnershipLookup(store),
+        policy=config.seller_credit,
+    )
 
     if config.content_guard:
         cg_client = GrpcClient(config.content_guard, timeout=config.request_budget_sec)
@@ -184,6 +199,11 @@ async def open_service(
         content_guard_checker = GrpcContentGuardChecker(protocol, cg_client.call)
 
     if config.asset_op_enabled:
+        player_trade_guard = PlayerTradeGuard(
+            policy=config.player_trade,
+            prices=reference_prices,
+            daily_out=daily_outflow,
+        )
         commerce_engine = CommerceEngine(
             protocol,
             store,
@@ -192,6 +212,8 @@ async def open_service(
             policy=config.policy,
             asset_caller=asset_caller,
             ledger_reader=ledger_reader,
+            credits=seller_credits,
+            player_trade_guard=player_trade_guard,
         )
         if config.mall_url:
             mall_adapter = MallAdapter(
@@ -205,6 +227,12 @@ async def open_service(
         if len(config.account_directory_secret) >= 32:
             role_trade_dir = GrpcRoleTradeDirectory(protocol, ds_client.call, config.account_directory_secret)
             rmb_identity = RmbIdentity(role_trade_dir)
+            seller_credits = SellerCreditService(
+                store=store,
+                ownership=DirectoryOwnershipLookup(role_trade_dir),
+                policy=config.seller_credit,
+            )
+            commerce_engine.credits = seller_credits
             if config.rmb_enabled and mall_adapter is not None:
                 sealer = GrpcRoleSealer(protocol, etcd_directory, config.account_directory_secret)
                 stack.push_async_callback(sealer.close)
@@ -214,6 +242,7 @@ async def open_service(
                     mall_adapter,
                     role_trade_dir,
                     sealer,
+                    credits=seller_credits,
                     currency_types=config.rmb_currencies,
                 )
                 commerce_engine.rmb = rmb_consignments
@@ -236,6 +265,10 @@ async def open_service(
         rmb=rmb_consignments,
         rmb_identity=rmb_identity,
         content_guard=content_guard_checker,
+        credits=seller_credits,
+        reference_prices=reference_prices,
+        player_trade_policy=config.player_trade,
+        daily_outflow=daily_outflow,
         manual_resolution_secret=config.manual_resolution_secret,
         manual_resolution_environment=config.manual_resolution_environment,
         request_budget_sec=config.request_budget_sec,

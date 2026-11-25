@@ -159,12 +159,30 @@ class BattleSkills:
             actor.attributes.mana -= cost
             self._mana_event(turn, group, 0, actor, actor, skill_id, -cost)
         base = self._base_damage(actor, rule) if not rule.class_id or rule.target_team == ENEMY else 0.0
+        subject_max_targets = (
+            (rule.pet_max_targets or rule.max_targets) if actor.actor_type == 3 else rule.max_targets
+        )
+        is_multi_target = (subject_max_targets > 1) or (not rule.class_id and 2 in rule.target_modes)
+        explicit_primary = action.target_id != 0 and targets[0].actor_id == action.target_id
+        primary_focus_bonus = (
+            getattr(self.engine, "is_competitive_pvp_battle", False)
+            and actor.actor_type == 1
+            and subject_max_targets > 1
+            and explicit_primary
+            and len(targets) < subject_max_targets
+        )
         for hit, target in enumerate(targets):
             if rule.class_id and not active(target):
                 continue
             if base > 0:
-                self.engine._damage(turn, group, actor, target, rule, skill_id=skill_id, hit_index=hit,
-                                    base=base, rank=rank)
+                is_primary_target = (target.actor_id == targets[0].actor_id)
+                self.engine._damage(
+                    turn, group, actor, target, rule, skill_id=skill_id, hit_index=hit,
+                    base=base, rank=rank,
+                    is_multi_target=is_multi_target,
+                    is_primary_target=is_primary_target,
+                    is_primary_focus=(primary_focus_bonus and is_primary_target),
+                )
             if target.is_dead:
                 continue
             if rule.class_id:
@@ -180,7 +198,10 @@ class BattleSkills:
     def _apply_support(self, turn: Message, group: int, hit: int, actor: Message, target: Message,
                        rule: BattleSkill, skill_id: int, rank: int) -> None:
         if rule.heal_multiplier > 0 or rule.heal_per_level > 0:
-            value = landed_heal(target, self._heal_amount(actor, target, rule, rank))
+            raw_heal = self._heal_amount(actor, target, rule, rank)
+            if getattr(self.engine, "escalation_stacks", 0) > 0:
+                raw_heal *= self.engine.escalation_support_pct / 100.0
+            value = landed_heal(target, raw_heal)
             target.attributes.health += value
             self.engine._event(turn, group, 4, actor, target, skill_table_id=skill_id, hit_index=hit, value=value,
                                target_health_after=target.attributes.health, target_mana_after=target.attributes.mana)
@@ -189,6 +210,12 @@ class BattleSkills:
             target.attributes.mana += value
             self._mana_event(turn, group, hit, actor, target, skill_id, value)
         if rule.dispel_count:
+            encounter = getattr(self.engine, "encounter", None)
+            if encounter is not None:
+                if actor.team_index != target.team_index:
+                    encounter.try_dispel_boss_stance(actor, target, turn, group)
+                else:
+                    encounter.clear_sunder_on_ally_dispel(actor, target)
             self.engine.effects.dispel(target, rule.dispel_count, turn, group, hit)
 
     def _mana_event(self, turn: Message, group: int, hit: int, source: Message, target: Message,

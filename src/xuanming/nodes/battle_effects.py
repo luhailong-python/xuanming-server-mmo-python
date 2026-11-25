@@ -138,6 +138,13 @@ class BattleEffects:
                 existing_rule = self.rules.get(target.buffs[index].buff_table_id)
                 if existing_rule is not None and rule.dispel_tags & existing_rule.tags:
                     self._remove(target, index, turn, group, hit)
+        caster = self.engine.actors.get(caster_id)
+        encounter = getattr(self.engine, "encounter", None)
+        if caster is not None and encounter is not None:
+            if (rule.buff_type == 35 or rule.battle_op == 5) and caster.team_index != target.team_index:
+                encounter.try_dispel_boss_stance(caster, target, turn, group)
+            elif rule.battle_op == 4 and caster.team_index == target.team_index:
+                encounter.clear_sunder_on_ally_dispel(caster, target)
         if rule.buff_type == 35:
             return
         for entry in target.buffs:

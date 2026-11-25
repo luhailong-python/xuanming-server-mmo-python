@@ -246,6 +246,8 @@ def evaluate_seal_condition(
     guard_survived: bool = False,
     self_triggered_shield_break: bool = False,
     self_triggered_anti_control_or_season_skill: bool = False,
+    heal_interrupt_backlash_count: int = 0,
+    all_self_cleaves_parried: bool = False,
 ) -> bool:
     """按 C++ trial_journal_rules.h 口径判定单条战法印是否达成。"""
     if total_rounds <= 0:
@@ -279,6 +281,13 @@ def evaluate_seal_condition(
         return (won or participated) and self_triggered_shield_break
     if condition_type == 12:  # kAntiControlOrSeasonSkill
         return (won or participated) and self_triggered_anti_control_or_season_skill
+    if condition_type == 13:  # kDualGuardBreak
+        return won and (
+            guard_stance_dispelled
+            or (team_dealt_physical_direct_damage and team_dealt_magic_direct_damage)
+        ) and (boss_guard_heal_total == 0 or heal_interrupt_backlash_count > 0)
+    if condition_type == 14:  # kPerfectCleaveParry
+        return won and all_self_cleaves_parried
     return False
 
 
@@ -658,6 +667,8 @@ class SceneTrialJournal:
         guard_survived: bool = False,
         self_triggered_shield_break: bool = False,
         self_triggered_anti_control_or_season_skill: bool = False,
+        heal_interrupt_backlash_count: int = 0,
+        all_self_cleaves_parried: bool = False,
         used_pet_table_id: int = 0,
         used_artifact_effect_ids: tuple[int, ...] = (),
         used_season_seal_id: int = 0,
@@ -699,6 +710,8 @@ class SceneTrialJournal:
             guard_survived = bool(facts.guard_survived)
             self_triggered_shield_break = bool(facts.self_triggered_shield_break)
             self_triggered_anti_control_or_season_skill = bool(facts.self_triggered_anti_control_or_season_skill)
+            heal_interrupt_backlash_count = int(getattr(facts, "heal_interrupt_backlash_count", 0))
+            all_self_cleaves_parried = bool(getattr(facts, "all_self_cleaves_parried", False))
             used_pet_table_id = facts.used_pet_table_id
             used_artifact_effect_ids = tuple(facts.used_artifact_effect_ids)
             used_season_seal_id = facts.used_season_seal_id
@@ -736,6 +749,8 @@ class SceneTrialJournal:
                     guard_survived=guard_survived,
                     self_triggered_shield_break=self_triggered_shield_break,
                     self_triggered_anti_control_or_season_skill=self_triggered_anti_control_or_season_skill,
+                    heal_interrupt_backlash_count=heal_interrupt_backlash_count,
+                    all_self_cleaves_parried=all_self_cleaves_parried,
                 )
             )
             if matched and self._mark_seal_lit(comp, seal.id, entry.season_id):

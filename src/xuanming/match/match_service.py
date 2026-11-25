@@ -20,6 +20,8 @@ from ..protocol import Protocol
 from .battle_scripts import REVIEW_REJECT_DENIED, BattleScriptManager
 from .config import MatchConfig
 from .errors import (
+    ActivityIntentConflictError,
+    ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
     ERR_MATCH_CHALLENGE_SELF,
@@ -75,7 +77,7 @@ from .model import (
     verify_probe_message,
 )
 from .outbox import OutcomeOutboxWorker
-from .ranked import RankedManager
+from .ranked import RankedManager, _default_config_tables
 from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
 from .store import MatchStore, StrandedFormationEntry
@@ -344,6 +346,8 @@ class MatchGrpcService:
         if mode not in (MODE_PVE_SOLO, MODE_PVE_TEAM, MODE_1V1, MODE_5V5, MODE_PVP_TEAM):
             return fail(ERR_MATCH_MODE_NOT_OPEN)
         config_id = int(request.battle_config_id)
+        if config_id != 0 and self._dungeon_boss_trial_kind(config_id) == 7:
+            return fail(ERR_MATCH_MODE_NOT_OPEN)
         team_size = int(request.team_size)
         if mode == MODE_PVE_TEAM:
             max_sz = self.config.pve_team_sizes.get(config_id, 0)
@@ -641,7 +645,131 @@ class MatchGrpcService:
         sign_internal_reply(path, request, reply, "match", self.config.scene_secret, int(self._clock_ms()))
         return reply
 
+    @staticmethod
+    def _dungeon_boss_trial_kind(battle_config_id: int) -> int:
+        tables = _default_config_tables()
+        if tables is None or "Dungeon" not in tables.tables:
+            return 0
+        row = tables["Dungeon"].get(battle_config_id)
+        return int(getattr(row, "boss_trial_kind", 0)) if row is not None else 0
+
+    def _unsigned_activity_payload(self, request: Message) -> bytes:
+        cloned = self.protocol.message("match.StartActivityBattleRequest")
+        cloned.CopyFrom(request)
+        cloned.ClearField("auth")
+        return cloned.SerializeToString(deterministic=True)
+
+    async def _start_festival_beast_activity(self, request: Message, context, path: str) -> Message:
+        """瑞兽迎春单人活动开局：只接受 scene 签名、校验 Kind=5 幂等与数据库时钟时间窗。"""
+        resp = self.protocol.message("match.StartActivityBattleResponse")
+        if (
+            has_session_metadata(context)
+            or not self.config.scene_secret
+            or not verify_internal_hmac(path, request, "scene", self.config.scene_secret, int(self._clock_ms()))
+        ):
+            resp.reject = 5  # INTERNAL
+            return resp
+        mids = [int(x) for x in request.member_player_ids]
+        act = request.activity_context
+        fb = act.festival_beast if act.HasField("festival_beast") else None
+        battle_config_id = int(request.battle_config_id)
+        if (
+            battle_config_id == 0
+            or len(mids) != 1
+            or mids[0] == 0
+            or int(act.initiator_player_id) != mids[0]
+            or (int(request.request_high) == 0 and int(request.request_low) == 0)
+            or fb is None
+            or int(fb.activity_instance_id) == 0
+            or not fb.reward_identity
+            or int(fb.required_wins) == 0
+            or int(fb.locked_pet_id) == 0
+            or int(fb.tier_id) == 0
+            or int(fb.boss_health) == 0
+            or int(fb.round_limit) == 0
+            or int(fb.cycle_rounds) == 0
+            or int(fb.first_heavy_round) == 0
+            or int(fb.first_heavy_round) > int(fb.cycle_rounds)
+            or int(fb.telegraph_lead_rounds) == 0
+            or int(fb.telegraph_lead_rounds) >= int(fb.first_heavy_round)
+            or int(fb.heavy_damage_percent) == 0
+            or int(fb.effective_start_at_ms) == 0
+            or int(fb.effective_end_at_ms) <= int(fb.effective_start_at_ms)
+            or not fb.client_request_id
+        ):
+            resp.reject = 1  # INVALID_ARGUMENT
+            return resp
+        tables = _default_config_tables()
+        if tables is not None and "Dungeon" in tables.tables and self._dungeon_boss_trial_kind(battle_config_id) != 7:
+            resp.reject = 1  # INVALID_ARGUMENT
+            return resp
+
+        pid = mids[0]
+        pres = await self.presence.get_presence(pid)
+        if not pres.online:
+            resp.reject = 2  # MEMBER_OFFLINE
+            resp.offender_player_id = pid
+            return resp
+        if pres.in_battle:
+            resp.reject = 3  # MEMBER_IN_BATTLE
+            resp.offender_player_id = pid
+            return resp
+        if not pres.scene_grpc_endpoint:
+            resp.reject = 4  # MEMBER_NOT_READY
+            resp.offender_player_id = pid
+            return resp
+
+        nodes = await self.battle_nodes.list_nodes(release_track="stable")
+        node = select_battle_node(nodes, release_track="stable")
+        if node is None:
+            resp.reject = 5  # INTERNAL
+            return resp
+
+        payload_bytes = self._unsigned_activity_payload(request)
+        try:
+            formation, created = await self.store.start_festival_beast_battle(
+                owner_id=pid,
+                request_high=int(request.request_high),
+                request_low=int(request.request_low),
+                payload_bytes=payload_bytes,
+                battle_config_id=battle_config_id,
+                activity_context_bytes=act.SerializeToString(deterministic=True),
+                effective_start_at_ms=int(fb.effective_start_at_ms),
+                effective_end_at_ms=int(fb.effective_end_at_ms),
+                battle_node=(node.node_id, node.node_uuid, node.grpc_endpoint, node.physical_region, "stable"),
+                battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+            )
+        except ActivityOutsideWindowError:
+            resp.reject = 6  # ACTIVITY_BATTLE_REJECT_OUTSIDE_WINDOW
+            return resp
+        except ActivityIntentConflictError:
+            resp.reject = 1  # INVALID_ARGUMENT
+            return resp
+        except TeamBusinessError as exc:
+            resp.reject = 4  # MEMBER_NOT_READY
+            resp.offender_player_id = int(exc.params[0]) if exc.params else 0
+            return resp
+        except MatchBusinessError:
+            resp.reject = 4
+            return resp
+        except Exception:
+            logger.error("match StartActivityBattle(festival_beast) failed player_id=%d", pid, exc_info=True)
+            resp.reject = 5
+            return resp
+
+        if created:
+            if self._inline_gather:
+                await self.gather.run_formation(formation)
+            else:
+                self._spawn(self.gather.run_formation(formation), name=f"festival-beast-gather-{formation.battle_id}")
+        resp.battle_id = int(formation.battle_id)
+        resp.formation_state = int(formation.state)
+        resp.admitted_at_ms = int(formation.created_ms)
+        return resp
+
     async def start_activity_battle(self, request: Message, context, path: str) -> Message:
+        if int(request.activity_context.kind) == 2:
+            return await self._start_festival_beast_activity(request, context, path)
         await self._admit_internal(context, request, path, "guild", self.config.guild_secret)
         resp = self.protocol.message("match.StartActivityBattleResponse")
         mids = [int(x) for x in request.member_player_ids]
@@ -652,7 +780,7 @@ class MatchGrpcService:
             or len(set(mids)) != len(mids)
             or any(pid == 0 for pid in mids)
             or int(request.request_id) == 0
-            or int(act.kind) == 0
+            or int(act.kind) != 1
             or int(act.guild_id) == 0
             or int(act.activity_id) == 0
             or int(act.initiator_player_id) != mids[0]
@@ -707,6 +835,7 @@ class MatchGrpcService:
                 self._spawn(self.gather.run_formation(formation), name=f"activity-gather-{formation.battle_id}")
         resp.battle_id = int(formation.battle_id)
         resp.formation_state = int(formation.state)
+        resp.admitted_at_ms = int(formation.created_ms)
         return resp
 
     async def cancel_activity_battle(self, request: Message, context, path: str) -> Message:

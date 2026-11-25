@@ -80,16 +80,16 @@ def test_config_tables_loads_synced_tables_with_json_pb_parity():
     tip_text = json.loads((tables_json.directory / "tip_text.json").read_text(encoding="utf-8"))
     assert tip_text
 
-    # 既有 49 张战斗/场景表保持指纹一致，不破坏既有战斗与场景契约。
-    assert battle_table_fingerprint(tables_json) == "19ee31807f2393e449dcebebb5cca233"
-    assert battle_table_fingerprint(tables_pb) == "19ee31807f2393e449dcebebb5cca233"
+    # 战斗/场景表指纹与最新配表基线严格一致（JSON/PB 双格式逐字节同值）。
+    assert battle_table_fingerprint(tables_json) == "31db787f98ca4b18c48e16f4ed0fdf1c"
+    assert battle_table_fingerprint(tables_pb) == "31db787f98ca4b18c48e16f4ed0fdf1c"
 
 
 def test_ranked_rule_and_presets_load_from_config_tables_with_fallback():
     tables = ConfigTables()
     rule = RankedRuleConfig.from_config_tables(tables)
     assert rule == RankedRuleConfig()
-    assert rule.rule_version == 1
+    assert rule.rule_version == 2
     assert rule.battle_config_id == 5
     assert rule.season_duration_days == 56
     assert rule.tier_wushuang_centi == 185_000

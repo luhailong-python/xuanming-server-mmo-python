@@ -6,6 +6,7 @@ import logging
 
 from ...cluster import GATE
 from .. import gate_drain
+from ..cellroute import select_cell_affinity_candidates
 from ..queue import (
     STATUS_ADMITTED,
     STATUS_ERROR,
@@ -90,9 +91,10 @@ def _make_admit_signer(ctx):
     return sign
 
 
-async def _sign_fast_path(ctx, zone_id: int, response):
+async def _sign_fast_path(ctx, zone_id: int, response, player_id: int = 0):
     try:
         candidates = await _load_candidates(ctx, zone_id)
+        candidates = select_cell_affinity_candidates(ctx.cell_router, player_id, candidates)
         gate = pick_gate(candidates)
     except Exception:
         logger.exception("AssignGate read gate candidates failed zone=%d", zone_id)
@@ -213,7 +215,7 @@ async def run(ctx, request, details):
                 await queue.hold_reconnect_slot(config.zone_id, reconnecting_pid)
             except Exception:
                 logger.exception("Hold reconnect slot failed zone=%d player_id=%d", config.zone_id, reconnecting_pid)
-            return await _sign_fast_path(ctx, config.zone_id, response)
+            return await _sign_fast_path(ctx, config.zone_id, response, player_id=reconnecting_pid)
 
     # 6. 容量核算与空队列快速通道原子占位
     try:

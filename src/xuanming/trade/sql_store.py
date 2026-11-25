@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import time
@@ -21,6 +22,17 @@ from google.protobuf.message import Message
 
 from .. import portal_sql
 from ..protocol import Protocol
+from .economy_credit import (
+    MAX_DAILY_PLAYER_TRADE_SCAN_ROWS,
+    MAX_REFERENCE_SCAN_ROWS,
+    MarketFillSample,
+    SellerCreditKey,
+    SellerCreditProfile,
+    SellerReviewRecord,
+    SellerViolationRecord,
+    saturating_add_uint64,
+    workflow_currency_outflow,
+)
 from .errors import (
     AssetOpLeaseLostError,
     AssetOpPoisonRowError,
@@ -36,8 +48,10 @@ from .model import (
     COMMERCE_ESCROWING,
     COMMERCE_KIND_MARKET_MATCH,
     COMMERCE_MANUAL,
+    COMMERCE_SETTLED,
     DUE_STATUSES,
     FRESH_ATTEMPT_LIMIT,
+    UINT64_MAX,
     LISTING_SORT_DEFAULT,
     LISTING_SORT_LEVEL_DESC,
     LISTING_SORT_PRICE_ASC,
@@ -85,6 +99,88 @@ REQUIRED_TABLES = (
     "trade_commerce",
     "trade_commerce_guard",
     "role_fence",
+)
+SELLER_CREDIT_TABLES = (
+    "trade_seller_credit",
+    "trade_seller_completed_order",
+    "trade_seller_review",
+    "trade_seller_violation",
+)
+SELLER_CREDIT_SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS `trade_seller_credit` (
+  `seller_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `owner_revision` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:2',
+  `owner_account` MEDIUMTEXT COMMENT 'pb:3',
+  `ownership_changed` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `ownership_changed_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `epoch_started_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:6',
+  `completed_orders` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:7',
+  `positive_reviews` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:8',
+  `neutral_reviews` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:9',
+  `negative_reviews` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:10',
+  `violation_count` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:11',
+  `env_credit_cleared` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:12',
+  `env_reset_count` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:13',
+  `last_env_changed_at_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:14',
+  `last_ip` MEDIUMTEXT COMMENT 'pb:15',
+  `last_device_id` MEDIUMTEXT COMMENT 'pb:16',
+  `known_devices_json` MEDIUMTEXT COMMENT 'pb:17',
+  `credit_score` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:18',
+  `star_rating_tenths` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:19',
+  `positive_rate_bps` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:20',
+  `risk_tier` MEDIUMTEXT COMMENT 'pb:21',
+  `updated_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:22',
+  PRIMARY KEY (`seller_player_id`,`owner_revision`) /*T![clustered_index] NONCLUSTERED */
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='trade_seller_credit';
+
+CREATE TABLE IF NOT EXISTS `trade_seller_completed_order` (
+  `record_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `order_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2',
+  `seller_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `owner_revision` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `created_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  PRIMARY KEY (`record_id`) /*T![clustered_index] NONCLUSTERED */,
+  UNIQUE KEY `uk_trade_seller_completed_order` (`order_id`),
+  INDEX `idx_trade_seller_completed_order_0` (`seller_player_id`,`owner_revision`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='trade_seller_completed_order';
+
+CREATE TABLE IF NOT EXISTS `trade_seller_review` (
+  `review_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `order_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2',
+  `seller_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:3',
+  `seller_owner_revision` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `buyer_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `buyer_account` MEDIUMTEXT COMMENT 'pb:6',
+  `buyer_ip` MEDIUMTEXT COMMENT 'pb:7',
+  `buyer_device_id` MEDIUMTEXT COMMENT 'pb:8',
+  `rating` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:9',
+  `counted_for_score` int unsigned NOT NULL DEFAULT 0 COMMENT 'pb:10',
+  `comment` MEDIUMTEXT COMMENT 'pb:11',
+  `created_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:12',
+  PRIMARY KEY (`review_id`) /*T![clustered_index] NONCLUSTERED */,
+  UNIQUE KEY `uk_trade_seller_review` (`order_id`),
+  INDEX `idx_trade_seller_review_0` (`seller_player_id`,`seller_owner_revision`,`created_ms`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='trade_seller_review';
+
+CREATE TABLE IF NOT EXISTS `trade_seller_violation` (
+  `violation_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:1',
+  `case_id` VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin NOT NULL DEFAULT '' COMMENT 'pb:2',
+  `order_id` MEDIUMTEXT COMMENT 'pb:3',
+  `seller_player_id` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:4',
+  `seller_owner_revision` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:5',
+  `seller_account` MEDIUMTEXT COMMENT 'pb:6',
+  `reason` MEDIUMTEXT COMMENT 'pb:7',
+  `recorded_ms` bigint unsigned NOT NULL DEFAULT 0 COMMENT 'pb:8',
+  PRIMARY KEY (`violation_id`) /*T![clustered_index] NONCLUSTERED */,
+  UNIQUE KEY `uk_trade_seller_violation` (`case_id`),
+  INDEX `idx_trade_seller_violation_0` (`seller_player_id`,`seller_owner_revision`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci /*T! SHARD_ROW_ID_BITS=4 PRE_SPLIT_REGIONS=4 */ COMMENT='trade_seller_violation';
+"""
+_SELLER_CREDIT_COLUMNS = (
+    "`seller_player_id`,`owner_revision`,`owner_account`,`ownership_changed`,`ownership_changed_at_ms`,"
+    "`epoch_started_at_ms`,`completed_orders`,`positive_reviews`,`neutral_reviews`,`negative_reviews`,`violation_count`,"
+    "`env_credit_cleared`,`env_reset_count`,`last_env_changed_at_ms`,`last_ip`,`last_device_id`,`known_devices_json`,"
+    "`credit_score`,`star_rating_tenths`,`positive_rate_bps`,`risk_tier`,`updated_ms`"
 )
 DB_NOW_MS = "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS UNSIGNED)"
 LOCK_ERRORS = (1205, 1213, 9007)
@@ -702,15 +798,25 @@ class SqlTradeStore(TradeStoreBase):
         protocol: Protocol,
         *,
         role_directory: RoleFenceDirectory | None = None,
+        id_allocator: Callable[[], Awaitable[int]] | None = None,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         super().__init__(protocol, role_directory=role_directory, clock_ms=clock_ms)
         self._pool = pool
+        self._id_allocator = id_allocator
+        self._local_seq = 0
+
+    async def _next_credit_id(self) -> int:
+        if self._id_allocator is not None:
+            return int(await self._id_allocator())
+        self._local_seq += 1
+        return (self.now_ms() << 16) | (self._local_seq & 0xFFFF)
 
     async def bootstrap(self) -> None:
-        """幂等建表（读取 config/trade_schema.sql）。"""
-        ddl = SCHEMA_FILE.read_text(encoding="utf-8")
-        statements = portal_sql.split_statements(ddl)
+        """幂等建表（读取 config/trade_schema.sql 并补建卖家信用 4 表）。"""
+        ddl = SCHEMA_FILE.read_text(encoding="utf-8") + "\n" + SELLER_CREDIT_SCHEMA_DDL
+        lines = [line for line in ddl.splitlines() if not line.lstrip().startswith("--")]
+        statements = [stmt.strip() for stmt in "\n".join(lines).split(";") if stmt.strip()]
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cur:
                 for stmt in statements:
@@ -1256,3 +1362,287 @@ class SqlTradeStore(TradeStoreBase):
                     (int(op_id),),
                 )
             await conn.commit()
+
+    # -- 卖家信用、近 7 日成交参考价与当面交易单日流出（对齐 Go seller_credit_sql.go / reference_price.go / player_trade_guard.go） --
+
+    async def get_credit_profile(self, key: SellerCreditKey) -> SellerCreditProfile | None:
+        row = await self._query_one(
+            f"SELECT {_SELLER_CREDIT_COLUMNS} FROM `trade_seller_credit` "
+            "WHERE `seller_player_id`=%s AND `owner_revision`=%s",
+            (int(key.seller_player_id), int(key.owner_revision)),
+        )
+        if row is None:
+            return None
+        known_raw = _to_str(row[16])
+        known: tuple[str, ...] = ()
+        if known_raw:
+            try:
+                parsed = json.loads(known_raw)
+                if isinstance(parsed, list):
+                    known = tuple(str(x) for x in parsed)
+            except Exception:
+                known = ()
+        return SellerCreditProfile(
+            seller_player_id=int(row[0]),
+            owner_revision=int(row[1]),
+            owner_account=_to_str(row[2]),
+            ownership_changed=bool(row[3]),
+            ownership_changed_at_ms=int(row[4]),
+            epoch_started_at_ms=int(row[5]),
+            completed_orders=int(row[6]),
+            positive_reviews=int(row[7]),
+            neutral_reviews=int(row[8]),
+            negative_reviews=int(row[9]),
+            violation_count=int(row[10]),
+            env_credit_cleared=bool(row[11]),
+            env_reset_count=int(row[12]),
+            last_env_changed_at_ms=int(row[13]),
+            last_ip=_to_str(row[14]),
+            last_device_id=_to_str(row[15]),
+            known_devices=known,
+            credit_score=int(row[17]),
+            star_rating_tenths=int(row[18]),
+            positive_rate_bps=int(row[19]),
+            risk_tier=_to_str(row[20]),
+        )
+
+    async def has_prior_credit_epoch(self, seller_player_id: int, current_revision: int) -> bool:
+        row = await self._query_one(
+            "SELECT 1 FROM `trade_seller_credit` WHERE `seller_player_id`=%s AND `owner_revision`<%s LIMIT 1",
+            (int(seller_player_id), int(current_revision)),
+        )
+        return row is not None
+
+    async def save_credit_profile(self, profile: SellerCreditProfile) -> None:
+        known_json = json.dumps(list(profile.known_devices), ensure_ascii=False) if profile.known_devices else "[]"
+        now = self.now_ms()
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    f"INSERT INTO `trade_seller_credit` ({_SELLER_CREDIT_COLUMNS}) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE "
+                    "`owner_account`=VALUES(`owner_account`),`ownership_changed`=VALUES(`ownership_changed`),"
+                    "`ownership_changed_at_ms`=VALUES(`ownership_changed_at_ms`),"
+                    "`epoch_started_at_ms`=VALUES(`epoch_started_at_ms`),"
+                    "`completed_orders`=VALUES(`completed_orders`),`positive_reviews`=VALUES(`positive_reviews`),"
+                    "`neutral_reviews`=VALUES(`neutral_reviews`),`negative_reviews`=VALUES(`negative_reviews`),"
+                    "`violation_count`=VALUES(`violation_count`),`env_credit_cleared`=VALUES(`env_credit_cleared`),"
+                    "`env_reset_count`=VALUES(`env_reset_count`),`last_env_changed_at_ms`=VALUES(`last_env_changed_at_ms`),"
+                    "`last_ip`=VALUES(`last_ip`),`last_device_id`=VALUES(`last_device_id`),"
+                    "`known_devices_json`=VALUES(`known_devices_json`),`credit_score`=VALUES(`credit_score`),"
+                    "`star_rating_tenths`=VALUES(`star_rating_tenths`),`positive_rate_bps`=VALUES(`positive_rate_bps`),"
+                    "`risk_tier`=VALUES(`risk_tier`),`updated_ms`=VALUES(`updated_ms`)",
+                    (
+                        int(profile.seller_player_id),
+                        int(profile.owner_revision),
+                        str(profile.owner_account),
+                        1 if profile.ownership_changed else 0,
+                        int(profile.ownership_changed_at_ms),
+                        int(profile.epoch_started_at_ms),
+                        int(profile.completed_orders),
+                        int(profile.positive_reviews),
+                        int(profile.neutral_reviews),
+                        int(profile.negative_reviews),
+                        int(profile.violation_count),
+                        1 if profile.env_credit_cleared else 0,
+                        int(profile.env_reset_count),
+                        int(profile.last_env_changed_at_ms),
+                        str(profile.last_ip),
+                        str(profile.last_device_id),
+                        known_json,
+                        int(profile.credit_score),
+                        int(profile.star_rating_tenths),
+                        int(profile.positive_rate_bps),
+                        str(profile.risk_tier),
+                        int(now),
+                    ),
+                )
+            await conn.commit()
+
+    async def mark_seller_order_completed(self, order_id: str, key: SellerCreditKey) -> bool:
+        rec_id = await self._next_credit_id()
+        now = self.now_ms()
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT IGNORE INTO `trade_seller_completed_order` "
+                    "(`record_id`,`order_id`,`seller_player_id`,`owner_revision`,`created_ms`) "
+                    "VALUES (%s,%s,%s,%s,%s)",
+                    (int(rec_id), str(order_id), int(key.seller_player_id), int(key.owner_revision), int(now)),
+                )
+                inserted = cur.rowcount == 1
+            await conn.commit()
+        return inserted
+
+    async def get_seller_review_by_order(self, order_id: str) -> SellerReviewRecord | None:
+        row = await self._query_one(
+            "SELECT `order_id`,`seller_player_id`,`seller_owner_revision`,`buyer_player_id`,"
+            "`buyer_account`,`buyer_ip`,`buyer_device_id`,`rating`,`counted_for_score`,`comment`,`created_ms` "
+            "FROM `trade_seller_review` WHERE `order_id`=%s",
+            (str(order_id),),
+        )
+        if row is None:
+            return None
+        return SellerReviewRecord(
+            order_id=_to_str(row[0]),
+            seller_player_id=int(row[1]),
+            seller_owner_revision=int(row[2]),
+            buyer_player_id=int(row[3]),
+            buyer_account=_to_str(row[4]),
+            buyer_ip=_to_str(row[5]),
+            buyer_device_id=_to_str(row[6]),
+            rating=int(row[7]),
+            counted_for_score=bool(row[8]),
+            comment=_to_str(row[9]),
+            created_at_ms=int(row[10]),
+        )
+
+    async def count_pair_scored_reviews(
+        self,
+        key: SellerCreditKey,
+        buyer_key: str,
+        buyer_ip: str,
+        buyer_device_id: str,
+        since_ms: int,
+        now_ms: int,
+    ) -> int:
+        row = await self._query_one(
+            "SELECT COUNT(*) FROM `trade_seller_review` "
+            "WHERE `seller_player_id`=%s AND `seller_owner_revision`=%s AND `counted_for_score`=1 "
+            "AND `created_ms`>=%s AND `created_ms`<=%s "
+            "AND (`buyer_account`=%s OR (%s<>'' AND `buyer_ip`=%s) OR (%s<>'' AND `buyer_device_id`=%s))",
+            (
+                int(key.seller_player_id),
+                int(key.owner_revision),
+                int(since_ms),
+                int(now_ms),
+                str(buyer_key),
+                str(buyer_ip),
+                str(buyer_ip),
+                str(buyer_device_id),
+                str(buyer_device_id),
+            ),
+        )
+        return int(row[0] or 0) if row is not None else 0
+
+    async def save_seller_review(self, rec: SellerReviewRecord) -> None:
+        review_id = await self._next_credit_id()
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO `trade_seller_review` "
+                    "(`review_id`,`order_id`,`seller_player_id`,`seller_owner_revision`,`buyer_player_id`,"
+                    "`buyer_account`,`buyer_ip`,`buyer_device_id`,`rating`,`counted_for_score`,`comment`,`created_ms`) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        int(review_id),
+                        str(rec.order_id),
+                        int(rec.seller_player_id),
+                        int(rec.seller_owner_revision),
+                        int(rec.buyer_player_id),
+                        str(rec.buyer_account),
+                        str(rec.buyer_ip),
+                        str(rec.buyer_device_id),
+                        int(rec.rating),
+                        1 if rec.counted_for_score else 0,
+                        str(rec.comment),
+                        int(rec.created_at_ms),
+                    ),
+                )
+            await conn.commit()
+
+    async def has_seller_violation(self, case_id: str) -> bool:
+        row = await self._query_one(
+            "SELECT 1 FROM `trade_seller_violation` WHERE `case_id`=%s LIMIT 1",
+            (str(case_id),),
+        )
+        return row is not None
+
+    async def save_seller_violation(self, rec: SellerViolationRecord) -> None:
+        violation_id = await self._next_credit_id()
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO `trade_seller_violation` "
+                    "(`violation_id`,`case_id`,`order_id`,`seller_player_id`,`seller_owner_revision`,"
+                    "`seller_account`,`reason`,`recorded_ms`) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        int(violation_id),
+                        str(rec.case_id),
+                        str(rec.order_id),
+                        int(rec.seller_player_id),
+                        int(rec.seller_owner_revision),
+                        str(rec.seller_account),
+                        str(rec.reason),
+                        int(rec.recorded_at_ms),
+                    ),
+                )
+            await conn.commit()
+
+    async def list_settled_market_fills(
+        self,
+        item_config_id: int,
+        currency_type: int,
+        floor_ms: int,
+        now_ms: int,
+        limit: int = MAX_REFERENCE_SCAN_ROWS,
+    ) -> list[MarketFillSample]:
+        rows = await self._query(
+            "SELECT `unit_price`,`quantity`,`updated_ms`,`workflow_proto` FROM `trade_commerce` "
+            "WHERE `kind`=4 AND `side`=0 AND `status`=%s AND `item_config_id`=%s AND `currency_type`=%s "
+            "AND `updated_ms`>=%s AND `updated_ms`<=%s ORDER BY `updated_ms` DESC,`commerce_id` DESC LIMIT %s",
+            (COMMERCE_SETTLED, int(item_config_id), int(currency_type), int(floor_ms), int(now_ms), int(limit)),
+        )
+        samples: list[MarketFillSample] = []
+        for row in rows:
+            raw_wf = _to_bytes(row[3])
+            seller_acct = ""
+            buyer_acct = ""
+            if raw_wf:
+                w = _decode_workflow(self.protocol, raw_wf)
+                if w is not None:
+                    if w.HasField("seller_identity"):
+                        seller_acct = str(w.seller_identity.account)
+                    if w.HasField("buyer_identity"):
+                        buyer_acct = str(w.buyer_identity.account)
+            samples.append(
+                MarketFillSample(
+                    item_config_id=int(item_config_id),
+                    currency_type=int(currency_type),
+                    unit_price=int(row[0]),
+                    quantity=int(row[1]),
+                    seller_account=seller_acct,
+                    buyer_account=buyer_acct,
+                    settled_at_ms=int(row[2]),
+                )
+            )
+        return samples
+
+    async def daily_player_trade_currency_outflow(
+        self,
+        player_id: int,
+        currency_type: int,
+        day_start_ms: int,
+    ) -> int:
+        async def _sum_side(col: str, *, as_seller: bool) -> int:
+            rows = await self._query(
+                f"SELECT `workflow_proto` FROM `trade_commerce` "
+                f"WHERE `{col}`=%s AND `kind`=2 AND `status` IN (1,3,4,5,10,11) AND `created_ms`>=%s "
+                "ORDER BY `commerce_id` DESC LIMIT %s",
+                (int(player_id), int(day_start_ms), MAX_DAILY_PLAYER_TRADE_SCAN_ROWS),
+            )
+            if len(rows) >= MAX_DAILY_PLAYER_TRADE_SCAN_ROWS:
+                return UINT64_MAX
+            total = 0
+            for row in rows:
+                part = workflow_currency_outflow(
+                    self.protocol, _to_bytes(row[0]), int(currency_type), as_seller=as_seller
+                )
+                total = saturating_add_uint64(total, part)
+            return total
+
+        seller_sum = await _sum_side("seller_player_id", as_seller=True)
+        buyer_sum = await _sum_side("buyer_player_id", as_seller=False)
+        return saturating_add_uint64(seller_sum, buyer_sum)

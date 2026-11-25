@@ -157,6 +157,29 @@ def is_owned_appearance(
     return bit_index is not None and test_packed_bit(owned_bits, bit_index)
 
 
+def is_blank_text(value: str) -> bool:
+    """判断字符串是否为空或仅含 ASCII 空白符（对齐 C++ appearance_rules.h）。"""
+    return not value or value.strip(" \t\r\n") == ""
+
+
+def biography_fields_valid(
+    archive_name: str,
+    nickname: str,
+    biography_summary: str,
+    story_title: str,
+    story_body: str,
+) -> bool:
+    """人物志字段必须全空或四项核心字段（档案名/小传/篇名/正文）同时非空，禁止半残行上线。"""
+    has_archive = not is_blank_text(archive_name)
+    has_nickname = not is_blank_text(nickname)
+    has_summary = not is_blank_text(biography_summary)
+    has_title = not is_blank_text(story_title)
+    has_body = not is_blank_text(story_body)
+    if not (has_archive or has_nickname or has_summary or has_title or has_body):
+        return True
+    return has_archive and has_summary and has_title and has_body
+
+
 class SceneAppearance:
     """角色形象衣柜、形象卡永久解锁与 1 小时免费试用处理器。"""
 
@@ -216,6 +239,46 @@ class SceneAppearance:
         if problem is not None:
             return None, problem
         return rule, None
+
+    def validate_tables(self) -> bool:
+        """校验 AppearanceRule / CharacterAppearance / AppearanceSeries 配表与人物志完整性。"""
+        rule, problem = self.current_rule()
+        if rule is None:
+            logger.error("Appearance table validation failed: %s", problem)
+            return False
+        table = self._table("CharacterAppearance")
+        if table is None:
+            logger.error("Appearance table validation failed: CharacterAppearance missing")
+            return False
+        series_table = self._table("AppearanceSeries")
+        enabled_series = {
+            int(row.id) for row in (series_table.rows() if series_table is not None else ())
+            if getattr(row, "enabled", 0)
+        }
+        seen_ids: set[str] = set()
+        for row in table.rows():
+            if not row.id or not row.appearance_id or row.appearance_id in seen_ids:
+                logger.error("Appearance table validation failed: invalid or duplicate appearance id=%s", row.id)
+                return False
+            seen_ids.add(row.appearance_id)
+            if self._bit_index(int(row.id)) is None:
+                logger.error("Appearance table validation failed: missing bit_index for id=%s", row.id)
+                return False
+            if not biography_fields_valid(
+                str(getattr(row, "archive_name", "")),
+                str(getattr(row, "nickname", "")),
+                str(getattr(row, "biography_summary", "")),
+                str(getattr(row, "story_title", "")),
+                str(getattr(row, "story_body", "")),
+            ):
+                logger.error("Appearance table validation failed: incomplete biography fields for id=%s", row.id)
+                return False
+            if getattr(row, "enabled", 0):
+                series_id = int(getattr(row, "series_id", 0))
+                if series_id and series_id not in enabled_series:
+                    logger.error("Appearance table validation failed: missing enabled series_id=%s for id=%s", series_id, row.id)
+                    return False
+        return True
 
     def _find_enabled_appearance(self, appearance_id: str):
         table = self._table("CharacterAppearance")

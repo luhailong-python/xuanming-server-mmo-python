@@ -102,6 +102,10 @@ ERR_MATCH_TOURNAMENT_QUALIFIER_LIMIT = 16048
 ERR_MATCH_TOURNAMENT_MATCH_NOT_READY = 16049
 ERR_MATCH_TOURNAMENT_ALREADY_CHEERED = 16050
 ERR_MATCH_TOURNAMENT_REWARD_UNAVAILABLE = 16051
+ERR_MATCH_BATTLE_SURRENDER_NOT_ALLOWED = 16052
+ERR_MATCH_BATTLE_SURRENDER_TOO_EARLY = 16053
+ERR_MATCH_BATTLE_SURRENDER_COOLDOWN = 16054
+ERR_MATCH_BATTLE_SURRENDER_ALREADY_VOTED = 16055
 
 
 def set_tip(resp: Message, code: int, *params: object) -> Message:
@@ -144,6 +148,14 @@ class BattleNotAllocatableError(MatchError):
     """Battle 节点返回 battle_not_allocatable，确认房间未建。"""
 
 
+class ActivityOutsideWindowError(MatchError):
+    """瑞兽迎春等限时活动开局不在权威开放时间窗 [start, end) 内。"""
+
+
+class ActivityIntentConflictError(MatchError):
+    """同一活动开局请求 UUID 携带不一致的请求正文。"""
+
+
 class PrepareRejectedError(MatchError):
     """Scene.PrepareBattle 明确以业务码拒绝该玩家（用于判定肇事者）。"""
 
@@ -169,3 +181,11 @@ class MatchBusinessError(MatchError):
         super().__init__(f"match error code={code}")
         self.code = code
         self.params = params
+
+
+class ActivityOutsideWindowError(MatchError):
+    """活动开局不在权威时钟左闭右开时间窗 [start, end) 内。"""
+
+
+class ActivityIntentConflictError(MatchError):
+    """同幂等键的活动开局请求载荷与已登记记录不一致。"""

@@ -12,7 +12,12 @@ from dataclasses import dataclass
 
 from ..data import StoreRejected, StoreUnavailable
 from .battle_tables import BattleTables
-from .scene_buffs import ACTOR_COMBAT, USE_SKILL, SceneBuffs
+from .scene_buffs import (
+    ACTOR_COMBAT,
+    EXIT_INTERRUPTED,
+    USE_SKILL,
+    SceneBuffs,
+)
 from .scene_facing import rotation_toward
 from .scene_stats import effective_level, player_stats
 
@@ -41,6 +46,8 @@ class SceneSkillCasts:
                                 apply_allowed=lambda actor: not self._frozen(actor),
                                 periodic_allowed=self._periodic_allowed)
         self.buffs.state_changed = self._publish_state
+        self.buffs.self_state_changed = self._publish_self_state_flags
+        self.buffs.register_exit_hook(ACTOR_COMBAT, self._on_combat_state_exited)
         self._healing: set[int] = set()
         self._tasks: set[asyncio.Task] = set()
         self._closed = False
@@ -205,6 +212,32 @@ class SceneSkillCasts:
             state.combat_state_flags.SetInParent()
             state.combat_state_flags.state_flags.update(self.buffs.state_flags(actor))
             self._broadcast(world, actor, "ScenePlayerSyncSyncBaseAttribute", state)
+
+    def _publish_self_state_flags(self, actor, action_mask: int, combat_mask: int, state_seq: int) -> None:
+        if not self._player(actor) or self._frozen(actor) or actor.disconnect_at is not None:
+            return
+        msg = self.protocol.message(
+            "SelfActorStateFlagsS2C",
+            action_state_mask=action_mask,
+            combat_state_mask=combat_mask,
+            state_seq=state_seq,
+        )
+        self.scene._push(actor, "SceneClientPlayerCommonNotifySelfActorStateFlags", msg)
+
+    def sync_self_state_after_entry(self, actor) -> None:
+        self.buffs.sync_self_state_after_entry(actor)
+
+    def _on_combat_state_exited(self, actor, _state: int, reason: int) -> None:
+        if reason != EXIT_INTERRUPTED:
+            return
+        active = self.casts.get(actor.entity)
+        if active is not None and not active.committing:
+            active.task.cancel()
+            self.casts.pop(actor.entity, None)
+            if (world := self._world(actor)) is not None and self._in_world(world, actor):
+                self._broadcast(world, actor, _SKILL_INTERRUPTED, self.protocol.message(
+                    "SkillInterruptedS2C", entity=actor.entity,
+                ))
 
     def _prune(self, now: float) -> None:
         present = {player.entity for world in self.scene.worlds.values() for player in world.players.values()}

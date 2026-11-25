@@ -7,7 +7,7 @@
 ## 1. 平替 C++ 服务端定位
 
 - **全量契约与行为对齐**：Python 服务端面向客户端与外部依赖，全协议（`.proto` / `message_id.txt` / `event_id.txt`）、全配置表、全微服务（Gate / Scene / Battle / Login / DB / DataService / Router / Match / SceneManager / PlayerLocator / PlayerInbox / Chat / Mail / Rank / Friend / Payment / Trade / Guild / MallGame / GmAdmin / ConfigNode / ContentGuard / SaTokenAuth）以及核心玩法与战斗逻辑均与 `xuanming-server-mmo-cpp` 保持契约与行为一致，客户端无需适配即可直接无缝平替。
-- **权威基线追踪**：当前对齐 C++ 基线 Commit 为 `bba38b77cffc99b37f418948d0b64e92add08589`（短 SHA：`bba38b77c`）；增量同步流程见 [AGENTS.md §4](../../AGENTS.md#4-对照-c-仓增量移植流程)。
+- **权威基线追踪**：当前对齐 C++ 基线 Commit 为 `2f0e62225c8aaab4aac209bebe69e3804d073020`（短 SHA：`2f0e62225`）；增量同步流程见 [AGENTS.md §4](../../AGENTS.md#4-对照-c-仓增量移植流程)。
 
 ---
 

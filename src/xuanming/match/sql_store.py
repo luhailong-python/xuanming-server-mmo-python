@@ -32,6 +32,8 @@ from .battle_scripts import (
     BattleScriptReviewError,
 )
 from .errors import (
+    ActivityIntentConflictError,
+    ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
@@ -2081,6 +2083,56 @@ class SqlMatchStore:
 
         return await self._run_tx(work)
 
+    async def start_festival_beast_battle(
+        self,
+        *,
+        owner_id: int,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        activity_context_bytes: bytes,
+        effective_start_at_ms: int,
+        effective_end_at_ms: int,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        battle_id_alloc = await self.next_id()
+
+        async def work(cur):
+            now = await self._db_now(cur)
+            if (
+                effective_start_at_ms == 0
+                or effective_end_at_ms <= effective_start_at_ms
+                or now < effective_start_at_ms
+                or now >= effective_end_at_ms
+            ):
+                raise ActivityOutsideWindowError("outside festival beast open window")
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id_alloc, operation_id=op_id, state=FORMATION_STATE_PREPARING,
+                physical_region=b_region, target_node_id=b_node_id, target_instance_id=b_uuid,
+                target_endpoint=b_endpoint, mode=MODE_PVE_SOLO, config_id=battle_config_id,
+                created_ms=now, deadline_ms=now + battle_deadline_ms, retry_at_ms=now + 60_000,
+                activity_context=activity_context_bytes, requeue_on_failure=False, release_track=b_track,
+            )
+            tk_id = f"fb-{battle_id_alloc}-{owner_id}"
+            formation.members.add(player_id=owner_id, ticket=tk_id, team_index=0, captain=True)
+            tk = self.protocol.message(
+                "match.MatchAuthorityTicketRecord",
+                player_id=owner_id, ticket=tk_id, request_id=op_id, mode=MODE_PVE_SOLO,
+                config_id=battle_config_id, team_size=1, state=TICKET_STATE_FORMING,
+                enqueued_ms=now, formation_id=battle_id_alloc, expires_ms=now + battle_deadline_ms,
+                selected_region=b_region, owner_account=f"acct:{owner_id}", owner_revision=1,
+            )
+            await self._insert_ticket_tx(cur, tk)
+            await self._insert_formation_tx(cur, formation)
+            return formation, True
+
+        return await self._run_tx(work)
+
     async def cancel_activity_battle(self, request_id: int) -> tuple[int, bool, int, int]:
         return 0, True, 0, OUTCOME_DECISION_UNKNOWN
 
@@ -3347,6 +3399,7 @@ class SqlMatchStore:
         participated: bool,
         settled_at_ms: int,
         milestones: tuple[tuple[int, int, int, str], ...],
+        win_milestone: tuple[int, int, int, str] | None = None,
     ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
         async def work(cur) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]:
             await cur.execute(
@@ -3421,6 +3474,26 @@ class SqlMatchStore:
                                 reward_kind=reward_kind,
                                 tier_value=threshold,
                                 item_code=item_code,
+                                granted_at_ms=settled_at_ms,
+                            )
+                        )
+            if win_milestone is not None:
+                w_target, w_bit, w_kind, w_code = win_milestone
+                if w_target > 0 and wins >= w_target and not (milestone_bits & w_bit):
+                    milestone_bits |= w_bit
+                    await cur.execute(
+                        "INSERT IGNORE INTO `match_ranked_reward`(`player_id`,`season_id`,`reward_kind`,"
+                        "`tier_value`,`item_code`,`granted_at_ms`) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (player_id, season_id, w_kind, w_target, w_code, settled_at_ms),
+                    )
+                    if cur.rowcount > 0:
+                        unlocked.append(
+                            RankedRewardRow(
+                                player_id=player_id,
+                                season_id=season_id,
+                                reward_kind=w_kind,
+                                tier_value=w_target,
+                                item_code=w_code,
                                 granted_at_ms=settled_at_ms,
                             )
                         )

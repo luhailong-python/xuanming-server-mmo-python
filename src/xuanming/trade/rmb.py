@@ -21,6 +21,7 @@ from .errors import (
     ERR_INVALID_PARAMETER,
     ERR_LOGIN_ACCOUNT_PLAYER_FULL,
     ERR_TRADE_ASSET_NOT_TRADABLE,
+    ERR_TRADE_CANNOT_TRADE_SELF,
     ERR_TRADE_ORDER_NOT_FOUND,
     ERR_TRADE_ORDER_STATE_CONFLICT,
     ERR_TRADE_REQUEST_CONFLICT,
@@ -245,6 +246,7 @@ def local_rmb_view(protocol: Protocol, rec: Message, w: Message) -> Message:
         price_fen=int(w.rmb.price_fen),
         state=state,
         phase=str(w.stage),
+        designated_only=bool(str(w.rmb.designated_buyer_account)),
     )
 
 
@@ -283,6 +285,7 @@ class RmbConsignments:
         directory: RoleTradeAuthority,
         sealer: RoleSealer,
         *,
+        credits=None,
         currency_types: tuple[int, ...] = (CURRENCY_GOLD,),
     ) -> None:
         self.protocol = protocol
@@ -290,6 +293,7 @@ class RmbConsignments:
         self.mall = mall
         self.directory = directory
         self.sealer = sealer
+        self.credits = credits
         self.currency_types = tuple(currency_types) if currency_types else (CURRENCY_GOLD,)
         self.delivery_cursor: str = ""
         self.return_cursor: str = ""
@@ -347,6 +351,17 @@ class RmbConsignments:
         ):
             raise TradeRejection(ERR_INVALID_PARAMETER, "invalid rmb consignment parameters")
         asset_kind = self._classify_selection(req)
+        designated_buyer_account = ""
+        target_id = int(req.designated_buyer_player_id)
+        if target_id != 0:
+            if target_id == player_id:
+                raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot designate self as rmb buyer")
+            target_owned = await self.directory.lookup(target_id)
+            if target_owned is None or not valid_account(str(target_owned.account)):
+                raise TradeRejection(ERR_INVALID_PARAMETER, "invalid designated rmb buyer account")
+            if str(target_owned.account) == account:
+                raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot designate own account as rmb buyer")
+            designated_buyer_account = str(target_owned.account)
         stage = "rmb_escrow"
         char_id = int(req.character_player_id)
         if asset_kind == "CHARACTER":
@@ -365,6 +380,7 @@ class RmbConsignments:
         w.rmb.market_zone = zone
         w.rmb.price_fen = price_fen
         w.rmb.client_request_id = str(req.client_request_id)
+        w.rmb.designated_buyer_account = designated_buyer_account
 
         input_clone = self.protocol.message("trade.TradeCommerceWorkflow")
         input_clone.CopyFrom(w)
@@ -514,14 +530,33 @@ class RmbConsignments:
 
     async def _settle_role_delivery(self, rec: Message) -> None:
         self._seal_after.pop(int(rec.commerce_id), None)
+        transferred_player = 0
+        new_buyer_account = ""
+        next_revision = 0
 
         def _finish(_tx, cur: Message, cw: Message) -> None:
+            nonlocal transferred_player, new_buyer_account, next_revision
             if str(cw.stage) != "rmb_delivery":
                 raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "rmb role delivery stage mismatch")
+            transferred_player = int(cw.rmb.character_player_id)
+            new_buyer_account = str(cw.rmb.buyer_account)
+            next_revision = int(cw.rmb.seller_owner_revision) + 1
             cw.stage = "rmb_delivered"
             cur.status = COMMERCE_SETTLED
 
         await self._save(rec, _finish)
+        if self.credits is not None and transferred_player and new_buyer_account and next_revision:
+            try:
+                await self.credits.on_character_transferred(
+                    transferred_player, new_buyer_account, next_revision, self.engine.now_ms()
+                )
+            except Exception as reset_exc:
+                logger.error(
+                    "trade seller credit reset after character transfer failed player_id=%d next_rev=%d err=%s",
+                    transferred_player,
+                    next_revision,
+                    reset_exc,
+                )
 
     async def _refund_role(self, rec: Message, w: Message, transfer_req: Message, cause: Exception) -> None:
         t = w.rmb

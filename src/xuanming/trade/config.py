@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, fields
 from urllib.parse import urlsplit
 
 from ..settings import Settings
+from .economy_credit import PlayerTradePolicy, SellerCreditPolicy
 from .model import (
     CURRENCY_GOLD,
     DATABASE_NAME,
@@ -97,6 +98,8 @@ class TradeConfig:
     commerce_pets: tuple[int, ...] = ()
     commerce_currencies: tuple[int, ...] = (CURRENCY_GOLD,)
     commerce_allow_instances: bool = False
+    player_trade: PlayerTradePolicy = field(default_factory=PlayerTradePolicy)
+    seller_credit: SellerCreditPolicy = field(default_factory=SellerCreditPolicy)
     mall_url: str = ""
     mall_gateway_secret_env: str = COMMERCE_GATEWAY_SECRET_ENV
     mall_delivery_secret_env: str = COMMERCE_DELIVERY_SECRET_ENV
@@ -152,6 +155,13 @@ class TradeConfig:
             raise ValueError(f"[trade_node] missing or has invalid fields: {sorted(unknown)}")
         if "market" in raw and isinstance(raw["market"], dict):
             raw["market"] = MarketLimits(**raw["market"])
+        if "player_trade" in raw and isinstance(raw["player_trade"], dict):
+            pt = dict(raw["player_trade"])
+            if "consumable_items" in pt:
+                pt["consumable_items"] = tuple(int(x) for x in pt["consumable_items"])
+            raw["player_trade"] = PlayerTradePolicy(**pt)
+        if "seller_credit" in raw and isinstance(raw["seller_credit"], dict):
+            raw["seller_credit"] = SellerCreditPolicy(**raw["seller_credit"])
         if "commerce_items" in raw:
             raw["commerce_items"] = tuple(int(x) for x in raw["commerce_items"])
         if "commerce_pets" in raw:
@@ -237,6 +247,8 @@ class TradeConfig:
             for cur in self.commerce_currencies:
                 if not is_tradable_currency(cur):
                     raise ValueError(f"non-tradable currency in commerce_currencies: {cur}")
+            self.player_trade.validate()
+            self.seller_credit.validate()
         if self.mall_url:
             parsed = urlsplit(self.mall_url)
             if (

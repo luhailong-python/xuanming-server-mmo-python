@@ -126,10 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`bba38b77cffc99b37f418948d0b64e92add08589`（短哈希 `bba38b77c`）
-  - 追平范围：涵盖 `5676d207a..bba38b77c` 全部 4 笔新提交（11 个赛季战队锦标赛 RPC、6 个技能书打造/代工摊位 RPC、3 个瑞兽迎春 RPC、7 张新增配表至 68 表）以及 C++ 战斗引擎核心逻辑平替对齐（装备/神器 8 类特效、宠物/助战特效、赛季印、试炼手札战斗事实产出 `trial_facts`、HFSM+Utility 副本怪物 AI）。
+  - Commit SHA：`2f0e62225c8aaab4aac209bebe69e3804d073020`（短哈希 `2f0e62225`）
+  - 追平范围：涵盖 `bba38b77c..2f0e62225` 全部最新提交（瑞兽迎春配表化活动与独立战斗隔离、论剑 V2 重做与投降投票 `479/480`、首领试炼 V2 战斗机制、外观人物志 V2、宠物专属隔离与赛季防挂机、排位 V2、聚宝斋经济与卖家信用 4 个新 RPC `481~484`、`CellRoute` 蜂窝路由与 `OwnerAuthority` 线性归属权威、70 张最新配表及单进程全 10 微服务枢纽 `LocalServiceHub`）。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline bba38b77cffc99b37f418948d0b64e92add08589..HEAD`。
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 2f0e62225c8aaab4aac209bebe69e3804d073020..HEAD`。
   2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

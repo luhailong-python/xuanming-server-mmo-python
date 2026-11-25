@@ -58,6 +58,6 @@ pytest tests/test_battle.py
 
 当用户在本仓库触发「继续移植」等增量同步指令时，固定按以下闭环执行（只读对照 `../xuanming-server-mmo-cpp`，严禁修改 C++ 仓）：
 
-1. 读取 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md) 末尾记录的已校对 C++ 基线 Commit SHA（当前为 `bba38b77cffc99b37f418948d0b64e92add08589`）；
+1. 读取 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md) 末尾记录的已校对 C++ 基线 Commit SHA（当前为 `2f0e62225c8aaab4aac209bebe69e3804d073020`）；
 2. 在 C++ 仓执行 `git log --oneline <baseline>..HEAD`，面向客户端可无缝平替 C++ 服务端的目标，对全协议、全配置表、全微服务及核心玩法/战斗逻辑（含传输/协议、存储/锁/围栏、鉴权/安全、停机疏散/故障切换、弹性加固、玩法与战斗结算逻辑及运维/离线工具）逐项纯 Python 增量对齐，确保契约与行为与 C++ 仓一致；
 3. 跑完回归测试并验证通过后，将最新已校对的 C++ `HEAD` Commit SHA 同步更新到本节、[docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)、[README.md](README.md) 与 [docs/design/python-full-service-port-plan.md](docs/design/python-full-service-port-plan.md)，供下一次增量移植衔接。

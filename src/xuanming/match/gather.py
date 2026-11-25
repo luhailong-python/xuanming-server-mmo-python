@@ -314,7 +314,17 @@ class GatherPipeline:
                 battle_node_id=int(formation.target_node_id),
                 deadline_ms=deadline_ms,
                 prepare_deadline_ms=prepare_deadline_ms,
+                battle_config_id=int(formation.config_id),
+                match_mode=int(formation.mode),
             )
+            if formation.activity_context:
+                req.activity_context.CopyFrom(
+                    self.protocol.parse("BattleActivityContext", formation.activity_context)
+                )
+            if getattr(formation, "ranked_context", b""):
+                req.ranked_context.CopyFrom(
+                    self.protocol.parse("RankedMatchContext", formation.ranked_context)
+                )
             try:
                 raw_resp = await self.rpc.call(
                     endpoint, PREPARE_BATTLE_PATH, req.SerializeToString(deterministic=True), timeout=3.0

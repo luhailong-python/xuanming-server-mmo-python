@@ -17,7 +17,24 @@ SUCCESS = 1000
 INVALID_ENTITY, IMMUNE = 1009, 8001
 SILENCE, STEALTH, DISPEL, NEXT_ATTACK, LOST_HEALTH_REGEN, COMBAT_IDLE = 31, 33, 35, 36, 42, 43
 SILENCE_STATE = 1
-USE_SKILL, ACTOR_COMBAT = 0, 0
+USE_SKILL, ACTOR_COMBAT, ACTOR_TEAM_FOLLOW, ACTOR_MOUNTED = 0, 0, 1, 2
+MAX_MUTEX_STATES = 64
+STATE_BLOCK, STATE_ALLOW, STATE_INTERRUPT = 0, 1, 2
+EXIT_REMOVED, EXIT_INTERRUPTED = 0, 1
+
+
+def _compile_action_matrix(table) -> dict[int, dict[int, tuple[int, int]]]:
+    """Compile normalized (id, state_id, state_mode, state_tip) or legacy slot rows into O(1) lookup."""
+    matrix: dict[int, dict[int, tuple[int, int]]] = {}
+    rows = table.rows() if hasattr(table, "rows") else ()
+    for row in rows:
+        rules = matrix.setdefault(int(row.id), {})
+        if hasattr(row, "state_id"):
+            rules[int(row.state_id)] = (int(row.state_mode), int(row.state_tip))
+        elif hasattr(row, "state"):
+            for state_id, entry in enumerate(row.state):
+                rules[state_id] = (int(entry.state_mode), int(entry.state_tip))
+    return matrix
 
 
 @dataclass(slots=True)
@@ -48,17 +65,22 @@ class SceneBuffs:
         self.protocol = protocol
         self.rows = {row.id: row for row in tables["Buff"].rows()}
         self.permissions = tables["SkillPermission"]
-        self.combat_actions = tables["ActorActionCombatState"]
-        self.actor_actions = tables["ActorActionState"]
+        self.combat_actions = _compile_action_matrix(tables["ActorActionCombatState"])
+        self.actor_actions = _compile_action_matrix(tables["ActorActionState"])
         self.valid = valid or (lambda actor: bool(actor.entity))
         self.apply_allowed = apply_allowed or self.valid
         self.periodic_allowed = periodic_allowed or self.valid
         self.visibility_changed = None
         self.state_changed = None
+        self.self_state_changed = None
         self._clock = clock or time.monotonic
         self._ids = itertools.count(1)
         self._actors: dict[int, _ActorBuffs] = {}
         self._action_states: dict[int, tuple[object, set[int]]] = {}
+        self._action_masks: dict[int, tuple[object, int]] = {}
+        self._exit_hooks: dict[int, list] = {}
+        self._self_state_sync: dict[int, tuple[object, int, int, int]] = {}
+        self._suppress_depth = 0
         self._bonus_damage = {key: _expression(row.bonus_damage) for key, row in self.rows.items() if row.buff_type == NEXT_ATTACK}
         self._health_regen = {key: _expression(row.health_regeneration) for key, row in self.rows.items()
                               if row.buff_type == LOST_HEALTH_REGEN}
@@ -93,6 +115,8 @@ class SceneBuffs:
         callback = self.visibility_changed if kind == STEALTH else self.state_changed
         if callback is not None:
             callback(actor)
+        if kind == SILENCE:
+            self._sync_self_state(actor)
 
     def add(self, actor, table_id: int, caster: int = 0, *, idle_owner: int = NO_BUFF) -> tuple[int, int]:
         if not self.valid(actor):
@@ -163,10 +187,18 @@ class SceneBuffs:
         states = self._action_states.get(actor.entity)
         if states is not None and states[0] is actor:
             self._action_states.pop(actor.entity, None)
+        masks = self._action_masks.get(actor.entity)
+        if masks is not None and masks[0] is actor:
+            self._action_masks.pop(actor.entity, None)
+        synced = self._self_state_sync.get(actor.entity)
+        if synced is not None and synced[0] is actor:
+            self._self_state_sync.pop(actor.entity, None)
 
     def clear(self) -> None:
         self._actors.clear()
         self._action_states.clear()
+        self._action_masks.clear()
+        self._self_state_sync.clear()
 
     def _add_children(self, actor, entry: SceneBuff) -> None:
         if entry.added_sub_buff:
@@ -205,7 +237,54 @@ class SceneBuffs:
             self.remove(caster, buff_id)
         return damage
 
+    def register_exit_hook(self, state: int, hook) -> None:
+        if 0 <= state < MAX_MUTEX_STATES and hook is not None:
+            hooks = self._exit_hooks.setdefault(state, [])
+            if hook not in hooks:
+                hooks.append(hook)
+
+    def unregister_exit_hook(self, state: int, hook) -> None:
+        hooks = self._exit_hooks.get(state)
+        if hooks and hook in hooks:
+            hooks.remove(hook)
+
+    def action_state_mask(self, actor) -> int:
+        current = self._action_masks.get(actor.entity)
+        return current[1] if current is not None and current[0] is actor else 0
+
+    def combat_state_mask(self, actor) -> int:
+        mask = 0
+        for flag, active in self.state_flags(actor).items():
+            if active and 0 <= flag < MAX_MUTEX_STATES:
+                mask |= 1 << flag
+        return mask
+
+    def _sync_self_state(self, actor) -> None:
+        if self._suppress_depth > 0 or not self.valid(actor):
+            return
+        action_mask = self.action_state_mask(actor)
+        combat_mask = self.combat_state_mask(actor)
+        existing = self._self_state_sync.get(actor.entity)
+        if existing is not None and existing[0] is actor:
+            _, prev_action, prev_combat, next_seq = existing
+        else:
+            prev_action, prev_combat, next_seq = 0, 0, 1
+        if action_mask == prev_action and combat_mask == prev_combat:
+            return
+        self._self_state_sync[actor.entity] = (actor, action_mask, combat_mask, next_seq + 1)
+        if self.self_state_changed is not None:
+            self.self_state_changed(actor, action_mask, combat_mask, next_seq)
+
+    def sync_self_state_after_entry(self, actor) -> None:
+        if not self.valid(actor):
+            return
+        existing = self._self_state_sync.get(actor.entity)
+        next_seq = existing[3] if existing is not None and existing[0] is actor else 1
+        self._self_state_sync[actor.entity] = (actor, 0, 0, next_seq)
+        self._sync_self_state(actor)
+
     def validate_skill(self, actor, skill_types, action: int = USE_SKILL) -> int:
+        action_rules = self.combat_actions.get(action, {})
         for state in self.state_flags(actor):
             row = self.permissions.get(state)
             if row is None:
@@ -216,11 +295,9 @@ class SceneBuffs:
                 tip = row.skill_type[bit]
                 if tip != SUCCESS:
                     return tip or 1002
-            action_row = self.combat_actions.get(action)
-            if action_row is None:
-                return 1001
-            if state < len(action_row.state) and action_row.state[state].state_mode == 1:
-                tip = action_row.state[state].state_tip
+            rule = action_rules.get(state)
+            if rule is not None and rule[0] == STATE_BLOCK:
+                tip = rule[1]
                 if tip != SUCCESS:
                     return tip or 1002
         return self.validate_action(actor, action)
@@ -229,40 +306,64 @@ class SceneBuffs:
         current = self._action_states.get(actor.entity)
         return current[1] if current is not None and current[0] is actor else set()
 
-    def set_action_state(self, actor, state: int, active: bool = True) -> None:
-        if not self.valid(actor) or not 0 <= state < 3:
+    def set_action_state(self, actor, state: int, active: bool = True, *, _reason: int = EXIT_REMOVED) -> None:
+        if not self.valid(actor) or not 0 <= state < MAX_MUTEX_STATES:
             return
         states = self._actions(actor)
+        mask = self.action_state_mask(actor)
+        bit = 1 << state
         if active:
+            if mask & bit:
+                return
             states.add(state)
+            mask |= bit
             self._action_states[actor.entity] = (actor, states)
+            self._action_masks[actor.entity] = (actor, mask)
+            self._sync_self_state(actor)
         else:
+            if not (mask & bit) and state not in states:
+                return
             states.discard(state)
-            if not states:
+            mask &= ~bit
+            if states:
+                self._action_states[actor.entity] = (actor, states)
+                self._action_masks[actor.entity] = (actor, mask)
+            else:
                 self._action_states.pop(actor.entity, None)
+                self._action_masks.pop(actor.entity, None)
+            self._sync_self_state(actor)
+            for hook in tuple(self._exit_hooks.get(state, ())):
+                hook(actor, state, _reason)
 
     def validate_action(self, actor, action: int) -> int:
         if not self.valid(actor):
             return INVALID_ENTITY
-        row = self.actor_actions.get(action)
-        if row is None:
+        rules = self.actor_actions.get(action)
+        if rules is None:
             return 1001
         for state in sorted(self._actions(actor)):
-            if state < len(row.state) and row.state[state].state_mode == 0 and row.state[state].state_tip != SUCCESS:
-                return row.state[state].state_tip or 1002
+            rule = rules.get(state)
+            if rule is not None and rule[0] == STATE_BLOCK and rule[1] != SUCCESS:
+                return rule[1] or 1002
         return 0
 
     def perform_action(self, actor, action: int, success_state: int) -> int:
-        if not 0 <= success_state < 3:
+        if not 0 <= success_state < MAX_MUTEX_STATES:
             return 1005
         error = self.validate_action(actor, action)
         if error:
             return error
-        row = self.actor_actions.get(action)
-        for state in tuple(self._actions(actor)):
-            if state < len(row.state) and row.state[state].state_mode == 2:
-                self.set_action_state(actor, state, False)
-        self.set_action_state(actor, success_state)
+        rules = self.actor_actions.get(action, {})
+        self._suppress_depth += 1
+        try:
+            for state in tuple(self._actions(actor)):
+                rule = rules.get(state)
+                if rule is not None and rule[0] == STATE_INTERRUPT:
+                    self.set_action_state(actor, state, False, _reason=EXIT_INTERRUPTED)
+            self.set_action_state(actor, success_state, True)
+        finally:
+            self._suppress_depth -= 1
+        self._sync_self_state(actor)
         return 0
 
     def tick(self, delta: float, *, healing_busy=None):

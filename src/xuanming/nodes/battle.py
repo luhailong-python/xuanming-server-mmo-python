@@ -11,13 +11,39 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from math import isfinite
+from math import ceil, isfinite
 from typing import TYPE_CHECKING
 
 from google.protobuf.message import DecodeError, Message
 
 from .battle_dropin_effects import (
+    BOSS_TRIAL_ACTION_TIMEOUT_MS,
+    BOSS_TRIAL_KIND_FESTIVAL_BEAST,
+    BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
+    BOSS_TRIAL_KIND_NONE,
+    BOSS_TRIAL_KIND_POLARITY_5V5,
+    ERR_SURRENDER_ALREADY_VOTED,
+    ERR_SURRENDER_COOLDOWN,
+    ERR_SURRENDER_NOT_ALLOWED,
+    ERR_SURRENDER_TOO_EARLY,
+    MATCH_MODE_POLARITY_5V5,
+    MATCH_MODE_PVE_SOLO,
+    MATCH_MODE_SEASON_TOURNAMENT,
+    POLARITY_DEFAULT_MAX_ROUNDS,
+    PVP_ESCALATION_DAMAGE_STEP_PCT,
+    PVP_ESCALATION_LEAD_ROUNDS,
+    PVP_ESCALATION_MIN_MAX_ROUNDS,
+    PVP_ESCALATION_SUPPORT_FLOOR_PCT,
+    PVP_ESCALATION_SUPPORT_STEP_PCT,
+    PVP_PRIMARY_FOCUS_DEN,
+    PVP_PRIMARY_FOCUS_NUM,
+    PVP_SURRENDER_EXPIRE_COOLDOWN_ROUNDS,
+    PVP_SURRENDER_IDLE_EXCLUDE_ROUNDS,
+    PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS,
+    PVP_SURRENDER_UNLOCK_ROUND,
+    RANKED_DEFAULT_MAX_ROUNDS,
     DungeonMonsterAiProfile,
+    EncounterV2Controller,
     EquipmentBattleEffects,
     MonsterAiRuntime,
     PetAndSupportEffects,
@@ -25,6 +51,7 @@ from .battle_dropin_effects import (
     TrialContext,
     TrialFactTracker,
     choose_monster_action,
+    is_boss_trial_kind,
 )
 from .battle_effects import FREEZE, STUN, U64_MAX, BattleEffects, landed_damage, landed_heal, rank_factor, scaled
 from .battle_replay import BattleReplayRecorder
@@ -56,7 +83,8 @@ _MAX_OUTCOME_PAYLOAD = 960 * 1024
 _UUID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 
 CLIENT_REQUESTS = {140: "GetBattleStateRequest", 149: "SubmitBattleActionRequest",
-                   162: "SetAutoBattleRequest", 165: "StopWatchBattleRequest"}
+                   162: "SetAutoBattleRequest", 165: "StopWatchBattleRequest",
+                   479: "SurrenderBattleRequest"}
 
 
 class BattleError(ValueError):
@@ -114,17 +142,76 @@ class TurnEngine:
         monster_ids: set[int] | None = None,
         monster_ai_profiles: Mapping[int, DungeonMonsterAiProfile] | None = None,
         trial_context: Message | TrialContext | None = None,
+        boss_trial_kind: int = BOSS_TRIAL_KIND_NONE,
+        battle_difficulty: int = 0,
+        has_explicit_round_limit: bool = False,
+        ranked_context: Message | None = None,
     ):
         if not request.battle_id or not request.players:
             raise BattleError("battle needs an identity and players")
         self.protocol = protocol
+        self.create_request = request
+        if ranked_context is not None:
+            self.ranked_context: Message | None = ranked_context
+        elif "ranked_context" in request.DESCRIPTOR.fields_by_name and request.HasField("ranked_context"):
+            self.ranked_context = request.ranked_context
+        else:
+            self.ranked_context = None
         self.battle_id = request.battle_id
+        self.match_mode = request.match_mode
         self.pve = request.match_mode in _PVE_MODES
         self.rng = _Mt19937_64(request.seed)
         self.item_rules = items
+
+        # 排位默认回合上限收敛到 20，物法易势 5V5 默认 16，瑞兽迎春硬性校验并取冻结 round_limit。
+        if self.is_ranked_battle and not has_explicit_round_limit:
+            max_rounds = min(max_rounds, RANKED_DEFAULT_MAX_ROUNDS)
+        if request.match_mode == MATCH_MODE_POLARITY_5V5 and boss_trial_kind == BOSS_TRIAL_KIND_NONE:
+            boss_trial_kind = BOSS_TRIAL_KIND_POLARITY_5V5
+            if max_rounds == _MAX_ROUNDS:
+                max_rounds = POLARITY_DEFAULT_MAX_ROUNDS
+
+        has_festival_activity = (
+            request.HasField("activity_context") and request.activity_context.kind == 2
+        )
+        if boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST or has_festival_activity:
+            if (
+                boss_trial_kind != BOSS_TRIAL_KIND_FESTIVAL_BEAST
+                or not has_festival_activity
+                or request.match_mode != MATCH_MODE_PVE_SOLO
+                or len(request.players) != 1
+                or len(request.players[0].pets) != 1
+                or not request.activity_context.HasField("festival_beast")
+            ):
+                raise BattleError("invalid festival beast battle admission")
+            fb = request.activity_context.festival_beast
+            if (
+                fb.activity_instance_id == 0
+                or not fb.reward_identity
+                or fb.required_wins == 0
+                or fb.locked_pet_id == 0
+                or request.players[0].pets[0].pet_id != fb.locked_pet_id
+                or fb.boss_health == 0
+                or fb.round_limit == 0
+                or fb.cycle_rounds == 0
+                or fb.first_heavy_round == 0
+                or fb.first_heavy_round > fb.cycle_rounds
+                or fb.telegraph_lead_rounds == 0
+                or fb.telegraph_lead_rounds >= fb.first_heavy_round
+                or fb.heavy_damage_percent == 0
+            ):
+                raise BattleError("invalid festival beast frozen context")
+            max_rounds = fb.round_limit
+
         self.max_rounds = max_rounds
         self.round_index = 1
         self.outcome = 0
+        self.surrendered_team: int | None = None
+        self.team_surrender_votes: list[Message] = [
+            protocol.message("BattleSurrenderVoteState"),
+            protocol.message("BattleSurrenderVoteState"),
+        ]
+        self.consecutive_idle_rounds_by_player: dict[int, int] = {}
         self.actors: dict[int, Message] = {}
         self.items: dict[int, list[Message]] = {}
         self.pending: dict[int, Message] = {}
@@ -142,6 +229,9 @@ class TurnEngine:
             effective_trial_ctx = request.trial_context
         self.trial_tracker = TrialFactTracker(self, effective_trial_ctx)
         self.monster_ai = MonsterAiRuntime(self, monster_ai_profiles)
+        self.encounter = EncounterV2Controller(
+            self, request, boss_trial_kind=boss_trial_kind, battle_difficulty=battle_difficulty,
+        )
         self._group = 0
         slots = [0, 0]
         for player in request.players:
@@ -169,21 +259,35 @@ class TurnEngine:
                     self.items[actor_id].append(entry)
 
         pet_ids: set[int] = set()
+        pet_index = 0
+        allow_temp_pet = self.uses_free_preset
         for player in request.players:
             for pet in player.pets:
-                if not pet.pet_id or pet.pet_id in pet_ids or pet.owner_player_id not in (0, player.player_id):
+                is_temp_pet = bool(getattr(pet, "competitive_temporary", False))
+                if is_temp_pet and not allow_temp_pet:
+                    raise BattleError("competitive_temporary pet rejected when use_free_preset is false")
+                if (not pet.pet_id and not (is_temp_pet and allow_temp_pet)) or (
+                    pet.pet_id and pet.pet_id in pet_ids
+                ) or pet.owner_player_id not in (0, player.player_id):
                     raise BattleError("invalid pet snapshot")
-                actor = self._actor(pet, _PET_ACTOR_BASE + len(pet_ids), _PET, player.team_index, slots, pet.pet_name)
+                actor = self._actor(pet, _PET_ACTOR_BASE + pet_index, _PET, player.team_index, slots, pet.pet_name)
+                pet_index += 1
                 actor.owner_player_id = player.player_id
                 actor.pet_table_id = pet.pet_table_id
                 actor.pet_id = pet.pet_id
+                actor.competitive_temporary = is_temp_pet
                 actor.is_auto = True
                 self.skills.initialize(actor, pet, pet=True)
                 if pet.HasField("pet_cultivation"):
                     if not self.pet_support.initialize_pet_cultivation(actor, pet.pet_cultivation):
                         raise BattleError("invalid pet cultivation snapshot")
-                pet_ids.add(pet.pet_id)
-        for index, monster in enumerate(monsters):
+                if pet.pet_id:
+                    pet_ids.add(pet.pet_id)
+        monster_list = list(monsters)
+        if self.encounter.is_festival_beast:
+            if len(monster_list) != 1:
+                raise BattleError("festival beast battle requires exactly 1 boss monster")
+        for index, monster in enumerate(monster_list):
             actor = self.protocol.message("BattleActorState")
             actor.CopyFrom(monster)
             actor.actor_id = _MONSTER_ACTOR_BASE + index
@@ -191,6 +295,27 @@ class TurnEngine:
             actor.team_index = 1
             actor.formation_slot = slots[1]
             slots[1] += 1
+            if self.encounter.is_festival_beast:
+                fb = request.activity_context.festival_beast
+                actor.is_boss = True
+                if fb.boss_name:
+                    actor.name = fb.boss_name
+                actor.max_health = fb.boss_health
+                actor.attributes.health = fb.boss_health
+                actor.attributes.strength = 0
+                actor.physical_attack = fb.boss_physical_attack
+                actor.magic_attack = 0
+                actor.attributes.armor = 0
+                actor.defense = fb.boss_defense
+                actor.attributes.resistance = fb.boss_resistance
+                actor.attributes.speed = fb.boss_speed
+                actor.attributes.critchance = 0
+                actor.ClearField("combat")
+                actor.ClearField("equipment_effects")
+                actor.ClearField("pet_cultivation")
+                actor.ClearField("skill_table_ids")
+                actor.ClearField("runtime_skills")
+                actor.capture_pet_table_id = 0
             self.actors[actor.actor_id] = actor
         if {actor.team_index for actor in self.actors.values()} != {0, 1}:
             raise BattleError("both sides need a unit")
@@ -198,6 +323,152 @@ class TurnEngine:
         self.scripts = BattleScriptRuntime(self, request, monster_ids)
         self.monster_ai.bind_actors()
         self.trial_tracker.initialize(request)
+        self.encounter.init_special_encounter_state()
+
+    @property
+    def is_ranked_battle(self) -> bool:
+        return self.ranked_context is not None and self.ranked_context.season_id != 0
+
+    @property
+    def uses_free_preset(self) -> bool:
+        return self.ranked_context is not None and bool(self.ranked_context.use_free_preset)
+
+    @property
+    def is_competitive_pvp_battle(self) -> bool:
+        return not self.pve and (
+            self.is_ranked_battle
+            or self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5
+            or self.match_mode in (MATCH_MODE_POLARITY_5V5, MATCH_MODE_SEASON_TOURNAMENT)
+        )
+
+    @property
+    def is_boss_trial_battle(self) -> bool:
+        return self.encounter.is_boss_trial
+
+    @property
+    def is_festival_beast_battle(self) -> bool:
+        return self.encounter.is_festival_beast
+
+    @property
+    def escalation_start_round(self) -> int:
+        if self.is_competitive_pvp_battle and self.max_rounds >= PVP_ESCALATION_MIN_MAX_ROUNDS:
+            return self.max_rounds - PVP_ESCALATION_LEAD_ROUNDS
+        return 0
+
+    @property
+    def escalation_stacks(self) -> int:
+        start = self.escalation_start_round
+        return (self.round_index - start + 1) if (start > 0 and self.round_index >= start) else 0
+
+    @property
+    def escalation_damage_pct(self) -> int:
+        return 100 + self.escalation_stacks * PVP_ESCALATION_DAMAGE_STEP_PCT
+
+    @property
+    def escalation_support_pct(self) -> int:
+        drop = self.escalation_stacks * PVP_ESCALATION_SUPPORT_STEP_PCT
+        max_drop = 100 - PVP_ESCALATION_SUPPORT_FLOOR_PCT
+        return PVP_ESCALATION_SUPPORT_FLOOR_PCT if drop >= max_drop else (100 - drop)
+
+    @property
+    def surrender_unlock_round(self) -> int:
+        return 0 if self.pve else PVP_SURRENDER_UNLOCK_ROUND
+
+    def team_index_of_player(self, player_id: int) -> int | None:
+        actor = self.actors.get(player_id)
+        if actor is None or actor.actor_type != _PLAYER or actor.team_index > 1:
+            return None
+        return actor.team_index
+
+    def completed_rounds(self) -> int:
+        if self.outcome == 0 or self.surrendered_team is not None:
+            return max(0, self.round_index - 1)
+        return self.round_index
+
+    def _expire_surrender_votes_for_round_advance(self) -> None:
+        for vote in self.team_surrender_votes:
+            if not vote.active:
+                continue
+            vote.active = False
+            vote.rejected = True
+            vote.passed = False
+            vote.ClearField("agreed_player_ids")
+            vote.next_allowed_round = self.round_index + PVP_SURRENDER_EXPIRE_COOLDOWN_ROUNDS
+
+    def submit_surrender_vote(self, player_id: int, agree: bool) -> tuple[int, Message | None]:
+        """PVP 第 5 回合起投降 / 同队投降投票表态；返回 `(tip_error, vote_state)`。"""
+        if self.outcome != 0:
+            return _INVALID, None
+        if self.pve:
+            return ERR_SURRENDER_NOT_ALLOWED, None
+        actor = self.actors.get(player_id)
+        if actor is None or actor.actor_type != _PLAYER or actor.team_index > 1:
+            return _INVALID, None
+        if self.round_index < PVP_SURRENDER_UNLOCK_ROUND:
+            return ERR_SURRENDER_TOO_EARLY, None
+
+        team_idx = actor.team_index
+        vote = self.team_surrender_votes[team_idx]
+        if not vote.active:
+            if not agree:
+                return _INVALID, None
+            if vote.next_allowed_round > 0 and self.round_index < vote.next_allowed_round:
+                return ERR_SURRENDER_COOLDOWN, None
+            active_voters = 0
+            for member in self.actors.values():
+                if member.actor_type != _PLAYER or member.team_index != team_idx:
+                    continue
+                idle_rounds = self.consecutive_idle_rounds_by_player.get(member.actor_id, 0)
+                if member.actor_id == player_id or idle_rounds < PVP_SURRENDER_IDLE_EXCLUDE_ROUNDS:
+                    active_voters += 1
+            vote.Clear()
+            vote.active = True
+            vote.team_index = team_idx
+            vote.initiator_player_id = player_id
+            vote.initiated_round = self.round_index
+            vote.agreed_player_ids.append(player_id)
+            vote.required_agrees = max(1, active_voters)
+        else:
+            if player_id in vote.agreed_player_ids:
+                return ERR_SURRENDER_ALREADY_VOTED, None
+            if not agree:
+                vote.active = False
+                vote.rejected = True
+                vote.passed = False
+                vote.ClearField("agreed_player_ids")
+                vote.next_allowed_round = self.round_index + PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS
+                out = self.protocol.message("BattleSurrenderVoteState")
+                out.CopyFrom(vote)
+                return 0, out
+            agreed = sorted((*vote.agreed_player_ids, player_id))
+            vote.ClearField("agreed_player_ids")
+            vote.agreed_player_ids.extend(agreed)
+
+        if vote.active and len(vote.agreed_player_ids) >= vote.required_agrees:
+            vote.active = False
+            vote.passed = True
+            vote.rejected = False
+            self.surrendered_team = team_idx
+            self.outcome = 2 if team_idx == 0 else 1
+            self.encounter.active_telegraphs.clear()
+
+        out = self.protocol.message("BattleSurrenderVoteState")
+        out.CopyFrom(vote)
+        return 0, out
+
+    def fill_surrender_vote_for_viewer(self, state: Message, viewer_player_id: int) -> None:
+        state.ClearField("surrender_vote")
+        team = self.team_index_of_player(viewer_player_id)
+        if team is None:
+            return
+        vote = self.team_surrender_votes[team]
+        if (
+            vote.active
+            or vote.passed
+            or vote.rejected
+            or (vote.next_allowed_round > 0 and self.round_index < vote.next_allowed_round)
+        ):
+            state.surrender_vote.CopyFrom(vote)
 
     def set_monster_ai_profiles(self, profiles: Mapping[int, DungeonMonsterAiProfile]) -> None:
         """为本场战斗动态挂载副本怪物战术 AI 档案。"""
@@ -233,8 +504,17 @@ class TurnEngine:
         state = self.protocol.message(
             "BattleStateS2C", battle_id=self.battle_id, round_index=self.round_index,
             action_deadline_ms=deadline_ms, outcome=self.outcome, pending_actor_ids=self.pending_players(),
+            round_limit=self.max_rounds,
         )
         state.actors.extend(self.actors.values())
+        self.encounter.fill_state_snapshot(state)
+        esc_start = self.escalation_start_round
+        if esc_start > 0:
+            state.escalation_start_round = esc_start
+            state.escalation_stacks = self.escalation_stacks
+        surrender_unlock = self.surrender_unlock_round
+        if surrender_unlock > 0:
+            state.surrender_unlock_round = surrender_unlock
         if not unredacted:
             self.personalize(state, viewer)
         return state
@@ -249,9 +529,12 @@ class TurnEngine:
             if actor.HasField("support_effects") and (not viewer or actor.actor_id != viewer):
                 actor.ClearField("support_effects")
         state.ClearField("self_items")
+        state.ClearField("surrender_vote")
         for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
             if item.count:
                 state.self_items.add().CopyFrom(item)
+        if viewer:
+            self.fill_surrender_vote_for_viewer(state, viewer)
 
     def validate(self, actor: Message, action: Message) -> int:
         if not _active(actor):
@@ -273,10 +556,14 @@ class TurnEngine:
                         return 0
             return error
         if action_type == _ITEM:
+            if self.is_festival_beast_battle:
+                return _INVALID
             return self._validate_item(actor, action.item_table_id, action.target_id)
         return _INVALID
 
     def _validate_item(self, actor: Message, item_id: int, target_id: int) -> int:
+        if self.is_festival_beast_battle:
+            return _INVALID
         rule = self.item_rules.get(item_id)
         if rule is None:
             return 1001
@@ -305,6 +592,28 @@ class TurnEngine:
         enemies = [other for other in self.actors.values() if self._enemy(actor, other)]
         return enemies[self.rng.next() % len(enemies)] if enemies else None
 
+    def _update_outcome(self) -> None:
+        if self.outcome:
+            return
+        if self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE and self.encounter.protected_guard_actor_id:
+            guard = self.actors.get(self.encounter.protected_guard_actor_id)
+            if guard is None or not _active(guard):
+                self.outcome = 2
+                return
+        side_a, side_b = (any(_active(actor) and actor.team_index == side for actor in self.actors.values())
+                          for side in (0, 1))
+        if not side_a and not side_b:
+            self.outcome = 3
+        elif not side_a:
+            self.outcome = 2
+        elif not side_b:
+            self.outcome = 1
+        elif self.round_index >= self.max_rounds:
+            if self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5 or self.match_mode == MATCH_MODE_POLARITY_5V5:
+                self.outcome = 3
+            else:
+                self.outcome = 2
+
     def resolve(self) -> Message:
         turn = self.protocol.message("TurnResultS2C", battle_id=self.battle_id, round_index=self.round_index)
         if self.outcome:
@@ -316,9 +625,12 @@ class TurnEngine:
         turn.action_order.extend(self.last_action_order)
         self._group = 0
         for actor in order:
+            if self.encounter.is_slow_phase_actor(actor.actor_id):
+                continue
             if _active(actor):
                 self._group += 1
                 self._execute(turn, self._group, actor, self.pending[actor.actor_id])
+        self.encounter.execute_slow_and_guardian_actions(turn)
         for actor in self.actors.values():
             if _active(actor) and actor.buffs:
                 self._group += 1
@@ -330,25 +642,34 @@ class TurnEngine:
             for skill_id, remaining in list(actor.skill_cooldown_rounds.items()):
                 if remaining:
                     actor.skill_cooldown_rounds[skill_id] = remaining - 1
-        side_a, side_b = (any(_active(actor) and actor.team_index == side for actor in self.actors.values())
-                          for side in (0, 1))
-        if not side_a and not side_b:
-            self.outcome = 3
-        elif not side_a:
-            self.outcome = 2
-        elif not side_b:
-            self.outcome = 1
-        elif self.round_index >= self.max_rounds:
-            self.outcome = 2
+        self._update_outcome()
+        if not self.outcome and self.is_boss_trial_battle:
+            self._group += 1
+            self.encounter.process_boss_trial_round_end(turn, self._group)
+            self._update_outcome()
         self.trial_tracker.on_round_complete(self.round_index)
+        for actor in self.actors.values():
+            if actor.actor_type != _PLAYER:
+                continue
+            manual_rounds = self.trial_tracker.manual_action_rounds.get(actor.actor_id)
+            if manual_rounds is not None and self.round_index in manual_rounds:
+                self.consecutive_idle_rounds_by_player[actor.actor_id] = 0
+            else:
+                self.consecutive_idle_rounds_by_player[actor.actor_id] = (
+                    self.consecutive_idle_rounds_by_player.get(actor.actor_id, 0) + 1
+                )
         self.pending.clear()
         if not self.outcome:
+            self._expire_surrender_votes_for_round_advance()
             self.round_index += 1
+            self.encounter.advance_round_cleanup()
+        else:
+            self.encounter.active_telegraphs.clear()
         turn.state.CopyFrom(self.snapshot(0, unredacted=True))
         return turn
 
     def _post_process_buff_ticks(self, target: Message, turn: Message, event_start: int) -> None:
-        """对本回合周期效果事件补充宠物毒伤修炼增幅与怪物护卫回血追踪。"""
+        """对本回合周期效果事件补充宠物毒伤修炼增幅、首领破绽易伤与怪物护卫回血追踪。"""
         for event in turn.events[event_start:]:
             if event.event_type != 7 or not event.value:
                 continue
@@ -360,6 +681,20 @@ class TurnEngine:
                 bonus = self.pet_support.pet_poison_bonus(caster)
                 if bonus > 0.0 and not target.is_dead:
                     extra = landed_damage(target, float(event.value) * bonus)
+                    if extra > 0:
+                        target.attributes.health -= extra
+                        event.value += extra
+                        event.target_health_after = target.attributes.health
+                        self._death(turn, event.group_id, target, caster.actor_id)
+            if rule.buff_type in (50, 51) and self.is_boss_trial_battle and target.team_index == 1 and not target.is_dead:
+                vuln_pct = 0
+                exp = self.encounter.exposed_actors.get(target.actor_id)
+                if exp is not None and exp[1] >= self.round_index:
+                    vuln_pct += exp[0]
+                if target.is_boss and self.encounter.boss_phase >= 2:
+                    vuln_pct += 15
+                if vuln_pct > 0:
+                    extra = min(target.attributes.health, (event.value * vuln_pct) // 100)
                     if extra > 0:
                         target.attributes.health -= extra
                         event.value += extra
@@ -398,6 +733,10 @@ class TurnEngine:
     def _effective_stat(self, actor: Message, kind: int) -> int:
         value = base_stat(actor, kind)
         rate = self.effects.multiplier(actor, kind)
+        if kind == 10:
+            rate *= self.encounter.effective_physical_attack_multiplier(actor)
+        elif kind == 11:
+            rate *= self.encounter.effective_defense_multiplier(actor)
         return value if rate == 1.0 else scaled(value, rate)
 
     @staticmethod
@@ -415,12 +754,22 @@ class TurnEngine:
                 self.equipment_effects.on_defend(actor, self.round_index, turn, group)
             return
         if action.action_type == _FLEE:
-            if self.pve:
+            if self.is_boss_trial_battle and actor.actor_type == _PLAYER:
+                # 首领试炼确定退出：不消耗 RNG，本人及名下出战宠原子离场。
+                actor.fled = True
+            elif self.pve:
                 top_speed = max((self._effective_stat(other, 13) for other in self.actors.values() if self._enemy(actor, other)), default=0)
                 difference = float(self._effective_stat(actor, 13)) - float(top_speed)
                 chance = max(0.05, min(0.95, 0.5 + difference * (0.01 / 12)))
                 actor.fled = self.rng.unit() < chance
             self._event(turn, group, 11, actor, actor, success=actor.fled)
+            if actor.fled and (self.is_boss_trial_battle or self.is_festival_beast_battle) and actor.actor_type == _PLAYER:
+                for other in self.actors.values():
+                    if other.actor_type == _PET and other.owner_player_id == actor.actor_id and not other.fled:
+                        was_active = _active(other)
+                        other.fled = True
+                        if was_active:
+                            self._event(turn, group, 11, other, other, success=True)
             return
         if action.action_type == _ITEM:
             self._use_item(turn, group, actor, action)
@@ -505,7 +854,10 @@ class TurnEngine:
         rule = self.item_rules[action.item_table_id]
         target = self.actors.get(target_id, actor)
         old_health, old_mana = target.attributes.health, target.attributes.mana
-        target.attributes.health = old_health + landed_heal(target, float(rule.heal_health))
+        raw_heal = float(rule.heal_health)
+        if self.escalation_stacks > 0:
+            raw_heal *= self.escalation_support_pct / 100.0
+        target.attributes.health = old_health + landed_heal(target, raw_heal)
         target.attributes.mana = old_mana + min(rule.heal_mana, max(0, target.max_mana - old_mana))
         item = next(entry for entry in self.items[actor.actor_id]
                     if entry.item_table_id == action.item_table_id and entry.count)
@@ -574,7 +926,9 @@ class TurnEngine:
 
     def _damage(self, turn: Message, group: int, actor: Message, target: Message, rule: BattleSkill,
                 *, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
-                base: float | None = None, rank: int = 0) -> None:
+                base: float | None = None, rank: int = 0,
+                is_multi_target: bool = False, is_primary_target: bool = True,
+                is_primary_focus: bool = False) -> None:
         damage = self._damage_before_critical(actor, target, rule, rule.base_damage if base is None else base)
         critical_rate = self._critical_chance(actor, rule)
         critical = critical_rate > 0 and self.rng.unit() < critical_rate
@@ -583,6 +937,8 @@ class TurnEngine:
         damage *= rank_factor(rank)
         if hit_kind == 1:
             damage *= 0.5
+        if is_primary_focus:
+            damage *= PVP_PRIMARY_FOCUS_NUM / PVP_PRIMARY_FOCUS_DEN
         if actor.actor_type == _PET and actor.HasField("pet_cultivation"):
             damage = self.pet_support.apply_pet_damage_bonus(
                 actor, damage, rule.damage_kind, is_direct=(hit_kind != 3), hit_kind=hit_kind,
@@ -590,7 +946,20 @@ class TurnEngine:
         extra_bonus = self.equipment_effects.actor_bonus(actor.actor_id)
         if extra_bonus is not None and extra_bonus.damage_bonus_bps > 0:
             damage = self.pet_support.apply_bonus(damage, extra_bonus.damage_bonus_bps / 10_000.0)
-        dealt = landed_damage(target, damage)
+        if self.escalation_stacks > 0 and hit_kind != 3:
+            damage *= self.escalation_damage_pct / 100.0
+
+        splash_reduced = False
+        if self.encounter.has_active_damage_modifiers:
+            scaled_dmg = damage * (0.5 if target.is_defending else 1.0)
+            remaining = ceil(scaled_dmg) if (scaled_dmg > 0 and isfinite(scaled_dmg)) else 0
+            remaining, splash_reduced = self.encounter.apply_encounter_damage_modifiers(
+                actor, target, remaining, rule.damage_kind, hit_kind != 2, turn, group,
+                is_multi_target_skill=is_multi_target, is_primary_target=is_primary_target,
+            )
+            dealt = min(target.attributes.health, remaining)
+        else:
+            dealt = landed_damage(target, damage)
         if dealt > 0 and (
             target.HasField("equipment_effects")
             or self.equipment_effects.actor_bonus(target.actor_id) is not None
@@ -609,10 +978,16 @@ class TurnEngine:
                     self.round_index, turn, group, original_shields,
                 )
         if dealt > 0 or not absorbed:
-            self._apply_damage(turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
-                               hit_kind=hit_kind, hit_index=hit_index)
+            self._apply_damage(
+                turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
+                hit_kind=hit_kind, hit_index=hit_index,
+                is_splash_reduced=splash_reduced, is_primary_focus=is_primary_focus,
+            )
+        if not skill_id:
+            self.encounter.apply_breaker_sunder_on_basic_hit(actor, target, dealt, hit_kind, turn, group)
         if (dealt + absorbed) > 0 and hit_kind in (0, 1):
             self.trial_tracker.record_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
+            self.encounter.record_player_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
         if dealt > 0:
             self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
         if not skill_id and hit_kind != 2 and dealt and _active(actor) and _active(target) and self.rng.percent(target.combat.reflect_rate):
@@ -620,11 +995,16 @@ class TurnEngine:
             self._apply_damage(turn, group, target, actor, reflected, hit_kind=3, hit_index=hit_index)
 
     def _apply_damage(self, turn: Message, group: int, source: Message, target: Message, value: int,
-                      *, critical: bool = False, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0) -> None:
+                      *, critical: bool = False, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
+                      is_splash_reduced: bool = False, is_primary_focus: bool = False) -> None:
         target.attributes.health -= value
-        self._event(turn, group, 3, source, target, value=value, is_critical=critical, skill_table_id=skill_id,
-                    hit_kind=hit_kind, hit_index=hit_index, target_health_after=target.attributes.health,
-                    target_mana_after=target.attributes.mana)
+        ev = self._event(turn, group, 3, source, target, value=value, is_critical=critical, skill_table_id=skill_id,
+                         hit_kind=hit_kind, hit_index=hit_index, target_health_after=target.attributes.health,
+                         target_mana_after=target.attributes.mana)
+        if is_splash_reduced:
+            ev.is_splash_reduced = True
+        if is_primary_focus:
+            ev.is_primary_focus = True
         self._death(turn, group, target, source.actor_id, hit_index)
 
     def _death(self, turn: Message, group: int, target: Message, source_id: int, hit: int = 0) -> None:
@@ -644,6 +1024,7 @@ class TurnEngine:
         self.trial_tracker.record_death(target)
         self.monster_ai.notify_dead(target.actor_id)
         self._event(turn, group, 8, target, target, hit_index=hit)
+        self.encounter.handle_boss_trial_monster_death(target, turn, group)
 
 
 @dataclass(slots=True)
@@ -746,6 +1127,7 @@ class BattleNode:
         *,
         trial_context: TrialContext | Message | None = None,
         monster_ai_profiles: Mapping[int, DungeonMonsterAiProfile] | None = None,
+        ranked_context: Message | None = None,
     ) -> Message:
         response = self.protocol.message("CreateBattleResponse", battle_id=request.battle_id)
         if self._draining:
@@ -787,6 +1169,10 @@ class BattleNode:
                               if self.tables and request.match_mode in _PVE_MODES else None)
             monsters = self.monster_factory(request) if self.monster_factory and request.match_mode in _PVE_MODES else ()
             max_rounds = self.tables.max_rounds(request, self.max_rounds) if self.tables else self.max_rounds
+            boss_trial_kind, battle_difficulty, explicit_round_limit = (
+                self.tables.dungeon_meta(request.battle_config_id)
+                if self.tables is not None else (0, 0, 0)
+            )
             resolved_trial_ctx = trial_context
             if resolved_trial_ctx is None and self.trial_context_resolver is not None:
                 resolved_trial_ctx = self.trial_context_resolver(request)
@@ -796,17 +1182,22 @@ class BattleNode:
                                 silence_permissions=self.tables.silence_permissions if self.tables else None,
                                 monster_ids={row.id for row in self.tables.tables["Monster"].rows()} if self.tables else None,
                                 monster_ai_profiles=resolved_ai_profiles,
-                                trial_context=resolved_trial_ctx)
+                                trial_context=resolved_trial_ctx,
+                                boss_trial_kind=boss_trial_kind,
+                                battle_difficulty=battle_difficulty,
+                                has_explicit_round_limit=explicit_round_limit > 0,
+                                ranked_context=ranked_context)
         except (BattleError, ValueError):
             return self._error(response, _INVALID_TABLE)
         now = self.now_ms()
         if request.admit_before_ms <= now:
             return self._error(response, _INVALID)
         deadline = request.deadline_ms if request.deadline_ms > now else now + (_MAX_ROUNDS + 2) * _ROUND_MS
+        manual_window_ms = BOSS_TRIAL_ACTION_TIMEOUT_MS if engine.is_boss_trial_battle else _ACTION_MS
         original = self.protocol.message("CreateBattleRequest")
         original.CopyFrom(request)
         routing = {player.player_id: player.routing for player in original.players}
-        room = _Room(engine, original, deadline, now + _ACTION_MS, routing,
+        room = _Room(engine, original, deadline, now + manual_window_ms, routing,
                      reward_profile=reward_profile,
                      confirm_until_ms=now + 180_000)
         if request.record_replay:
@@ -818,9 +1209,9 @@ class BattleNode:
         admitted_at = self.now_ms()
         if request.admit_before_ms <= admitted_at:
             return self._error(response, _INVALID)
-        room.action_deadline_ms = admitted_at + _ACTION_MS
+        room.action_deadline_ms = admitted_at + manual_window_ms
         armed_at = self._steady_ms()
-        room.action_due_steady_ms = armed_at + _ACTION_MS
+        room.action_due_steady_ms = armed_at + manual_window_ms
         room.battle_due_steady_ms = armed_at + deadline - now
         self.rooms[request.battle_id] = room
         if self.on_rooms_changed:
@@ -1183,7 +1574,12 @@ class BattleNode:
         room = self._member(ticket) if request.battle_id == ticket.battle_id else None
         if message_id == 140:
             return self._snapshot(room, ticket.player_id if ticket.role == _PARTICIPANT else 0) if room is not None else self.protocol.message("BattleStateS2C")
-        responses = {149: "SubmitBattleActionResponse", 162: "SetAutoBattleResponse", 165: "StopWatchBattleResponse"}
+        responses = {
+            149: "SubmitBattleActionResponse",
+            162: "SetAutoBattleResponse",
+            165: "StopWatchBattleResponse",
+            479: "SurrenderBattleResponse",
+        }
         if message_id not in responses:
             raise BattleError("message_id_not_allowed")
         response = self.protocol.message(responses[message_id])
@@ -1198,6 +1594,23 @@ class BattleNode:
         if room.proposed_outcome or room.battle_due_steady_ms <= steady:
             return self._error(response, _UNAVAILABLE)
         engine = room.engine
+        if message_id == 479:
+            visible_before = self._terminal_visibility(room)
+            err, vote_state = engine.submit_surrender_vote(ticket.player_id, bool(request.agree))
+            if err:
+                return self._error(response, err)
+            response.vote_state.CopyFrom(vote_state)
+            notify = self.protocol.message("SurrenderVoteS2C", battle_id=engine.battle_id)
+            notify.vote_state.CopyFrom(vote_state)
+            for member_id in tuple(room.routing):
+                if engine.team_index_of_player(member_id) == vote_state.team_index:
+                    self._emit(room, member_id, 480, notify)
+            if engine.outcome:
+                if room.replay is not None:
+                    room.replay.mark_deadline_draw(engine.snapshot(0))
+                room.visible_before_terminal = visible_before
+                self._propose_outcome(room, engine.outcome, self.now_ms())
+            return response
         if steady >= room.action_due_steady_ms:
             self._resolve(room)
             return self._error(response, _INVALID)
@@ -1236,7 +1649,8 @@ class BattleNode:
             room.final_turn = turn
             self._propose_outcome(room, room.engine.outcome, self.now_ms())
             return
-        interval = _ACTION_MS if room.engine.pending_players() else max(2000, 250 * len(turn.action_order))
+        manual_window_ms = BOSS_TRIAL_ACTION_TIMEOUT_MS if room.engine.is_boss_trial_battle else _ACTION_MS
+        interval = manual_window_ms if room.engine.pending_players() else max(2000, 250 * len(turn.action_order))
         room.action_deadline_ms = self.now_ms() + interval
         room.action_due_steady_ms = self._steady_ms() + interval
         self._broadcast_turn(room, turn)
@@ -1280,7 +1694,7 @@ class BattleNode:
     def _result(self, room: _Room) -> Message:
         engine = room.engine
         request = room.original
-        rounds = engine.round_index if engine.outcome else engine.round_index - 1
+        rounds = engine.completed_rounds()
         event = self.protocol.message(
             "contracts.kafka.BattleResultEvent", battle_id=engine.battle_id, match_mode=request.match_mode,
             battle_config_id=request.battle_config_id, outcome=room.proposed_outcome,
@@ -1289,6 +1703,8 @@ class BattleNode:
         )
         if request.activity_context.kind:
             event.activity_context.CopyFrom(request.activity_context)
+        if engine.is_ranked_battle and engine.ranked_context is not None:
+            event.ranked_context.CopyFrom(engine.ranked_context)
         teams: dict[int, list[int]] = {}
         for player in sorted(room.routing):
             actor = engine.actors[player]
@@ -1299,7 +1715,19 @@ class BattleNode:
                 is_dead=actor.is_dead, fled=actor.fled, total_rounds=rounds,
                 finished_at_ms=event.finished_at_ms, match_mode=request.match_mode,
                 battle_config_id=request.battle_config_id,
+                surrendered=(engine.surrendered_team is not None and actor.team_index == engine.surrendered_team),
+                use_free_preset=engine.uses_free_preset,
+                boss_trial_kind=engine.encounter.boss_trial_kind,
+                battle_difficulty=engine.encounter.battle_difficulty,
+                manual_action_rounds=len(engine.trial_tracker.manual_action_rounds.get(player, ())),
+                effective_combat_contribution=(player in engine.trial_tracker.effective_contribution_players),
             )
+            if engine.is_festival_beast_battle:
+                settlement.festival_beast.CopyFrom(request.activity_context.festival_beast)
+            if engine.is_ranked_battle and engine.ranked_context is not None:
+                settlement.competitive_ranked = True
+                settlement.season_id = engine.ranked_context.season_id
+                settlement.ranked_rule_version = engine.ranked_context.rule_version
             if actor.fled:
                 event.fled_player_ids.append(player)
             if actor.is_dead:
@@ -1307,10 +1735,11 @@ class BattleNode:
             for item_id, count in engine.items_consumed.get(player, {}).items():
                 settlement.items_consumed.add(item_table_id=item_id, count=count)
             for pet in engine.actors.values():
-                if pet.actor_type == _PET and pet.owner_player_id == player:
+                if pet.actor_type == _PET and pet.owner_player_id == player and not pet.competitive_temporary:
                     settlement.pets.add(pet_id=pet.pet_id, health=pet.attributes.health,
                                         mana=pet.attributes.mana, is_dead=pet.is_dead)
-            if engine.pve and engine.outcome == 1 and actor.team_index == 0 and _active(actor):
+            if (engine.pve and not engine.is_festival_beast_battle
+                    and engine.outcome == 1 and actor.team_index == 0 and _active(actor)):
                 for monster_id in engine.defeated_monsters:
                     settlement.defeated_monsters.add(monster_config_id=monster_id, count=1)
                 if self.tables:
@@ -1346,7 +1775,7 @@ class BattleNode:
         room.action_deadline_ms = 0
         if committed and room.final_turn is not None:
             self._broadcast_turn(room, room.final_turn)
-        reason = 1 if committed and room.final_turn is not None else 2
+        reason = 1 if committed and (room.final_turn is not None or room.engine.surrendered_team is not None) else 2
         end = self.protocol.message("SpectateEndS2C", battle_id=battle_id,
                                     outcome=room.proposed_outcome if committed else 0, reason=reason)
         self._spectate_frame(room, END, room.engine.round_index, end)

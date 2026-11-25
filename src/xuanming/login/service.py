@@ -12,6 +12,7 @@ import grpc
 from . import gate_commands
 from .account_deletion import AccountDeletionService
 from .caller_auth import SESSION_DETAIL, AuthError, CallerVerifier, parse_details
+from .cellroute import CellRouteConfig, Router, build_router, build_static_router
 from .config import LoginConfig
 from .directory import DataService
 from .logic import (
@@ -37,6 +38,17 @@ logger = logging.getLogger(__name__)
 _SHUTDOWN_DRAIN = 15
 
 
+async def init_cell_router(cfg: CellRouteConfig, etcd_client=None):
+    """构建可选 4096 槽位确定性单元路由器；``cfg.mode == ""`` 时返回 ``(None, None)``。"""
+    router, stop = await build_router(cfg, etcd_client)
+    if router is not None:
+        logger.info(
+            "[login] cellroute router ready: mode=%s self=(%d,%d) enforce=%s",
+            cfg.mode, cfg.self_region, cfg.self_cell, cfg.enforce_ownership,
+        )
+    return router, stop
+
+
 @dataclass(eq=False)
 class ServiceContext:
     protocol: object
@@ -59,6 +71,20 @@ class ServiceContext:
     content_guard_call: object = None
     merged_zones: dict[int, int] = field(default_factory=dict)
     zone_capacity_fn: object = None
+    cell_router: Router | None = None
+    _cell_route_stop: object = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.config.cell_route.validate()
+        if self.cell_router is None and self.config.cell_route.mode == "static":
+            self.cell_router = build_static_router(self.config.cell_route)
+
+    async def start_cell_router(self, etcd_client=None) -> Router | None:
+        """按配置初始化可选单元路由器（支持 static 与 etcd 热监听）。"""
+        router, stop = await init_cell_router(self.config.cell_route, etcd_client)
+        self.cell_router = router
+        self._cell_route_stop = stop
+        return router
 
     async def send_gate(self, built, player_id: int) -> None:
         node_id, command = built
@@ -75,6 +101,12 @@ class ServiceContext:
         return True
 
     async def close(self) -> None:
+        if self._cell_route_stop is not None:
+            stop = self._cell_route_stop
+            self._cell_route_stop = None
+            result = stop()
+            if asyncio.iscoroutine(result):
+                await result
         if self.tasks:
             _, pending = await asyncio.wait(set(self.tasks), timeout=_SHUTDOWN_DRAIN)
             for task in pending:

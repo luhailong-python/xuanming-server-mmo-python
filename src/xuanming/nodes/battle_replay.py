@@ -20,9 +20,12 @@ def _strip_live(state: Message) -> None:
     state.ClearField("action_deadline_ms")
     state.ClearField("pending_actor_ids")
     state.ClearField("self_items")
+    state.ClearField("surrender_vote")
     for actor in state.actors:
         actor.ClearField("combat")
         actor.ClearField("skill_cooldown_rounds")
+        actor.ClearField("support_effects")
+        actor.ClearField("season_seal_state")
 
 
 class BattleReplayRecorder:

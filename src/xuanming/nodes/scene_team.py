@@ -60,6 +60,12 @@ class SceneTeam:
 
     def register(self) -> None:
         self.scene.register("SceneMovementClientPlayer", "TeamFollow", self.follow)
+        if self.scene.buffs is not None:
+            self.scene.buffs.register_exit_hook(1, self._on_follow_state_exited)
+
+    def _on_follow_state_exited(self, actor, _state: int, reason: int) -> None:
+        if reason == 1 and getattr(actor, "player_id", 0) in self._followers:
+            self._detach(actor.player_id, _LEFT)
 
     def follow(self, world, player, route, request) -> None:
         if request.follow:
@@ -227,6 +233,8 @@ class SceneTeam:
                 place = not needs_placement
         formation.add(TeamFollowMember(player_id, join_seq, cursor, needs_placement=needs_placement))
         self._followers[player_id] = _Follower(leader_id)
+        if self.scene.buffs is not None:
+            self.scene.buffs.set_action_state(player, 1, True)
         self.scene.set_velocity(player, ZERO)
         player.motion.teleport_until = 0.0
         if place:
@@ -258,6 +266,8 @@ class SceneTeam:
                 self._formations.pop(follower.leader, None)
         player = self._player(player_id)
         if player is not None:
+            if self.scene.buffs is not None:
+                self.scene.buffs.set_action_state(player, 1, False)
             if reason == _LEADER_GONE and player_id in self.intents:
                 self._await_leader[player_id] = follower.leader, self.scene.current_frame
             player.motion.teleport_target = None

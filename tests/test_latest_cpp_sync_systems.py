@@ -100,18 +100,20 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 68
-    assert len(pb_tables.tables) == 68
+    assert len(json_tables.tables) == 70
+    assert len(pb_tables.tables) == 70
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {
         "EquipAffixQuality": 5,
+        "FestivalBeastActivity": 1,
+        "FestivalBeastTier": 8,
         "SkillScrollCraft": 3,
         "TournamentReward": 7,
         "TournamentRule": 1,
-        "TrialJournalEntry": 11,
-        "TrialJournalMilestone": 10,
-        "TrialJournalSeal": 30,
+        "TrialJournalEntry": 12,
+        "TrialJournalMilestone": 11,
+        "TrialJournalSeal": 33,
     }
     for name, expected in expected_counts.items():
         jrows = json_tables[name].rows()

@@ -1,7 +1,7 @@
 """trade 三组 gRPC 服务适配层与 fail-closed 鉴权。
 
 对外暴露：
-- ``trade.ClientPlayerJubaozhai``: P1 目录 (4) + 核心交易 (18) + 官方商城/人民币 (13)
+- ``trade.ClientPlayerJubaozhai``: P1 目录 (4) + 核心交易 (18) + 官方商城/人民币 (13) + 经济信用与参考价/额度 (4)
 - ``trade.TradeAdmin``: SeedListing / ListManualContracts / ResolveManualContract
 - ``rolefence.RoleFenceParticipant``: PrepareRoleFreeze / ApplyRoleFence / PurgeRemovedRole
 """
@@ -27,6 +27,28 @@ from .commerce_engine import (
     owns_record,
     parse_partial_part,
 )
+from .economy_credit import (
+    DAY_MS,
+    DEFAULT_COOLING_LOCK_DURATION_MS,
+    DEFAULT_MAX_REFERENCE_DEVIATION_PCT,
+    DEFAULT_MIN_FRIEND_DURATION_MS,
+    MAX_SELLER_REVIEW_COMMENT_RUNES,
+    PLAYER_TRADE_MODE_ACQUAINTANCE_LOCKED,
+    SELLER_RATING_NEGATIVE,
+    SELLER_RATING_NEUTRAL,
+    SELLER_RATING_POSITIVE,
+    DailyPlayerTradeTracker,
+    PlayerTradePolicy,
+    ReferencePriceReader,
+    SellerCreditService,
+    SellerReviewRequest,
+    StoreDailyPlayerTradeTracker,
+    StoreOwnershipLookup,
+    StoreReferencePriceReader,
+    parse_commerce_order_id,
+    seller_credit_view,
+    settled_trade_fact,
+)
 from .errors import (
     ERR_INVALID_PARAMETER,
     ERR_SERVICE_UNAVAILABLE,
@@ -37,6 +59,7 @@ from .errors import (
     ERR_TRADE_HOME_ZONE_UNKNOWN,
     ERR_TRADE_LISTING_NOT_FOUND,
     ERR_TRADE_ORDER_NOT_FOUND,
+    ERR_TRADE_ORDER_STATE_CONFLICT,
     ERR_TRADE_TEXT_CHECK_UNAVAILABLE,
     ERR_TRADE_TITLE_SENSITIVE,
     InvalidRoleFenceStateError,
@@ -72,6 +95,7 @@ from .model import (
     clamp_page_size,
     clamp_uint32,
     escape_like,
+    is_known_currency,
     normalize_search,
     page_window,
     to_listing_summary,
@@ -107,6 +131,8 @@ _VERDICT_REFUSED = 3
 _VERDICT_VERSION_CHANGED = 4
 _VERDICT_RETRY = 5
 
+_AUTO = object()
+
 
 def _has_session_metadata(context) -> bool:
     if context is None:
@@ -139,6 +165,10 @@ class TradeService:
         rmb: RmbConsignments | None = None,
         rmb_identity: RmbIdentityResolver | None = None,
         content_guard: ContentGuardChecker | None = None,
+        credits: SellerCreditService | None | object = _AUTO,
+        reference_prices: ReferencePriceReader | None | object = _AUTO,
+        player_trade_policy: PlayerTradePolicy = PlayerTradePolicy(),
+        daily_outflow: DailyPlayerTradeTracker | None | object = _AUTO,
         manual_resolution_secret: bytes = b"",
         manual_resolution_environment: str = "",
         request_budget_sec: float = 3.5,
@@ -160,6 +190,29 @@ class TradeService:
         self._rmb = rmb
         self._rmb_identity = rmb_identity or (RmbIdentity(rmb.directory) if rmb is not None else None)
         self._content_guard = content_guard
+        if credits is _AUTO:
+            if commerce is not None and commerce.credits is not None:
+                self._credits: SellerCreditService | None = commerce.credits
+            else:
+                self._credits = SellerCreditService(store=store, ownership=StoreOwnershipLookup(store))
+        else:
+            self._credits = credits  # type: ignore[assignment]
+        if reference_prices is _AUTO:
+            self._reference_prices: ReferencePriceReader | None = StoreReferencePriceReader(store)
+        else:
+            self._reference_prices = reference_prices  # type: ignore[assignment]
+        self._player_trade_policy = player_trade_policy
+        if daily_outflow is _AUTO:
+            if (
+                commerce is not None
+                and commerce.player_trade_guard is not None
+                and commerce.player_trade_guard.daily_out is not None
+            ):
+                self._daily_outflow: DailyPlayerTradeTracker | None = commerce.player_trade_guard.daily_out
+            else:
+                self._daily_outflow = StoreDailyPlayerTradeTracker(store)
+        else:
+            self._daily_outflow = daily_outflow  # type: ignore[assignment]
         self._manual_secret = manual_resolution_secret
         self._manual_target = manual_resolution_environment
         self._replica = socket.gethostname() or "unknown"
@@ -208,6 +261,11 @@ class TradeService:
                 "ListSellerIncomes": self.list_seller_incomes,
                 "CreateWithdrawal": self.create_withdrawal,
                 "GetWithdrawal": self.get_withdrawal,
+                # Economy & Seller Credit (4)
+                "GetSellerCredit": self.get_seller_credit,
+                "SubmitSellerReview": self.submit_seller_review,
+                "GetMarketReferencePrice": self.get_market_reference_price,
+                "GetPlayerTradeQuota": self.get_player_trade_quota,
             },
             SERVICE_ADMIN: {
                 "SeedListing": self.seed_listing,
@@ -323,6 +381,7 @@ class TradeService:
         if w is not None:
             view.seller_confirmed = bool(w.seller_confirmed)
             view.buyer_confirmed = bool(w.buyer_confirmed)
+            view.designated_buyer_player_id = int(w.designated_buyer_player_id)
             if int(rec.kind) == COMMERCE_KIND_OFFICIAL:
                 view.order_id = str(w.external_order_sn)
                 view.related_id = str(w.sku_id)
@@ -649,9 +708,13 @@ class TradeService:
         except Exception:
             logger.error("trade content guard error, rmb consignment title refused player=%d", player_id)
             return ERR_TRADE_TEXT_CHECK_UNAVAILABLE
-        if res.verdict == TEXT_VERDICT_PASS:
+        if isinstance(res, int):
+            verdict, category = res, 0
+        else:
+            verdict, category = int(res.verdict), int(res.category)
+        if verdict == TEXT_VERDICT_PASS:
             return 0
-        logger.info("trade rmb consignment title refused by content guard category=%d player=%d", res.category, player_id)
+        logger.info("trade rmb consignment title refused by content guard category=%d player=%d", category, player_id)
         return ERR_TRADE_TITLE_SENSITIVE
 
     async def _rmb_disabled(self, context, path: str, resp_name: str, *, with_now: bool = True) -> Message:
@@ -984,7 +1047,15 @@ class TradeService:
         return await self._run_commerce_order(context, path, _call)
 
     async def create_consignment(self, request: Message, context, path: str) -> Message:
-        return await self._run_commerce_order(context, path, lambda orig, eng: eng.create_consignment(orig, request))
+        async def _call(orig: RoleOriginal, eng: CommerceEngine) -> Message:
+            target_id = int(request.designated_buyer_player_id)
+            if target_id != 0 and self._home_zones is not None:
+                zone = await self._home_zones.home_zone(target_id)
+                if zone == 0:
+                    raise TradeRejection(ERR_TRADE_COUNTERPARTY_UNKNOWN, "designated buyer unknown")
+            return await eng.create_consignment(orig, request)
+
+        return await self._run_commerce_order(context, path, _call)
 
     async def buy_consignment(self, request: Message, context, path: str) -> Message:
         async def _call(orig: RoleOriginal, eng: CommerceEngine) -> Message:
@@ -1244,6 +1315,179 @@ class TradeService:
                 lot_v = self._lot_view(r)
                 if lot_v is not None:
                     offer.auction.CopyFrom(lot_v)
+        return resp
+
+    # -- Economy & Seller Credit RPCs (4) -----------------------------------------------------------
+
+    async def get_seller_credit(self, request: Message, context, path: str) -> Message:
+        """查询指定卖家在当前权威持有周期下的店铺信用档案（严格脱敏，不下发账号/IP/设备）。"""
+        original = await self._admit_client(context, path)
+        now = self._now_ms()
+        resp = self.protocol.message("trade.SellerCreditResponse", server_now_ms=now)
+        if self._credits is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        target_id = int(request.seller_player_id) or original.player_id
+        try:
+            prof = await self._with_budget(self._credits.get_profile(target_id, now))
+        except Exception as exc:
+            code = commerce_tip_id(exc)
+            if code == ERR_SERVICE_UNAVAILABLE:
+                logger.error("trade GetSellerCredit failed seller_id=%d err=%s", target_id, exc)
+            resp.error_message.id = code
+            return resp
+        resp.profile.CopyFrom(seller_credit_view(self.protocol, prof))
+        return resp
+
+    async def submit_seller_review(self, request: Message, context, path: str) -> Message:
+        """买家对官方托管已结案订单在 7 日窗口内提交好评/中评/差评。"""
+        original = await self._admit_client(context, path)
+        now = self._now_ms()
+        resp = self.protocol.message("trade.SubmitSellerReviewResponse", server_now_ms=now)
+        if self._credits is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        rating = int(request.rating)
+        if rating not in (SELLER_RATING_POSITIVE, SELLER_RATING_NEUTRAL, SELLER_RATING_NEGATIVE):
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        comment = str(request.comment).strip()
+        if len(comment) > MAX_SELLER_REVIEW_COMMENT_RUNES:
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        if comment:
+            reject_tip = await self._with_budget(self._check_trade_title(original.player_id, comment))
+            if reject_tip != 0:
+                resp.error_message.id = reject_tip
+                return resp
+        order_num = parse_commerce_order_id(str(request.order_id))
+        if order_num is None:
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        try:
+            rec = await self._with_budget(self.store.get_commerce(order_num))
+        except Exception as exc:
+            logger.error("trade SubmitSellerReview load order=%d failed err=%s", order_num, exc)
+            resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+            return resp
+        if rec is None:
+            resp.error_message.id = ERR_TRADE_ORDER_NOT_FOUND
+            return resp
+        try:
+            wf = decode_workflow(self.protocol, rec)
+        except Exception as exc:
+            logger.error("trade SubmitSellerReview decode order=%d failed err=%s", order_num, exc)
+            resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+            return resp
+        fact = settled_trade_fact(rec, wf, int(rec.updated_ms))
+        if fact is None:
+            resp.error_message.id = ERR_TRADE_ORDER_STATE_CONFLICT
+            return resp
+        if fact.buyer_player_id != original.player_id:
+            resp.error_message.id = ERR_TRADE_ORDER_NOT_FOUND
+            return resp
+        try:
+            review_rec, prof, replayed = await self._with_budget(
+                self._credits.submit_review(
+                    SellerReviewRequest(trade=fact, rating=rating, comment=comment),
+                    now,
+                )
+            )
+        except Exception as exc:
+            code = commerce_tip_id(exc)
+            if code == ERR_SERVICE_UNAVAILABLE:
+                logger.error("trade SubmitSellerReview persist order=%d failed err=%s", order_num, exc)
+            resp.error_message.id = code
+            return resp
+        resp.counted_for_score = bool(review_rec.counted_for_score)
+        resp.replayed = bool(replayed)
+        resp.profile.CopyFrom(seller_credit_view(self.protocol, prof))
+        return resp
+
+    async def get_market_reference_price(self, request: Message, context, path: str) -> Message:
+        """查询指定标准品在近 7 日真实成交中的中位参考价（p50）及样本量；不足 10 笔明确标记样本不足。"""
+        await self._admit_client(context, path)
+        now = self._now_ms()
+        item_id = int(request.item_config_id)
+        currency = int(request.currency_type)
+        resp = self.protocol.message(
+            "trade.GetMarketReferencePriceResponse",
+            item_config_id=item_id,
+            currency_type=currency,
+            window_days=7,
+            server_now_ms=now,
+        )
+        if item_id == 0 or not is_known_currency(currency):
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        if self._reference_prices is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        try:
+            ref = await self._with_budget(self._reference_prices.reference_price(item_id, currency, now))
+        except Exception as exc:
+            logger.error(
+                "trade GetMarketReferencePrice item=%d currency=%d failed err=%s",
+                item_id,
+                currency,
+                exc,
+            )
+            resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+            return resp
+        resp.median_unit_price = int(ref.median_unit_price)
+        resp.sample_count = clamp_uint32(ref.sample_count)
+        resp.insufficient_sample = bool(ref.insufficient_sample)
+        return resp
+
+    async def get_player_trade_quota(self, request: Message, context, path: str) -> Message:
+        """返回当前游戏内当面交易防骗模式、当日累计已用/剩余货币额度与耗材白名单。"""
+        original = await self._admit_client(context, path)
+        now = self._now_ms()
+        currency = int(request.currency_type)
+        resp = self.protocol.message(
+            "trade.GetPlayerTradeQuotaResponse",
+            currency_type=currency,
+            server_now_ms=now,
+        )
+        if not is_known_currency(currency):
+            resp.error_message.id = ERR_INVALID_PARAMETER
+            return resp
+        cfg = self._player_trade_policy
+        resp.mode = str(cfg.mode)
+        resp.daily_currency_limit = int(cfg.max_daily_currency_amount)
+        resp.consumable_item_ids.extend(int(x) for x in cfg.consumable_items)
+        min_friend = int(cfg.min_friend_duration_ms)
+        if min_friend == 0 and cfg.mode == PLAYER_TRADE_MODE_ACQUAINTANCE_LOCKED:
+            min_friend = DEFAULT_MIN_FRIEND_DURATION_MS
+        resp.min_friend_duration_ms = min_friend
+        max_dev = int(cfg.max_reference_deviation_pct)
+        if max_dev == 0 and cfg.mode == PLAYER_TRADE_MODE_ACQUAINTANCE_LOCKED:
+            max_dev = DEFAULT_MAX_REFERENCE_DEVIATION_PCT
+        resp.max_reference_deviation_pct = max_dev
+        cool_ms = int(cfg.cooling_lock_duration_ms)
+        if cool_ms == 0 and cfg.mode == PLAYER_TRADE_MODE_ACQUAINTANCE_LOCKED:
+            cool_ms = DEFAULT_COOLING_LOCK_DURATION_MS
+        resp.cooling_lock_duration_ms = cool_ms
+
+        used = 0
+        if self._daily_outflow is not None:
+            day_start = (now // DAY_MS) * DAY_MS
+            try:
+                used = await self._with_budget(
+                    self._daily_outflow.daily_currency_outflow(original.player_id, currency, day_start)
+                )
+            except Exception as exc:
+                logger.error(
+                    "trade GetPlayerTradeQuota player=%d currency=%d failed err=%s",
+                    original.player_id,
+                    currency,
+                    exc,
+                )
+                resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+                return resp
+        resp.daily_currency_used = int(used)
+        if int(resp.daily_currency_limit) > int(used):
+            resp.daily_currency_remaining = int(resp.daily_currency_limit) - int(used)
         return resp
 
     # -- TradeAdmin (3 RPCs) ------------------------------------------------------------------------

@@ -210,4 +210,7 @@ def test_combo_matches_native_head_each_round():
         assert list(actual.action_order) == expected_order
         assert not native.action_order
         actual.ClearField('action_order')
+        # 历史黄金固件录制于 BattleStateS2C.round_limit 字段新增之前，比对前先校验并清空该新增字段。
+        assert actual.state.round_limit == 20
+        actual.state.ClearField('round_limit')
         assert actual == native

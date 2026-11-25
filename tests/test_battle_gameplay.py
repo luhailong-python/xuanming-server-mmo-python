@@ -37,7 +37,7 @@ def _defend(p, engine):
 
 
 def test_battle_fingerprint_matches_native_protobuf_for_same_tables():
-    expected = "19ee31807f2393e449dcebebb5cca233"
+    expected = "31db787f98ca4b18c48e16f4ed0fdf1c"
     assert battle_table_fingerprint(ConfigTables()) == expected
     assert battle_table_fingerprint(ConfigTables(fmt="pb")) == expected
 
@@ -78,7 +78,7 @@ def test_class_rank_clamps_and_group_cast_spends_once_with_initiative():
     _action(p, engine, 1, 1, 4)
     turn = engine.resolve()
     assert sha256(turn.SerializeToString(deterministic=True)).hexdigest() == (
-        "901ece7451619ac423fc677828f76e6234616e2c98ff706e606422f062eb5d54"
+        "0f70d07929be804544f8b49f4d9f2fd439224a6c0c9932f6ee249cf03033fcbb"
     )
     assert turn.action_order[0] == 1
     assert [(e.event_type, e.target_id, e.hit_index) for e in turn.events[:4]] == [

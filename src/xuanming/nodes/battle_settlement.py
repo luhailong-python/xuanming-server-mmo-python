@@ -4,6 +4,12 @@ import logging
 from collections import Counter
 
 from ..data.asset_inventory import BAG_FULL, carries_unknown, release_item_hold
+from .battle_dropin_effects import (
+    BOSS_TRIAL_KIND_FESTIVAL_BEAST,
+    BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
+    is_boss_trial_kind,
+)
+from .scene_festival_beast import SceneFestivalBeast
 from .scene_mission import now_ms
 from .scene_stats import pet_pool, pet_stats, player_stats
 
@@ -71,6 +77,7 @@ class BattleSettlement:
             if any(field.number not in allowed for field, _ in settlement.ListFields()):
                 return False
             release_item_hold(data, settlement.battle_id)
+            SceneFestivalBeast.on_battle_prepare_cancelled_or_void(data, settlement.battle_id)
             if not any(entry.battle_id == settlement.battle_id for entry in data.battle_results.entries):
                 self._record(data.battle_results, settlement, {}, {}, {}, self.clock())
             return True
@@ -128,25 +135,57 @@ class BattleSettlement:
                         defer_reasons.append(BAG_SPACE_DEFERRED)
                     return False
         self._audit(player, checkpoint, data, 20, audits, correlation=settlement.battle_id, item_extra=details, gains=gains)
-        stats = player_stats(self.protocol, self.tables, data)
-        base = data.derived_attributes_component
-        base.health = min(settlement.health, stats.max_health)
-        base.mana = min(settlement.mana, stats.max_mana) if stats.max_mana else settlement.mana
-        if not base.health:
-            base.health, base.mana = stats.max_health, stats.max_mana
-        if not self._pets(data, settlement.pets):
-            return False
+        is_festival_beast = (
+            settlement.HasField("festival_beast") and settlement.festival_beast.activity_instance_id != 0
+        ) or int(getattr(settlement, "boss_trial_kind", 0)) == BOSS_TRIAL_KIND_FESTIVAL_BEAST
+        isolate_temp_state = (
+            is_festival_beast
+            or bool(getattr(settlement, "use_free_preset", False))
+            or bool(getattr(settlement, "competitive_ranked", False))
+            or is_boss_trial_kind(int(getattr(settlement, "boss_trial_kind", 0)))
+            or int(getattr(settlement, "boss_trial_kind", 0)) == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+        )
+        if not isolate_temp_state:
+            stats = player_stats(self.protocol, self.tables, data)
+            base = data.derived_attributes_component
+            base.health = min(settlement.health, stats.max_health)
+            base.mana = min(settlement.mana, stats.max_mana) if stats.max_mana else settlement.mana
+            if not base.health:
+                base.health, base.mana = stats.max_health, stats.max_mana
+            if not self._pets(data, settlement.pets):
+                return False
         stamp = self.clock()
-        if settlement.defeated_monsters:
+        if settlement.defeated_monsters and not is_festival_beast:
             checkpoint = self._checkpoint(data, audits)
             gains = []
             await self.missions.battle_defeats(data, settlement.defeated_monsters, stamp, gains=gains)
             self._audit(player, checkpoint, data, 7, audits, gains=gains)
-        self._apply_progression_hooks(player, data, settlement, stamp)
-        self._record(data.battle_results, settlement, currencies, gained, consumed, stamp, items_mailed=items_mailed)
+        fb_delta = self._apply_festival_beast_credit(data, settlement, stamp)
+        if fb_delta is None:
+            return False
+        self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
+        self._record(
+            data.battle_results, settlement, currencies, gained, consumed, stamp,
+            items_mailed=items_mailed, fb_delta=fb_delta,
+        )
         return True
 
-    def _apply_progression_hooks(self, player, data, settlement, stamp: int) -> None:
+    def _apply_festival_beast_credit(self, data, settlement, stamp: int) -> dict | None:
+        if not settlement.HasField("festival_beast") or not settlement.festival_beast.activity_instance_id:
+            return {"active": False}
+        fb_sys = getattr(self.scene, "festival_beast", None)
+        if fb_sys is None:
+            fb_sys = SceneFestivalBeast(self.scene, self.tables)
+        err, candidate, delta = fb_sys.prepare_battle_credit(data.festival_beast_component, settlement, stamp)
+        if err:
+            return None
+        if delta.get("changed"):
+            data.festival_beast_component.CopyFrom(candidate)
+        return delta
+
+    def _apply_progression_hooks(
+        self, player, data, settlement, stamp: int, *, is_festival_beast: bool = False,
+    ) -> None:
         """在战斗终局落盘前，安全推进赛季印、试炼志与装备每日材料自选额度。"""
         if (
             settlement.fled
@@ -160,48 +199,57 @@ class BattleSettlement:
             or (settlement.outcome == 2 and settlement.player_team_index == 1)
         )
 
-        season = getattr(self.scene, "season", None)
-        if season is not None:
-            try:
-                season.record_battle_progress(
-                    data,
-                    match_mode=settlement.match_mode,
-                    player_won=player_won,
-                    fled=bool(settlement.fled),
-                    total_rounds=settlement.total_rounds,
-                    now_ms_val=stamp,
-                )
-            except Exception:
-                logger.warning(
-                    "Battle settlement season progress hook failed player_id=%s battle_id=%s",
-                    player.player_id, settlement.battle_id, exc_info=True,
-                )
-
-        trial_journal = getattr(self.scene, "trial_journal", None)
-        if trial_journal is not None:
-            try:
-                if _has_trial_facts(settlement):
-                    trial_journal.record_trial_progress(data, settlement=settlement)
-                elif settlement.battle_config_id:
-                    trial_journal.record_trial_progress(
+        if not is_festival_beast:
+            season = getattr(self.scene, "season", None)
+            if season is not None:
+                try:
+                    season.record_battle_progress(
                         data,
-                        settlement.battle_config_id,
-                        won=player_won,
-                        participated=bool(getattr(settlement, "participated", False)),
+                        match_mode=settlement.match_mode,
+                        player_won=player_won,
+                        fled=bool(settlement.fled),
                         total_rounds=settlement.total_rounds,
-                        self_or_pet_ever_died=bool(settlement.is_dead),
-                        achieved_at_ms=settlement.finished_at_ms or stamp,
+                        now_ms_val=stamp,
+                        competitive_ranked=bool(getattr(settlement, "competitive_ranked", False)),
+                        participated=bool(getattr(settlement, "participated", True)),
+                        manual_action_rounds=int(getattr(settlement, "manual_action_rounds", 0)),
+                        effective_combat_contribution=bool(
+                            getattr(settlement, "effective_combat_contribution", False)
+                        ),
                     )
-            except Exception:
-                logger.warning(
-                    "Battle settlement trial journal hook failed player_id=%s battle_id=%s",
-                    player.player_id, settlement.battle_id, exc_info=True,
-                )
+                except Exception:
+                    logger.warning(
+                        "Battle settlement season progress hook failed player_id=%s battle_id=%s",
+                        player.player_id, settlement.battle_id, exc_info=True,
+                    )
+
+            trial_journal = getattr(self.scene, "trial_journal", None)
+            if trial_journal is not None:
+                try:
+                    if _has_trial_facts(settlement):
+                        trial_journal.record_trial_progress(data, settlement=settlement)
+                    elif settlement.battle_config_id:
+                        trial_journal.record_trial_progress(
+                            data,
+                            settlement.battle_config_id,
+                            won=player_won,
+                            participated=bool(getattr(settlement, "participated", False)),
+                            total_rounds=settlement.total_rounds,
+                            self_or_pet_ever_died=bool(settlement.is_dead),
+                            achieved_at_ms=settlement.finished_at_ms or stamp,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Battle settlement trial journal hook failed player_id=%s battle_id=%s",
+                        player.player_id, settlement.battle_id, exc_info=True,
+                    )
 
         equip_craft = getattr(self.scene, "equip_craft", None)
         material_eligible = (
-            (settlement.match_mode in _PVE_MODES and player_won)
-            or settlement.match_mode in _PVP_MODES
+            player_won if is_festival_beast else (
+                (settlement.match_mode in _PVE_MODES and player_won)
+                or settlement.match_mode in _PVP_MODES
+            )
         )
         if equip_craft is not None and material_eligible:
             try:
@@ -324,7 +372,7 @@ class BattleSettlement:
         return True
 
     @staticmethod
-    def _record(history, settlement, currencies, gained, consumed, stamp, *, items_mailed=False):
+    def _record(history, settlement, currencies, gained, consumed, stamp, *, items_mailed=False, fb_delta=None):
         seq = max(history.last_result_seq, max((entry.result_seq for entry in history.entries), default=0)) + 1
         history.last_result_seq = seq
         entry = history.entries.add(
@@ -334,6 +382,13 @@ class BattleSettlement:
             lines_truncated=len(gained) > MAX_LINES or len(consumed) > MAX_LINES,
             match_mode=settlement.match_mode, battle_config_id=settlement.battle_config_id, items_mailed=items_mailed,
         )
+        if fb_delta and fb_delta.get("active"):
+            entry.festival_activity_instance_id = int(fb_delta.get("activity_instance_id", 0))
+            entry.festival_reward_identity = str(fb_delta.get("reward_identity", ""))
+            entry.festival_wins_before = int(fb_delta.get("wins_before", 0))
+            entry.festival_wins_after = int(fb_delta.get("wins_after", 0))
+            entry.festival_required_wins = int(fb_delta.get("required_wins", 0))
+            entry.festival_newly_eligible = bool(fb_delta.get("newly_eligible", False))
         for kind, amount in sorted(currencies.items()):
             entry.currencies.add(currency_type=kind, amount=amount)
         for items, lines in ((gained, entry.items_gained), (consumed, entry.items_consumed)):
@@ -352,7 +407,20 @@ class BattleSettlement:
         data = self.scene.rows.assemble(player.snapshot)
         result = next((entry for entry in data.battle_results.entries
                        if entry.battle_id == settlement.battle_id), None)
-        self.scene._push(player, "BattleClientPlayerNotifyBattleEnd", self.protocol.message(
+        end_msg = self.protocol.message(
             "BattleEndS2C", battle_id=settlement.battle_id, outcome=settlement.outcome, settlement=settlement,
             items_mailed=bool(result and result.items_mailed),
-        ))
+        )
+        if result is not None and result.festival_activity_instance_id:
+            fb_summary = end_msg.festival_beast_settlement
+            fb_summary.activity_instance_id = result.festival_activity_instance_id
+            fb_summary.reward_identity = result.festival_reward_identity
+            fb_summary.wins_before = result.festival_wins_before
+            fb_summary.wins_after = result.festival_wins_after
+            fb_summary.required_wins = result.festival_required_wins
+            fb_summary.newly_eligible = result.festival_newly_eligible
+            fb_summary.material_units_added = result.material_credit_units_added
+            fb_summary.material_tradable_units_added = result.material_tradable_units_added
+            fb_summary.material_available_units_after = result.material_available_units_after
+            fb_summary.material_earnable_remaining_after = result.material_earnable_remaining_after
+        self.scene._push(player, "BattleClientPlayerNotifyBattleEnd", end_msg)

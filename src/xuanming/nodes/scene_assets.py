@@ -402,6 +402,9 @@ class SceneAssets(AssetInventory):
             for index, pet in enumerate(data.pet_component.pets):
                 if pet.pet_id != bundle.pet_id:
                     continue
+                pet_row = self.tables["Pet"].get(pet.pet_table_id)
+                if pet_row is None or int(getattr(pet_row, "transfer_policy", 0)) != 0:
+                    return Outcome.REJECTED, 26018, False
                 payload = pet.SerializeToString(deterministic=True)
                 if len(payload) > INSTANCE_LIMIT:
                     return Outcome.REJECTED, _INVALID_BUNDLE, False
@@ -450,9 +453,16 @@ class SceneAssets(AssetInventory):
         pet = None
         if bundle.HasField("pet_instance"):
             pet = self.protocol.parse("PetInstance", bundle.pet_instance.instance_proto)
+            pet_row = self.tables["Pet"].get(pet.pet_table_id)
+            if pet_row is None or int(getattr(pet_row, "transfer_policy", 0)) != 0:
+                return Outcome.REJECTED, 26018, False
             rules = self.tables["PetRule"].rows()
             capacity = (rules[0].max_pets if rules else 0) or 1
-            if len(data.pet_component.pets) >= capacity:
+            normal_pets = sum(
+                1 for existing in data.pet_component.pets
+                if int(getattr(self.tables["Pet"].get(existing.pet_table_id), "exclusive_gift_slots", 0)) == 0
+            )
+            if normal_pets >= capacity:
                 return Outcome.RETRY, _ASSET_BAG_FULL, False
             if any(existing.pet_id == pet.pet_id for existing in data.pet_component.pets):
                 return Outcome.REJECTED, _INVALID_BUNDLE, False

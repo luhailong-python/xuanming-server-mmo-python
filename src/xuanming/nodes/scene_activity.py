@@ -195,6 +195,9 @@ class Activities:
                             5000: "请先完成同类型活动任务",
                         }.get(error, "活动所需玩法或当前状态暂不满足参与条件")
             response.activities.append(info)
+        festival_beast = getattr(self.scene, "festival_beast", None)
+        if festival_beast is not None and hasattr(festival_beast, "append_activity_catalog_entry"):
+            festival_beast.append_activity_catalog_entry(player, stamp, response)
         return response
 
     async def claim(self, world, player, route, request):

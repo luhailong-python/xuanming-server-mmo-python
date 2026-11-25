@@ -17,6 +17,8 @@ def test_repeated_default_input_sequence_is_accepted_over_real_tcp(tmp_path):
                 actor = await _enter(runtime, client)
                 # Use a legacy no-navigation world to isolate packet semantics.
                 scene.tables = None
+                for world in scene.worlds.values():
+                    world.nav = None
                 original = actor.transform.position
                 position = dict(zip(("x", "y", "z"), original))
 

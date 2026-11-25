@@ -140,3 +140,39 @@ def test_realtime_next_damage_bonus_consumes_and_creates_target_sub_buff():
     snapshot = buffs.protocol.message("BattlePlayerSnapshot", player_id=2)
     buffs.snapshot(target, snapshot)
     assert snapshot.buffs[0].caster_id == 0 and snapshot.buffs[0].remain_rounds == 1
+
+
+def test_normalized_action_mutex_exit_hooks_and_self_state_sync():
+    actor, clock = _Actor(11, 100), _Clock()
+    buffs = _buffs(clock, {"id": 100, "duration": 2, "buff_type": 31},
+                   {"id": 101, "duration": 4, "buff_type": 31})
+    pushes = []
+    exits = []
+    buffs.self_state_changed = lambda a, act, cmb, seq: pushes.append((act, cmb, seq))
+    buffs.register_exit_hook(1, lambda a, st, reason: exits.append((a.entity, st, reason)))
+
+    # Entering TeamFollow (1) and Mounted (2) pushes monotonic seqs cleanly.
+    buffs.set_action_state(actor, 1, True)
+    buffs.set_action_state(actor, 2, True)
+    assert pushes == [(0b010, 0, 1), (0b110, 0, 2)]
+
+    # Action 0 (UseSkill -> state 0) interrupts TeamFollow (1) & Mounted (2) in one suppressed batch.
+    assert buffs.perform_action(actor, 0, 0) == 0
+    assert exits == [(11, 1, 1)]
+    assert len(pushes) == 3 and pushes[-1] == (0b001, 0, 3)
+
+    # Silence (combat bit 1) stacks across two sources: pushes once on 0->1, not on 1->2, once on 1->0.
+    buffs.add(actor, 100, caster=1)
+    buffs.add(actor, 101, caster=2)
+    assert len(pushes) == 4 and pushes[-1] == (0b001, 0b10, 4)
+    clock.now += 2
+    buffs.tick(2)
+    assert len(pushes) == 4
+
+    # EnterScene resync pushes current non-zero state with monotonic seq.
+    buffs.sync_self_state_after_entry(actor)
+    assert len(pushes) == 5 and pushes[-1] == (0b001, 0b10, 5)
+
+    clock.now += 2
+    buffs.tick(2)
+    assert len(pushes) == 6 and pushes[-1] == (0b001, 0, 6)

@@ -494,6 +494,7 @@ def parse_rmb_listing_view(protocol: Protocol, data: dict[str, Any]) -> Message:
         state=state,
         phase=phase,
         order_id=order_id,
+        designated_only=bool(str(data.get("designatedBuyerAccount", "") or "")),
     )
 
 
@@ -761,6 +762,8 @@ class MallAdapter:
             "title": str(t.title),
             "assetCurrencyType": int(w.seller_assets.currency_type) if str(t.asset_kind) == "CURRENCY" else None,
         }
+        if str(t.designated_buyer_account):
+            payload["designatedBuyerAccount"] = str(t.designated_buyer_account)
         data = await self.consignment_call("register", payload)
         view = parse_rmb_listing_view(self.protocol, data)
         if (
@@ -848,6 +851,8 @@ class MallAdapter:
             reserved = int(item.get("reservedFen", 0) or 0)
             paid = int(item.get("paidFen", 0) or 0)
             forfeited = int(item.get("forfeitedFen", 0) or 0)
+            dispute_frozen = int(item.get("disputeFrozenFen", 0) or 0)
+            dispute_case = str(item.get("disputeCaseId", "") or "")
             avail = int(item.get("availableMs", 0) or 0)
             if (
                 not isinstance(oid, str)
@@ -863,6 +868,8 @@ class MallAdapter:
                 or reserved > net - paid
                 or forfeited < 0
                 or forfeited > net - paid - reserved
+                or dispute_frozen < 0
+                or dispute_frozen > net - paid - reserved - forfeited
             ):
                 raise StoreUnavailableError("invalid seller income arithmetic from mall")
             inc = out.incomes.add()
@@ -873,6 +880,8 @@ class MallAdapter:
             inc.reserved_fen = reserved
             inc.paid_fen = paid
             inc.available_ms = avail
+            inc.dispute_frozen_fen = dispute_frozen
+            inc.dispute_case_id = dispute_case
             out.next_cursor = oid
         return out
 

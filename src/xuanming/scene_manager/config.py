@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..settings import Settings
+from .owner_authority import OwnerAuthorityConfig, parse_sql_backend
 
 SCENE_MANAGER_NODE_TYPE = 25   # common.base.eNodeType.SceneManagerNodeService
 SCENE_NODE_TYPE = 3            # common.base.eNodeType.SceneNodeService
@@ -125,6 +126,7 @@ class SceneManagerConfig:
     reentry_barrier_sec: int = DEFAULT_REENTRY_BARRIER_SEC
     world_table_path: Path = DEFAULT_WORLD_JSON_PATH
     world_conf_ids: tuple[int, ...] = ()
+    owner_authority: OwnerAuthorityConfig = OwnerAuthorityConfig()
 
     def effective_world_conf_ids(self) -> tuple[int, ...]:
         if self.world_conf_ids:
@@ -198,6 +200,14 @@ class SceneManagerConfig:
             raise ValueError("scene_manager 下游 RPC/Kafka 超时配置必须 > 0")
         if self.reentry_barrier_sec < 0:
             raise ValueError("scene_manager reentry_barrier_sec 不能为负数")
+        if self.owner_authority.enabled():
+            if self.owner_authority.mode not in ("", "shadow", "enforce"):
+                raise ValueError(
+                    f"scene_manager owner_authority.mode 无效: {self.owner_authority.mode!r}"
+                )
+            parse_sql_backend(self.owner_authority.backend)
+            if self.owner_authority.skew_margin_ms < 0:
+                raise ValueError("scene_manager owner_authority.skew_margin_ms 不能为负数")
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "SceneManagerConfig":
@@ -217,6 +227,16 @@ class SceneManagerConfig:
         gate_secret_env = str(raw.get("gate_token_secret_env") or GATE_TOKEN_SECRET_ENV)
         gate_secret_raw = os.environ.get(gate_secret_env) or str(raw.get("gate_token_secret") or "")
 
+        raw_oa = raw.get("owner_authority") or {}
+        owner_authority_cfg = OwnerAuthorityConfig(
+            mode=str(raw_oa.get("mode", "")),
+            dsn=str(raw_oa.get("dsn", "")),
+            dsn_env=str(raw_oa.get("dsn_env", "")),
+            database=str(raw_oa.get("database", "")),
+            backend=str(raw_oa.get("backend", "")),
+            max_open_conns=int(raw_oa.get("max_open_conns", 0)),
+            skew_margin_ms=int(raw_oa.get("skew_margin_ms", 0)),
+        )
         world_path = Path(raw["world_table_path"]) if raw.get("world_table_path") else DEFAULT_WORLD_JSON_PATH
         cfg = cls(
             node_id=int(raw.get("node_id", 104)),
@@ -258,6 +278,7 @@ class SceneManagerConfig:
             leave_holder_release_wait_sec=int(raw.get("leave_holder_release_wait_sec", DEFAULT_LEAVE_RELEASE_WAIT_SEC)),
             reentry_barrier_sec=int(raw.get("reentry_barrier_sec", DEFAULT_REENTRY_BARRIER_SEC)),
             world_table_path=world_path,
+            owner_authority=owner_authority_cfg,
         )
         cfg.validate()
         return cfg

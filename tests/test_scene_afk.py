@@ -27,8 +27,6 @@ async def _manual_frames(runtime):
     task = next(task for task in runtime._background if task.get_name() == "scene-tick")
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
-    for world in runtime.scene.worlds.values():
-        world.nav = None
 
 
 async def _enter(runtime, client):

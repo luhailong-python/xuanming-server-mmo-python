@@ -1,835 +1,66 @@
 
-∆
-'table_wire/activityschedule_table.proto"Ü
-ActivityScheduleTable
-
-id (
-enabled (
-baseline_start_at_ms (
-baseline_end_at_ms (
-definition_key (	
-configuration_revision (
-category (
-name (	
-description	 (	
+Ÿ
+'table_wire/activityschedule_table.proto"ì
+ActivityScheduleTable
+id (Rid
+enabled (Renabled/
+baseline_start_at_ms (RbaselineStartAtMs+
+baseline_end_at_ms (RbaselineEndAtMs%
+definition_key (	RdefinitionKey5
+configuration_revision (RconfigurationRevision
+category (Rcategory
+name (	Rname 
+description	 (	Rdescription
 icon_key
- (	
-vitality_points ("A
-ActivityScheduleTableData$
-data (2.ActivityScheduleTableBG
+ (	RiconKey'
+vitality_points (RvitalityPoints"G
+ActivityScheduleTableData*
+data (2.ActivityScheduleTableRdataBG
 com.game.tableBActivityScheduleTableOuterClassPZgenerated/pb/tablebproto3
-Ω
--table_wire/activityvitalityreward_table.proto"f
-ActivityVitalityRewardTable
-
-id (
-rule_id (
-required_points (
-	reward_id ("M
-ActivityVitalityRewardTableData*
-data (2.ActivityVitalityRewardTableBM
+Í
+-table_wire/activityvitalityreward_table.proto"å
+ActivityVitalityRewardTable
+id (Rid
+rule_id (RruleId'
+required_points (RrequiredPoints
+	reward_id (RrewardId"S
+ActivityVitalityRewardTableData0
+data (2.ActivityVitalityRewardTableRdataBM
 com.game.tableB%ActivityVitalityRewardTableOuterClassPZgenerated/pb/tablebproto3
-˝
-+table_wire/activityvitalityrule_table.proto"≠
-ActivityVitalityRuleTable
-
-id (
-enabled (
-configuration_revision (!
-first_period_starts_at_ms (
-period_duration_ms (
-points_limit ("I
-ActivityVitalityRuleTableData(
-data (2.ActivityVitalityRuleTableBK
+›
++table_wire/activityvitalityrule_table.proto"á
+ActivityVitalityRuleTable
+id (Rid
+enabled (Renabled5
+configuration_revision (RconfigurationRevision8
+first_period_starts_at_ms (RfirstPeriodStartsAtMs,
+period_duration_ms (RperiodDurationMs!
+points_limit (RpointsLimit"O
+ActivityVitalityRuleTableData.
+data (2.ActivityVitalityRuleTableRdataBK
 com.game.tableB#ActivityVitalityRuleTableOuterClassPZgenerated/pb/tablebproto3
-Û
--table_wire/actoractioncombatstate_table.proto"D
-ActorActionCombatStatestate
+‚
+-table_wire/actoractioncombatstate_table.proto"Ñ
+ActorActionCombatStateTable
+id (Rid
+state_id (RstateId
 
-state_mode (
-	state_tip ("V
-ActorActionCombatStateTable
-
-id (+
-state (2.ActorActionCombatStatestate"M
-ActorActionCombatStateTableData*
-data (2.ActorActionCombatStateTableBM
+state_mode (R	stateMode
+	state_tip (RstateTip"S
+ActorActionCombatStateTableData0
+data (2.ActorActionCombatStateTableRdataBM
 com.game.tableB%ActorActionCombatStateTableOuterClassPZgenerated/pb/tablebproto3
-…
-'table_wire/actoractionstate_table.proto">
-ActorActionStatestate
+√
+'table_wire/actoractionstate_table.proto"~
+ActorActionStateTable
+id (Rid
+state_id (RstateId
 
-state_mode (
-	state_tip ("J
-ActorActionStateTable
-
-id (%
-state (2.ActorActionStatestate"A
-ActorActionStateTableData$
-data (2.ActorActionStateTableBG
+state_mode (R	stateMode
+	state_tip (RstateTip"G
+ActorActionStateTableData*
+data (2.ActorActionStateTableRdataBG
 com.game.tableBActorActionStateTableOuterClassPZgenerated/pb/tablebproto3
-ù
-*table_wire/attributeallocratio_table.proto"—
-AttributeAllocRatioTable
-
-id (
-dimension_id (
-class_id (
-
-max_health (
-max_mana (
-physical_attack (
-magic_attack (
-speed (
-defense	 (
-desc
- (	"G
-AttributeAllocRatioTableData'
-data (2.AttributeAllocRatioTableBJ
-com.game.tableB"AttributeAllocRatioTableOuterClassPZgenerated/pb/tablebproto3
-ª
-(table_wire/attributeautoplan_table.proto"x
-AttributeAutoPlanTable
-
-id (
-class_id (
-pool_id (
-	dimension (
-weight (
-desc (	"C
-AttributeAutoPlanTableData%
-data (2.AttributeAutoPlanTableBH
-com.game.tableB AttributeAutoPlanTableOuterClassPZgenerated/pb/tablebproto3
-µ
-)table_wire/attributedimension_table.proto"Ì
-AttributeDimensionTable
-
-id (
-pool_id (
-name (	
-desc (	
-sort (
-base_per_level (
-
-max_health (
-max_mana (
-physical_attack	 (
-magic_attack
- (
-speed (
-defense ("E
-AttributeDimensionTableData&
-data (2.AttributeDimensionTableBI
-com.game.tableB!AttributeDimensionTableOuterClassPZgenerated/pb/tablebproto3
-ô
-$table_wire/attributepool_table.proto"Â
-AttributePoolTable
-
-id (
-name (	
-unlock_level (
-points_per_level (
-base_points (
-dimension_cap (
-reset_cost_gold (
-reset_free_below_level (
-desc	 (	
-
-owner_type
- (";
-AttributePoolTableData!
-data (2.AttributePoolTableBD
-com.game.tableBAttributePoolTableOuterClassPZgenerated/pb/tablebproto3
-É
-$table_wire/attributerule_table.proto"œ
-AttributeRuleTable
-
-id (
-max_schemes (
-free_scheme_count (
-create_scheme_cost_gold (
-switch_cooldown_seconds (
-scheme_name_max_len (
-alloc_efficiency_bonus (";
-AttributeRuleTableData!
-data (2.AttributeRuleTableBD
-com.game.tableBAttributeRuleTableOuterClassPZgenerated/pb/tablebproto3
-à
- table_wire/basescene_table.proto"e
-BaseSceneTable
-
-id (
-nav_bin_file (	
-spawn_x (
-spawn_y (
-spawn_z ("3
-BaseSceneTableData
-data (2.BaseSceneTableB@
-com.game.tableBBaseSceneTableOuterClassPZgenerated/pb/tablebproto3
-—
-table_wire/buff_table.proto"¡
-	BuffTable
-
-id (
-	no_caster (
-	buff_type ( 
-tag (2.BuffTable.TagEntry-
-
-immune_tag (2.BuffTable.ImmuneTagEntry-
-
-dispel_tag (2.BuffTable.DispelTagEntry
-level (
-	max_layer (
-infinite_duration	 (
-duration
- (
-force_interrupt (
-interval (
-interval_count (
-interval_effect (
-movement_speed_boost ( 
-movement_speed_reduction (
-health_regeneration (	
-sub_buff (
-target_sub_buff (
-combat_idle_seconds (
-time (
-bonus_damage (	*
-TagEntry
-key (	
-value (:80
-ImmuneTagEntry
-key (	
-value (:80
-DispelTagEntry
-key (	
-value (:8")
-BuffTableData
-data (2
-.BuffTableB;
-com.game.tableBBuffTableOuterClassPZgenerated/pb/tablebproto3
-‘
-table_wire/class_table.proto"¿
-
-ClassTable
-
-id (
-skill (
-init_health (
-	init_mana (
-init_strength (
-
-init_armor (
-init_resistance (
-init_critchance (
-
-init_speed	 ("+
-ClassTableData
-data (2.ClassTableB<
-com.game.tableBClassTableOuterClassPZgenerated/pb/tablebproto3
-à
- table_wire/condition_table.proto"‰
-ConditionTable
-
-id (
-condition_category (
-
-condition1 (
-
-condition2 (
-
-condition3 (
-
-condition4 (
-valid_duration (
-quantity_type (
-target_count	 (
-comparison_op
- ("3
-ConditionTableData
-data (2.ConditionTableB@
-com.game.tableBConditionTableOuterClassPZgenerated/pb/tablebproto3
-Ã
-table_wire/cooldown_table.proto"-
-CooldownTable
-
-id (
-duration ("1
-CooldownTableData
-data (2.CooldownTableB?
-com.game.tableBCooldownTableOuterClassPZgenerated/pb/tablebproto3
-É
-table_wire/dungeon_table.proto"h
-DungeonTable
-
-id (
-scene_id (
-max_team_size (
-
-time_limit (
-monster ("/
-DungeonTableData
-data (2.DungeonTableB>
-com.game.tableBDungeonTableOuterClassPZgenerated/pb/tablebproto3
-ä
-%table_wire/equipaffixpool_table.proto"S
-EquipAffixPoolTable
-
-id (
-pool_id (
-attr_id (
-weight ("=
-EquipAffixPoolTableData"
-data (2.EquipAffixPoolTableBE
-com.game.tableBEquipAffixPoolTableOuterClassPZgenerated/pb/tablebproto3
-§
-%table_wire/equipaffixrule_table.proto"m
-EquipAffixRuleTable
-
-id (
-blue_min (
-blue_max (
-	pink_rate (
-yellow_rate ("=
-EquipAffixRuleTableData"
-data (2.EquipAffixRuleTableBE
-com.game.tableBEquipAffixRuleTableOuterClassPZgenerated/pb/tablebproto3
-´
-%table_wire/equipattribute_table.proto"t
-EquipAttributeTable
-
-id (
-name (	
-effect (
-effect_param (
-percent (
-sort ("=
-EquipAttributeTableData"
-data (2.EquipAttributeTableBE
-com.game.tableBEquipAttributeTableOuterClassPZgenerated/pb/tablebproto3
-ß
-(table_wire/equipattributecap_table.proto"d
-EquipAttributeCapTable
-
-id (
-attr_id (
-level (
-	min_value (
-cap ("C
-EquipAttributeCapTableData%
-data (2.EquipAttributeCapTableBH
-com.game.tableB EquipAttributeCapTableOuterClassPZgenerated/pb/tablebproto3
-◊
-#table_wire/equipenhance_table.proto"ß
-EquipEnhanceTable
-
-id (
-bonus_permyriad (
-success_rate (
-fail_level_loss (
-	cost_gold (
-material_id (
-material_count ("9
-EquipEnhanceTableData 
-data (2.EquipEnhanceTableBC
-com.game.tableBEquipEnhanceTableOuterClassPZgenerated/pb/tablebproto3
-Ï
-table_wire/equipgem_table.proto"M
-EquipGemTable
-
-id (
-gem_type (
-attr_id (
-value ("1
-EquipGemTableData
-data (2.EquipGemTableB?
-com.game.tableBEquipGemTableOuterClassPZgenerated/pb/tablebproto3
-ú
-%table_wire/equipgemsocket_table.proto"e
-EquipGemSocketTable
-
-id (
-
-equip_kind (
-socket (
-gem_type (
-name (	"=
-EquipGemSocketTableData"
-data (2.EquipGemSocketTableBE
-com.game.tableBEquipGemSocketTableOuterClassPZgenerated/pb/tablebproto3
-·
- table_wire/equipslot_table.proto">
-EquipSlotTable
-
-id (
-
-equip_kind (
-name (	"3
-EquipSlotTableData
-data (2.EquipSlotTableB@
-com.game.tableBEquipSlotTableOuterClassPZgenerated/pb/tablebproto3
-ÿ
-%table_wire/globalvariable_table.proto"!
-GlobalVariableTable
-
-id ("=
-GlobalVariableTableData"
-data (2.GlobalVariableTableBE
-com.game.tableBGlobalVariableTableOuterClassPZgenerated/pb/tablebproto3
-˘
-$table_wire/guildactivity_table.proto"≈
-GuildActivityTable
-
-id (
-name (	
-type (
-enabled (
-start_at_ms (
-	end_at_ms (
-min_guild_level (
-personal_contribution (
-guild_funds	 (
-guild_threshold
- (
-	reward_id (
-
-dungeon_id (
-team_size_min (
-team_size_max (
-daily_limit (";
-GuildActivityTableData!
-data (2.GuildActivityTableBD
-com.game.tableBGuildActivityTableOuterClassPZgenerated/pb/tablebproto3
-·
-"table_wire/guilddonate_table.proto"µ
-GuildDonateTable
-
-id (
-name (	
-currency_type (
-cost_amount (
-contribution_gain (
-
-funds_gain (
-daily_limit (
-min_guild_level ("7
-GuildDonateTableData
-data (2.GuildDonateTableBB
-com.game.tableBGuildDonateTableOuterClassPZgenerated/pb/tablebproto3
-ã
-!table_wire/guildlevel_table.proto"d
-GuildLevelTable
-
-id (
-max_members (
-max_officers (
-upgrade_cost_funds ("5
-GuildLevelTableData
-data (2.GuildLevelTableBA
-com.game.tableBGuildLevelTableOuterClassPZgenerated/pb/tablebproto3
-å
- table_wire/guildrule_table.proto"Ë
-GuildRuleTable
-
-id ( 
-application_expire_hours (+
-#max_pending_applications_per_player (*
-"max_pending_applications_per_guild (!
-asset_op_deadline_seconds (
-asset_op_retry_base_ms ("
-reunion_min_online_members (
-activity_join_min_hours ( 
-trial_invite_ttl_seconds	 (%
-trial_invite_cooldown_seconds
- ("3
-GuildRuleTableData
-data (2.GuildRuleTableB@
-com.game.tableBGuildRuleTableOuterClassPZgenerated/pb/tablebproto3
-È
- table_wire/guildshop_table.proto"≈
-GuildShopTable
-
-id (
-name (	
-category (
-item_id (
-
-item_count (
-cost_contribution (
-required_guild_level (
-limit_period (
-limit_count	 ("3
-GuildShopTableData
-data (2.GuildShopTableB@
-com.game.tableBGuildShopTableOuterClassPZgenerated/pb/tablebproto3
-Ñ
-table_wire/item_table.proto">
-Itembase_attr
-base_attr_id (
-base_attr_value ("¥
-	ItemTable
-
-id (
-max_stack_size (
-
-equip_kind (
-battle_usable (
-battle_heal_hp (
-battle_heal_mp (
-name (	
-description (	
-icon_key	 (	
-equip_level
- (
-equip_class (
-
-affix_pool (
-
-affix_rule (!
-	base_attr (2.Itembase_attr")
-ItemTableData
-data (2
-.ItemTableB;
-com.game.tableBItemTableOuterClassPZgenerated/pb/tablebproto3
-ò
-%table_wire/messagelimiter_table.proto"a
-MessageLimiterTable
-
-id (
-max_requests (
-time_window (
-tip_message ("=
-MessageLimiterTableData"
-data (2.MessageLimiterTableBE
-com.game.tableBMessageLimiterTableOuterClassPZgenerated/pb/tablebproto3
-Ÿ
-table_wire/mirror_table.proto"B
-MirrorTable
-
-id (
-scene_id (
-main_scene_id ("-
-MirrorTableData
-data (2.MirrorTableB=
-com.game.tableBMirrorTableOuterClassPZgenerated/pb/tablebproto3
-Ï
-table_wire/mission_table.proto"–
-MissionTable
-
-id (
-condition_id (
-mission_type (
-mission_sub_type (
-condition_order (
-auto_reward (
-	reward_id (
-next_mission_id (
-target_count	 ("/
-MissionTableData
-data (2.MissionTableB>
-com.game.tableBMissionTableOuterClassPZgenerated/pb/tablebproto3
-¨
-table_wire/monster_table.proto"G
-Monsterdrop
-	drop_item (
-
-drop_count (
-	drop_rate ("«
-MonsterTable
-
-id (
-health (
-strength (
-armor (
-
-resistance (
-
-critchance (
-speed (
-
-exp_reward (
-gold_reward	 (
-drop
- (2.Monsterdrop"/
-MonsterTableData
-data (2.MonsterTableB>
-com.game.tableBMonsterTableOuterClassPZgenerated/pb/tablebproto3
-ı
-+table_wire/mysterymerchantgoods_table.proto"•
-MysteryMerchantGoodsTable
-
-id (
-name (	
-item_id (
-
-item_count (
-currency_type (
-price (
-weight (
-limit_count ("I
-MysteryMerchantGoodsTableData(
-data (2.MysteryMerchantGoodsTableBK
-com.game.tableB#MysteryMerchantGoodsTableOuterClassPZgenerated/pb/tablebproto3
-≠
-*table_wire/mysterymerchantrule_table.proto"·
-MysteryMerchantRuleTable
-
-id (
-interval_seconds (
-stay_seconds (
-
-shelf_size (
-weight_discount60 (
-weight_discount50 (
-weight_discount40 (
-interact_range (
-desc	 (	"G
-MysteryMerchantRuleTableData'
-data (2.MysteryMerchantRuleTableBJ
-com.game.tableB"MysteryMerchantRuleTableOuterClassPZgenerated/pb/tablebproto3
-π
-*table_wire/mysterymerchantspot_table.proto"n
-MysteryMerchantSpotTable
-
-id (
-scene_config_id (	
-x (	
-y (	
-z (
-desc (	"G
-MysteryMerchantSpotTableData'
-data (2.MysteryMerchantSpotTableBJ
-com.game.tableB"MysteryMerchantSpotTableOuterClassPZgenerated/pb/tablebproto3
-Å
-table_wire/pet_table.proto"ı
-PetTable
-
-id (
-name (	
-desc (	
-model_id (
-quality (
-unlock_level (
-	level_cap (
-init_health (
-	init_mana	 (
-
-init_speed
- (
-aptitude_min (
-aptitude_max (
-skill ("'
-PetTableData
-data (2	.PetTableB:
-com.game.tableBPetTableOuterClassPZgenerated/pb/tablebproto3
-ß
-table_wire/petrule_table.proto"ã
-PetRuleTable
-
-id (
-max_pets (
-name_max_len (
-rename_cost_gold (
-summon_cooldown_seconds (
-desc (	"/
-PetRuleTableData
-data (2.PetRuleTableB>
-com.game.tableBPetRuleTableOuterClassPZgenerated/pb/tablebproto3
-ê
-table_wire/playmode_table.proto"q
-PlayModeTable
-
-id (
-
-match_mode (
-battle_config_id (
-enabled (
-team_size_max ("1
-PlayModeTableData
-data (2.PlayModeTableB?
-com.game.tableBPlayModeTableOuterClassPZgenerated/pb/tablebproto3
-ä
-table_wire/reward_table.proto"9
-Rewardreward
-reward_item (
-reward_count ("8
-RewardTable
-
-id (
-reward (2.Rewardreward"-
-RewardTableData
-data (2.RewardTableB=
-com.game.tableBRewardTableOuterClassPZgenerated/pb/tablebproto3
-⁄
-#table_wire/rolenamerule_table.proto"™
-RoleNameRuleTable
-
-id (
-	min_chars (
-	max_chars (
-generated_prefix (	
-generated_suffix_len (
-max_generate_attempts (
-desc (	"9
-RoleNameRuleTableData 
-data (2.RoleNameRuleTableBC
-com.game.tableBRoleNameRuleTableOuterClassPZgenerated/pb/tablebproto3
-¿
-table_wire/skill_table.proto"M
-Skillrequired_item
-required_item_type (
-required_item_value ("Y
-Skillrequired_resource
-required_resource_type (
-required_resource_value ("J
-Skillcost_resource
-cost_resource_id (
-cost_resource_cost ("∂
-
-SkillTable
-
-id (
-
-skill_type (
-targeting_mode (
-require_target (
-target_status (
-
-cast_point (
-recovery_time (
-	immediate (
-effect	 (
-channel_think
- (
-channel_finish (
-think_interval (
-channel_time (
-range (
-	max_range (
-	min_range (
-self_status (
-required_status (
-cooldown_id (
-damage (	
-damage_type (
-attack_multiplier (
-class_id (
-name (	
-description (	
-icon_key (	
-category (	
-unlock_level (
-max_rank  (
-target_team! (
-max_targets" (
-mana_percent# (
-cooldown_rounds$ (
-heal_multiplier% (
-heal_per_level& (
-execute_heal_threshold' (
-execute_heal_bonus( (
-restore_mana_percent) (
-dispel_count* (
-
-initiative+ (
-passive_stat, (	
-passive_percent- (
-buff_percent. (*
-required_item (2.Skillrequired_item2
-required_resource (2.Skillrequired_resource*
-cost_resource (2.Skillcost_resource"+
-SkillTableData
-data (2.SkillTableB<
-com.game.tableBSkillTableOuterClassPZgenerated/pb/tablebproto3
-Ò
-&table_wire/skillpermission_table.proto"6
-SkillPermissionTable
-
-id (
-
-skill_type ("?
-SkillPermissionTableData#
-data (2.SkillPermissionTableBF
-com.game.tableBSkillPermissionTableOuterClassPZgenerated/pb/tablebproto3
-œ
-table_wire/test_table.proto"9
-Testtestobj
-testobj_key (
-testobj_value ("Ñ
-	TestTable
-
-id (
-level (
-effect ( 
-tag (2.TestTable.TagEntry-
-
-immune_tag (2.TestTable.ImmuneTagEntry
-testobj (2.Testtestobj*
-TagEntry
-key (	
-value (	:80
-ImmuneTagEntry
-key (	
-value (	:8")
-TestTableData
-data (2
-.TestTableB;
-com.game.tableBTestTableOuterClassPZgenerated/pb/tablebproto3
-√
-#table_wire/testmultikey_table.proto"D
-TestMultiKeytestobj1
-testobj1_key (
-testobj1_value ("Õ
-TestMultiKeyTable
-
-id (
-level (
-effect (
-
-string_key (	
-
-uint32_key (
-	int32_key (
-m_string_key (	
-m_uint32_key (
-m_int32_key	 (
-test_ref
- (
-	test_refs (*
-tag1 (2.TestMultiKeyTable.Tag1Entry7
-immune_tag1 (2".TestMultiKeyTable.ImmuneTag1Entry'
-testobj1 (2.TestMultiKeytestobj1+
-	Tag1Entry
-key (	
-value (	:81
-ImmuneTag1Entry
-key (	
-value (	:8"9
-TestMultiKeyTableData 
-data (2.TestMultiKeyTableBC
-com.game.tableBTestMultiKeyTableOuterClassPZgenerated/pb/tablebproto3
-Ω
-table_wire/world_table.proto"*
-
-WorldTable
-
-id (
-scene_id ("+
-WorldTableData
-data (2.WorldTableB<
-com.game.tableBWorldTableOuterClassPZgenerated/pb/tablebproto3
-˜
- table_wire/zonegroup_table.proto"T
-ZoneGroupTable
-
-id (
-group_id (
-
-zone_begin (
-zone_end ("3
-ZoneGroupTableData
-data (2.ZoneGroupTableB@
-com.game.tableBZoneGroupTableOuterClassPZgenerated/pb/tablebproto3
 ≠
 "table_wire/afkpassrule_table.proto"˚
 AfkPassRuleTable
@@ -875,8 +106,182 @@ sort_order (R	sortOrder
 AppearanceSeriesTableData*
 data (2.AppearanceSeriesTableRdataBG
 com.game.tableBAppearanceSeriesTableOuterClassPZgenerated/pb/tablebproto3
-ı
-*table_wire/characterappearance_table.proto"£
+Ñ
+*table_wire/attributeallocratio_table.proto"≤
+AttributeAllocRatioTable
+id (Rid!
+dimension_id (RdimensionId
+class_id (RclassId
+
+max_health (R	maxHealth
+max_mana (RmaxMana'
+physical_attack (RphysicalAttack!
+magic_attack (RmagicAttack
+speed (Rspeed
+defense	 (Rdefense
+desc
+ (	Rdesc"M
+AttributeAllocRatioTableData-
+data (2.AttributeAllocRatioTableRdataBJ
+com.game.tableB"AttributeAllocRatioTableOuterClassPZgenerated/pb/tablebproto3
+
+(table_wire/attributeautoplan_table.proto"¶
+AttributeAutoPlanTable
+id (Rid
+class_id (RclassId
+pool_id (RpoolId
+	dimension (R	dimension
+weight (Rweight
+desc (	Rdesc"I
+AttributeAutoPlanTableData+
+data (2.AttributeAutoPlanTableRdataBH
+com.game.tableB AttributeAutoPlanTableOuterClassPZgenerated/pb/tablebproto3
+®
+)table_wire/attributedimension_table.proto"⁄
+AttributeDimensionTable
+id (Rid
+pool_id (RpoolId
+name (	Rname
+desc (	Rdesc
+sort (Rsort$
+base_per_level (RbasePerLevel
+
+max_health (R	maxHealth
+max_mana (RmaxMana'
+physical_attack	 (RphysicalAttack!
+magic_attack
+ (RmagicAttack
+speed (Rspeed
+defense (Rdefense"K
+AttributeDimensionTableData,
+data (2.AttributeDimensionTableRdataBI
+com.game.tableB!AttributeDimensionTableOuterClassPZgenerated/pb/tablebproto3
+ï
+$table_wire/attributepool_table.proto"€
+AttributePoolTable
+id (Rid
+name (	Rname!
+unlock_level (RunlockLevel(
+points_per_level (RpointsPerLevel
+base_points (R
+basePoints#
+dimension_cap (RdimensionCap&
+reset_cost_gold (RresetCostGold3
+reset_free_below_level (RresetFreeBelowLevel
+desc	 (	Rdesc
+
+owner_type
+ (R	ownerType"A
+AttributePoolTableData'
+data (2.AttributePoolTableRdataBD
+com.game.tableBAttributePoolTableOuterClassPZgenerated/pb/tablebproto3
+ˇ
+$table_wire/attributerule_table.proto"≈
+AttributeRuleTable
+id (Rid
+max_schemes (R
+maxSchemes*
+free_scheme_count (RfreeSchemeCount5
+create_scheme_cost_gold (RcreateSchemeCostGold6
+switch_cooldown_seconds (RswitchCooldownSeconds-
+scheme_name_max_len (RschemeNameMaxLen4
+alloc_efficiency_bonus (RallocEfficiencyBonus"A
+AttributeRuleTableData'
+data (2.AttributeRuleTableRdataBD
+com.game.tableBAttributeRuleTableOuterClassPZgenerated/pb/tablebproto3
+∑
+ table_wire/basescene_table.proto"ç
+BaseSceneTable
+id (Rid 
+nav_bin_file (	R
+navBinFile
+spawn_x (RspawnX
+spawn_y (RspawnY
+spawn_z (RspawnZ"9
+BaseSceneTableData#
+data (2.BaseSceneTableRdataB@
+com.game.tableBBaseSceneTableOuterClassPZgenerated/pb/tablebproto3
+¢
+table_wire/buff_table.proto"å
+	BuffTable
+id (Rid
+	no_caster (RnoCaster
+	buff_type (RbuffType%
+tag (2.BuffTable.TagEntryRtag8
+
+immune_tag (2.BuffTable.ImmuneTagEntryR	immuneTag8
+
+dispel_tag (2.BuffTable.DispelTagEntryR	dispelTag
+level (Rlevel
+	max_layer (RmaxLayer+
+infinite_duration	 (RinfiniteDuration
+duration
+ (Rduration'
+force_interrupt (RforceInterrupt
+interval (Rinterval%
+interval_count (RintervalCount'
+interval_effect (RintervalEffect0
+movement_speed_boost (RmovementSpeedBoost8
+movement_speed_reduction (RmovementSpeedReduction/
+health_regeneration (	RhealthRegeneration
+sub_buff (RsubBuff&
+target_sub_buff (RtargetSubBuff.
+combat_idle_seconds (RcombatIdleSeconds
+time (Rtime!
+bonus_damage (	RbonusDamage
+	battle_op (RbattleOp#
+trigger_event (RtriggerEvent#
+effect_target (ReffectTarget
+
+flat_value (R	flatValue
+	per_level (RperLevel
+ratio (Rratio
+value_basis (R
+valueBasis#
+damage_filter (RdamageFilter'
+duration_rounds (RdurationRounds
+
+tick_count  (R	tickCount%
+trigger_chance! (RtriggerChance&
+per_round_limit" (RperRoundLimit
+	hit_limit# (RhitLimit#
+modifier_stat$ (RmodifierStat
+
+state_kind% (R	stateKind-
+application_chance& (RapplicationChance!
+required_tag' (	RrequiredTag.
+second_required_tag( (	RsecondRequiredTag+
+conditional_bonus) (RconditionalBonus'
+secondary_ratio* (RsecondaryRatio!
+effect_count+ (ReffectCount!
+target_count, (RtargetCount(
+pet_target_count- (RpetTargetCount
+	stack_key. (RstackKey%
+refresh_policy/ (RrefreshPolicy"
+keep_on_death0 (RkeepOnDeath'
+effect_priority1 (ReffectPriority
+start_round2 (R
+startRound
+stack_limit3 (R
+stackLimit2
+require_living_caster4 (RrequireLivingCaster"
+tick_on_apply5 (RtickOnApply$
+keep_on_logout6 (RkeepOnLogout6
+TagEntry
+key (	Rkey
+value (Rvalue:8<
+ImmuneTagEntry
+key (	Rkey
+value (Rvalue:8<
+DispelTagEntry
+key (	Rkey
+value (Rvalue:8"/
+BuffTableData
+data (2
+.BuffTableRdataB;
+com.game.tableBBuffTableOuterClassPZgenerated/pb/tablebproto3
+°
+*table_wire/characterappearance_table.proto"œ
 CharacterAppearanceTable
 id (Rid#
 appearance_id (	RappearanceId
@@ -887,10 +292,123 @@ sort_order (R	sortOrder
 desc (	Rdesc+
 starter_creatable (RstarterCreatable'
 card_unlockable (RcardUnlockable
-	series_id	 (RseriesId"M
+	series_id	 (RseriesId!
+archive_name
+ (	RarchiveName
+nickname (	Rnickname+
+biography_summary (	RbiographySummary
+story_title (	R
+storyTitle
+
+story_body (	R	storyBody"M
 CharacterAppearanceTableData-
 data (2.CharacterAppearanceTableRdataBJ
 com.game.tableB"CharacterAppearanceTableOuterClassPZgenerated/pb/tablebproto3
+ø
+table_wire/class_table.proto"•
+
+ClassTable
+id (Rid
+skill (Rskill
+init_health (R
+initHealth
+	init_mana (RinitMana#
+init_strength (RinitStrength
+
+init_armor (R	initArmor'
+init_resistance (RinitResistance'
+init_critchance (RinitCritchance
+
+init_speed	 (R	initSpeed"1
+ClassTableData
+data (2.ClassTableRdataB<
+com.game.tableBClassTableOuterClassPZgenerated/pb/tablebproto3
+ç
+ table_wire/condition_table.proto"„
+ConditionTable
+id (Rid-
+condition_category (RconditionCategory
+
+condition1 (R
+condition1
+
+condition2 (R
+condition2
+
+condition3 (R
+condition3
+
+condition4 (R
+condition4%
+valid_duration (RvalidDuration#
+quantity_type (RquantityType!
+target_count	 (RtargetCount#
+comparison_op
+ (RcomparisonOp"9
+ConditionTableData#
+data (2.ConditionTableRdataB@
+com.game.tableBConditionTableOuterClassPZgenerated/pb/tablebproto3
+‡
+table_wire/cooldown_table.proto";
+CooldownTable
+id (Rid
+duration (Rduration"7
+CooldownTableData"
+data (2.CooldownTableRdataB?
+com.game.tableBCooldownTableOuterClassPZgenerated/pb/tablebproto3
+Õ
+table_wire/dungeon_table.proto"´
+DungeonTable
+id (Rid
+scene_id (RsceneId"
+max_team_size (RmaxTeamSize
+
+time_limit (R	timeLimit
+monster (Rmonster*
+allow_pet_capture (RallowPetCapture&
+boss_trial_kind (RbossTrialKind
+
+difficulty (R
+difficulty
+round_limit	 (R
+roundLimit"5
+DungeonTableData!
+data (2.DungeonTableRdataB>
+com.game.tableBDungeonTableOuterClassPZgenerated/pb/tablebproto3
+¨
+%table_wire/equipaffixpool_table.proto"o
+EquipAffixPoolTable
+id (Rid
+pool_id (RpoolId
+attr_id (RattrId
+weight (Rweight"C
+EquipAffixPoolTableData(
+data (2.EquipAffixPoolTableRdataBE
+com.game.tableBEquipAffixPoolTableOuterClassPZgenerated/pb/tablebproto3
+ú
+(table_wire/equipaffixquality_table.proto"“
+EquipAffixQualityTable
+id (Rid
+name (	Rname
+	ratio_pct (RratioPct+
+apprentice_weight (RapprenticeWeight%
+artisan_weight (RartisanWeight#
+master_weight (RmasterWeight"I
+EquipAffixQualityTableData+
+data (2.EquipAffixQualityTableRdataBH
+com.game.tableB EquipAffixQualityTableOuterClassPZgenerated/pb/tablebproto3
+◊
+%table_wire/equipaffixrule_table.proto"ô
+EquipAffixRuleTable
+id (Rid
+blue_min (RblueMin
+blue_max (RblueMax
+	pink_rate (RpinkRate
+yellow_rate (R
+yellowRate"C
+EquipAffixRuleTableData(
+data (2.EquipAffixRuleTableRdataBE
+com.game.tableBEquipAffixRuleTableOuterClassPZgenerated/pb/tablebproto3
 Ï
 $table_wire/equipartifact_table.proto"≤
 EquipArtifactTable
@@ -906,6 +424,81 @@ $table_wire/equipartifact_table.proto"≤
 EquipArtifactTableData'
 data (2.EquipArtifactTableRdataBD
 com.game.tableBEquipArtifactTableOuterClassPZgenerated/pb/tablebproto3
+‡
+%table_wire/equipattribute_table.proto"¢
+EquipAttributeTable
+id (Rid
+name (	Rname
+effect (Reffect!
+effect_param (ReffectParam
+percent (Rpercent
+sort (Rsort"C
+EquipAttributeTableData(
+data (2.EquipAttributeTableRdataBE
+com.game.tableBEquipAttributeTableOuterClassPZgenerated/pb/tablebproto3
+–
+(table_wire/equipattributecap_table.proto"Ü
+EquipAttributeCapTable
+id (Rid
+attr_id (RattrId
+level (Rlevel
+	min_value (RminValue
+cap (Rcap"I
+EquipAttributeCapTableData+
+data (2.EquipAttributeCapTableRdataBH
+com.game.tableB EquipAttributeCapTableOuterClassPZgenerated/pb/tablebproto3
+Ü
+#table_wire/equipenhance_table.proto"–
+EquipEnhanceTable
+id (Rid'
+bonus_permyriad (RbonusPermyriad!
+success_rate (RsuccessRate&
+fail_level_loss (RfailLevelLoss
+	cost_gold (RcostGold
+material_id (R
+materialId%
+material_count (RmaterialCount
+
+profile_id (R	profileId
+level	 (Rlevel
+
+pity_limit
+ (R	pityLimit"?
+EquipEnhanceTableData&
+data (2.EquipEnhanceTableRdataBC
+com.game.tableBEquipEnhanceTableOuterClassPZgenerated/pb/tablebproto3
+é
+table_wire/equipgem_table.proto"i
+EquipGemTable
+id (Rid
+gem_type (RgemType
+attr_id (RattrId
+value (Rvalue"7
+EquipGemTableData"
+data (2.EquipGemTableRdataB?
+com.game.tableBEquipGemTableOuterClassPZgenerated/pb/tablebproto3
+…
+%table_wire/equipgemsocket_table.proto"ã
+EquipGemSocketTable
+id (Rid
+
+equip_kind (R	equipKind
+socket (Rsocket
+gem_type (RgemType
+name (	Rname"C
+EquipGemSocketTableData(
+data (2.EquipGemSocketTableRdataBE
+com.game.tableBEquipGemSocketTableOuterClassPZgenerated/pb/tablebproto3
+¸
+ table_wire/equipslot_table.proto"S
+EquipSlotTable
+id (Rid
+
+equip_kind (R	equipKind
+name (	Rname"9
+EquipSlotTableData#
+data (2.EquipSlotTableRdataB@
+com.game.tableBEquipSlotTableOuterClassPZgenerated/pb/tablebproto3
 Ó
 #table_wire/equipv1affix_table.proto"∏
 EquipV1AffixTable
@@ -925,6 +518,323 @@ materialId%
 EquipV1AffixTableData&
 data (2.EquipV1AffixTableRdataBC
 com.game.tableBEquipV1AffixTableOuterClassPZgenerated/pb/tablebproto3
+õ
+,table_wire/festivalbeastactivity_table.proto"¡
+FestivalBeastActivityTable
+id (Rid
+enabled (Renabled'
+config_revision (RconfigRevision#
+activity_name (	RactivityName
+	boss_name (	RbossName(
+banner_asset_key (	RbannerAssetKey
+icon_key (	RiconKey1
+effective_start_at_ms (ReffectiveStartAtMs-
+effective_end_at_ms	 (ReffectiveEndAtMs.
+claim_showcase_days
+ (RclaimShowcaseDays(
+battle_config_id (RbattleConfigId#
+required_wins (RrequiredWins'
+reward_identity (	RrewardIdentity:
+reward_definition_version (RrewardDefinitionVersion-
+reward_pet_table_id (RrewardPetTableId
+round_limit (R
+roundLimit!
+cycle_rounds (RcycleRounds*
+first_heavy_round (RfirstHeavyRound2
+telegraph_lead_rounds (RtelegraphLeadRounds0
+heavy_damage_percent (RheavyDamagePercent"Q
+FestivalBeastActivityTableData/
+data (2.FestivalBeastActivityTableRdataBL
+com.game.tableB$FestivalBeastActivityTableOuterClassPZgenerated/pb/tablebproto3
+Í
+(table_wire/festivalbeasttier_table.proto"†
+FestivalBeastTierTable
+id (Rid
+	min_level (RminLevel
+	max_level (RmaxLevel
+boss_health (R
+bossHealth0
+boss_physical_attack (RbossPhysicalAttack!
+boss_defense (RbossDefense'
+boss_resistance (RbossResistance
+
+boss_speed (R	bossSpeed"I
+FestivalBeastTierTableData+
+data (2.FestivalBeastTierTableRdataBH
+com.game.tableB FestivalBeastTierTableOuterClassPZgenerated/pb/tablebproto3
+‚
+%table_wire/globalvariable_table.proto"%
+GlobalVariableTable
+id (Rid"C
+GlobalVariableTableData(
+data (2.GlobalVariableTableRdataBE
+com.game.tableBGlobalVariableTableOuterClassPZgenerated/pb/tablebproto3
+®
+$table_wire/guildactivity_table.proto"Ó
+GuildActivityTable
+id (Rid
+name (	Rname
+type (Rtype
+enabled (Renabled
+start_at_ms (R	startAtMs
+	end_at_ms (RendAtMs&
+min_guild_level (RminGuildLevel3
+personal_contribution (RpersonalContribution
+guild_funds	 (R
+guildFunds'
+guild_threshold
+ (RguildThreshold
+	reward_id (RrewardId
+
+dungeon_id (R	dungeonId"
+team_size_min (RteamSizeMin"
+team_size_max (RteamSizeMax
+daily_limit (R
+dailyLimit"A
+GuildActivityTableData'
+data (2.GuildActivityTableRdataBD
+com.game.tableBGuildActivityTableOuterClassPZgenerated/pb/tablebproto3
+√
+"table_wire/guilddonate_table.proto"ë
+GuildDonateTable
+id (Rid
+name (	Rname#
+currency_type (RcurrencyType
+cost_amount (R
+costAmount+
+contribution_gain (RcontributionGain
+
+funds_gain (R	fundsGain
+daily_limit (R
+dailyLimit&
+min_guild_level (RminGuildLevel"=
+GuildDonateTableData%
+data (2.GuildDonateTableRdataBB
+com.game.tableBGuildDonateTableOuterClassPZgenerated/pb/tablebproto3
+¡
+!table_wire/guildlevel_table.proto"ì
+GuildLevelTable
+id (Rid
+max_members (R
+maxMembers!
+max_officers (RmaxOfficers,
+upgrade_cost_funds (RupgradeCostFunds";
+GuildLevelTableData$
+data (2.GuildLevelTableRdataBA
+com.game.tableBGuildLevelTableOuterClassPZgenerated/pb/tablebproto3
+ç
+ table_wire/guildrule_table.proto"„
+GuildRuleTable
+id (Rid8
+application_expire_hours (RapplicationExpireHoursL
+#max_pending_applications_per_player (RmaxPendingApplicationsPerPlayerJ
+"max_pending_applications_per_guild (RmaxPendingApplicationsPerGuild9
+asset_op_deadline_seconds (RassetOpDeadlineSeconds2
+asset_op_retry_base_ms (RassetOpRetryBaseMs;
+reunion_min_online_members (RreunionMinOnlineMembers5
+activity_join_min_hours (RactivityJoinMinHours7
+trial_invite_ttl_seconds	 (RtrialInviteTtlSecondsA
+trial_invite_cooldown_seconds
+ (RtrialInviteCooldownSeconds6
+rename_cooldown_seconds (RrenameCooldownSeconds*
+name_hold_seconds (RnameHoldSeconds*
+rename_cost_funds (RrenameCostFunds"9
+GuildRuleTableData#
+data (2.GuildRuleTableRdataB@
+com.game.tableBGuildRuleTableOuterClassPZgenerated/pb/tablebproto3
+’
+ table_wire/guildshop_table.proto"´
+GuildShopTable
+id (Rid
+name (	Rname
+category (Rcategory
+item_id (RitemId
+
+item_count (R	itemCount+
+cost_contribution (RcostContribution0
+required_guild_level (RrequiredGuildLevel!
+limit_period (RlimitPeriod
+limit_count	 (R
+limitCount"9
+GuildShopTableData#
+data (2.GuildShopTableRdataB@
+com.game.tableBGuildShopTableOuterClassPZgenerated/pb/tablebproto3
+‰
+table_wire/item_table.proto"Y
+Itembase_attr 
+base_attr_id (R
+baseAttrId&
+base_attr_value (RbaseAttrValue"Û
+	ItemTable
+id (Rid$
+max_stack_size (RmaxStackSize
+
+equip_kind (R	equipKind#
+battle_usable (RbattleUsable$
+battle_heal_hp (RbattleHealHp$
+battle_heal_mp (RbattleHealMp
+name (	Rname 
+description (	Rdescription
+icon_key	 (	RiconKey
+equip_level
+ (R
+equipLevel
+equip_class (R
+equipClass
+
+affix_pool (R	affixPool
+
+affix_rule (R	affixRule#
+equip_profile (RequipProfile*
+forge_material_id (RforgeMaterialId0
+forge_material_count (RforgeMaterialCount
+artifact_id (R
+artifactId+
+	base_attr (2.Itembase_attrRbaseAttr"/
+ItemTableData
+data (2
+.ItemTableRdataB;
+com.game.tableBItemTableOuterClassPZgenerated/pb/tablebproto3
+»
+%table_wire/messagelimiter_table.proto"ä
+MessageLimiterTable
+id (Rid!
+max_requests (RmaxRequests
+time_window (R
+timeWindow
+tip_message (R
+tipMessage"C
+MessageLimiterTableData(
+data (2.MessageLimiterTableRdataBE
+com.game.tableBMessageLimiterTableOuterClassPZgenerated/pb/tablebproto3
+˘
+table_wire/mirror_table.proto"\
+MirrorTable
+id (Rid
+scene_id (RsceneId"
+main_scene_id (RmainSceneId"3
+MirrorTableData 
+data (2.MirrorTableRdataB=
+com.game.tableBMirrorTableOuterClassPZgenerated/pb/tablebproto3
+‚
+table_wire/mission_table.proto"¿
+MissionTable
+id (Rid!
+condition_id (RconditionId!
+mission_type (RmissionType(
+mission_sub_type (RmissionSubType'
+condition_order (RconditionOrder
+auto_reward (R
+autoReward
+	reward_id (RrewardId&
+next_mission_id (RnextMissionId!
+target_count	 (RtargetCount"5
+MissionTableData!
+data (2.MissionTableRdataB>
+com.game.tableBMissionTableOuterClassPZgenerated/pb/tablebproto3
+ó
+table_wire/monster_table.proto"f
+Monsterdrop
+	drop_item (RdropItem
+
+drop_count (R	dropCount
+	drop_rate (RdropRate"ç
+MonsterTable
+id (Rid
+health (Rhealth
+strength (Rstrength
+armor (Rarmor
+
+resistance (R
+resistance
+
+critchance (R
+critchance
+speed (Rspeed
+
+exp_reward (R	expReward
+gold_reward	 (R
+goldReward/
+capture_pet_table_id (RcapturePetTableId!
+capture_rate (RcaptureRate
+is_boss (RisBoss 
+drop
+ (2.MonsterdropRdrop"5
+MonsterTableData!
+data (2.MonsterTableRdataB>
+com.game.tableBMonsterTableOuterClassPZgenerated/pb/tablebproto3
+¡
++table_wire/mysterymerchantgoods_table.proto"Î
+MysteryMerchantGoodsTable
+id (Rid
+name (	Rname
+item_id (RitemId
+
+item_count (R	itemCount#
+currency_type (RcurrencyType
+price (Rprice
+weight (Rweight
+limit_count (R
+limitCount"O
+MysteryMerchantGoodsTableData.
+data (2.MysteryMerchantGoodsTableRdataBK
+com.game.tableB#MysteryMerchantGoodsTableOuterClassPZgenerated/pb/tablebproto3
+´
+*table_wire/mysterymerchantrule_table.proto"Ÿ
+MysteryMerchantRuleTable
+id (Rid)
+interval_seconds (RintervalSeconds!
+stay_seconds (RstaySeconds
+
+shelf_size (R	shelfSize+
+weight_discount60 (RweightDiscount60+
+weight_discount50 (RweightDiscount50+
+weight_discount40 (RweightDiscount40%
+interact_range (RinteractRange
+desc	 (	Rdesc"M
+MysteryMerchantRuleTableData-
+data (2.MysteryMerchantRuleTableRdataBJ
+com.game.tableB"MysteryMerchantRuleTableOuterClassPZgenerated/pb/tablebproto3
+‚
+*table_wire/mysterymerchantspot_table.proto"ê
+MysteryMerchantSpotTable
+id (Rid&
+scene_config_id (RsceneConfigId
+x (Rx
+y (Ry
+z (Rz
+desc (	Rdesc"M
+MysteryMerchantSpotTableData-
+data (2.MysteryMerchantSpotTableRdataBJ
+com.game.tableB"MysteryMerchantSpotTableOuterClassPZgenerated/pb/tablebproto3
+ë
+table_wire/pet_table.proto"ˇ
+PetTable
+id (Rid
+name (	Rname
+desc (	Rdesc
+model_id (RmodelId
+quality (Rquality!
+unlock_level (RunlockLevel
+	level_cap (RlevelCap
+init_health (R
+initHealth
+	init_mana	 (RinitMana
+
+init_speed
+ (R	initSpeed!
+aptitude_min (RaptitudeMin!
+aptitude_max (RaptitudeMax
+skill (Rskill&
+shop_price_gold (RshopPriceGold)
+acquisition_tier (RacquisitionTier)
+cultivation_tier (RcultivationTier'
+transfer_policy (RtransferPolicy0
+exclusive_gift_slots (RexclusiveGiftSlots4
+fixed_initial_aptitude (RfixedInitialAptitude"-
+PetTableData
+data (2	.PetTableRdataB:
+com.game.tableBPetTableOuterClassPZgenerated/pb/tablebproto3
 †
 table_wire/petentry_table.proto"˙
 PetEntryTable
@@ -943,6 +853,22 @@ state_kind (R	stateKind
 PetEntryTableData"
 data (2.PetEntryTableRdataB?
 com.game.tableBPetEntryTableOuterClassPZgenerated/pb/tablebproto3
+Ö
+table_wire/petrule_table.proto"„
+PetRuleTable
+id (Rid
+max_pets (RmaxPets 
+name_max_len (R
+nameMaxLen(
+rename_cost_gold (RrenameCostGold6
+summon_cooldown_seconds (RsummonCooldownSeconds
+desc (	Rdesc0
+entry_config_version (RentryConfigVersion,
+entry_total_points (RentryTotalPoints0
+entry_max_directions	 (RentryMaxDirections"5
+PetRuleTableData!
+data (2.PetRuleTableRdataB>
+com.game.tableBPetRuleTableOuterClassPZgenerated/pb/tablebproto3
 Ä
 table_wire/pettier_table.proto"_
 PetTierTable
@@ -953,6 +879,19 @@ state_kind (R	stateKind
 PetTierTableData!
 data (2.PetTierTableRdataB>
 com.game.tableBPetTierTableOuterClassPZgenerated/pb/tablebproto3
+˙
+table_wire/playmode_table.proto"‘
+PlayModeTable
+id (Rid
+
+match_mode (R	matchMode(
+battle_config_id (RbattleConfigId
+enabled (Renabled,
+allowed_team_sizes (RallowedTeamSizes"
+team_size_max (RteamSizeMax"7
+PlayModeTableData"
+data (2.PlayModeTableRdataB?
+com.game.tableBPlayModeTableOuterClassPZgenerated/pb/tablebproto3
 Í
 #table_wire/rankedpreset_table.proto"¥
 RankedPresetTable
@@ -980,8 +919,8 @@ weight_agi
 RankedPresetTableData&
 data (2.RankedPresetTableRdataBC
 com.game.tableBRankedPresetTableOuterClassPZgenerated/pb/tablebproto3
-ø	
-!table_wire/rankedrule_table.proto"ë
+Û	
+!table_wire/rankedrule_table.proto"≈
 RankedRuleTable
 id (Rid!
 rule_version (RruleVersion(
@@ -1005,10 +944,41 @@ weight_agi
 tier_yunzhang_centi (RtierYunzhangCenti,
 tier_tianshu_centi (RtierTianshuCenti.
 tier_wushuang_centi (RtierWushuangCenti
-desc (	Rdesc";
+desc (	Rdesc2
+milestone_win_matches (RmilestoneWinMatches";
 RankedRuleTableData$
 data (2.RankedRuleTableRdataBA
 com.game.tableBRankedRuleTableOuterClassPZgenerated/pb/tablebproto3
+µ
+table_wire/reward_table.proto"R
+Rewardreward
+reward_item (R
+rewardItem!
+reward_count (RrewardCount"D
+RewardTable
+id (Rid%
+reward (2.RewardrewardRreward"3
+RewardTableData 
+data (2.RewardTableRdataB=
+com.game.tableBRewardTableOuterClassPZgenerated/pb/tablebproto3
+ı
+#table_wire/rolenamerule_table.proto"ø
+RoleNameRuleTable
+id (Rid
+	min_chars (RminChars
+	max_chars (RmaxChars)
+generated_prefix (	RgeneratedPrefix0
+generated_suffix_len (RgeneratedSuffixLen2
+max_generate_attempts (RmaxGenerateAttempts
+desc (	Rdesc6
+rename_cooldown_seconds (RrenameCooldownSeconds1
+old_name_hold_seconds	 (RoldNameHoldSeconds$
+rename_item_id
+ (RrenameItemId*
+rename_item_count (RrenameItemCount"?
+RoleNameRuleTableData&
+data (2.RoleNameRuleTableRdataBC
+com.game.tableBRoleNameRuleTableOuterClassPZgenerated/pb/tablebproto3
 ◊
 !table_wire/seasonrule_table.proto"©
 SeasonRuleTable
@@ -1052,6 +1022,328 @@ ends_at_ms (RendsAtMs
 SeasonSealTableData$
 data (2.SeasonSealTableRdataBA
 com.game.tableBSeasonSealTableOuterClassPZgenerated/pb/tablebproto3
+˚
+table_wire/skill_table.proto"r
+Skillrequired_item,
+required_item_type (RrequiredItemType.
+required_item_value (RrequiredItemValue"Ü
+Skillrequired_resource4
+required_resource_type (RrequiredResourceType6
+required_resource_value (RrequiredResourceValue"l
+Skillcost_resource(
+cost_resource_id (RcostResourceId,
+cost_resource_cost (RcostResourceCost"ˆ
+
+SkillTable
+id (Rid
+
+skill_type (R	skillType%
+targeting_mode (RtargetingMode%
+require_target (RrequireTarget#
+target_status (RtargetStatus
+
+cast_point (R	castPoint#
+recovery_time (RrecoveryTime
+	immediate (R	immediate
+effect	 (Reffect#
+channel_think
+ (RchannelThink%
+channel_finish (RchannelFinish%
+think_interval (RthinkInterval!
+channel_time (RchannelTime
+range (Rrange
+	max_range (RmaxRange
+	min_range (RminRange
+self_status (R
+selfStatus'
+required_status (RrequiredStatus
+cooldown_id (R
+cooldownId
+damage (	Rdamage
+damage_type (R
+damageType+
+attack_multiplier (RattackMultiplier
+class_id (RclassId
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey
+category (	Rcategory!
+unlock_level (RunlockLevel
+max_rank  (RmaxRank
+target_team! (R
+targetTeam
+max_targets" (R
+maxTargets!
+mana_percent# (RmanaPercent'
+cooldown_rounds$ (RcooldownRounds'
+heal_multiplier% (RhealMultiplier$
+heal_per_level& (RhealPerLevel4
+execute_heal_threshold' (RexecuteHealThreshold,
+execute_heal_bonus( (RexecuteHealBonus0
+restore_mana_percent) (RrestoreManaPercent!
+dispel_count* (RdispelCount
+
+initiative+ (R
+initiative!
+passive_stat, (	RpassiveStat'
+passive_percent- (RpassivePercent!
+buff_percent. (RbuffPercent!
+battle_model/ (RbattleModel
+caster_mask0 (R
+casterMask!
+ability_kind1 (RabilityKind&
+pet_max_targets2 (RpetMaxTargets
+init_effect3 (R
+initEffect%
+prototype_code4 (	RprototypeCode&
+max_battle_uses5 (RmaxBattleUses(
+health_cost_mode6 (RhealthCostMode
+action_tags7 (R
+actionTags*
+allow_dead_target8 (RallowDeadTarget
+forbid_copy9 (R
+forbidCopy
+	season_id: (RseasonId
+	scroll_id; (RscrollId
+rarity_tier< (R
+rarityTier8
+required_item (2.Skillrequired_itemRrequiredItemD
+required_resource (2.Skillrequired_resourceRrequiredResource8
+cost_resource (2.Skillcost_resourceRcostResource"1
+SkillTableData
+data (2.SkillTableRdataB<
+com.game.tableBSkillTableOuterClassPZgenerated/pb/tablebproto3
+Ü
+&table_wire/skillpermission_table.proto"E
+SkillPermissionTable
+id (Rid
+
+skill_type (R	skillType"E
+SkillPermissionTableData)
+data (2.SkillPermissionTableRdataBF
+com.game.tableBSkillPermissionTableOuterClassPZgenerated/pb/tablebproto3
+÷
+'table_wire/skillscrollcraft_table.proto"ê
+SkillScrollCraftTable
+id (Rid
+name (	Rname 
+description (	Rdescription
+rarity_tier (R
+rarityTier(
+fragment_item_id (RfragmentItemId2
+random_fragment_count (RrandomFragmentCount(
+random_gold_cost (RrandomGoldCost6
+targeted_fragment_count (RtargetedFragmentCount,
+targeted_gold_cost	 (RtargetedGoldCost8
+dismantle_fragment_count
+ (RdismantleFragmentCount-
+rare_scroll_item_id (RrareScrollItemId*
+rare_scroll_count (RrareScrollCount'
+rare_ink_item_id (RrareInkItemId$
+rare_ink_count (RrareInkCount$
+rare_gold_cost (RrareGoldCost
+enabled (Renabled"G
+SkillScrollCraftTableData*
+data (2.SkillScrollCraftTableRdataBG
+com.game.tableBSkillScrollCraftTableOuterClassPZgenerated/pb/tablebproto3
+≥
+table_wire/test_table.proto"S
+Testtestobj
+testobj_key (R
+testobjKey#
+testobj_value (RtestobjValue"»
+	TestTable
+id (Rid
+level (Rlevel
+effect (Reffect%
+tag (2.TestTable.TagEntryRtag8
+
+immune_tag (2.TestTable.ImmuneTagEntryR	immuneTag&
+testobj (2.TesttestobjRtestobj6
+TagEntry
+key (	Rkey
+value (	Rvalue:8<
+ImmuneTagEntry
+key (	Rkey
+value (	Rvalue:8"/
+TestTableData
+data (2
+.TestTableRdataB;
+com.game.tableBTestTableOuterClassPZgenerated/pb/tablebproto3
+Ç
+#table_wire/testmultikey_table.proto"`
+TestMultiKeytestobj1!
+testobj1_key (Rtestobj1Key%
+testobj1_value (Rtestobj1Value"Í
+TestMultiKeyTable
+id (Rid
+level (Rlevel
+effect (Reffect
+
+string_key (	R	stringKey
+
+uint32_key (R	uint32Key
+	int32_key (Rint32Key 
+m_string_key (	R
+mStringKey 
+m_uint32_key (R
+mUint32Key
+m_int32_key	 (R	mInt32Key
+test_ref
+ (RtestRef
+	test_refs (RtestRefs0
+tag1 (2.TestMultiKeyTable.Tag1EntryRtag1C
+immune_tag1 (2".TestMultiKeyTable.ImmuneTag1EntryR
+immuneTag11
+testobj1 (2.TestMultiKeytestobj1Rtestobj17
+	Tag1Entry
+key (	Rkey
+value (	Rvalue:8=
+ImmuneTag1Entry
+key (	Rkey
+value (	Rvalue:8"?
+TestMultiKeyTableData&
+data (2.TestMultiKeyTableRdataBC
+com.game.tableBTestMultiKeyTableOuterClassPZgenerated/pb/tablebproto3
+´
+'table_wire/tournamentreward_table.proto"Â
+TournamentRewardTable
+id (Rid
+	tier_kind (RtierKind
+min_rank (RminRank
+max_rank (RmaxRank
+gold_amount (R
+goldAmount
+item_ids (RitemIds
+item_counts (R
+itemCounts
+
+title_code (	R	titleCode
+
+badge_code	 (	R	badgeCode
+
+mail_title
+ (	R	mailTitle
+	mail_body (	RmailBody
+desc (	Rdesc"G
+TournamentRewardTableData*
+data (2.TournamentRewardTableRdataBG
+com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
+°
+%table_wire/tournamentrule_table.proto"„
+TournamentRuleTable
+id (Rid!
+rule_version (RruleVersion
+enabled (Renabled(
+battle_config_id (RbattleConfigId(
+battle_team_size (RbattleTeamSize&
+roster_max_size (RrosterMaxSize
+	min_level (RminLevel+
+registration_days (RregistrationDays%
+qualifier_days	 (RqualifierDays#
+knockout_days
+ (RknockoutDays.
+settle_display_days (RsettleDisplayDays2
+qualifier_max_matches (RqualifierMaxMatches:
+participation_min_matches (RparticipationMinMatches,
+knockout_max_teams (RknockoutMaxTeamsC
+knockout_round_timeout_seconds (RknockoutRoundTimeoutSeconds0
+qualifier_win_points (RqualifierWinPoints2
+qualifier_draw_points (RqualifierDrawPoints2
+qualifier_loss_points (RqualifierLossPoints,
+invite_ttl_seconds (RinviteTtlSeconds
+desc (	Rdesc"C
+TournamentRuleTableData(
+data (2.TournamentRuleTableRdataBE
+com.game.tableBTournamentRuleTableOuterClassPZgenerated/pb/tablebproto3
+œ
+(table_wire/trialjournalentry_table.proto"Ö
+TrialJournalEntryTable
+id (Rid
+
+chapter_id (R	chapterId
+	season_id (RseasonId
+source_kind (R
+sourceKind
+
+difficulty (R
+difficulty
+variant_key (	R
+variantKey!
+rule_version (RruleVersion*
+rule_version_name (	RruleVersionName
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder!
+display_name (	RdisplayName!
+chapter_name (	RchapterName
+icon_key (	RiconKey
+unlock_mode (R
+unlockMode
+jump_target (	R
+jumpTarget
+desc (	Rdesc"I
+TrialJournalEntryTableData+
+data (2.TrialJournalEntryTableRdataBH
+com.game.tableB TrialJournalEntryTableOuterClassPZgenerated/pb/tablebproto3
+ä
+,table_wire/trialjournalmilestone_table.proto"∞
+TrialJournalMilestoneTable
+id (Rid(
+scope_chapter_id (RscopeChapterId
+	season_id (RseasonId%
+required_seals (RrequiredSeals(
+bound_sand_count (RboundSandCount?
+bound_artifact_voucher_count (RboundArtifactVoucherCount
+	badge_key (	RbadgeKey
+
+badge_name (	R	badgeName%
+commentary_key	 (	RcommentaryKey)
+commentary_title
+ (	RcommentaryTitle'
+commentary_body (	RcommentaryBody.
+grant_appearance_id (	RgrantAppearanceId
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc"Q
+TrialJournalMilestoneTableData/
+data (2.TrialJournalMilestoneTableRdataBL
+com.game.tableB$TrialJournalMilestoneTableOuterClassPZgenerated/pb/tablebproto3
+¬
+'table_wire/trialjournalseal_table.proto"¸
+TrialJournalSealTable
+id (Rid
+entry_id (RentryId$
+seal_slot_kind (RsealSlotKind%
+condition_type (RconditionType'
+condition_param (RconditionParam
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc"G
+TrialJournalSealTableData*
+data (2.TrialJournalSealTableRdataBG
+com.game.tableBTrialJournalSealTableOuterClassPZgenerated/pb/tablebproto3
+–
+table_wire/world_table.proto"7
+
+WorldTable
+id (Rid
+scene_id (RsceneId"1
+WorldTableData
+data (2.WorldTableRdataB<
+com.game.tableBWorldTableOuterClassPZgenerated/pb/tablebproto3
+û
+ table_wire/zonegroup_table.proto"u
+ZoneGroupTable
+id (Rid
+group_id (RgroupId
+
+zone_begin (R	zoneBegin
+zone_end (RzoneEnd"9
+ZoneGroupTableData#
+data (2.ZoneGroupTableRdataB@
+com.game.tableBZoneGroupTableOuterClassPZgenerated/pb/tablebproto3
 áj
  google/protobuf/descriptor.protogoogle.protobuf"[
 FileDescriptorSet8
@@ -1467,8 +1759,8 @@ sourceFile
 cfg_expr_type.google.protobuf.FieldOptions–’ (	RcfgExprType:E
 cfg_expr_param.google.protobuf.FieldOptions—’ (	RcfgExprParam:D
 cfg_composite.google.protobuf.FieldOptions“’ (	RcfgCompositebproto3
-•
-activityschedule_table.protommorpg.cfgtable.v1cfg_options.proto"’
+©
+activityschedule_table.protommorpg.cfgtable.v1cfg_options.proto"Ÿ
 ActivityScheduleTable
 id (BÚ¨MissionRid
 enabled (Renabled/
@@ -1481,44 +1773,78 @@ sourceFile
 description	 (	Rdescription
 icon_key
  (	RiconKey'
-vitality_points (RvitalityPoints:3ä¶ActivityScheduleí¶ActivitySchedule.xlsxö¶idbproto3
-…
-"activityvitalityreward_table.protommorpg.cfgtable.v1cfg_options.proto"Û
+vitality_points (RvitalityPoints:7ä¶ActivityScheduleí¶ActivitySchedule.xlsxö¶id∞¶bproto3
+Õ
+"activityvitalityreward_table.protommorpg.cfgtable.v1cfg_options.proto"˜
 ActivityVitalityRewardTable
 id (Rid1
 rule_id (BÚ¨ActivityVitalityRuleRruleId'
 required_points (RrequiredPoints'
 	reward_id (B
-Ú¨RewardRrewardId:?ä¶ActivityVitalityRewardí¶ActivityVitalityReward.xlsxö¶idbproto3
-ò
- activityvitalityrule_table.protommorpg.cfgtable.v1cfg_options.proto"ƒ
+Ú¨RewardRrewardId:Cä¶ActivityVitalityRewardí¶ActivityVitalityReward.xlsxö¶id∞¶bproto3
+ú
+ activityvitalityrule_table.protommorpg.cfgtable.v1cfg_options.proto"»
 ActivityVitalityRuleTable
 id (Rid
 enabled (Renabled5
 configuration_revision (RconfigurationRevision8
 first_period_starts_at_ms (RfirstPeriodStartsAtMs,
 period_duration_ms (RperiodDurationMs!
-points_limit (RpointsLimit:;ä¶ActivityVitalityRuleí¶ActivityVitalityRule.xlsxö¶idbproto3
-®
-"actoractioncombatstate_table.protommorpg.cfgtable.v1cfg_options.proto"Y
-ActorActionCombatStatestate
+points_limit (RpointsLimit:?ä¶ActivityVitalityRuleí¶ActivityVitalityRule.xlsxö¶id∞¶bproto3
+
+"actoractioncombatstate_table.protommorpg.cfgtable.v1cfg_options.proto"ö
+ActorActionCombatStateTable
+id (B–¨Rid:
+constants_name©F (B≤¨constants_nameRconstantsName
+state_id (RstateId
 
-state_mode (R	stateMode
-	state_tip (RstateTip"˜
-ActorActionCombatStateTable
-id (Rid:
-constants_name©F (B≤¨constants_nameRconstantsNameK
-state (2/.mmorpg.cfgtable.v1.ActorActionCombatStatestateB∏¨Rstate:?ä¶ActorActionCombatStateí¶ActorActionCombatState.xlsxö¶idbproto3
-Ñ
-actoractionstate_table.protommorpg.cfgtable.v1cfg_options.proto"S
-ActorActionStatestate
+state_mode (R	stateMode!
+	state_tip (BË¨RstateTip:?ä¶ActorActionCombatStateí¶ActorActionCombatState.xlsxö¶idJRstatebproto3
+ÿ
+actoractionstate_table.protommorpg.cfgtable.v1cfg_options.proto"à
+ActorActionStateTable
+id (B–¨Rid:
+constants_name©F (B≤¨constants_nameRconstantsName
+state_id (RstateId
 
-state_mode (R	stateMode
-	state_tip (RstateTip"ﬂ
-ActorActionStateTable
-id (Rid:
-constants_name©F (B≤¨constants_nameRconstantsNameE
-state (2).mmorpg.cfgtable.v1.ActorActionStatestateB∏¨Rstate:3ä¶ActorActionStateí¶ActorActionState.xlsxö¶idbproto3
+state_mode (R	stateMode!
+	state_tip (BË¨RstateTip:3ä¶ActorActionStateí¶ActorActionState.xlsxö¶idJRstatebproto3
+Ò
+afkpassrule_table.protommorpg.cfgtable.v1cfg_options.proto"¶
+AfkPassRuleTable
+id (Rid
+period_days (R
+periodDays.
+price_currency_type (RpriceCurrencyType
+price (Rprice,
+max_remaining_days (RmaxRemainingDays.
+remind_before_hours (RremindBeforeHours
+desc (	Rdesc:)ä¶AfkPassRuleí¶AfkPassRule.xlsxö¶idbproto3
+à
+appearancerule_table.protommorpg.cfgtable.v1cfg_options.proto"∫
+AppearanceRuleTable
+id (Rid*
+card_item_id (BÚ¨ItemR
+cardItemId&
+card_item_count (RcardItemCount4
+trial_duration_seconds (RtrialDurationSeconds
+mall_sku_id (R	mallSkuId$
+mall_price_fen (RmallPriceFen
+desc (	Rdesc:/ä¶AppearanceRuleí¶AppearanceRule.xlsxö¶idbproto3
+∞
+appearanceseries_table.protommorpg.cfgtable.v1cfg_options.proto"‡
+AppearanceSeriesTable
+id (Rid
+
+series_key (	R	seriesKey
+name (	Rname
+
+sort_order (R	sortOrder
+enabled (Renabled
+desc (	Rdesc2
+completion_badge_name (	RcompletionBadgeName%
+epilogue_title (	RepilogueTitle#
+epilogue_body	 (	RepilogueBody:7ä¶AppearanceSeriesí¶AppearanceSeries.xlsxö¶id®¶bproto3
 ‚
 attributeallocratio_table.protommorpg.cfgtable.v1cfg_options.proto"è
 AttributeAllocRatioTable
@@ -1596,9 +1922,8 @@ navBinFile
 spawn_x (RspawnX
 spawn_y (RspawnY
 spawn_z (RspawnZ:%ä¶	BaseSceneí¶BaseScene.xlsxö¶idbproto3
-¢
-
-buff_table.protommorpg.cfgtable.v1cfg_options.proto"ﬁ	
+¬
+buff_table.protommorpg.cfgtable.v1cfg_options.proto"˛
 	BuffTable
 id (Rid)
 designer©F (B≤¨designerRdesigner
@@ -1626,7 +1951,46 @@ dispel_tag (2,.mmorpg.cfgtable.v1.BuffTable.DispelTagEntryB∏¨¿¨R	dispel
 combat_idle_seconds (RcombatIdleSeconds
 time (Rtime-
 bonus_damage (	B
-Ç≠doubleRbonusDamage6
+Ç≠doubleRbonusDamage
+	battle_op (RbattleOp#
+trigger_event (RtriggerEvent#
+effect_target (ReffectTarget
+
+flat_value (R	flatValue
+	per_level (RperLevel
+ratio (Rratio
+value_basis (R
+valueBasis#
+damage_filter (RdamageFilter'
+duration_rounds (RdurationRounds
+
+tick_count  (R	tickCount%
+trigger_chance! (RtriggerChance&
+per_round_limit" (RperRoundLimit
+	hit_limit# (RhitLimit#
+modifier_stat$ (RmodifierStat
+
+state_kind% (R	stateKind-
+application_chance& (RapplicationChance!
+required_tag' (	RrequiredTag.
+second_required_tag( (	RsecondRequiredTag+
+conditional_bonus) (RconditionalBonus'
+secondary_ratio* (RsecondaryRatio!
+effect_count+ (ReffectCount!
+target_count, (RtargetCount(
+pet_target_count- (RpetTargetCount
+	stack_key. (RstackKey%
+refresh_policy/ (RrefreshPolicy"
+keep_on_death0 (RkeepOnDeath'
+effect_priority1 (ReffectPriority
+start_round2 (R
+startRound
+stack_limit3 (R
+stackLimit2
+require_living_caster4 (RrequireLivingCaster"
+tick_on_apply5 (RtickOnApply0
+keep_on_logout6 (B
+≤¨serverRkeepOnLogout6
 TagEntry
 key (	Rkey
 value (Rvalue:8<
@@ -1635,7 +1999,28 @@ dispel_tag (2,.mmorpg.cfgtable.v1.BuffTable.DispelTagEntryB∏¨¿¨R	dispel
 value (Rvalue:8<
 DispelTagEntry
 key (	Rkey
-value (Rvalue:8:ä¶Buffí¶	Buff.xlsxö¶idbproto3
+value (Rvalue:8:ä¶Buffí¶	Buff.xlsxö¶id∞¶bproto3
+˝
+characterappearance_table.protommorpg.cfgtable.v1cfg_options.proto"™
+CharacterAppearanceTable
+id (B‡¨Rid#
+appearance_id (	RappearanceId
+name (	Rname
+enabled (Renabled
+
+sort_order (R	sortOrder
+desc (	Rdesc+
+starter_creatable (RstarterCreatable'
+card_unlockable (RcardUnlockable1
+	series_id	 (BÚ¨AppearanceSeriesRseriesId!
+archive_name
+ (	RarchiveName
+nickname (	Rnickname+
+biography_summary (	RbiographySummary
+story_title (	R
+storyTitle
+
+story_body (	R	storyBody:=ä¶CharacterAppearanceí¶CharacterAppearance.xlsxö¶id®¶bproto3
 è
 class_table.protommorpg.cfgtable.v1cfg_options.proto" 
 
@@ -1677,20 +2062,27 @@ condition4%
  (RcomparisonOp.
 design_note©F (B≤¨designerR
 designNote:%ä¶	Conditioní¶Condition.xlsxö¶idbproto3
-ß
-cooldown_table.protommorpg.cfgtable.v1cfg_options.proto"`
+´
+cooldown_table.protommorpg.cfgtable.v1cfg_options.proto"d
 CooldownTable
 id (Rid
-duration (Rduration:#ä¶Cooldowní¶Cooldown.xlsxö¶idbproto3
-†
-dungeon_table.protommorpg.cfgtable.v1cfg_options.proto"Ÿ
+duration (Rduration:'ä¶Cooldowní¶Cooldown.xlsxö¶id∞¶bproto3
+µ
+dungeon_table.protommorpg.cfgtable.v1cfg_options.proto"Ó
 DungeonTable
 id (Rid(
 scene_id (BÚ¨	BaseSceneRsceneId"
 max_team_size (RmaxTeamSize
 
 time_limit (R	timeLimit)
-monster (B∏¨Ú¨MonsterRmonster:!ä¶Dungeoní¶Dungeon.xlsxö¶idbproto3
+monster (B∏¨Ú¨MonsterRmonster*
+allow_pet_capture (RallowPetCapture&
+boss_trial_kind (RbossTrialKind
+
+difficulty (R
+difficulty
+round_limit	 (R
+roundLimit:!ä¶Dungeoní¶Dungeon.xlsxö¶idbproto3
 à
 equipaffixpool_table.protommorpg.cfgtable.v1cfg_options.proto"∫
 EquipAffixPoolTable
@@ -1698,6 +2090,15 @@ time_limit (R	timeLimit)
 pool_id (Bÿ¨RpoolId+
 attr_id (BÚ¨EquipAttributeRattrId
 weight (Rweight:/ä¶EquipAffixPoolí¶EquipAffixPool.xlsxö¶idbproto3
+ﬁ
+equipaffixquality_table.protommorpg.cfgtable.v1cfg_options.proto"ç
+EquipAffixQualityTable
+id (Rid
+name (	Rname
+	ratio_pct (RratioPct+
+apprentice_weight (RapprenticeWeight%
+artisan_weight (RartisanWeight#
+master_weight (RmasterWeight:9ä¶EquipAffixQualityí¶EquipAffixQuality.xlsxö¶id∞¶bproto3
 ò
 equipaffixrule_table.protommorpg.cfgtable.v1cfg_options.proto" 
 EquipAffixRuleTable
@@ -1707,6 +2108,18 @@ time_limit (R	timeLimit)
 	pink_rate (RpinkRate
 yellow_rate (R
 yellowRate:/ä¶EquipAffixRuleí¶EquipAffixRule.xlsxö¶idbproto3
+≤
+equipartifact_table.protommorpg.cfgtable.v1cfg_options.proto"Â
+EquipArtifactTable
+id (Rid
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit (RperRoundLimit!
+battle_limit (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps
+name (	Rname 
+description	 (	Rdescription:1ä¶EquipArtifactí¶EquipArtifact.xlsxö¶id®¶bproto3
 °
 equipattribute_table.protommorpg.cfgtable.v1cfg_options.proto"”
 EquipAttributeTable
@@ -1724,8 +2137,8 @@ yellowRate:/ä¶EquipAffixRuleí¶EquipAffixRule.xlsxö¶idbproto3
 level (Rlevel
 	min_value (RminValue
 cap (Rcap:5ä¶EquipAttributeCapí¶EquipAttributeCap.xlsxö¶idbproto3
-ˇ
-equipenhance_table.protommorpg.cfgtable.v1cfg_options.proto"≥
+Ÿ
+equipenhance_table.protommorpg.cfgtable.v1cfg_options.proto"ç
 EquipEnhanceTable
 id (Rid'
 bonus_permyriad (RbonusPermyriad!
@@ -1734,7 +2147,13 @@ yellowRate:/ä¶EquipAffixRuleí¶EquipAffixRule.xlsxö¶idbproto3
 	cost_gold (RcostGold)
 material_id (BÚ¨ItemR
 materialId%
-material_count (RmaterialCount:+ä¶EquipEnhanceí¶EquipEnhance.xlsxö¶idbproto3
+material_count (RmaterialCount#
+
+profile_id (Bÿ¨R	profileId
+level	 (Rlevel
+
+pity_limit
+ (R	pityLimit:+ä¶EquipEnhanceí¶EquipEnhance.xlsxö¶idbproto3
 Ù
 equipgem_table.protommorpg.cfgtable.v1cfg_options.proto"¨
 EquipGemTable
@@ -1758,6 +2177,60 @@ equip_kind (Bÿ¨R	equipKind
 
 equip_kind (R	equipKind
 name (	Rname:%ä¶	EquipSlotí¶EquipSlot.xlsxö¶idbproto3
+≈
+equipv1affix_table.protommorpg.cfgtable.v1cfg_options.proto"˘
+EquipV1AffixTable
+id (Rid
+pool (Bÿ¨Rpool
+effect (Reffect!
+effect_param (ReffectParam'
+value_permyriad (RvaluePermyriad
+
+source_cap (R	sourceCap
+name (	Rname 
+description (	Rdescription)
+material_id	 (BÚ¨ItemR
+materialId%
+material_count
+ (RmaterialCount:/ä¶EquipV1Affixí¶EquipV1Affix.xlsxö¶id®¶bproto3
+Ô
+!festivalbeastactivity_table.protommorpg.cfgtable.v1cfg_options.proto"ö
+FestivalBeastActivityTable
+id (Rid
+enabled (Renabled'
+config_revision (RconfigRevision#
+activity_name (	RactivityName
+	boss_name (	RbossName(
+banner_asset_key (	RbannerAssetKey
+icon_key (	RiconKey1
+effective_start_at_ms (ReffectiveStartAtMs-
+effective_end_at_ms	 (ReffectiveEndAtMs.
+claim_showcase_days
+ (RclaimShowcaseDays5
+battle_config_id (BÚ¨DungeonRbattleConfigId#
+required_wins (RrequiredWins'
+reward_identity (	RrewardIdentity:
+reward_definition_version (RrewardDefinitionVersion6
+reward_pet_table_id (BÚ¨PetRrewardPetTableId
+round_limit (R
+roundLimit!
+cycle_rounds (RcycleRounds*
+first_heavy_round (RfirstHeavyRound2
+telegraph_lead_rounds (RtelegraphLeadRounds0
+heavy_damage_percent (RheavyDamagePercent:Aä¶FestivalBeastActivityí¶FestivalBeastActivity.xlsxö¶id∞¶bproto3
+¨
+festivalbeasttier_table.protommorpg.cfgtable.v1cfg_options.proto"€
+FestivalBeastTierTable
+id (Rid
+	min_level (RminLevel
+	max_level (RmaxLevel
+boss_health (R
+bossHealth0
+boss_physical_attack (RbossPhysicalAttack!
+boss_defense (RbossDefense'
+boss_resistance (RbossResistance
+
+boss_speed (R	bossSpeed:9ä¶FestivalBeastTierí¶FestivalBeastTier.xlsxö¶id∞¶bproto3
 ª
 globalvariable_table.protommorpg.cfgtable.v1cfg_options.proto"Ì
 GlobalVariableTable
@@ -1792,8 +2265,8 @@ dungeon_id (BÚ¨DungeonR	dungeonId"
 team_size_max (RteamSizeMax
 daily_limit (R
 dailyLimit:-ä¶GuildActivityí¶GuildActivity.xlsxö¶idbproto3
-á
-guilddonate_table.protommorpg.cfgtable.v1cfg_options.proto"º
+ã
+guilddonate_table.protommorpg.cfgtable.v1cfg_options.proto"¿
 GuildDonateTable
 id (Rid
 name (	Rname#
@@ -1805,7 +2278,7 @@ costAmount+
 funds_gain (R	fundsGain
 daily_limit (R
 dailyLimit&
-min_guild_level (RminGuildLevel:)ä¶GuildDonateí¶GuildDonate.xlsxö¶idbproto3
+min_guild_level (RminGuildLevel:-ä¶GuildDonateí¶GuildDonate.xlsxö¶id∞¶bproto3
 Ü
 guildlevel_table.protommorpg.cfgtable.v1cfg_options.proto"º
 GuildLevelTable
@@ -1815,8 +2288,8 @@ maxMembers!
 max_officers (RmaxOfficers,
 upgrade_cost_funds (RupgradeCostFunds:'ä¶
 GuildLevelí¶GuildLevel.xlsxö¶idbproto3
-√
-guildrule_table.protommorpg.cfgtable.v1cfg_options.proto"˙
+”
+guildrule_table.protommorpg.cfgtable.v1cfg_options.proto"ä
 GuildRuleTable
 id (Rid8
 application_expire_hours (RapplicationExpireHoursL
@@ -1828,9 +2301,12 @@ GuildLevelí¶GuildLevel.xlsxö¶idbproto3
 activity_join_min_hours (RactivityJoinMinHours7
 trial_invite_ttl_seconds	 (RtrialInviteTtlSecondsA
 trial_invite_cooldown_seconds
- (RtrialInviteCooldownSeconds:%ä¶	GuildRuleí¶GuildRule.xlsxö¶idbproto3
-•
-guildshop_table.protommorpg.cfgtable.v1cfg_options.proto"‹
+ (RtrialInviteCooldownSeconds6
+rename_cooldown_seconds (RrenameCooldownSeconds*
+name_hold_seconds (RnameHoldSeconds*
+rename_cost_funds (RrenameCostFunds:%ä¶	GuildRuleí¶GuildRule.xlsxö¶idbproto3
+©
+guildshop_table.protommorpg.cfgtable.v1cfg_options.proto"‡
 GuildShopTable
 id (Rid
 name (	Rname
@@ -1842,13 +2318,13 @@ item_count (R	itemCount+
 required_guild_level (RrequiredGuildLevel!
 limit_period (RlimitPeriod
 limit_count	 (R
-limitCount:%ä¶	GuildShopí¶GuildShop.xlsxö¶idbproto3
-∏
+limitCount:)ä¶	GuildShopí¶GuildShop.xlsxö¶id∞¶bproto3
+˝
 item_table.protommorpg.cfgtable.v1cfg_options.proto"Y
 Itembase_attr 
 base_attr_id (R
 baseAttrId&
-base_attr_value (RbaseAttrValue"ô
+base_attr_value (RbaseAttrValue"ﬁ
 	ItemTable
 id (Rid$
 max_stack_size (RmaxStackSize
@@ -1869,16 +2345,21 @@ equipClass
 affix_pool (R	affixPool1
 
 affix_rule (BÚ¨EquipAffixRuleR	affixRuleD
-	base_attr (2!.mmorpg.cfgtable.v1.Itembase_attrB∏¨RbaseAttr:ä¶Itemí¶	Item.xlsxö¶idbproto3
-è
-messagelimiter_table.protommorpg.cfgtable.v1cfg_options.proto"¡
+	base_attr (2!.mmorpg.cfgtable.v1.Itembase_attrB∏¨RbaseAttr#
+equip_profile (RequipProfile4
+forge_material_id (BÚ¨ItemRforgeMaterialId0
+forge_material_count (RforgeMaterialCount2
+artifact_id (BÚ¨EquipArtifactR
+artifactId:ä¶Itemí¶	Item.xlsxö¶id®¶bproto3
+ì
+messagelimiter_table.protommorpg.cfgtable.v1cfg_options.proto"≈
 MessageLimiterTable
 id (Rid!
 max_requests (RmaxRequests
 time_window (R
 timeWindow%
 tip_message (BË¨R
-tipMessage:/ä¶MessageLimiterí¶MessageLimiter.xlsxö¶idbproto3
+tipMessage:3ä¶MessageLimiterí¶MessageLimiter.xlsxö¶id∞¶bproto3
 ›
 mirror_table.protommorpg.cfgtable.v1cfg_options.proto"ó
 MirrorTable
@@ -1899,13 +2380,13 @@ autoReward'
 Ú¨RewardRrewardId,
 next_mission_id (B∏¨RnextMissionId'
 target_count	 (B∏¨RtargetCount:!ä¶Missioní¶Mission.xlsxö¶idbproto3
-∂
+∞
 monster_table.protommorpg.cfgtable.v1cfg_options.proto"f
 Monsterdrop
 	drop_item (RdropItem
 
 drop_count (R	dropCount
-	drop_rate (RdropRate"á
+	drop_rate (RdropRate"Å
 MonsterTable
 id (Rid
 health (Rhealth
@@ -1924,9 +2405,12 @@ exp_reward (R	expReward
 goldReward9
 drop
  (2.mmorpg.cfgtable.v1.MonsterdropB∏¨Rdrop)
-designer©F (B≤¨designerRdesigner:!ä¶Monsterí¶Monster.xlsxö¶idbproto3
-Ü
- mysterymerchantgoods_table.protommorpg.cfgtable.v1cfg_options.proto"≤
+designer©F (B≤¨designerRdesigner8
+capture_pet_table_id (BÚ¨PetRcapturePetTableId!
+capture_rate (RcaptureRate
+is_boss (RisBoss:%ä¶Monsterí¶Monster.xlsxö¶id∞¶bproto3
+ä
+ mysterymerchantgoods_table.protommorpg.cfgtable.v1cfg_options.proto"∂
 MysteryMerchantGoodsTable
 id (Rid
 name (	Rname!
@@ -1937,9 +2421,9 @@ item_count (R	itemCount#
 price (Rprice
 weight (Rweight
 limit_count (R
-limitCount:;ä¶MysteryMerchantGoodsí¶MysteryMerchantGoods.xlsxö¶idbproto3
-Á
-mysterymerchantrule_table.protommorpg.cfgtable.v1cfg_options.proto"î
+limitCount:?ä¶MysteryMerchantGoodsí¶MysteryMerchantGoods.xlsxö¶id∞¶bproto3
+Î
+mysterymerchantrule_table.protommorpg.cfgtable.v1cfg_options.proto"ò
 MysteryMerchantRuleTable
 id (Rid)
 interval_seconds (RintervalSeconds!
@@ -1950,7 +2434,7 @@ shelf_size (R	shelfSize+
 weight_discount50 (RweightDiscount50+
 weight_discount40 (RweightDiscount40%
 interact_range (RinteractRange
-desc	 (	Rdesc:9ä¶MysteryMerchantRuleí¶MysteryMerchantRule.xlsxö¶idbproto3
+desc	 (	Rdesc:=ä¶MysteryMerchantRuleí¶MysteryMerchantRule.xlsxö¶id∞¶bproto3
 §
 mysterymerchantspot_table.protommorpg.cfgtable.v1cfg_options.proto"—
 MysteryMerchantSpotTable
@@ -1960,8 +2444,8 @@ shelf_size (R	shelfSize+
 y (Ry
 z (Rz
 desc (	Rdesc:9ä¶MysteryMerchantSpotí¶MysteryMerchantSpot.xlsxö¶idbproto3
-‡
-pet_table.protommorpg.cfgtable.v1cfg_options.proto"ù
+Û
+pet_table.protommorpg.cfgtable.v1cfg_options.proto"∞
 PetTable
 id (Rid
 name (	Rname
@@ -1978,9 +2462,30 @@ init_speed
  (R	initSpeed'
 aptitude_min (B∏¨RaptitudeMin'
 aptitude_max (B∏¨RaptitudeMax
-skill (B∏¨Rskill:ä¶Petí¶Pet.xlsxö¶idbproto3
-ª
-petrule_table.protommorpg.cfgtable.v1cfg_options.proto"Ù
+skill (B∏¨Rskill&
+shop_price_gold (RshopPriceGold)
+acquisition_tier (RacquisitionTier)
+cultivation_tier (RcultivationTier'
+transfer_policy (RtransferPolicy0
+exclusive_gift_slots (RexclusiveGiftSlots4
+fixed_initial_aptitude (RfixedInitialAptitude:ä¶Petí¶Pet.xlsxö¶id®¶bproto3
+Î
+petentry_table.protommorpg.cfgtable.v1cfg_options.proto"£
+PetEntryTable
+id (Rid
+name (	Rname
+desc (	Rdesc
+category (Rcategory
+channel (Rchannel
+
+state_kind (R	stateKind
+cap (Rcap"
+per_point_bps (RperPointBps
+sort	 (Rsort
+icon
+ (	Ricon:'ä¶PetEntryí¶PetEntry.xlsxö¶id®¶bproto3
+Õ
+petrule_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
 PetRuleTable
 id (Rid
 max_pets (RmaxPets 
@@ -1988,16 +2493,79 @@ init_speed
 nameMaxLen(
 rename_cost_gold (RrenameCostGold6
 summon_cooldown_seconds (RsummonCooldownSeconds
-desc (	Rdesc:!ä¶PetRuleí¶PetRule.xlsxö¶idbproto3
-†
-playmode_table.protommorpg.cfgtable.v1cfg_options.proto"ÿ
+desc (	Rdesc0
+entry_config_version (RentryConfigVersion,
+entry_total_points (RentryTotalPoints0
+entry_max_directions	 (RentryMaxDirections:!ä¶PetRuleí¶PetRule.xlsxö¶idbproto3
+Õ
+pettier_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
+PetTierTable
+id (Rid
+name (	Rname
+art_key (	RartKey
+desc (	Rdesc:%ä¶PetTierí¶PetTier.xlsxö¶id®¶bproto3
+‘
+playmode_table.protommorpg.cfgtable.v1cfg_options.proto"å
 PlayModeTable
 id (Rid
 
 match_mode (R	matchMode5
 battle_config_id (BÚ¨DungeonRbattleConfigId
 enabled (Renabled"
-team_size_max (RteamSizeMax:#ä¶PlayModeí¶PlayMode.xlsxö¶idbproto3
+team_size_max (RteamSizeMax2
+allowed_team_sizes (B∏¨RallowedTeamSizes:#ä¶PlayModeí¶PlayMode.xlsxö¶idbproto3
+›
+rankedpreset_table.protommorpg.cfgtable.v1cfg_options.proto"ë
+RankedPresetTable
+id (Rid
+	role_kind (RroleKind
+code (	Rcode
+name (	Rname
+role_tag (	RroleTag)
+pet_table_id (BÚ¨PetR
+petTableId
+
+weight_con (R	weightCon
+
+weight_spi (R	weightSpi
+
+weight_str	 (R	weightStr
+
+weight_agi
+ (R	weightAgi*
+	skill_ids (B∏¨Ú¨SkillRskillIds4
+pet_entry_ids (B∏¨Ú¨PetEntryRpetEntryIds.
+pet_entry_points (B∏¨RpetEntryPoints
+sort (Rsort
+desc (	Rdesc:+ä¶RankedPresetí¶RankedPreset.xlsxö¶idbproto3
+–	
+rankedrule_table.protommorpg.cfgtable.v1cfg_options.proto"Ü	
+RankedRuleTable
+id (Rid!
+rule_version (RruleVersion5
+battle_config_id (BÚ¨DungeonRbattleConfigId7
+reference_class_id (B	Ú¨ClassRreferenceClassId+
+competitive_level (RcompetitiveLevel=
+default_character_preset_id (RdefaultCharacterPresetId1
+default_pet_preset_id (RdefaultPetPresetId0
+season_duration_days (RseasonDurationDays.
+wait_prompt_seconds	 (RwaitPromptSeconds0
+spread_tier1_seconds
+ (RspreadTier1Seconds.
+spread_tier1_points (RspreadTier1Points0
+spread_tier2_seconds (RspreadTier2Seconds.
+spread_tier2_points (RspreadTier2Points.
+spread_tier3_points (RspreadTier3Points8
+milestone_avatar_matches (RmilestoneAvatarMatches4
+milestone_card_matches (RmilestoneCardMatches<
+milestone_talisman_matches (RmilestoneTalismanMatches.
+tier_qingfeng_centi (RtierQingfengCenti.
+tier_yunzhang_centi (RtierYunzhangCenti,
+tier_tianshu_centi (RtierTianshuCenti.
+tier_wushuang_centi (RtierWushuangCenti
+desc (	Rdesc2
+milestone_win_matches (RmilestoneWinMatches:'ä¶
+RankedRuleí¶RankedRule.xlsxö¶idbproto3
 û
 reward_table.protommorpg.cfgtable.v1cfg_options.proto"R
 Rewardreward
@@ -2007,8 +2575,8 @@ rewardItem!
 RewardTable
 id (B‡¨Rid>
 reward (2 .mmorpg.cfgtable.v1.RewardrewardB∏¨Rreward:ä¶Rewardí¶Reward.xlsxö¶idbproto3
-˚
-rolenamerule_table.protommorpg.cfgtable.v1cfg_options.proto"Ø
+∏
+rolenamerule_table.protommorpg.cfgtable.v1cfg_options.proto"Ï
 RoleNameRuleTable
 id (Rid
 	min_chars (RminChars
@@ -2016,8 +2584,53 @@ rewardItem!
 generated_prefix (	RgeneratedPrefix0
 generated_suffix_len (RgeneratedSuffixLen2
 max_generate_attempts (RmaxGenerateAttempts
-desc (	Rdesc:+ä¶RoleNameRuleí¶RoleNameRule.xlsxö¶idbproto3
-≈
+desc (	Rdesc6
+rename_cooldown_seconds (RrenameCooldownSeconds1
+old_name_hold_seconds	 (RoldNameHoldSeconds$
+rename_item_id
+ (RrenameItemId*
+rename_item_count (RrenameItemCount:+ä¶RoleNameRuleí¶RoleNameRule.xlsxö¶idbproto3
+†
+seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"÷
+SeasonRuleTable
+id (Rid
+name (	Rname 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+enabled (Renabled&
+seal_max_points (RsealMaxPoints$
+pve_win_points (RpveWinPoints$
+pvp_win_points (RpvpWinPoints(
+pvp_other_points	 (RpvpOtherPoints+
+max_health_bps_cap
+ (RmaxHealthBpsCap&
+defense_bps_cap (RdefenseBpsCap2
+catchup_currency_type (RcatchupCurrencyType5
+catchup_price_per_point (RcatchupPricePerPoint&
+default_seal_id (RdefaultSealId
+desc (	Rdesc:+ä¶
+SeasonRuleí¶SeasonRule.xlsxö¶id∞¶bproto3
+è
+seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"≈
+SeasonSealTable
+id (Rid/
+	season_id (Bÿ¨Ú¨
+SeasonRuleRseasonId
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey
+	effect_id (ReffectId
+	bonus_bps (RbonusBps
+cap_bps (RcapBps&
+per_round_limit	 (RperRoundLimit!
+battle_limit
+ (RbattleLimit#
+active_rounds (RactiveRounds0
+health_threshold_bps (RhealthThresholdBps:+ä¶
+SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3
+¡
 skill_table.protommorpg.cfgtable.v1cfg_options.proto"l
 Skillcost_resource(
 cost_resource_id (RcostResourceId,
@@ -2027,7 +2640,7 @@ rewardItem!
 required_item_value (RrequiredItemValue"Ü
 Skillrequired_resource4
 required_resource_type (RrequiredResourceType6
-required_resource_value (RrequiredResourceValue"ï
+required_resource_value (RrequiredResourceValue"ë
 
 SkillTable
 id (Rid#
@@ -2085,14 +2698,54 @@ initiative+ (R
 initiative!
 passive_stat, (	RpassiveStat'
 passive_percent- (RpassivePercent!
-buff_percent. (RbuffPercent:ä¶Skillí¶
-Skill.xlsxö¶idbproto3
-—
-skillpermission_table.protommorpg.cfgtable.v1cfg_options.proto"Ç
+buff_percent. (RbuffPercent!
+battle_model/ (RbattleModel
+caster_mask0 (R
+casterMask!
+ability_kind1 (RabilityKind&
+pet_max_targets2 (RpetMaxTargets%
+init_effect3 (B∏¨R
+initEffect%
+prototype_code4 (	RprototypeCode&
+max_battle_uses5 (RmaxBattleUses(
+health_cost_mode6 (RhealthCostMode
+action_tags7 (R
+actionTags*
+allow_dead_target8 (RallowDeadTarget
+forbid_copy9 (R
+forbidCopy
+	season_id: (RseasonId
+	scroll_id; (RscrollId
+rarity_tier< (R
+rarityTier:!ä¶Skillí¶
+Skill.xlsxö¶id∞¶bproto3
+’
+skillpermission_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
 SkillPermissionTable
 id (Rid'
 
-skill_type (B∏¨Ë¨R	skillType:1ä¶SkillPermissioní¶SkillPermission.xlsxö¶idbproto3
+skill_type (B∏¨Ë¨R	skillType:5ä¶SkillPermissioní¶SkillPermission.xlsxö¶id∞¶bproto3
+£
+skillscrollcraft_table.protommorpg.cfgtable.v1cfg_options.proto"”
+SkillScrollCraftTable
+id (Rid
+name (	Rname 
+description (	Rdescription
+rarity_tier (R
+rarityTier2
+fragment_item_id (BÚ¨ItemRfragmentItemId2
+random_fragment_count (RrandomFragmentCount(
+random_gold_cost (RrandomGoldCost6
+targeted_fragment_count (RtargetedFragmentCount,
+targeted_gold_cost	 (RtargetedGoldCost8
+dismantle_fragment_count
+ (RdismantleFragmentCount-
+rare_scroll_item_id (RrareScrollItemId*
+rare_scroll_count (RrareScrollCount'
+rare_ink_item_id (RrareInkItemId$
+rare_ink_count (RrareInkCount$
+rare_gold_cost (RrareGoldCost
+enabled (Renabled:7ä¶SkillScrollCraftí¶SkillScrollCraft.xlsxö¶id∞¶bproto3
 œ
 test_table.protommorpg.cfgtable.v1cfg_options.proto"S
 Testtestobj
@@ -2145,397 +2798,6 @@ mUint32Key(
 ImmuneTag1Entry
 key (	Rkey
 value (	Rvalue:8:+ä¶TestMultiKeyí¶TestMultiKey.xlsxö¶idbproto3
-©
-world_table.protommorpg.cfgtable.v1cfg_options.proto"e
-
-WorldTable
-id (Rid(
-scene_id (BÚ¨	BaseSceneRsceneId:ä¶Worldí¶
-World.xlsxö¶idbproto3
-à
-zonegroup_table.protommorpg.cfgtable.v1cfg_options.proto"ø
-ZoneGroupTable
-id (Rid
-group_id (RgroupId
-
-zone_begin (R	zoneBegin
-zone_end (RzoneEnd!
-name©F (	B≤¨designerRname:%ä¶	ZoneGroupí¶ZoneGroup.xlsxö¶idbproto3
-Ò
-afkpassrule_table.protommorpg.cfgtable.v1cfg_options.proto"¶
-AfkPassRuleTable
-id (Rid
-period_days (R
-periodDays.
-price_currency_type (RpriceCurrencyType
-price (Rprice,
-max_remaining_days (RmaxRemainingDays.
-remind_before_hours (RremindBeforeHours
-desc (	Rdesc:)ä¶AfkPassRuleí¶AfkPassRule.xlsxö¶idbproto3
-à
-appearancerule_table.protommorpg.cfgtable.v1cfg_options.proto"∫
-AppearanceRuleTable
-id (Rid*
-card_item_id (BÚ¨ItemR
-cardItemId&
-card_item_count (RcardItemCount4
-trial_duration_seconds (RtrialDurationSeconds
-mall_sku_id (R	mallSkuId$
-mall_price_fen (RmallPriceFen
-desc (	Rdesc:/ä¶AppearanceRuleí¶AppearanceRule.xlsxö¶idbproto3
-∞
-appearanceseries_table.protommorpg.cfgtable.v1cfg_options.proto"‡
-AppearanceSeriesTable
-id (Rid
-
-series_key (	R	seriesKey
-name (	Rname
-
-sort_order (R	sortOrder
-enabled (Renabled
-desc (	Rdesc2
-completion_badge_name (	RcompletionBadgeName%
-epilogue_title (	RepilogueTitle#
-epilogue_body	 (	RepilogueBody:7ä¶AppearanceSeriesí¶AppearanceSeries.xlsxö¶id®¶bproto3
-—
-characterappearance_table.protommorpg.cfgtable.v1cfg_options.proto"˛
-CharacterAppearanceTable
-id (B‡¨Rid#
-appearance_id (	RappearanceId
-name (	Rname
-enabled (Renabled
-
-sort_order (R	sortOrder
-desc (	Rdesc+
-starter_creatable (RstarterCreatable'
-card_unlockable (RcardUnlockable1
-	series_id	 (BÚ¨AppearanceSeriesRseriesId:=ä¶CharacterAppearanceí¶CharacterAppearance.xlsxö¶id®¶bproto3
-≤
-equipartifact_table.protommorpg.cfgtable.v1cfg_options.proto"Â
-EquipArtifactTable
-id (Rid
-	bonus_bps (RbonusBps
-cap_bps (RcapBps&
-per_round_limit (RperRoundLimit!
-battle_limit (RbattleLimit#
-active_rounds (RactiveRounds0
-health_threshold_bps (RhealthThresholdBps
-name (	Rname 
-description	 (	Rdescription:1ä¶EquipArtifactí¶EquipArtifact.xlsxö¶id®¶bproto3
-≈
-equipv1affix_table.protommorpg.cfgtable.v1cfg_options.proto"˘
-EquipV1AffixTable
-id (Rid
-pool (Bÿ¨Rpool
-effect (Reffect!
-effect_param (ReffectParam'
-value_permyriad (RvaluePermyriad
-
-source_cap (R	sourceCap
-name (	Rname 
-description (	Rdescription)
-material_id	 (BÚ¨ItemR
-materialId%
-material_count
- (RmaterialCount:/ä¶EquipV1Affixí¶EquipV1Affix.xlsxö¶id®¶bproto3
-Î
-petentry_table.protommorpg.cfgtable.v1cfg_options.proto"£
-PetEntryTable
-id (Rid
-name (	Rname
-desc (	Rdesc
-category (Rcategory
-channel (Rchannel
-
-state_kind (R	stateKind
-cap (Rcap"
-per_point_bps (RperPointBps
-sort	 (Rsort
-icon
- (	Ricon:'ä¶PetEntryí¶PetEntry.xlsxö¶id®¶bproto3
-Õ
-pettier_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
-PetTierTable
-id (Rid
-name (	Rname
-art_key (	RartKey
-desc (	Rdesc:%ä¶PetTierí¶PetTier.xlsxö¶id®¶bproto3
-›
-rankedpreset_table.protommorpg.cfgtable.v1cfg_options.proto"ë
-RankedPresetTable
-id (Rid
-	role_kind (RroleKind
-code (	Rcode
-name (	Rname
-role_tag (	RroleTag)
-pet_table_id (BÚ¨PetR
-petTableId
-
-weight_con (R	weightCon
-
-weight_spi (R	weightSpi
-
-weight_str	 (R	weightStr
-
-weight_agi
- (R	weightAgi*
-	skill_ids (B∏¨Ú¨SkillRskillIds4
-pet_entry_ids (B∏¨Ú¨PetEntryRpetEntryIds.
-pet_entry_points (B∏¨RpetEntryPoints
-sort (Rsort
-desc (	Rdesc:+ä¶RankedPresetí¶RankedPreset.xlsxö¶idbproto3
-ú	
-rankedrule_table.protommorpg.cfgtable.v1cfg_options.proto"“
-RankedRuleTable
-id (Rid!
-rule_version (RruleVersion5
-battle_config_id (BÚ¨DungeonRbattleConfigId7
-reference_class_id (B	Ú¨ClassRreferenceClassId+
-competitive_level (RcompetitiveLevel=
-default_character_preset_id (RdefaultCharacterPresetId1
-default_pet_preset_id (RdefaultPetPresetId0
-season_duration_days (RseasonDurationDays.
-wait_prompt_seconds	 (RwaitPromptSeconds0
-spread_tier1_seconds
- (RspreadTier1Seconds.
-spread_tier1_points (RspreadTier1Points0
-spread_tier2_seconds (RspreadTier2Seconds.
-spread_tier2_points (RspreadTier2Points.
-spread_tier3_points (RspreadTier3Points8
-milestone_avatar_matches (RmilestoneAvatarMatches4
-milestone_card_matches (RmilestoneCardMatches<
-milestone_talisman_matches (RmilestoneTalismanMatches.
-tier_qingfeng_centi (RtierQingfengCenti.
-tier_yunzhang_centi (RtierYunzhangCenti,
-tier_tianshu_centi (RtierTianshuCenti.
-tier_wushuang_centi (RtierWushuangCenti
-desc (	Rdesc:'ä¶
-RankedRuleí¶RankedRule.xlsxö¶idbproto3
-†
-seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"÷
-SeasonRuleTable
-id (Rid
-name (	Rname 
-starts_at_ms (R
-startsAtMs
-
-ends_at_ms (RendsAtMs
-enabled (Renabled&
-seal_max_points (RsealMaxPoints$
-pve_win_points (RpveWinPoints$
-pvp_win_points (RpvpWinPoints(
-pvp_other_points	 (RpvpOtherPoints+
-max_health_bps_cap
- (RmaxHealthBpsCap&
-defense_bps_cap (RdefenseBpsCap2
-catchup_currency_type (RcatchupCurrencyType5
-catchup_price_per_point (RcatchupPricePerPoint&
-default_seal_id (RdefaultSealId
-desc (	Rdesc:+ä¶
-SeasonRuleí¶SeasonRule.xlsxö¶id∞¶bproto3
-è
-seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"≈
-SeasonSealTable
-id (Rid/
-	season_id (Bÿ¨Ú¨
-SeasonRuleRseasonId
-name (	Rname 
-description (	Rdescription
-icon_key (	RiconKey
-	effect_id (ReffectId
-	bonus_bps (RbonusBps
-cap_bps (RcapBps&
-per_round_limit	 (RperRoundLimit!
-battle_limit
- (RbattleLimit#
-active_rounds (RactiveRounds0
-health_threshold_bps (RhealthThresholdBps:+ä¶
-SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3
-ú
-(table_wire/equipaffixquality_table.proto"“
-EquipAffixQualityTable
-id (Rid
-name (	Rname
-	ratio_pct (RratioPct+
-apprentice_weight (RapprenticeWeight%
-artisan_weight (RartisanWeight#
-master_weight (RmasterWeight"I
-EquipAffixQualityTableData+
-data (2.EquipAffixQualityTableRdataBH
-com.game.tableB EquipAffixQualityTableOuterClassPZgenerated/pb/tablebproto3
-÷
-'table_wire/skillscrollcraft_table.proto"ê
-SkillScrollCraftTable
-id (Rid
-name (	Rname 
-description (	Rdescription
-rarity_tier (R
-rarityTier(
-fragment_item_id (RfragmentItemId2
-random_fragment_count (RrandomFragmentCount(
-random_gold_cost (RrandomGoldCost6
-targeted_fragment_count (RtargetedFragmentCount,
-targeted_gold_cost	 (RtargetedGoldCost8
-dismantle_fragment_count
- (RdismantleFragmentCount-
-rare_scroll_item_id (RrareScrollItemId*
-rare_scroll_count (RrareScrollCount'
-rare_ink_item_id (RrareInkItemId$
-rare_ink_count (RrareInkCount$
-rare_gold_cost (RrareGoldCost
-enabled (Renabled"G
-SkillScrollCraftTableData*
-data (2.SkillScrollCraftTableRdataBG
-com.game.tableBSkillScrollCraftTableOuterClassPZgenerated/pb/tablebproto3
-´
-'table_wire/tournamentreward_table.proto"Â
-TournamentRewardTable
-id (Rid
-	tier_kind (RtierKind
-min_rank (RminRank
-max_rank (RmaxRank
-gold_amount (R
-goldAmount
-item_ids (RitemIds
-item_counts (R
-itemCounts
-
-title_code (	R	titleCode
-
-badge_code	 (	R	badgeCode
-
-mail_title
- (	R	mailTitle
-	mail_body (	RmailBody
-desc (	Rdesc"G
-TournamentRewardTableData*
-data (2.TournamentRewardTableRdataBG
-com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
-°
-%table_wire/tournamentrule_table.proto"„
-TournamentRuleTable
-id (Rid!
-rule_version (RruleVersion
-enabled (Renabled(
-battle_config_id (RbattleConfigId(
-battle_team_size (RbattleTeamSize&
-roster_max_size (RrosterMaxSize
-	min_level (RminLevel+
-registration_days (RregistrationDays%
-qualifier_days	 (RqualifierDays#
-knockout_days
- (RknockoutDays.
-settle_display_days (RsettleDisplayDays2
-qualifier_max_matches (RqualifierMaxMatches:
-participation_min_matches (RparticipationMinMatches,
-knockout_max_teams (RknockoutMaxTeamsC
-knockout_round_timeout_seconds (RknockoutRoundTimeoutSeconds0
-qualifier_win_points (RqualifierWinPoints2
-qualifier_draw_points (RqualifierDrawPoints2
-qualifier_loss_points (RqualifierLossPoints,
-invite_ttl_seconds (RinviteTtlSeconds
-desc (	Rdesc"C
-TournamentRuleTableData(
-data (2.TournamentRuleTableRdataBE
-com.game.tableBTournamentRuleTableOuterClassPZgenerated/pb/tablebproto3
-œ
-(table_wire/trialjournalentry_table.proto"Ö
-TrialJournalEntryTable
-id (Rid
-
-chapter_id (R	chapterId
-	season_id (RseasonId
-source_kind (R
-sourceKind
-
-difficulty (R
-difficulty
-variant_key (	R
-variantKey!
-rule_version (RruleVersion*
-rule_version_name (	RruleVersionName
-enabled	 (Renabled
-
-sort_order
- (R	sortOrder!
-display_name (	RdisplayName!
-chapter_name (	RchapterName
-icon_key (	RiconKey
-unlock_mode (R
-unlockMode
-jump_target (	R
-jumpTarget
-desc (	Rdesc"I
-TrialJournalEntryTableData+
-data (2.TrialJournalEntryTableRdataBH
-com.game.tableB TrialJournalEntryTableOuterClassPZgenerated/pb/tablebproto3
-ä
-,table_wire/trialjournalmilestone_table.proto"∞
-TrialJournalMilestoneTable
-id (Rid(
-scope_chapter_id (RscopeChapterId
-	season_id (RseasonId%
-required_seals (RrequiredSeals(
-bound_sand_count (RboundSandCount?
-bound_artifact_voucher_count (RboundArtifactVoucherCount
-	badge_key (	RbadgeKey
-
-badge_name (	R	badgeName%
-commentary_key	 (	RcommentaryKey)
-commentary_title
- (	RcommentaryTitle'
-commentary_body (	RcommentaryBody.
-grant_appearance_id (	RgrantAppearanceId
-enabled (Renabled
-title (	Rtitle
-desc (	Rdesc"Q
-TrialJournalMilestoneTableData/
-data (2.TrialJournalMilestoneTableRdataBL
-com.game.tableB$TrialJournalMilestoneTableOuterClassPZgenerated/pb/tablebproto3
-¬
-'table_wire/trialjournalseal_table.proto"¸
-TrialJournalSealTable
-id (Rid
-entry_id (RentryId$
-seal_slot_kind (RsealSlotKind%
-condition_type (RconditionType'
-condition_param (RconditionParam
-enabled (Renabled
-title (	Rtitle
-desc (	Rdesc"G
-TrialJournalSealTableData*
-data (2.TrialJournalSealTableRdataBG
-com.game.tableBTrialJournalSealTableOuterClassPZgenerated/pb/tablebproto3
-ﬁ
-equipaffixquality_table.protommorpg.cfgtable.v1cfg_options.proto"ç
-EquipAffixQualityTable
-id (Rid
-name (	Rname
-	ratio_pct (RratioPct+
-apprentice_weight (RapprenticeWeight%
-artisan_weight (RartisanWeight#
-master_weight (RmasterWeight:9ä¶EquipAffixQualityí¶EquipAffixQuality.xlsxö¶id∞¶bproto3
-£
-skillscrollcraft_table.protommorpg.cfgtable.v1cfg_options.proto"”
-SkillScrollCraftTable
-id (Rid
-name (	Rname 
-description (	Rdescription
-rarity_tier (R
-rarityTier2
-fragment_item_id (BÚ¨ItemRfragmentItemId2
-random_fragment_count (RrandomFragmentCount(
-random_gold_cost (RrandomGoldCost6
-targeted_fragment_count (RtargetedFragmentCount,
-targeted_gold_cost	 (RtargetedGoldCost8
-dismantle_fragment_count
- (RdismantleFragmentCount-
-rare_scroll_item_id (RrareScrollItemId*
-rare_scroll_count (RrareScrollCount'
-rare_ink_item_id (RrareInkItemId$
-rare_ink_count (RrareInkCount$
-rare_gold_cost (RrareGoldCost
-enabled (Renabled:7ä¶SkillScrollCraftí¶SkillScrollCraft.xlsxö¶id∞¶bproto3
 Ñ
 tournamentreward_table.protommorpg.cfgtable.v1cfg_options.proto"¥
 TournamentRewardTable
@@ -2640,3 +2902,19 @@ badge_name (	R	badgeName%
 enabled (Renabled
 title (	Rtitle
 desc (	Rdesc:;ä¶TrialJournalSealí¶TrialJournalSeal.xlsxö¶id®¶∞¶bproto3
+©
+world_table.protommorpg.cfgtable.v1cfg_options.proto"e
+
+WorldTable
+id (Rid(
+scene_id (BÚ¨	BaseSceneRsceneId:ä¶Worldí¶
+World.xlsxö¶idbproto3
+à
+zonegroup_table.protommorpg.cfgtable.v1cfg_options.proto"ø
+ZoneGroupTable
+id (Rid
+group_id (RgroupId
+
+zone_begin (R	zoneBegin
+zone_end (RzoneEnd!
+name©F (	B≤¨designerRname:%ä¶	ZoneGroupí¶ZoneGroup.xlsxö¶idbproto3
