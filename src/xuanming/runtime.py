@@ -77,6 +77,7 @@ class Runtime:
         self.gate = None
         self.scene = None
         self.battle = None
+        self.local_services = None
         self._battle_control = None
         self._battle_clients = None
         self._battle_agones = None
@@ -99,10 +100,19 @@ class Runtime:
             self._scene_drain_budget = budget_from_env()
         try:
             if self.local:
+                from .nodes.local_services import LocalServiceHub
+
                 self.directory = LocalDirectory()
+                self.local_services = LocalServiceHub(
+                    self.protocol, tables=self._config_tables(), zone_id=self.settings.zone_id,
+                )
+                self._stack.push_async_callback(self.local_services.close)
                 await self._scene()
                 await self._gate()
                 await self._battle()
+                self.local_services.bind_runtime(
+                    local_login=self.local_login, gate=self.gate, scene=self.scene, battle=self.battle,
+                )
             else:
                 self.directory = EtcdDirectory(self.protocol, self.settings.etcd)
                 self._stack.push_async_callback(self.directory.close)
@@ -252,11 +262,16 @@ class Runtime:
         info.max_connections = self.settings.max_gate_connections
         if self.local:
             from .nodes.local_login import LocalLogin
+            from .nodes.local_services import LocalGatewayForwarder
 
             token = self.dev_token or os.getenv("XUANMING_DEV_LOGIN_TOKEN", "")
             if not token:
                 raise ValueError("本地模式需要设置 XUANMING_DEV_LOGIN_TOKEN")
-            forward = self.local_login = LocalLogin(self.protocol, self.scene.info, access_token=token)
+            accounts_path = (self.settings.local_player_store or self.settings.database).with_name("local_accounts.json")
+            self.local_login = LocalLogin(
+                self.protocol, self.scene.info, access_token=token, store_path=accounts_path,
+            )
+            forward = LocalGatewayForwarder(self.local_login, self.local_services)
         elif self.settings.gate_uses_router():
             client = GrpcClient(self.settings.router)
             self._stack.push_async_callback(client.close)
@@ -561,6 +576,9 @@ class Runtime:
             scene.create(self.protocol.message("CreateSceneRequest", config_id=1, scene_id=1))
             scene.register("SceneSceneClientPlayer", "EnterScene", scene.local_scene_entry)
             scene.register("SceneSceneClientPlayer", "TravelToZone", scene.local_zone_travel)
+            if self.local_services is not None:
+                match_call = self.local_services.call_raw
+                account_secret = self.local_services._internal_secret
         else:
             account_secret = secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE")
             scene.travel = await create_scene_travel(scene, tables, self.settings, self.directory)
@@ -636,7 +654,7 @@ class Runtime:
         scene.skill_craft.register()
         scene.festival_beast = SceneFestivalBeast(scene, tables, scene.assets)
         scene.festival_beast.register()
-        scene_cg_call = None
+        scene_cg_call = self.local_services.call_raw if (self.local and self.local_services is not None) else None
         if not self.local:
             cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()
             if not cg_endpoint and isinstance(self.settings.content_guard_node, dict):
@@ -664,7 +682,12 @@ class Runtime:
         settlement = BattleSettlement(scene, tables, scene.assets, missions)
         settlement.register()
         mail_ids = IdSegments.local(self.settings.database, "txlog") if self.local else allocate_tx_id
-        scene.mail_outbox = SceneMailOutbox(scene, mail_ids, MailSender(self.protocol, self.directory))
+        mail_sender = (
+            self.local_services.mail_sender
+            if (self.local and self.local_services is not None)
+            else MailSender(self.protocol, self.directory)
+        )
+        scene.mail_outbox = SceneMailOutbox(scene, mail_ids, mail_sender)
         scene.inbox = SceneInbox(scene, peer, settlement, scene.assets, poll_seconds=5 if self.local else 60)
         skills = SceneSkills(scene, tables)
         skills.register()

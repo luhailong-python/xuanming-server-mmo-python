@@ -7,10 +7,12 @@ import time
 import uuid
 
 import grpc
+from aiohttp import web
 
 from .portal_sql import connection
 
 _LOG = logging.getLogger(__name__)
+_HEALTH_TASK_KEY = web.AppKey("health_task", asyncio.Task | None)
 
 
 def summarize(zone, capacity, gates, scenes):
@@ -127,11 +129,11 @@ class HealthPublisher:
 
 def register_background(app, deps):
     async def start(_app):
-        app["health_task"] = (asyncio.create_task(HealthPublisher(deps).run())
-                              if deps.settings.home_zone_ids else None)
+        app[_HEALTH_TASK_KEY] = (asyncio.create_task(HealthPublisher(deps).run())
+                                 if deps.settings.home_zone_ids else None)
 
     async def stop(_app):
-        task = app["health_task"]
+        task = app[_HEALTH_TASK_KEY]
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

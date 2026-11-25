@@ -16,7 +16,7 @@
 - **双击一键单进程启动**：保留面向 Windows 本地开发的「双击一键单进程启动」范式：
   - 一键脚本：`启动玄冥服务器.bat`
   - 标准 CLI 入口：`python -m xuanming run local --config config/local.toml`
-- **全量进程内托管**：单进程同时托管 Gate + Scene + Battle 全量逻辑，使用内存目录与本地存档，**零外部中间件依赖**（无需安装或启动 MySQL / TiDB / Redis / etcd / Kafka）。
+- **全量进程内托管**：单进程同时托管 Gate + Scene + Battle 及 `LocalServiceHub`（进程内直接复用正式 Friend / Chat / Mail / Guild / Team / Match / Rank / Payment / Trade / ContentGuard 微服务与 `Memory*Store`），使用内存目录、ProtoJSON 角色存档与 `local_accounts.json` 本地角色名册，**零外部中间件依赖**（无需安装或启动 MySQL / TiDB / Redis / etcd / Kafka）。
 - **回环绑定与日志诊断**：
   - 本地模式强制仅监听回环地址（`127.0.0.1` / `::1`），防止开发节点暴露至局域网或公网。
   - 静默控制台启动日志统一落盘至 `run/logs/server-console.log`；若进程异常退出，启动脚本必须自动展示日志末尾 **40 行**并执行 `pause`，避免窗口闪退丢失现场。

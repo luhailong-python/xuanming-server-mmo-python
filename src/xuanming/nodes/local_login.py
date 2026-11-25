@@ -1,8 +1,15 @@
 """单机开发模式的登录适配器，复用正式的 Gate 入场契约。"""
 
+from __future__ import annotations
+
 import hashlib
 import hmac
+import json
+import os
+import tempfile
+import time
 from itertools import count
+from pathlib import Path
 
 _LOGIN_SERVICE = "loginpb.ClientPlayerLogin"
 _INVALID_PARAMETER = 1005
@@ -16,22 +23,123 @@ _LOGIN_FIRST = 1
 _LOGIN_REPLACE = 2
 _EXIT_LOGOUT = 1
 _MAX_LOCAL_ROLES = 2
+_REPLACE_RETRY_COUNT = 12
+_REPLACE_RETRY_BASE_SECONDS = 0.04
 
 
 class LocalLogin:
-    """开发账号共用本地访问令牌，角色档案依旧由 Scene 持久化。"""
+    """开发账号共用本地访问令牌，角色档案由 Scene 持久化，角色列表支持可选 JSON 落盘。"""
 
-    def __init__(self, protocol, scene_info, *, access_token: str | bytes) -> None:
+    def __init__(
+        self,
+        protocol,
+        scene_info,
+        *,
+        access_token: str | bytes,
+        store_path: str | Path | None = None,
+    ) -> None:
         self.protocol = protocol
         self.scene_info = scene_info
         self._token = access_token.encode("utf-8") if isinstance(access_token, str) else access_token
         if not self._token:
             raise ValueError("单机登录需要配置开发访问令牌")
+        self._store_path = Path(store_path) if store_path is not None else None
         self._sessions: dict[tuple[int, int], str] = {}
         self._roles: dict[str, list] = {}
         self._profiles: dict[int, object] = {}
+        self._player_accounts: dict[int, str] = {}
         self._active: dict[int, tuple[int, int, int]] = {}
         self._generation = count(1)
+        self._load_accounts()
+
+    def _load_accounts(self) -> None:
+        if self._store_path is None or not self._store_path.exists():
+            return
+        try:
+            doc = json.loads(self._store_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        accounts = doc.get("accounts") if isinstance(doc, dict) else None
+        if not isinstance(accounts, dict):
+            return
+        role_cls = self.protocol.message_class("AccountSimplePlayer")
+        for account, entries in accounts.items():
+            if not isinstance(account, str) or not isinstance(entries, list):
+                continue
+            roles = []
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("player_id"):
+                    continue
+                role = role_cls(
+                    player_id=int(entry["player_id"]),
+                    zone_id=int(entry.get("zone_id") or self.scene_info.zone_id or 1),
+                    name=str(entry.get("name") or ""),
+                    class_id=int(entry.get("class_id") or 1),
+                    gender=int(entry.get("gender") or 1),
+                    appearance_id=str(entry.get("appearance_id") or ""),
+                )
+                roles.append(role)
+                self._profiles[role.player_id] = role
+                self._player_accounts[role.player_id] = account
+            if roles:
+                self._roles[account] = roles
+
+    def _save_accounts(self) -> None:
+        if self._store_path is None:
+            return
+        payload = {
+            "format_version": 1,
+            "accounts": {
+                account: [
+                    {
+                        "player_id": int(role.player_id),
+                        "zone_id": int(role.zone_id),
+                        "name": str(role.name),
+                        "class_id": int(role.class_id),
+                        "gender": int(role.gender),
+                        "appearance_id": str(role.appearance_id),
+                    }
+                    for role in roles
+                ]
+                for account, roles in sorted(self._roles.items())
+            },
+        }
+        self._store_path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{self._store_path.name}.", suffix=".tmp", dir=self._store_path.parent
+        )
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+            for attempt in range(_REPLACE_RETRY_COUNT):
+                try:
+                    os.replace(temporary, self._store_path)
+                    break
+                except PermissionError:
+                    if attempt + 1 >= _REPLACE_RETRY_COUNT:
+                        raise
+                    time.sleep(_REPLACE_RETRY_BASE_SECONDS * (attempt + 1))
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    def account_of(self, player_id: int) -> str:
+        return self._player_accounts.get(int(player_id), "")
+
+    def role_of(self, player_id: int):
+        return self._profiles.get(int(player_id))
+
+    def all_roles(self) -> list[tuple[str, object]]:
+        result: list[tuple[str, object]] = []
+        for account, roles in self._roles.items():
+            for role in roles:
+                result.append((account, role))
+        return result
 
     def initialize_role(self, data) -> None:
         role = self._profiles.get(data.player_id)
@@ -58,6 +166,8 @@ class LocalLogin:
             self._create(gate, account, payload, response)
         elif route.method == "EnterGame":
             await self._enter(gate, session, account, payload, response)
+        elif route.method == "RefreshToken":
+            self._refresh_token(account, payload, response)
         elif route.method == "LeaveGame":
             await gate.exit_scene(session, _EXIT_LOGOUT)
             self._forget(session)
@@ -74,6 +184,17 @@ class LocalLogin:
         return self.protocol.content(
             request.message_id, request.id, body=response.SerializeToString()
         )
+
+    def _refresh_token(self, account: str | None, request, response) -> None:
+        if account is None:
+            response.error_message.id = _NOT_LOGGED_IN
+            return
+        token = self._token.decode("utf-8", errors="replace")
+        now = int(time.time())
+        response.access_token = token
+        response.refresh_token = request.refresh_token or token
+        response.access_token_expire = now + 3600
+        response.refresh_token_expire = now + 86400
 
     def _login(self, gate, key, current, request, response) -> None:
         account = request.account.strip()
@@ -94,6 +215,7 @@ class LocalLogin:
             self._roles[account] = [
                 self._new_role(gate, account, 0, name=account[:12], class_id=1, gender=1)
             ]
+            self._save_accounts()
         self._sessions[key] = account
         self._list_roles(account, response)
 
@@ -113,6 +235,7 @@ class LocalLogin:
             gate, account, len(roles), name=name, class_id=request.class_id or 1,
             gender=request.gender or 1, appearance_id=request.appearance_id,
         ))
+        self._save_accounts()
         self._list_roles(account, response)
 
     async def _enter(self, gate, session, account, request, response) -> None:
@@ -181,6 +304,7 @@ class LocalLogin:
             player_id=player_id, zone_id=gate.info.zone_id, **fields
         )
         self._profiles[player_id] = role
+        self._player_accounts[player_id] = account
         return role
 
     def _list_roles(self, account: str, response) -> None:

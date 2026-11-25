@@ -5,11 +5,13 @@ import json
 import logging
 
 import grpc
+from aiohttp import web
 
 from .portal_db import as_bool
 from .portal_sql import connection
 
 _LOG = logging.getLogger(__name__)
+_ZONE_BACKGROUND_TASKS_KEY = web.AppKey("zone_background_tasks", list[asyncio.Task])
 
 
 async def _row(deps, zone, columns):
@@ -83,13 +85,13 @@ async def _loop(deps, operation, interval):
 
 def register_background(app, deps):
     async def start(_app):
-        app["zone_background_tasks"] = [
+        app[_ZONE_BACKGROUND_TASKS_KEY] = [
             asyncio.create_task(_loop(deps, publish_zone, deps.settings.zone_policy_interval_seconds)),
             asyncio.create_task(_loop(deps, check_capacity, deps.settings.role_capacity_interval_seconds)),
         ] if deps.settings.home_zone_ids else []
 
     async def stop(_app):
-        tasks = app["zone_background_tasks"]
+        tasks = app[_ZONE_BACKGROUND_TASKS_KEY]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
