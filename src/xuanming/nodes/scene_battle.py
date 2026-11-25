@@ -20,10 +20,14 @@ from .battle_dropin_effects import (
 from .battle_tables import battle_table_fingerprint
 from .scene_festival_beast import FESTIVAL_BEAST_PET_CHANGED, FESTIVAL_BEAST_PET_DEAD, SceneFestivalBeast
 from .scene_mission import effective_level
-from .scene_stats import battle_skills, class_id, pet_level, pet_skills, pet_stats, player_stats
+from .scene_pets import build_single_pet_battle_snapshot, build_standby_battle_snapshots
+from .scene_season import find_active_season_rule, valid_seal_row
+from .scene_stats import battle_skills, class_id, player_stats
 
 logger = logging.getLogger(__name__)
 TERMINAL = "/match.MatchInternal/GetBattleTerminalDecision"
+_MATCH_MODE_SEASON_TOURNAMENT = 11
+_MAX_STANDBY_PETS = 5
 _SETTLEMENT_GRACE_MS = 120_000  # Match 终局宽限和收件箱投递余量各 60 秒。
 _HOLD_CAP_MS = 15 * 60_000
 _LOCK_EXTRA_SECONDS = 60
@@ -482,7 +486,10 @@ class SceneBattle:
         routing.session_id, routing.gate_node_id, routing.gate_instance_id = player.session_id, player.session_id >> 17, player.gate_uuid
         routing.scene_node_id, routing.scene_instance_id = self.scene.info.node_id, self.scene.info.node_uuid
         routing.zone_id = self.scene.info.zone_id
-        battle_skills(self.tables, data, snapshot)
+        now_stamp = self._clock()
+        active_season_rule = find_active_season_rule(self.tables, now_stamp)
+        active_season_id = active_season_rule.id if active_season_rule is not None else 0
+        battle_skills(self.tables, data, snapshot, active_season_id=active_season_id)
         buffs = getattr(self.scene, "buffs", None)
         if buffs is not None:
             buffs.snapshot(player, snapshot)
@@ -506,23 +513,44 @@ class SceneBattle:
                     snapshot.items.add(item_table_id=config, count=min((1 << 32) - 1, available))
         if data.pet_component.active_pet_id:
             pet = next((item for item in data.pet_component.pets if item.pet_id == data.pet_component.active_pet_id), None)
-            row = self.tables["Pet"].get(pet.pet_table_id) if pet is not None else None
-            pstats = pet_stats(self.tables, pet) if pet is not None else None
-            if row is not None and pstats and pet.health and snapshot.level >= pet_level(pet.level, row):
-                wire = snapshot.pets.add(
-                    pet_id=pet.pet_id, owner_player_id=player.player_id, pet_name=pet.name or row.name,
-                    pet_table_id=pet.pet_table_id, level=pet_level(pet.level, row),
-                    max_health=pstats["max_health"], max_mana=pstats["max_mana"], defense=pstats["defense"],
-                    physical_attack=pstats["physical_attack"], magic_attack=pstats["magic_attack"],
-                    skill_table_ids=pet_skills(pet, row),
-                )
-                if isolate_temp_state:
-                    wire.base_attributes.health = pstats["max_health"]
-                    wire.base_attributes.mana = pstats["max_mana"]
-                else:
-                    wire.base_attributes.health = min(pet.health, pstats["max_health"])
-                    wire.base_attributes.mana = min(pet.mana, pstats["max_mana"]) if pstats["max_mana"] else pet.mana
-                wire.base_attributes.speed = pstats["speed"]
+            if pet is not None:
+                wire = self.protocol.message("BattlePetSnapshot")
+                if build_single_pet_battle_snapshot(
+                    self.tables, player.player_id, pet, snapshot.level, full_resources=False, out=wire,
+                ):
+                    if isolate_temp_state:
+                        wire.base_attributes.health = wire.max_health
+                        wire.base_attributes.mana = wire.max_mana
+                    snapshot.pets.add().CopyFrom(wire)
+        # 论剑 V3 战前 15 秒明牌变阵：仅正式自养论剑与赛季锦标赛打包备选灵宠（至多 5 只）与当季全部赛季印。
+        is_tournament = request is not None and int(getattr(request, "match_mode", 0)) == _MATCH_MODE_SEASON_TOURNAMENT
+        if not use_free_preset and (is_formal_ranked or is_tournament):
+            active_pet_id = snapshot.pets[0].pet_id if snapshot.pets else 0
+            standby_pets = build_standby_battle_snapshots(
+                self.tables, player.player_id, data, active_pet_id, _MAX_STANDBY_PETS,
+                full_resources=isolate_temp_state, protocol=self.protocol,
+            )
+            for standby in standby_pets:
+                snapshot.standby_pets.add().CopyFrom(standby)
+            if active_season_rule is not None and "SeasonSeal" in self.tables.tables:
+                seals = [
+                    seal for seal in self.tables["SeasonSeal"].rows()
+                    if seal.season_id == active_season_rule.id and valid_seal_row(seal)
+                ]
+                seals.sort(key=lambda row: row.id)
+                for seal in seals:
+                    snapshot.available_season_seals.add(
+                        season_id=active_season_rule.id,
+                        seal_id=seal.id,
+                        effect_id=seal.effect_id,
+                        bonus_bps=seal.bonus_bps,
+                        cap_bps=seal.cap_bps,
+                        per_round_limit=seal.per_round_limit,
+                        battle_limit=seal.battle_limit,
+                        active_rounds=seal.active_rounds,
+                        health_threshold_bps=seal.health_threshold_bps,
+                        name=seal.name,
+                    )
         return 0
 
     async def cancel(self, request):

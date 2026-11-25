@@ -106,11 +106,22 @@ class BattleEffects:
         total = min(U64_MAX, getattr(actor.combat, specific) + actor.combat.resist_all_ailment)
         return self.engine.rng.percent(max(0, total - caster.combat.ignore_ailment_resist))
 
+    def next_buff_id(self) -> int:
+        buff_id = self._next_id & U64_MAX
+        self._next_id += 1
+        return buff_id
+
     def _remove(self, target: Message, index: int, turn: Message, group: int, hit: int) -> None:
         entry = target.buffs[index]
+        rule = self.rules.get(entry.buff_table_id)
         turn.events.add(event_type=6, source_id=entry.caster_id, target_id=target.actor_id,
-                        buff_table_id=entry.buff_table_id, group_id=group, hit_index=hit)
+                        buff_table_id=entry.buff_table_id, buff_instance_id=entry.buff_id,
+                        group_id=group, hit_index=hit)
         del target.buffs[index]
+        if rule is not None and rule.battle_op == 27:
+            configured = getattr(self.engine, "configured", None)
+            if configured is not None:
+                configured.sync_charging_skill_id(target)
 
     def dispel(self, target: Message, count: int, turn: Message, group: int, hit: int) -> None:
         index = 0

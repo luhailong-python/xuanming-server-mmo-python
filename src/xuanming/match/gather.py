@@ -278,7 +278,12 @@ class GatherPipeline:
             )
             return False
 
-    async def run_formation(self, formation: Message) -> bool:
+    async def run_formation(
+        self,
+        formation: Message,
+        *,
+        ai_defender_snapshots: tuple[Message, ...] = (),
+    ) -> bool:
         """同步执行一局成局的 Prepare -> Preflight -> SaveIntent -> CreateBattle 管线。"""
         battle_id = int(formation.battle_id)
         now_ms = await self.store.now_ms()
@@ -405,6 +410,11 @@ class GatherPipeline:
             )
         for _, _, snap, _ in prepared_members:
             create_req.players.add().CopyFrom(snap)
+        for ai_snap in ai_defender_snapshots:
+            dst = create_req.players.add()
+            dst.CopyFrom(ai_snap)
+            dst.team_index = 1
+            dst.ai_controlled = True
 
         create_bytes = create_req.SerializeToString(deterministic=True)
         try:

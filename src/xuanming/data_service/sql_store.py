@@ -54,6 +54,7 @@ from .model import (
     ROUTE_BATCH_LIMIT,
     ROUTE_SHARDS,
     SCHEMA_GEN,
+    STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT,
     Ownership,
     valid_account,
     valid_pi,
@@ -112,6 +113,15 @@ NAME_TAKE_OVER = ("UPDATE player_name SET player_id = %s, name = %s, created_ms 
 NAME_BIND = "UPDATE player_name SET bound_ms = %s WHERE name_norm = %s AND player_id = %s AND bound_ms = 0"
 NAME_HOLDER = "SELECT player_id, held_until_ms FROM player_name WHERE name_norm = %s"
 NAME_ROW_STATE = "SELECT created_ms, bound_ms FROM player_name WHERE player_id = %s AND name_norm = %s"
+ACCOUNT_ROLE_TRADABLE_QUOTA_TABLE = "account_role_tradable_quota"
+ACCOUNT_ROLE_TRADABLE_QUOTA_DDL = (
+    "CREATE TABLE IF NOT EXISTS account_role_tradable_quota ("
+    "account VARBINARY(191) NOT NULL COMMENT 'pb:1',"
+    "player_id BIGINT UNSIGNED NOT NULL COMMENT 'pb:2',"
+    "confirmed_units INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'pb:3',"
+    "updated_ms BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'pb:4',"
+    "PRIMARY KEY(account,player_id)) ENGINE=InnoDB"
+)
 
 
 def _chunks(items, size):
@@ -140,6 +150,13 @@ class SqlStore(_SqlTradeMixin, _SqlAuditMixin):
             for statement in re.split(r";\s*\n", text):
                 if statement.strip():
                     await cursor.execute(statement)
+            await cursor.execute(ACCOUNT_ROLE_TRADABLE_QUOTA_DDL)
+            await cursor.execute("SHOW COLUMNS FROM account_directory LIKE 'stage1_tradable_material_used'")
+            if await cursor.fetchone() is None:
+                await cursor.execute(
+                    "ALTER TABLE account_directory "
+                    "ADD COLUMN stage1_tradable_material_used INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'pb:9'"
+                )
             await cursor.execute("SELECT writable FROM route_meta WHERE id = 1")
             if await cursor.fetchone() is None:
                 try:
@@ -831,6 +848,57 @@ class SqlStore(_SqlTradeMixin, _SqlAuditMixin):
         if not rows:
             return False, ""
         return True, bytes(rows[0][0] or b"").decode("utf-8")
+
+    async def sync_account_stage1_tradable(self, player_id: int, desired_char_total: int) -> tuple[bool, int, int]:
+        """在账号分片单片事务内幂等确认单角色阶段一可交易材料份数并累加到账号终身 60 份硬上限（删角不重置）。"""
+        if not player_id or desired_char_total > STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT:
+            raise Invalid("stage1_tradable")
+        owned = await self._read_owner(player_id)
+        if owned is None or not owned.account:
+            return False, 0, 0
+        account_bytes = owned.account.encode("utf-8")
+
+        async def work(cursor):
+            await cursor.execute(
+                "SELECT stage1_tradable_material_used FROM account_directory WHERE account=%s FOR UPDATE",
+                (account_bytes,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise Missing(owned.account)
+            used = min(int(row[0] or 0), STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT)
+            await cursor.execute(
+                f"SELECT confirmed_units FROM {ACCOUNT_ROLE_TRADABLE_QUOTA_TABLE} "
+                "WHERE account=%s AND player_id=%s FOR UPDATE",
+                (account_bytes, player_id),
+            )
+            qrow = await cursor.fetchone()
+            prev_confirmed = int(qrow[0] or 0) if qrow is not None else 0
+            confirmed_char = prev_confirmed
+            account_used = used
+            if desired_char_total > prev_confirmed and used < STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT:
+                want = desired_char_total - prev_confirmed
+                remaining = STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT - used
+                grant = min(want, remaining)
+                if grant > 0:
+                    confirmed_char = prev_confirmed + grant
+                    account_used = used + grant
+                    await cursor.execute(
+                        f"INSERT INTO {ACCOUNT_ROLE_TRADABLE_QUOTA_TABLE}"
+                        f"(account,player_id,confirmed_units,updated_ms) VALUES (%s,%s,%s,{DB_NOW_MS}) "
+                        "ON DUPLICATE KEY UPDATE confirmed_units=VALUES(confirmed_units),updated_ms=VALUES(updated_ms)",
+                        (account_bytes, player_id, confirmed_char),
+                    )
+                    await cursor.execute(
+                        "UPDATE account_directory SET stage1_tradable_material_used=%s WHERE account=%s",
+                        (account_used, account_bytes),
+                    )
+            return True, confirmed_char, account_used
+
+        try:
+            return await self._tx(work)
+        except Missing:
+            return False, 0, 0
 
     # -- repair & remove roles -----------------------------------------------------------------------
     def _merge_role(self, old_raw: bytes, patch):

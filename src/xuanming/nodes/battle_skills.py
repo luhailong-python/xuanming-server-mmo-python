@@ -31,7 +31,7 @@ def mana_ratio(actor: Message) -> float:
 
 
 def mana_cost(actor: Message, skill: BattleSkill) -> int:
-    if skill.class_id:
+    if skill.class_id or skill.battle_model == 1:
         return max(1, scaled(actor.max_mana, skill.mana_percent, up=True)) if skill.mana_percent > 0 else 0
     return skill.mana_cost
 
@@ -55,17 +55,52 @@ class BattleSkills:
         self.permissions = permissions
 
     def initialize(self, actor: Message, snapshot: Message, *, pet: bool = False) -> None:
-        if not pet:
-            for skill_id, stored_rank in snapshot.skill_ranks.items():
-                rule = self.rules.get(skill_id)
-                if rule is None or not rule.class_id or rule.class_id != actor.class_id:
+        active_season_id = 0 if pet else int(getattr(snapshot, "active_season_id", 0))
+        mask = 2 if pet else 1
+        occupied_exclusive_groups: set[int] = set()
+        for skill_id, stored_rank in sorted(snapshot.skill_ranks.items()):
+            rule = self.rules.get(skill_id)
+            if rule is None:
+                continue
+            if rule.battle_model == 1:
+                if not pet and rule.season_id != 0 and (active_season_id == 0 or rule.season_id != active_season_id):
+                    continue
+                if (rule.caster_mask & mask) == 0 or actor.level < rule.unlock_level:
                     continue
                 rank = effective_rank(stored_rank, actor.level, rule.unlock_level, rule.max_rank)
-                if rank:
-                    actor.skill_ranks[skill_id] = rank
+                if not rank:
+                    continue
+                if not pet and rule.exclusive_group != 0:
+                    if rule.exclusive_group in occupied_exclusive_groups:
+                        continue
+                    occupied_exclusive_groups.add(rule.exclusive_group)
+                actor.skill_ranks[skill_id] = rank
+                continue
+            if pet or not rule.class_id or rule.class_id != actor.class_id:
+                continue
+            rank = effective_rank(stored_rank, actor.level, rule.unlock_level, rule.max_rank)
+            if rank:
+                actor.skill_ranks[skill_id] = rank
         for skill_id in snapshot.skill_table_ids:
             rule = self.rules.get(skill_id)
-            if rule and rule.castable and (not rule.class_id or (not pet and actor.skill_ranks.get(skill_id))):
+            if rule is None or not rule.castable:
+                continue
+            if rule.battle_model == 1:
+                if not pet and rule.season_id != 0 and (active_season_id == 0 or rule.season_id != active_season_id):
+                    continue
+                if (rule.caster_mask & mask) == 0 or actor.level < rule.unlock_level:
+                    continue
+                if skill_id not in actor.skill_ranks:
+                    if skill_id in snapshot.skill_ranks or not effective_rank(1, actor.level, rule.unlock_level, rule.max_rank):
+                        continue
+                    if not pet and rule.exclusive_group != 0:
+                        if rule.exclusive_group in occupied_exclusive_groups:
+                            continue
+                        occupied_exclusive_groups.add(rule.exclusive_group)
+                    actor.skill_ranks[skill_id] = 1
+                actor.skill_table_ids.append(skill_id)
+                continue
+            if not rule.class_id or (not pet and actor.skill_ranks.get(skill_id)):
                 actor.skill_table_ids.append(skill_id)
 
     def validate(self, actor: Message, action: Message) -> int:
@@ -73,6 +108,10 @@ class BattleSkills:
         rule = self.rules.get(skill_id)
         if rule is None:
             return 1001
+        if rule.battle_model == 1:
+            if skill_id not in actor.skill_table_ids or not actor.skill_ranks.get(skill_id):
+                return 1005
+            return self.engine.configured.check_skill(actor, action, rule)
         if skill_id not in actor.skill_table_ids or rule.class_id and not actor.skill_ranks.get(skill_id):
             return 1005
         if not rule.castable:
@@ -134,6 +173,9 @@ class BattleSkills:
     def execute(self, actor: Message, action: Message, turn: Message, group: int) -> None:
         skill_id = action.skill_table_id
         rule = self.rules.get(skill_id)
+        if rule is not None and rule.battle_model == 1:
+            self.engine.configured.execute_skill(actor, action, rule, turn, group)
+            return
         if rule is None or self.validate(actor, action):
             if rule is None or not rule.class_id or rule.target_team == ENEMY:
                 self.engine._attack_target(turn, group, actor, action.target_id)

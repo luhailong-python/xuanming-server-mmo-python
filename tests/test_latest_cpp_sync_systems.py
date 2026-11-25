@@ -100,15 +100,15 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 70
-    assert len(pb_tables.tables) == 70
+    assert len(json_tables.tables) == 72
+    assert len(pb_tables.tables) == 72
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {
         "EquipAffixQuality": 5,
         "FestivalBeastActivity": 1,
         "FestivalBeastTier": 8,
-        "SkillScrollCraft": 3,
+        "SkillScrollCraft": 6,
         "TournamentReward": 7,
         "TournamentRule": 1,
         "TrialJournalEntry": 12,
@@ -468,7 +468,7 @@ def test_skill_craft_six_rpcs_and_proxy_stall(tmp_path):
             # 1. GetSkillCraftingState
             st0 = await rpc(1, "SceneSkillClientPlayer", "GetSkillCraftingState")
             assert not st0.error_message.id
-            assert len(st0.state.scrolls) == 3
+            assert len(st0.state.scrolls) == 6
             assert st0.state.gold_balance == 1000 and st0.state.fragment_owned == 60
 
             # 2. SetCraftProxyStall & ListCraftProxyStalls

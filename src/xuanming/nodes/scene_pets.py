@@ -5,14 +5,23 @@ from secrets import randbelow
 from time import time
 
 from ..data.asset_inventory import (
-    FEATURE_UNAVAILABLE, INSUFFICIENT, INVALID, INVALID_DATA, UNAVAILABLE,
+    BAG_INSUFFICIENT, FEATURE_UNAVAILABLE, INSUFFICIENT, INVALID, INVALID_DATA, UNAVAILABLE,
     balance, carries_unknown, clone,
 )
 from ..data.asset_ledger import INT64_MAX, UINT64_MAX
 from ..data.attribute_allocation import AllocationError, distribute_points, evaluate_pool, validate_allocation
 from .scene_mission import effective_level
 from .scene_skills import _rescale
-from .scene_stats import pet_dimensions, pet_level, pet_pool, pet_skills, pet_stats
+from .scene_stats import (
+    UINT32_MAX,
+    is_turn_battle_castable,
+    pet_dimensions,
+    pet_level,
+    pet_pool,
+    pet_skills,
+    pet_stats,
+    rank_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +30,15 @@ _NOT_FOUND, _ROW_MISSING, _FULL, _LEVEL_LOW, _ACTIVE, _NOT_ACTIVE = range(26000,
 _INVALID_NAME, _IN_BATTLE, _POINTS_LOW, _CANNOT_DECREASE, _CAP, _UNKNOWN_DIM = range(26007, 26013)
 _GOLD_LOW, _NO_AUTO_PLAN, _NO_CHANGE, _ID_UNAVAILABLE = range(26013, 26017)
 PET_NOT_TRANSFERABLE = 26018
-PET_NOT_TRANSFERABLE = 26018
+PET_TIER_MAX_REACHED = 26019
+PET_TIER_CHANGED = 26020
+PET_TIER_LEVEL_NOT_ENOUGH = 26021
+PET_TIER_MATERIAL_NOT_ENOUGH = 26022
+PET_ENTRY_PRESET_INVALID = 26023
+_MAX_PRESET_SLOTS = 3
+_MAX_PRESET_TAG = 3
+_KEEP_PRESET_TAG = 0xFFFFFFFF
+_MAX_CULTIVATION_TIER = 5
 _DEFAULT_ENTRY_CONFIG_VERSION = 1
 _DEFAULT_ENTRY_TOTAL_POINTS = 20
 _DEFAULT_ENTRY_MAX_DIRECTIONS = 0
@@ -96,6 +113,183 @@ def _entry_state_version(value: int) -> int:
 
 def _valid_entry_request_id(request_id: str) -> bool:
     return 16 <= len(request_id) <= 64 and all(ch in _REQUEST_ID_CHARS for ch in request_id)
+
+
+def _valid_preset_slot(slot_id: int) -> bool:
+    return 1 <= slot_id <= _MAX_PRESET_SLOTS
+
+
+def _valid_preset_tag(tag: int) -> bool:
+    return tag <= _MAX_PRESET_TAG or tag == _KEEP_PRESET_TAG
+
+
+def _effective_preset_slot(stored: int) -> int:
+    return stored if _valid_preset_slot(stored) else 1
+
+
+def _effective_cultivation_tier(tables, pet) -> int:
+    tier = int(pet.cultivation_tier)
+    if not tier:
+        species = tables["Pet"].get(pet.pet_table_id)
+        if species is not None:
+            tier = _pet_cultivation_tier(species)
+    return tier or 1
+
+
+def _effective_budget_for_pet(tables, pet, base_budget: int) -> int:
+    bonus = 0
+    if "PetTier" in tables.tables:
+        tier_row = tables["PetTier"].get(_effective_cultivation_tier(tables, pet))
+        if tier_row is not None:
+            bonus = int(getattr(tier_row, "bonus_entry_points", 0))
+    return base_budget + bonus
+
+
+def _find_preset(pet, slot_id: int):
+    return next((preset for preset in pet.entry_presets if preset.slot_id == slot_id), None)
+
+
+def _find_or_create_preset(pet, slot_id: int):
+    existing = _find_preset(pet, slot_id)
+    if existing is not None:
+        return existing
+    return pet.entry_presets.add(slot_id=slot_id, tag=0)
+
+
+def _sync_active_preset_from_allocated(pet, active_slot: int) -> None:
+    preset = _find_or_create_preset(pet, active_slot)
+    preset.allocated.clear()
+    for entry_id, points in pet.entry_allocated.items():
+        if points > 0:
+            preset.allocated[entry_id] = points
+
+
+def _inventory_total_count(data, config_id: int) -> int:
+    if data is None or not config_id:
+        return 0
+    total = 0
+    for entry in data.bag_component.items:
+        if entry.bag_type != 0:
+            continue
+        if entry.HasField("instance"):
+            if entry.instance.config_id == config_id:
+                total += entry.instance.size
+        elif entry.config_id == config_id:
+            total += entry.stack_size
+    return total
+
+
+def _accumulate_pet_entry_effects(tables, pet, effects) -> bool:
+    """将单只灵宠的生效培养条目效果汇总至 PetCultivationEffects，供战斗快照复用。"""
+    if "PetEntry" not in tables.tables or "PetRule" not in tables.tables:
+        return False
+    rule = next(iter(tables["PetRule"].rows()), None)
+    if rule is None:
+        return False
+    fields = rule.DESCRIPTOR.fields_by_name
+    base_budget = rule.entry_total_points if "entry_total_points" in fields else _DEFAULT_ENTRY_TOTAL_POINTS
+    max_directions = rule.entry_max_directions if "entry_max_directions" in fields else _DEFAULT_ENTRY_MAX_DIRECTIONS
+    rules: dict[int, tuple[int, int]] = {}
+    for row in tables["PetEntry"].rows():
+        invalid_row = (
+            not row.id or not row.cap or not 1 <= row.channel <= 9
+            or not row.per_point_bps or row.cap * row.per_point_bps > 10_000
+            or (row.channel in (5, 6) and not 1 <= row.state_kind <= 7)
+        )
+        if invalid_row:
+            return False
+        rules[row.id] = (row.cap, row.per_point_bps)
+    if not rules or not base_budget:
+        return False
+    budget = _effective_budget_for_pet(tables, pet, base_budget)
+    values = dict(pet.entry_allocated)
+    known_values = {eid: pts for eid, pts in values.items() if eid in rules}
+    effective = _validate_entries(values, known_values, rules, budget, max_directions) == 0
+    effects.Clear()
+    for row in sorted(tables["PetEntry"].rows(), key=lambda r: (r.sort, r.id)):
+        points = values.get(row.id, 0)
+        bps = points * row.per_point_bps if effective else 0
+        if bps:
+            _accumulate_entry_effect(effects, row, bps)
+    return True
+
+
+def build_single_pet_battle_snapshot(
+    tables,
+    player_id: int,
+    pet,
+    owner_level: int,
+    *,
+    full_resources: bool,
+    out,
+) -> bool:
+    """构建单只灵宠的 BattlePetSnapshot（出战主宠与论剑 V3 备选灵宠共用同一口径）。"""
+    row = tables["Pet"].get(pet.pet_table_id)
+    if row is None or owner_level < pet_level(pet.level, row):
+        return False
+    if not full_resources and pet.health == 0:
+        return False
+    stats = pet_stats(tables, pet)
+    if not stats:
+        return False
+    eff_level = pet_level(pet.level, row)
+    if not _accumulate_pet_entry_effects(tables, pet, out.pet_cultivation):
+        out.ClearField("pet_cultivation")
+    out.pet_id = pet.pet_id
+    out.owner_player_id = player_id
+    out.pet_name = pet.name or row.name
+    out.pet_table_id = pet.pet_table_id
+    out.level = eff_level
+    out.max_health = stats["max_health"]
+    out.max_mana = stats["max_mana"]
+    out.physical_attack = stats["physical_attack"]
+    out.magic_attack = stats["magic_attack"]
+    out.defense = stats["defense"]
+    out.base_attributes.health = stats["max_health"] if full_resources else min(pet.health, stats["max_health"])
+    out.base_attributes.mana = (
+        stats["max_mana"] if full_resources
+        else (min(pet.mana, stats["max_mana"]) if stats["max_mana"] else pet.mana)
+    )
+    out.base_attributes.speed = stats["speed"]
+    stored_ranks = dict(pet.skill_ranks)
+    for skill_id in pet_skills(pet, row):
+        skill = tables["Skill"].get(skill_id)
+        if skill is None:
+            continue
+        if is_turn_battle_castable(skill):
+            out.skill_table_ids.append(skill_id)
+        if getattr(skill, "battle_model", 0) == 1:
+            stored_rank = stored_ranks.get(skill_id, 1)
+            out.skill_ranks[skill_id] = min(stored_rank, rank_limit(eff_level, skill))
+    return True
+
+
+def build_standby_battle_snapshots(
+    tables,
+    player_id: int,
+    data,
+    exclude_pet_id: int,
+    max_count: int,
+    *,
+    full_resources: bool,
+    protocol,
+) -> list:
+    """收集除首发灵宠外至多 max_count 只合规备选灵宠快照，供论剑 V3 战前 15 秒明牌变阵使用。"""
+    if max_count <= 0 or not data.HasField("pet_component") or not data.HasField("level_component"):
+        return []
+    owner_level = effective_level(data)
+    result = []
+    for pet in data.pet_component.pets:
+        if len(result) >= max_count:
+            break
+        if not pet.pet_id or pet.pet_id == exclude_pet_id:
+            continue
+        snap = protocol.message("BattlePetSnapshot")
+        if build_single_pet_battle_snapshot(
+            tables, player_id, pet, owner_level, full_resources=full_resources, out=snap,
+        ):
+            result.append(snap)
+    return result
 
 
 def _validate_entries(stored: dict[int, int], target: dict[int, int], rules: dict[int, tuple[int, int]],
@@ -183,6 +377,8 @@ class ScenePets:
         self.scene.register(_SERVICE, "GetPetEntries", self.get_entries)
         self.scene.register(_SERVICE, "PreviewPetEntries", self.preview_entries, mutating=True)
         self.scene.register(_SERVICE, "SavePetEntries", self.save_entries, mutating=True)
+        self.scene.register(_SERVICE, "SwitchPetEntryPreset", self.switch_entry_preset, mutating=True)
+        self.scene.register(_SERVICE, "AscendPetTier", self.ascend_tier, mutating=True)
 
     def _allocation(self, pet, level):
         current = {dim.id: pet.allocated.get(dim.id, 0) for dim in self.dimensions}
@@ -192,7 +388,7 @@ class ScenePets:
     def _reset_cost(self, level, allocation):
         return self.pool.reset_cost_gold if allocation.effective and level >= self.pool.reset_free_below_level else 0
 
-    def _fill_list(self, comp, listing):
+    def _fill_list(self, comp, listing, *, player=None, data=None):
         listing.active_pet_id = comp.active_pet_id
         listing.max_pets, listing.rename_cost_gold = self.max_pets, self.rename_cost
         if self.pool is None:
@@ -211,6 +407,7 @@ class ScenePets:
                 info.quality, info.model_id, info.desc = row.quality, row.model_id, row.desc
                 info.skill_table_ids.extend(pet_skills(pet, row))
             self._fill_cultivation_tier(pet, info)
+            self._fill_tier_ascension(player, data, pet, level, info)
             if self._build_entries_info(pet, info.entries):
                 info.ClearField("entries")
             aptitude_total = 0
@@ -230,23 +427,23 @@ class ScenePets:
                     setattr(info.derived, key, amount)
             info.derived.health, info.derived.mana = pet.health, pet.mana
 
-    def _reply(self, route, error=0, data=None, **fields):
+    def _reply(self, route, error=0, data=None, *, player=None, **fields):
         reply = self.protocol.message(route.response_type, **fields)
         if error:
             reply.error_message.id = error
         elif data is not None:
-            self._fill_list(data.pet_component, reply.pets)
+            self._fill_list(data.pet_component, reply.pets, player=player, data=data)
         return reply
 
     def get_list(self, _world, player, route, _request):
         data = self.scene.rows.assemble(player.snapshot)
-        return self._reply(route, 0 if data.HasField("pet_component") else UNAVAILABLE, data)
+        return self._reply(route, 0 if data.HasField("pet_component") else UNAVAILABLE, data, player=player)
 
     def notify(self, player):
         data = self.scene.rows.assemble(player.snapshot)
         if data.HasField("pet_component"):
             message = self.protocol.message("PetListChangedS2C")
-            self._fill_list(data.pet_component, message.pets)
+            self._fill_list(data.pet_component, message.pets, player=player, data=data)
             self.scene._push(player, "ScenePetClientPlayerNotifyPetListChanged", message)
 
     def initialize_on_load(self, data):
@@ -314,7 +511,7 @@ class ScenePets:
             return self._reply(route, error)
         audit = self.assets.make_audit_callback(player, before, data, self.debit_tx) if before is not None else None
         await self.scene.commit_player_data(player, data, on_committed=audit)
-        return self._reply(route, data=data)
+        return self._reply(route, data=data, player=player)
 
     def _summon(self, data, request):
         comp = data.pet_component
@@ -537,7 +734,7 @@ class ScenePets:
             return self._reply(route, error)
         comp.pets.add().CopyFrom(candidate)
         await self.scene.commit_player_data(player, data)
-        return self._reply(route, data=data, pet_id=candidate.pet_id)
+        return self._reply(route, data=data, player=player, pet_id=candidate.pet_id)
 
     # ── 宠物商店（GetPetShop / BuyPet） ──
 
@@ -586,7 +783,7 @@ class ScenePets:
             response.gold = balance(data, self.gold)
             if not error:
                 response.pet_id = pet_id
-                self._fill_list(data.pet_component, response.pets)
+                self._fill_list(data.pet_component, response.pets, player=player, data=data)
             return response
 
         if error := self._writable(player):
@@ -668,17 +865,50 @@ class ScenePets:
     # ── 宠物培养阶位与独立条目池（GetPetEntries / PreviewPetEntries / SavePetEntries） ──
 
     def _fill_cultivation_tier(self, pet, info) -> None:
-        tier = pet.cultivation_tier
-        if not tier:
-            species = self.tables["Pet"].get(pet.pet_table_id)
-            if species is not None:
-                tier = _pet_cultivation_tier(species)
+        tier = _effective_cultivation_tier(self.tables, pet)
         info.cultivation_tier = tier
         if "PetTier" in self.tables.tables:
             tier_row = self.tables["PetTier"].get(tier)
             if tier_row is not None:
                 info.cultivation_tier_name = tier_row.name
                 info.cultivation_art_key = tier_row.art_key
+
+    def _fill_tier_ascension(self, player, data, pet, eff_level: int, info) -> None:
+        """填充宝宝下一灵阶突破预览（五阶满阶时清空 next_tier）。"""
+        info.ClearField("next_tier")
+        current_tier = _effective_cultivation_tier(self.tables, pet)
+        if current_tier >= _MAX_CULTIVATION_TIER or "PetTier" not in self.tables.tables:
+            return
+        current_row = self.tables["PetTier"].get(current_tier)
+        next_row = self.tables["PetTier"].get(current_tier + 1)
+        if current_row is None or next_row is None:
+            return
+        out = info.next_tier
+        out.next_tier = next_row.id
+        out.next_tier_name = next_row.name
+        out.next_art_key = next_row.art_key
+        out.min_pet_level = int(getattr(current_row, "ascend_min_pet_level", 0))
+        out.cost_item_id = int(getattr(current_row, "ascend_cost_item_id", 0))
+        out.cost_item_count = int(getattr(current_row, "ascend_cost_item_count", 0))
+        out.cost_gold = int(getattr(current_row, "ascend_cost_gold", 0))
+        out.bonus_entry_points = int(getattr(next_row, "bonus_entry_points", 0))
+
+        owned_material = _inventory_total_count(data, out.cost_item_id) if out.cost_item_id else 0
+        out.owned_item_count = owned_material
+
+        block_tip = 0
+        if player is not None and self.scene.battle and self.scene.battle.frozen(player.player_id):
+            block_tip = _IN_BATTLE
+        elif player is not None and not self.scene.mutable(player):
+            block_tip = INVALID
+        elif eff_level < out.min_pet_level:
+            block_tip = PET_TIER_LEVEL_NOT_ENOUGH
+        elif out.cost_item_id and owned_material < out.cost_item_count:
+            block_tip = PET_TIER_MATERIAL_NOT_ENOUGH
+        elif out.cost_gold and (data is None or balance(data, self.gold) < out.cost_gold):
+            block_tip = _GOLD_LOW
+        out.can_ascend = block_tip == 0
+        out.block_tip_id = block_tip
 
     def _read_entry_config(self):
         if self.rule is None or "PetEntry" not in self.tables.tables:
@@ -708,15 +938,18 @@ class ScenePets:
 
     def _fill_entries_snapshot(self, pet, config, values: dict[int, int], info) -> int:
         info.Clear()
-        version, budget, max_directions, rules = config
+        version, base_budget, max_directions, rules = config
         if not version:
             return INVALID_DATA
+        budget = _effective_budget_for_pet(self.tables, pet, base_budget)
+        active_slot = _effective_preset_slot(int(pet.active_entry_preset_slot))
         info.pet_id = pet.pet_id
         info.state_version = _entry_state_version(pet.entry_state_version)
         info.config_version = version
         info.total_points = budget
         info.max_directions = max_directions
         info.last_request_id = pet.entry_last_request_id
+        info.active_preset_slot = active_slot
 
         known_values = {}
         total_used = 0
@@ -752,6 +985,18 @@ class ScenePets:
                 icon=row.icon,
             )
             _accumulate_entry_effect(info.effects, row, effective_bps)
+
+        for slot in range(1, _MAX_PRESET_SLOTS + 1):
+            summary = info.presets.add(slot_id=slot)
+            stored_preset = _find_preset(pet, slot)
+            summary.tag = stored_preset.tag if stored_preset is not None else 0
+            preset_used = 0
+            source = values if slot == active_slot else (stored_preset.allocated if stored_preset is not None else {})
+            for entry_id, points in source.items():
+                if points > 0:
+                    summary.allocated[entry_id] = points
+                    preset_used += points
+            summary.used_points = min(UINT32_MAX, preset_used)
         return 0
 
     def _build_entries_info(self, pet, info) -> int:
@@ -787,7 +1032,8 @@ class ScenePets:
             return response
 
         config = self._read_entry_config()
-        version, budget, max_directions, rules = config
+        version, base_budget, max_directions, rules = config
+        budget = _effective_budget_for_pet(self.tables, pet, base_budget)
         stored = dict(pet.entry_allocated)
         target = dict(request.target)
 
@@ -837,7 +1083,8 @@ class ScenePets:
         target = dict(request.target)
         if pet.entry_last_request_id == request.request_id:
             same = (
-                pet.entry_last_base_version == request.state_version
+                pet.entry_last_preset_slot == 0
+                and pet.entry_last_base_version == request.state_version
                 and pet.entry_last_config_version == request.config_version
                 and dict(pet.entry_last_target) == target
             )
@@ -852,7 +1099,7 @@ class ScenePets:
             return response
 
         config = self._read_entry_config()
-        version, budget, max_directions, rules = config
+        version, base_budget, max_directions, rules = config
         if not version:
             return fail(INVALID_DATA)
         if (
@@ -862,19 +1109,25 @@ class ScenePets:
         ):
             return fail(INVALID)
 
+        budget = _effective_budget_for_pet(self.tables, pet, base_budget)
         stored = dict(pet.entry_allocated)
         error = _validate_entries(stored, target, rules, budget, max_directions)
         if error:
             return fail(error)
 
+        active_slot = _effective_preset_slot(int(pet.active_entry_preset_slot))
+        pet.active_entry_preset_slot = active_slot
         replaced = _replace_known_entries(stored, target, rules)
         pet.entry_allocated.clear()
         for entry_id, points in replaced.items():
             pet.entry_allocated[entry_id] = points
+        _sync_active_preset_from_allocated(pet, active_slot)
         pet.entry_state_version = _entry_state_version(pet.entry_state_version) + 1
         pet.entry_last_request_id = request.request_id
         pet.entry_last_base_version = request.state_version
         pet.entry_last_config_version = request.config_version
+        pet.entry_last_preset_slot = 0
+        pet.entry_last_preset_tag = 0
         pet.entry_last_target.clear()
         for entry_id, points in target.items():
             pet.entry_last_target[entry_id] = points
@@ -885,7 +1138,197 @@ class ScenePets:
             return fail(INVALID_DATA)
         await self.scene.commit_player_data(player, data)
         logger.info(
-            "Pet entries saved player_id=%s pet_id=%s state_version=%s remaining=%s",
-            player.player_id, pet.pet_id, pet.entry_state_version, response.entries.remaining_points,
+            "Pet entries saved player_id=%s pet_id=%s preset_slot=%s state_version=%s remaining=%s",
+            player.player_id, pet.pet_id, active_slot, pet.entry_state_version, response.entries.remaining_points,
+        )
+        return response
+
+    async def switch_entry_preset(self, _world, player, _route, request):
+        """切换宝宝条目预设槽位（1..3）或更新其用途标签，战外免费、乐观锁 + 幂等。"""
+        response = self.protocol.message("SwitchPetEntryPresetResponse", request_id=request.request_id)
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("pet_component"):
+            response.error_message.id = UNAVAILABLE
+            return response
+        pet = _find(data.pet_component, request.pet_id)
+        if pet is None:
+            response.error_message.id = _NOT_FOUND
+            return response
+
+        def fail(err: int):
+            response.error_message.id = err
+            if self._build_entries_info(pet, response.entries):
+                response.ClearField("entries")
+            return response
+
+        if error := self._writable(player):
+            return fail(error)
+        if not _valid_entry_request_id(request.request_id):
+            return fail(INVALID)
+        if not _valid_preset_slot(request.slot_id) or not _valid_preset_tag(request.tag):
+            return fail(PET_ENTRY_PRESET_INVALID)
+
+        if pet.entry_last_request_id == request.request_id:
+            same = (
+                pet.entry_last_preset_slot == request.slot_id
+                and pet.entry_last_preset_tag == request.tag
+                and pet.entry_last_base_version == request.state_version
+                and pet.entry_last_config_version == request.config_version
+            )
+            if not same:
+                return fail(INVALID)
+            build_err = self._build_entries_info(pet, response.entries)
+            if build_err:
+                response.ClearField("entries")
+                response.error_message.id = build_err
+                return response
+            response.replayed = True
+            return response
+
+        config = self._read_entry_config()
+        version = config[0]
+        if not version:
+            return fail(INVALID_DATA)
+        if (
+            request.config_version != version
+            or request.state_version != _entry_state_version(pet.entry_state_version)
+            or pet.entry_state_version >= UINT64_MAX
+        ):
+            return fail(INVALID)
+
+        current_slot = _effective_preset_slot(int(pet.active_entry_preset_slot))
+        # 先把当前槽位的权威分配落回预设槽，确保切走时不丢当前方案点位。
+        _sync_active_preset_from_allocated(pet, current_slot)
+
+        target_preset = _find_or_create_preset(pet, request.slot_id)
+        if request.tag != _KEEP_PRESET_TAG:
+            target_preset.tag = request.tag
+        pet.active_entry_preset_slot = request.slot_id
+        pet.entry_allocated.clear()
+        for entry_id, points in target_preset.allocated.items():
+            if points > 0:
+                pet.entry_allocated[entry_id] = points
+
+        pet.entry_state_version = _entry_state_version(pet.entry_state_version) + 1
+        pet.entry_last_request_id = request.request_id
+        pet.entry_last_base_version = request.state_version
+        pet.entry_last_config_version = request.config_version
+        pet.entry_last_preset_slot = request.slot_id
+        pet.entry_last_preset_tag = request.tag
+        pet.entry_last_target.clear()
+
+        fill_err = self._fill_entries_snapshot(pet, config, dict(pet.entry_allocated), response.entries)
+        if fill_err:
+            response.ClearField("entries")
+            return fail(INVALID_DATA)
+        await self.scene.commit_player_data(player, data)
+        logger.info(
+            "Pet entry preset switched player_id=%s pet_id=%s slot=%s->%s state_version=%s",
+            player.player_id, pet.pet_id, current_slot, request.slot_id, pet.entry_state_version,
+        )
+        return response
+
+    async def ascend_tier(self, _world, player, _route, request):
+        """宝宝灵阶突破（普通→变异→灵兽→神兽→圣兽）：扣 PetTier 材料与银两，乐观锁 + 幂等。"""
+        response = self.protocol.message("AscendPetTierResponse", client_request_id=request.client_request_id)
+        data = self.scene.rows.assemble(player.snapshot)
+
+        def fail(err: int):
+            response.error_message.id = err
+            response.gold = balance(data, self.gold)
+            if data.HasField("pet_component"):
+                self._fill_list(data.pet_component, response.pets, player=player, data=data)
+            return response
+
+        if not data.HasField("pet_component"):
+            return fail(UNAVAILABLE)
+        pet = _find(data.pet_component, request.pet_id)
+        if pet is None:
+            return fail(_NOT_FOUND)
+        if not request.client_request_id:
+            return fail(INVALID)
+
+        if pet.tier_last_request_id == request.client_request_id:
+            if pet.tier_last_expected_tier != request.expected_tier:
+                return fail(INVALID)
+            response.replayed = True
+            response.new_tier = pet.tier_last_result_tier
+            response.gold = balance(data, self.gold)
+            self._fill_list(data.pet_component, response.pets, player=player, data=data)
+            return response
+
+        if error := self._writable(player):
+            return fail(error)
+
+        species = self.tables["Pet"].get(pet.pet_table_id)
+        if species is None:
+            return fail(_ROW_MISSING)
+        current_tier = _effective_cultivation_tier(self.tables, pet)
+        if current_tier >= _MAX_CULTIVATION_TIER:
+            return fail(PET_TIER_MAX_REACHED)
+        if request.expected_tier != current_tier:
+            return fail(PET_TIER_CHANGED)
+
+        if "PetTier" not in self.tables.tables:
+            return fail(INVALID_DATA)
+        current_row = self.tables["PetTier"].get(current_tier)
+        next_row = self.tables["PetTier"].get(current_tier + 1)
+        if current_row is None or next_row is None:
+            return fail(INVALID_DATA)
+
+        eff_level = pet_level(pet.level, species)
+        if eff_level < int(getattr(current_row, "ascend_min_pet_level", 0)):
+            return fail(PET_TIER_LEVEL_NOT_ENOUGH)
+
+        cost_gold = int(getattr(current_row, "ascend_cost_gold", 0))
+        if cost_gold > 0 and (cost_gold > INT64_MAX or balance(data, self.gold) < cost_gold):
+            return fail(_GOLD_LOW)
+
+        cost_item_id = int(getattr(current_row, "ascend_cost_item_id", 0))
+        cost_item_count = int(getattr(current_row, "ascend_cost_item_count", 0))
+        staged = clone(data)
+        staged_pet = _find(staged.pet_component, request.pet_id)
+        if staged_pet is None:
+            return fail(_NOT_FOUND)
+
+        if cost_item_id and cost_item_count:
+            if self.assets is None:
+                return fail(UNAVAILABLE)
+            consume_err = self.assets.consume_items(staged, {cost_item_id: cost_item_count})
+            if consume_err == BAG_INSUFFICIENT:
+                return fail(PET_TIER_MATERIAL_NOT_ENOUGH)
+            if consume_err:
+                return fail(consume_err)
+
+        if cost_gold > 0:
+            if self.assets is None:
+                return fail(UNAVAILABLE)
+            deduct_err = self._deduct(staged, cost_gold)
+            if deduct_err:
+                return fail(deduct_err)
+
+        staged_pet.cultivation_tier = current_tier + 1
+        if staged_pet.entry_state_version < UINT64_MAX:
+            staged_pet.entry_state_version = _entry_state_version(staged_pet.entry_state_version) + 1
+        staged_pet.tier_last_request_id = request.client_request_id
+        staged_pet.tier_last_expected_tier = current_tier
+        staged_pet.tier_last_result_tier = current_tier + 1
+
+        before = clone(data) if self.assets is not None and self.assets.audit_enabled else None
+        audit = (
+            self.assets.make_audit_callback(
+                player, before, staged, self.debit_tx, correlation=staged_pet.pet_table_id,
+            )
+            if before is not None else None
+        )
+        await self.scene.commit_player_data(player, staged, on_committed=audit)
+
+        response.new_tier = current_tier + 1
+        response.gold = balance(staged, self.gold)
+        self._fill_list(staged.pet_component, response.pets, player=player, data=staged)
+        logger.info(
+            "Pet tier ascended player_id=%s pet_id=%s tier=%s->%s cost_gold=%s cost_item=%sx%s",
+            player.player_id, staged_pet.pet_id, current_tier, current_tier + 1,
+            cost_gold, cost_item_id, cost_item_count,
         )
         return response

@@ -41,7 +41,9 @@ from .economy_credit import (
     PlayerTradePolicy,
     ReferencePriceReader,
     SellerCreditService,
+    SellerEnvironmentEvent,
     SellerReviewRequest,
+    SellerViolationRecord,
     StoreDailyPlayerTradeTracker,
     StoreOwnershipLookup,
     StoreReferencePriceReader,
@@ -271,6 +273,8 @@ class TradeService:
                 "SeedListing": self.seed_listing,
                 "ListManualContracts": self.list_manual_contracts,
                 "ResolveManualContract": self.resolve_manual_contract,
+                "RecordSellerEnvironment": self.record_seller_environment,
+                "RecordSellerViolation": self.record_seller_violation,
             },
             SERVICE_ROLE_FENCE: {
                 "PrepareRoleFreeze": self.prepare_role_freeze,
@@ -331,6 +335,21 @@ class TradeService:
         if not verify_service_call(path, request, MANUAL_RESOLUTION_CALLER, self._clock_ms(), self._manual_secret):
             logger.error("trade manual resolution caller proof invalid path=%s", path)
             await context.abort(CODE.PERMISSION_DENIED, "manual resolution caller proof is invalid")
+
+    async def _admit_credit_internal(self, context, request: Message, path: str) -> None:
+        """校验卖家信用内部管理入口：拒绝客户端会话；配置密钥时验签，非 dev/test 缺密钥直接拒绝。"""
+        if _has_session_metadata(context):
+            await context.abort(CODE.PERMISSION_DENIED, "clients cannot call internal seller credit admin endpoints")
+        if len(self._manual_secret) >= 32:
+            if not verify_service_call(path, request, MANUAL_RESOLUTION_CALLER, self._clock_ms(), self._manual_secret):
+                logger.error("trade seller credit admin caller proof invalid path=%s", path)
+                await context.abort(CODE.PERMISSION_DENIED, "manual resolution caller proof is invalid")
+            return
+        if self._mode not in ("dev", "test"):
+            await context.abort(
+                CODE.PERMISSION_DENIED,
+                "internal seller credit admin endpoint requires signed serviceauth",
+            )
 
     async def _with_budget(self, coro):
         if self._budget_sec > 0:
@@ -1674,6 +1693,77 @@ class TradeService:
             logger.error("%s", line)
         else:
             logger.info("%s", line)
+
+    async def record_seller_environment(self, request: Message, context, path: str) -> Message:
+        """接收上游登录/风控上报的脱敏环境信号（仅换 IP 不扣分；异地新 IP + 陌生新设备清 0 正面信用并保留黑历史）。"""
+        await self._admit_credit_internal(context, request, path)
+        resp = self.protocol.message("trade.RecordSellerEnvironmentResponse")
+        if self._credits is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        observed_ms = int(request.observed_at_ms) or self._now_ms()
+        try:
+            prof, cleared = await self._with_budget(
+                self._credits.record_seller_environment(
+                    SellerEnvironmentEvent(
+                        seller_player_id=int(request.seller_player_id),
+                        owner_account=str(request.owner_account).strip(),
+                        owner_revision=int(request.owner_revision),
+                        ip=str(request.client_ip).strip(),
+                        device_id=str(request.device_id).strip(),
+                        observed_at_ms=observed_ms,
+                    )
+                )
+            )
+        except Exception as exc:
+            code = commerce_tip_id(exc)
+            if code == ERR_SERVICE_UNAVAILABLE:
+                logger.error(
+                    "trade RecordSellerEnvironment failed seller_id=%d err=%s",
+                    int(request.seller_player_id),
+                    exc,
+                )
+            resp.error_message.id = code
+            return resp
+        resp.env_credit_cleared = bool(cleared)
+        resp.profile.CopyFrom(seller_credit_view(self.protocol, prof))
+        return resp
+
+    async def record_seller_violation(self, request: Message, context, path: str) -> Message:
+        """记录经核实的卖家违约黑历史（按 case_id 幂等，异地换机清 0 时永久保留防洗白）。"""
+        await self._admit_credit_internal(context, request, path)
+        resp = self.protocol.message("trade.RecordSellerViolationResponse")
+        if self._credits is None:
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        recorded_ms = int(request.recorded_at_ms) or self._now_ms()
+        try:
+            prof = await self._with_budget(
+                self._credits.record_violation(
+                    SellerViolationRecord(
+                        case_id=str(request.case_id).strip(),
+                        order_id=str(request.order_id).strip(),
+                        seller_player_id=int(request.seller_player_id),
+                        seller_account=str(request.seller_account).strip(),
+                        seller_owner_revision=int(request.seller_owner_revision),
+                        reason=str(request.reason).strip(),
+                        recorded_at_ms=recorded_ms,
+                    )
+                )
+            )
+        except Exception as exc:
+            code = commerce_tip_id(exc)
+            if code == ERR_SERVICE_UNAVAILABLE:
+                logger.error(
+                    "trade RecordSellerViolation failed seller_id=%d case_id=%s err=%s",
+                    int(request.seller_player_id),
+                    str(request.case_id),
+                    exc,
+                )
+            resp.error_message.id = code
+            return resp
+        resp.profile.CopyFrom(seller_credit_view(self.protocol, prof))
+        return resp
 
     # -- RoleFenceParticipant (3 RPCs) --------------------------------------------------------------
 

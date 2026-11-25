@@ -19,6 +19,7 @@ from ..data.asset_inventory import (
     held_item_count,
 )
 from .scene_mission import now_ms
+from .scene_stats import try_auto_slot_newly_learned
 
 logger = logging.getLogger(__name__)
 
@@ -712,10 +713,15 @@ class SceneSkillCraft:
             existing = next(
                 (s for s in staged.skill_list.skill_list if s.skill_table_id == skill_id), None,
             )
+            newly_learned = existing is None or existing.rank == 0
             if existing is None:
                 staged.skill_list.skill_list.add(skill_table_id=skill_id, rank=1)
             elif existing.rank == 0:
                 existing.rank = 1
+            if newly_learned:
+                skill_row = self.tables["Skill"].get(skill_id)
+                if skill_row is not None:
+                    try_auto_slot_newly_learned(self.tables, staged.skill_list, skill_row)
 
         sc = staged.craft_component
         del sc.skill_books[book_idx]

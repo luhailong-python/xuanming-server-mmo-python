@@ -300,7 +300,7 @@ def test_python_commerce_gm_and_config_node_e2e():
                 async with http.get(f"{cfg_url}/api/table/status") as resp:
                     assert resp.status == 200
                     status_body = await resp.json()
-                    assert status_body["tableCount"] == 70
+                    assert status_body["tableCount"] == 72
                 async with http.get(f"{cfg_url}/api/table/RankedRule/1") as resp:
                     assert resp.status == 200
                     row = await resp.json()

@@ -140,9 +140,23 @@ class BattleSkill:
     passive_percent: float = 0.0
     buff_percent: float = 0.0
     damage_formula: Callable[[float, float], float] | None = None
+    battle_model: int = 0
+    caster_mask: int = 0
+    ability_kind: int = 0
+    init_effects: tuple[int, ...] = ()
+    action_tags: int = 0
+    allow_dead_target: bool = False
+    forbid_copy: bool = False
+    season_id: int = 0
+    max_battle_uses: int = 0
+    health_cost_mode: int = 0
+    secondary_target_policy: int = 0
+    exclusive_group: int = 0
 
     @property
     def castable(self) -> bool:
+        if self.battle_model == 1:
+            return self.ability_kind == 1
         return not self.passive_stat and not {0, 2, 3}.intersection(self.skill_types)
 
     @property
@@ -183,6 +197,21 @@ class BattleBuff:
     modifier_stat: int = 0
     ratio: float = 0.0
     state_kind: int = 0
+    trigger_event: int = 0
+    effect_target: int = 0
+    flat_value: float = 0.0
+    per_level: float = 0.0
+    value_basis: int = 0
+    config_duration_rounds: int = 0
+    trigger_chance: float = 0.0
+    per_round_limit: int = 0
+    hit_limit: int = 0
+    application_chance: float = 0.0
+    required_tag: str = ""
+    second_required_tag: str = ""
+    stack_limit: int = 0
+    start_round: int = 0
+    require_living_caster: bool = False
 
 
 class BattleTables:
@@ -209,6 +238,21 @@ class BattleTables:
                 modifier_stat=int(getattr(row, "modifier_stat", 0)),
                 ratio=float(getattr(row, "ratio", 0.0)),
                 state_kind=int(getattr(row, "state_kind", 0)),
+                trigger_event=int(getattr(row, "trigger_event", 0)),
+                effect_target=int(getattr(row, "effect_target", 0)),
+                flat_value=float(getattr(row, "flat_value", 0.0)),
+                per_level=float(getattr(row, "per_level", 0.0)),
+                value_basis=int(getattr(row, "value_basis", 0)),
+                config_duration_rounds=int(getattr(row, "duration_rounds", 0)),
+                trigger_chance=float(getattr(row, "trigger_chance", 0.0)),
+                per_round_limit=int(getattr(row, "per_round_limit", 0)),
+                hit_limit=int(getattr(row, "hit_limit", 0)),
+                application_chance=float(getattr(row, "application_chance", 0.0)),
+                required_tag=str(getattr(row, "required_tag", "")),
+                second_required_tag=str(getattr(row, "second_required_tag", "")),
+                stack_limit=int(getattr(row, "stack_limit", 0)),
+                start_round=int(getattr(row, "start_round", 0)),
+                require_living_caster=bool(getattr(row, "require_living_caster", 0)),
             ) for row in tables["Buff"].rows()
         }
         self.silence_permissions = {
@@ -259,7 +303,7 @@ class BattleTables:
             result[row.id] = BattleSkill(
                 base_damage=0.0,
                 mana_cost=sum(entry.cost_resource_cost for entry in row.cost_resource if entry.cost_resource_id == 1),
-                cooldown_rounds=row.cooldown_rounds if row.class_id else legacy_cooldown,
+                cooldown_rounds=row.cooldown_rounds if (row.class_id or getattr(row, "battle_model", 0) == 1) else legacy_cooldown,
                 attack_multiplier=max(0, row.attack_multiplier or 1.0), initiative=row.initiative,
                 cooldown_group=row.cooldown_id, requires_target=bool(row.targeting_mode),
                 class_id=row.class_id, unlock_level=row.unlock_level, max_rank=row.max_rank,
@@ -271,6 +315,18 @@ class BattleTables:
                 restore_mana_percent=row.restore_mana_percent, dispel_count=row.dispel_count,
                 passive_stat=row.passive_stat, passive_percent=row.passive_percent, buff_percent=row.buff_percent,
                 damage_formula=_expression(row.damage),
+                battle_model=int(getattr(row, "battle_model", 0)),
+                caster_mask=int(getattr(row, "caster_mask", 0)),
+                ability_kind=int(getattr(row, "ability_kind", 0)),
+                init_effects=tuple(getattr(row, "init_effect", ())),
+                action_tags=int(getattr(row, "action_tags", 0)),
+                allow_dead_target=bool(getattr(row, "allow_dead_target", 0)),
+                forbid_copy=bool(getattr(row, "forbid_copy", 0)),
+                season_id=int(getattr(row, "season_id", 0)),
+                max_battle_uses=int(getattr(row, "max_battle_uses", 0)),
+                health_cost_mode=int(getattr(row, "health_cost_mode", 0)),
+                secondary_target_policy=int(getattr(row, "secondary_target_policy", 0)),
+                exclusive_group=int(getattr(row, "exclusive_group", 0)),
             )
         return result
 

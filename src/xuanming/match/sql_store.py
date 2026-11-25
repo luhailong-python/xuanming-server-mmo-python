@@ -35,6 +35,7 @@ from .errors import (
     ActivityIntentConflictError,
     ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
+    GuildWarMemberOccupiedError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
     ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED,
@@ -2128,6 +2129,72 @@ class SqlMatchStore:
                 selected_region=b_region, owner_account=f"acct:{owner_id}", owner_revision=1,
             )
             await self._insert_ticket_tx(cur, tk)
+            await self._insert_formation_tx(cur, formation)
+            return formation, True
+
+        return await self._run_tx(work)
+
+    async def active_battle_id_of(self, player_id: int) -> int:
+        async def work(cur) -> int:
+            await cur.execute(
+                "SELECT `state`,`formation_id` FROM `match_authority_ticket` WHERE `player_id`=%s",
+                (int(player_id),),
+            )
+            row = await cur.fetchone()
+            if row and int(row[0]) in (TICKET_STATE_FORMING, TICKET_STATE_READY):
+                return int(row[1])
+            return 0
+
+        return await self._run_tx(work)
+
+    async def start_guild_war_battle(
+        self,
+        *,
+        request_id: int,
+        battle_config_id: int,
+        match_mode: int,
+        attacker_player_ids: list[int],
+        defender_player_ids: list[int],
+        activity_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        battle_id_alloc = await self.next_id()
+        all_humans = list(attacker_player_ids) + list(defender_player_ids)
+
+        async def work(cur):
+            now = await self._db_now(cur)
+            for pid in sorted(set(all_humans)):
+                await cur.execute(
+                    "SELECT `state`,`formation_id` FROM `match_authority_ticket` WHERE `player_id`=%s FOR UPDATE",
+                    (pid,),
+                )
+                row = await cur.fetchone()
+                if row and int(row[0]) in (TICKET_STATE_QUEUED, TICKET_STATE_FORMING, TICKET_STATE_READY):
+                    in_battle = int(row[0]) in (TICKET_STATE_FORMING, TICKET_STATE_READY) and int(row[1]) > 0
+                    raise GuildWarMemberOccupiedError(pid, int(row[1]) if in_battle else 0, in_battle=in_battle)
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id_alloc, operation_id=op_id, state=FORMATION_STATE_PREPARING,
+                physical_region=b_region, target_node_id=b_node_id, target_instance_id=b_uuid,
+                target_endpoint=b_endpoint, mode=match_mode, config_id=battle_config_id,
+                created_ms=now, deadline_ms=now + battle_deadline_ms, retry_at_ms=now + 60_000,
+                activity_context=activity_context_bytes, requeue_on_failure=False, release_track=b_track,
+            )
+            for team_idx, side in ((0, attacker_player_ids), (1, defender_player_ids)):
+                for idx, pid in enumerate(side):
+                    tk_id = f"gwar-{battle_id_alloc}-{pid}"
+                    formation.members.add(player_id=pid, ticket=tk_id, team_index=team_idx, captain=(idx == 0))
+                    tk = self.protocol.message(
+                        "match.MatchAuthorityTicketRecord",
+                        player_id=pid, ticket=tk_id, request_id=op_id, mode=match_mode,
+                        config_id=battle_config_id, team_size=len(side), state=TICKET_STATE_FORMING,
+                        enqueued_ms=now, formation_id=battle_id_alloc, expires_ms=now + battle_deadline_ms,
+                        selected_region=b_region, owner_account=f"acct:{pid}", owner_revision=1,
+                    )
+                    await self._insert_ticket_tx(cur, tk)
             await self._insert_formation_tx(cur, formation)
             return formation, True
 

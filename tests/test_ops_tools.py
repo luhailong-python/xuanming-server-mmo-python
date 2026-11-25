@@ -325,11 +325,11 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert res_a.manifest == res_b.manifest
     assert is_lower_hex(res_a.manifest.bundle_sha256, 64)
     assert is_lower_hex(res_a.manifest.content_digest, 64)
-    assert res_a.manifest.version == "66"
+    assert res_a.manifest.version == "71"
 
-    # 142 个 tables/ 文件（70 json + 70 pb + manifest.json + tip_text.json）+ 1 个 _table_descriptors.pb = 143。
+    # 146 个 tables/ 文件（72 json + 72 pb + manifest.json + tip_text.json）+ 1 个 _table_descriptors.pb = 147。
     manifest_paths = {entry.path for entry in res_a.manifest.files}
-    assert len(manifest_paths) == 143
+    assert len(manifest_paths) == 147
     assert DESCRIPTOR_FILENAME in manifest_paths
     assert "manifest.json" in manifest_paths
     assert "item.json" in manifest_paths
@@ -340,9 +340,9 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
         f"{res_a.manifest.bundle_sha256}  {bundle_a.name}\n"
     )
     sidecar_manifest = json.loads(res_a.manifest_path.read_text(encoding="utf-8"))
-    assert sidecar_manifest["version"] == "66"
+    assert sidecar_manifest["version"] == "71"
     assert sidecar_manifest["bundle_sha256"] == res_a.manifest.bundle_sha256
-    assert len(sidecar_manifest["files"]) == 143
+    assert len(sidecar_manifest["files"]) == 147
 
     # 只读校验通过。
     verified = verify_bundle(bundle_a, expected_sha256=res_a.manifest.bundle_sha256)
@@ -358,8 +358,8 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert (dest_dir / DESCRIPTOR_FILENAME).read_bytes() == DESCRIPTORS_FILE.read_bytes()
 
     loaded_tables = ConfigTables(dest_dir, fmt="pb", descriptor_set=dest_dir / DESCRIPTOR_FILENAME)
-    assert loaded_tables.version == 66
-    assert len(loaded_tables.tables) == 70
+    assert loaded_tables.version == 71
+    assert len(loaded_tables.tables) == 72
 
 
 def test_unpack_rejects_tampered_bundle_and_preserves_existing_dest(tmp_path: Path) -> None:

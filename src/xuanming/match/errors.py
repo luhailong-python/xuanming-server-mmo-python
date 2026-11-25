@@ -189,3 +189,13 @@ class ActivityOutsideWindowError(MatchError):
 
 class ActivityIntentConflictError(MatchError):
     """同幂等键的活动开局请求载荷与已登记记录不一致。"""
+
+
+class GuildWarMemberOccupiedError(MatchError):
+    """帮战开局时某真人参与者已有活跃票据或正在战斗中。"""
+
+    def __init__(self, player_id: int, battle_id: int = 0, *, in_battle: bool = False) -> None:
+        super().__init__(f"guild war member occupied player={player_id} battle={battle_id}")
+        self.player_id = int(player_id)
+        self.battle_id = int(battle_id)
+        self.in_battle = bool(in_battle)

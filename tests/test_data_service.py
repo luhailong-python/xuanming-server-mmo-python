@@ -475,7 +475,7 @@ def test_all_proto_rpcs_registered():
     service = DataService(protocol, MemoryStore(protocol), SECRETS)
     registered = set(service.services()["data_service.DataService"].keys())
     assert proto_methods == registered
-    assert len(registered) == 49
+    assert len(registered) == 50
 
 
 @pytest.mark.parametrize("kind", KINDS)

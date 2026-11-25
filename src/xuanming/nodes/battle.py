@@ -42,6 +42,12 @@ from .battle_dropin_effects import (
     PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS,
     PVP_SURRENDER_UNLOCK_ROUND,
     RANKED_DEFAULT_MAX_ROUNDS,
+    TACTICAL_PREP_DURATION_SECONDS,
+    TACTICAL_PREP_TIMEOUT_MS,
+    BattleModifier,
+    BattleStateKind,
+    BattleTrigger,
+    ConfiguredAbilitiesController,
     DungeonMonsterAiProfile,
     EncounterV2Controller,
     EquipmentBattleEffects,
@@ -84,7 +90,7 @@ _UUID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 
 CLIENT_REQUESTS = {140: "GetBattleStateRequest", 149: "SubmitBattleActionRequest",
                    162: "SetAutoBattleRequest", 165: "StopWatchBattleRequest",
-                   479: "SurrenderBattleRequest"}
+                   479: "SurrenderBattleRequest", 504: "UpdateBattlePrepRequest"}
 
 
 class BattleError(ValueError):
@@ -126,6 +132,20 @@ class _ObserverReceipt:
     expires_ms: int
     canonical: bytes = b""
     error: int = _INVALID
+
+
+@dataclass(slots=True)
+class _PrepPlayerOptions:
+    """论剑 V3 战前 15 秒明牌变阵单人可选配置与锁定态（对照 C++ `PrepPlayerOptions`）。"""
+
+    team_index: int
+    active_season_id: int
+    ai_controlled: bool
+    selected_seal_id: int = 0
+    selected_pet_id: int = 0
+    ready: bool = False
+    available_seals: list[Message] = field(default_factory=list)
+    available_pets: list[Message] = field(default_factory=list)
 
 
 def _uuid(value: str) -> bool:
@@ -221,6 +241,7 @@ class TurnEngine:
         self.defeated_monsters: list[int] = []
         self.effects = BattleEffects(self, buffs or {})
         self.skills = BattleSkills(self, skills, silence_permissions)
+        self.configured = ConfiguredAbilitiesController(self)
         self.equipment_effects = EquipmentBattleEffects(self)
         self.pet_support = PetAndSupportEffects(self)
         self.season_rules = SeasonBattleRules
@@ -232,8 +253,14 @@ class TurnEngine:
         self.encounter = EncounterV2Controller(
             self, request, boss_trial_kind=boss_trial_kind, battle_difficulty=battle_difficulty,
         )
+        self.round_start_speeds: dict[int, int] = {}
+        self.ai_controlled_players: set[int] = set()
+        self.prep_active: bool = False
+        self._next_pet_actor_index: int = 0
+        self.prep_options_by_player: dict[int, _PrepPlayerOptions] = {}
         self._group = 0
-        slots = [0, 0]
+        self._team_slots = [0, 0]
+        slots = self._team_slots
         for player in request.players:
             actor_id = player.player_id
             if not 0 < actor_id < _ENGINE_ACTOR_FLAG or actor_id in self.actors or player.team_index > 1:
@@ -244,6 +271,9 @@ class TurnEngine:
             actor.appearance_id = player.appearance_id
             actor.class_id = player.class_id
             actor.gender = player.gender
+            if bool(getattr(player, "ai_controlled", False)):
+                actor.is_auto = True
+                self.ai_controlled_players.add(actor_id)
             if player.HasField("combat"):
                 actor.combat.CopyFrom(player.combat)
             actor.buffs.extend(player.buffs)
@@ -259,30 +289,19 @@ class TurnEngine:
                     self.items[actor_id].append(entry)
 
         pet_ids: set[int] = set()
-        pet_index = 0
-        allow_temp_pet = self.uses_free_preset
         for player in request.players:
             for pet in player.pets:
-                is_temp_pet = bool(getattr(pet, "competitive_temporary", False))
-                if is_temp_pet and not allow_temp_pet:
-                    raise BattleError("competitive_temporary pet rejected when use_free_preset is false")
-                if (not pet.pet_id and not (is_temp_pet and allow_temp_pet)) or (
-                    pet.pet_id and pet.pet_id in pet_ids
-                ) or pet.owner_player_id not in (0, player.player_id):
+                if pet.pet_id and pet.pet_id in pet_ids:
                     raise BattleError("invalid pet snapshot")
-                actor = self._actor(pet, _PET_ACTOR_BASE + pet_index, _PET, player.team_index, slots, pet.pet_name)
-                pet_index += 1
-                actor.owner_player_id = player.player_id
-                actor.pet_table_id = pet.pet_table_id
-                actor.pet_id = pet.pet_id
-                actor.competitive_temporary = is_temp_pet
-                actor.is_auto = True
-                self.skills.initialize(actor, pet, pet=True)
-                if pet.HasField("pet_cultivation"):
-                    if not self.pet_support.initialize_pet_cultivation(actor, pet.pet_cultivation):
-                        raise BattleError("invalid pet cultivation snapshot")
+                actor = self._build_pet_actor(
+                    player, pet, _PET_ACTOR_BASE + self._next_pet_actor_index, slots[player.team_index],
+                )
+                slots[player.team_index] += 1
+                self._next_pet_actor_index += 1
+                self.actors[actor.actor_id] = actor
                 if pet.pet_id:
                     pet_ids.add(pet.pet_id)
+        self._init_tactical_prep(request)
         monster_list = list(monsters)
         if self.encounter.is_festival_beast:
             if len(monster_list) != 1:
@@ -322,8 +341,283 @@ class TurnEngine:
         self.effects.sanitize()
         self.scripts = BattleScriptRuntime(self, request, monster_ids)
         self.monster_ai.bind_actors()
+        # 战前 15 秒明牌变阵期间延迟到 finalize_prep_phase 锁阵后再初始化开场光环/被动，防止替换首发宠残留旧光环。
+        if not self.prep_active:
+            self.configured.initialize_abilities()
         self.trial_tracker.initialize(request)
         self.encounter.init_special_encounter_state()
+
+    @property
+    def is_in_prep_phase(self) -> bool:
+        """当前是否处于论剑 V3 战前 15 秒明牌变阵期。"""
+        return self.prep_active
+
+    def _build_pet_actor(
+        self, owner_snapshot: Message, pet: Message, actor_id: int, formation_slot: int,
+    ) -> Message:
+        """按 C++ `BuildPetActor` 校验并构造单个灵宠战斗单位（供开局与变阵换宠复用）。"""
+        allow_temp_pet = self.uses_free_preset
+        is_temp_pet = bool(getattr(pet, "competitive_temporary", False))
+        if is_temp_pet and not allow_temp_pet:
+            raise BattleError("competitive_temporary pet rejected when use_free_preset is false")
+        if not pet.pet_id and not (is_temp_pet and allow_temp_pet):
+            raise BattleError("invalid pet snapshot")
+        if pet.owner_player_id not in (0, owner_snapshot.player_id):
+            raise BattleError("invalid pet snapshot")
+        if pet.HasField("pet_cultivation") and not PetAndSupportEffects.valid_pet_cultivation(pet.pet_cultivation):
+            raise BattleError("invalid pet cultivation snapshot")
+
+        attributes = pet.base_attributes
+        actor = self.protocol.message(
+            "BattleActorState",
+            actor_id=actor_id,
+            actor_type=_PET,
+            team_index=owner_snapshot.team_index,
+            level=pet.level,
+            attributes=attributes,
+            max_health=pet.max_health or attributes.health,
+            max_mana=pet.max_mana or attributes.mana,
+            physical_attack=pet.physical_attack,
+            magic_attack=pet.magic_attack,
+            defense=pet.defense,
+            formation_slot=formation_slot,
+            owner_player_id=owner_snapshot.player_id,
+            pet_table_id=pet.pet_table_id,
+            pet_id=pet.pet_id,
+            competitive_temporary=is_temp_pet,
+            is_auto=True,
+        )
+        actor.name = pet.pet_name
+        self.skills.initialize(actor, pet, pet=True)
+        if pet.HasField("pet_cultivation"):
+            self.pet_support.initialize_pet_cultivation(actor, pet.pet_cultivation)
+        return actor
+
+    def _init_tactical_prep(self, request: Message) -> None:
+        """初始化论剑 V3 战前 15 秒明牌变阵配置（对照 C++ `InitTacticalPrep`）。"""
+        self.prep_active = False
+        self.prep_options_by_player.clear()
+
+        # 仅正式自养论剑与赛季战队锦标赛开启战前 15 秒明牌变阵；PVE / 免费预设娱乐场 / 切磋 / 帮战零打扰。
+        mode_eligible = (
+            not self.pve
+            and not self.uses_free_preset
+            and (self.is_ranked_battle or request.match_mode == MATCH_MODE_SEASON_TOURNAMENT)
+        )
+        if not mode_eligible:
+            return
+
+        all_battle_pet_ids = {
+            actor.pet_id
+            for actor in self.actors.values()
+            if actor.actor_type == _PET and actor.pet_id != 0
+        }
+        has_any_choice = False
+        for snapshot in request.players:
+            ai_ctrl = bool(getattr(snapshot, "ai_controlled", False))
+            opt = _PrepPlayerOptions(
+                team_index=snapshot.team_index,
+                active_season_id=snapshot.active_season_id,
+                ai_controlled=ai_ctrl,
+                ready=ai_ctrl,
+            )
+            seen_seal_ids: set[int] = set()
+            if snapshot.HasField("equipment_effects") and snapshot.equipment_effects.HasField("season_seal"):
+                equipped_seal = snapshot.equipment_effects.season_seal
+                opt.selected_seal_id = equipped_seal.seal_id
+                if equipped_seal.seal_id not in seen_seal_ids:
+                    seen_seal_ids.add(equipped_seal.seal_id)
+                    opt.available_seals.append(equipped_seal)
+            for seal in getattr(snapshot, "available_season_seals", ()):
+                if not SeasonBattleRules.valid_seal_effect(
+                    seal.season_id,
+                    seal.seal_id,
+                    seal.effect_id,
+                    seal.bonus_bps,
+                    seal.cap_bps,
+                    seal.per_round_limit,
+                    seal.battle_limit,
+                    seal.active_rounds,
+                    seal.health_threshold_bps,
+                ):
+                    raise BattleError("invalid available_season_seal snapshot")
+                if snapshot.active_season_id != 0 and seal.season_id != snapshot.active_season_id:
+                    raise BattleError("available_season_seal season mismatch")
+                if seal.seal_id not in seen_seal_ids:
+                    seen_seal_ids.add(seal.seal_id)
+                    opt.available_seals.append(seal)
+            opt.available_seals.sort(key=lambda s: s.seal_id)
+
+            if snapshot.pets:
+                opt.available_pets.append(snapshot.pets[0])
+                opt.selected_pet_id = snapshot.pets[0].pet_id
+            for standby in getattr(snapshot, "standby_pets", ()):
+                if bool(getattr(standby, "competitive_temporary", False)) or standby.pet_id == 0:
+                    raise BattleError("invalid standby pet id or temporary flag")
+                if standby.owner_player_id not in (0, snapshot.player_id):
+                    raise BattleError("standby pet ownership mismatch")
+                if standby.HasField("pet_cultivation") and not PetAndSupportEffects.valid_pet_cultivation(standby.pet_cultivation):
+                    raise BattleError("invalid standby pet_cultivation")
+                if standby.pet_id == opt.selected_pet_id:
+                    continue
+                if standby.pet_id in all_battle_pet_ids:
+                    raise BattleError("duplicate standby pet_id across battle")
+                all_battle_pet_ids.add(standby.pet_id)
+                opt.available_pets.append(standby)
+
+            if not opt.ai_controlled and (
+                len(opt.available_seals) > 1
+                or len(opt.available_pets) > 1
+                or (opt.selected_pet_id == 0 and len(opt.available_pets) > 0)
+            ):
+                has_any_choice = True
+            self.prep_options_by_player[snapshot.player_id] = opt
+
+        if has_any_choice:
+            self.prep_active = True
+        else:
+            self.prep_options_by_player.clear()
+
+    def all_prep_players_ready(self) -> bool:
+        """判定全部非 AI 参战者是否已完成变阵锁定。"""
+        if not self.prep_active:
+            return True
+        return all(opt.ready for opt in self.prep_options_by_player.values() if not opt.ai_controlled)
+
+    def update_battle_prep(
+        self,
+        player_id: int,
+        selected_seal_id: int,
+        selected_pet_id: int,
+        ready: bool,
+        *,
+        deadline_ms: int = 0,
+    ) -> tuple[int, Message | None]:
+        """处理单个参战者的战前变阵提交（换赛季印/换首发宠/锁定），返回 `(tip_error, viewer_prep_state)`。"""
+        if self.outcome != 0 or not self.prep_active:
+            return _FEATURE, None
+        opt = self.prep_options_by_player.get(player_id)
+        if opt is None or opt.ai_controlled:
+            return _INVALID, None
+
+        if opt.ready:
+            seal_changed = selected_seal_id != 0 and selected_seal_id != opt.selected_seal_id
+            pet_changed = selected_pet_id != 0 and selected_pet_id != opt.selected_pet_id
+            if seal_changed or pet_changed:
+                return _FEATURE, None
+            return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
+
+        if selected_seal_id != 0 and not any(s.seal_id == selected_seal_id for s in opt.available_seals):
+            return _INVALID, None
+        if selected_pet_id != 0 and not any(p.pet_id == selected_pet_id for p in opt.available_pets):
+            return _INVALID, None
+
+        if selected_seal_id != 0:
+            opt.selected_seal_id = selected_seal_id
+        if selected_pet_id != 0:
+            opt.selected_pet_id = selected_pet_id
+        if ready:
+            opt.ready = True
+        return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
+
+    def finalize_prep_phase(self) -> bool:
+        """锁定战前变阵：应用赛季印、原地替换或补发首发宠，并一次性初始化全部开场光环/被动。"""
+        if not self.prep_active:
+            return False
+
+        snap_by_player = {snap.player_id: snap for snap in self.create_request.players}
+        for player_id, opt in sorted(self.prep_options_by_player.items()):
+            # 1. 仅替换单槽赛季印机制（不重算基础气血/防御万分比）。
+            if opt.selected_seal_id != 0:
+                actor = self.actors.get(player_id)
+                if actor is not None:
+                    for seal in opt.available_seals:
+                        if seal.seal_id == opt.selected_seal_id:
+                            if (
+                                not actor.equipment_effects.HasField("season_seal")
+                                or actor.equipment_effects.season_seal.seal_id != opt.selected_seal_id
+                            ):
+                                actor.equipment_effects.season_seal.CopyFrom(seal)
+                                actor.ClearField("season_seal_state")
+                            break
+
+            # 2. 替换或补发首发灵宠（原地保留局内 actor_id 与阵位）。
+            if opt.selected_pet_id != 0:
+                chosen_pet = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
+                owner_snap = snap_by_player.get(player_id)
+                if chosen_pet is not None and owner_snap is not None:
+                    existing_pet = next(
+                        (a for a in self.actors.values() if a.actor_type == _PET and a.owner_player_id == player_id),
+                        None,
+                    )
+                    if existing_pet is not None:
+                        if existing_pet.pet_id != chosen_pet.pet_id:
+                            rebuilt = self._build_pet_actor(
+                                owner_snap, chosen_pet, existing_pet.actor_id, existing_pet.formation_slot,
+                            )
+                            self.actors[existing_pet.actor_id] = rebuilt
+                    else:
+                        new_actor_id = _PET_ACTOR_BASE + self._next_pet_actor_index
+                        self._next_pet_actor_index += 1
+                        slot = self._team_slots[opt.team_index]
+                        self._team_slots[opt.team_index] += 1
+                        added = self._build_pet_actor(owner_snap, chosen_pet, new_actor_id, slot)
+                        self.actors[new_actor_id] = added
+
+        self.prep_active = False
+        self.configured.initialize_abilities()
+        return True
+
+    def build_prep_state_for_viewer(self, viewer_player_id: int, deadline_ms: int = 0) -> Message:
+        """按收信视角脱敏构建 `BattlePrepState`（本人看全部可选+同队态，观众仅看倒计时）。"""
+        out = self.protocol.message("BattlePrepState")
+        if not self.prep_active:
+            return out
+        out.active = True
+        out.deadline_ms = deadline_ms
+        out.duration_seconds = TACTICAL_PREP_DURATION_SECONDS
+        if not viewer_player_id:
+            return out
+        self_opt = self.prep_options_by_player.get(viewer_player_id)
+        if self_opt is None:
+            return out
+        for seal in self_opt.available_seals:
+            out.self_available_seals.add(seal_id=seal.seal_id, effect_id=seal.effect_id, name=seal.name)
+        for pet in self_opt.available_pets:
+            dst = out.self_available_pets.add(
+                pet_id=pet.pet_id,
+                pet_table_id=pet.pet_table_id,
+                pet_name=pet.pet_name,
+                level=pet.level,
+                max_health=pet.max_health or pet.base_attributes.health,
+                speed=pet.base_attributes.speed,
+                physical_attack=pet.physical_attack,
+                magic_attack=pet.magic_attack,
+                defense=pet.defense,
+            )
+            dst.skill_table_ids.extend(pet.skill_table_ids)
+        for member_id, opt in sorted(self.prep_options_by_player.items()):
+            if opt.team_index != self_opt.team_index:
+                continue
+            ps = out.team_states.add(
+                player_id=member_id,
+                team_index=opt.team_index,
+                selected_seal_id=opt.selected_seal_id,
+                selected_pet_id=opt.selected_pet_id,
+                ready=opt.ready,
+            )
+            if opt.selected_pet_id != 0:
+                chosen = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
+                if chosen is not None:
+                    ps.selected_pet_table_id = chosen.pet_table_id
+                    ps.selected_pet_name = chosen.pet_name
+        return out
+
+    def fill_prep_state_for_viewer(self, state: Message, viewer_player_id: int, deadline_ms: int = 0) -> None:
+        state.ClearField("prep_state")
+        if not self.prep_active:
+            return
+        state.prep_state.CopyFrom(self.build_prep_state_for_viewer(viewer_player_id, deadline_ms))
 
     @property
     def is_ranked_battle(self) -> bool:
@@ -399,6 +693,8 @@ class TurnEngine:
         """PVP 第 5 回合起投降 / 同队投降投票表态；返回 `(tip_error, vote_state)`。"""
         if self.outcome != 0:
             return _INVALID, None
+        if self.prep_active:
+            return _FEATURE, None
         if self.pve:
             return ERR_SURRENDER_NOT_ALLOWED, None
         actor = self.actors.get(player_id)
@@ -494,13 +790,15 @@ class TurnEngine:
         return actor
 
     def pending_players(self) -> list[int]:
-        if self.outcome:
+        if self.outcome or self.prep_active:
             return []
         return [actor.actor_id for actor in self.actors.values()
                 if actor.actor_type == _PLAYER and _active(actor) and not actor.is_auto
                 and actor.actor_id not in self.pending]
 
-    def snapshot(self, deadline_ms: int, viewer: int = 0, *, unredacted: bool = False) -> Message:
+    def snapshot(
+        self, deadline_ms: int, viewer: int = 0, *, unredacted: bool = False, prep_deadline_ms: int = 0,
+    ) -> Message:
         state = self.protocol.message(
             "BattleStateS2C", battle_id=self.battle_id, round_index=self.round_index,
             action_deadline_ms=deadline_ms, outcome=self.outcome, pending_actor_ids=self.pending_players(),
@@ -515,11 +813,17 @@ class TurnEngine:
         surrender_unlock = self.surrender_unlock_round
         if surrender_unlock > 0:
             state.surrender_unlock_round = surrender_unlock
-        if not unredacted:
-            self.personalize(state, viewer)
+        if unredacted:
+            if self.prep_active:
+                state.prep_state.active = True
+                state.prep_state.duration_seconds = TACTICAL_PREP_DURATION_SECONDS
+                if prep_deadline_ms:
+                    state.prep_state.deadline_ms = prep_deadline_ms
+        else:
+            self.personalize(state, viewer, prep_deadline_ms=prep_deadline_ms)
         return state
 
-    def personalize(self, state: Message, viewer: int) -> None:
+    def personalize(self, state: Message, viewer: int, *, prep_deadline_ms: int = 0) -> None:
         for actor in state.actors:
             actor.ClearField("combat")
             if actor.HasField("season_seal_state"):
@@ -530,19 +834,35 @@ class TurnEngine:
                 actor.ClearField("support_effects")
         state.ClearField("self_items")
         state.ClearField("surrender_vote")
+        state.ClearField("prep_state")
         for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
             if item.count:
                 state.self_items.add().CopyFrom(item)
         if viewer:
             self.fill_surrender_vote_for_viewer(state, viewer)
+        if self.prep_active:
+            self.fill_prep_state_for_viewer(state, viewer, prep_deadline_ms)
 
     def validate(self, actor: Message, action: Message) -> int:
+        if self.prep_active:
+            return _FEATURE
         if not _active(actor):
             return _INACTIVE
-        if self.effects.has(actor, STUN, FREEZE):
+        if (
+            self.effects.has(actor, STUN, FREEZE)
+            or self.configured.has_state(actor, BattleStateKind.FREEZE)
+            or self.configured.has_state(actor, BattleStateKind.SLEEP)
+        ):
             return 7006
         action_type = action.action_type
-        if action_type in (_ATTACK, _DEFEND):
+        if action_type == _ATTACK:
+            if (
+                self.configured.has_state(actor, BattleStateKind.SEAL_PHYSICAL)
+                or self.configured.is_physical_forbidden(actor)
+            ):
+                return 7004
+            return 0
+        if action_type == _DEFEND:
             return 0
         if action_type == _FLEE:
             return 0 if self.pve else _INVALID
@@ -619,8 +939,11 @@ class TurnEngine:
         if self.outcome:
             turn.state.CopyFrom(self.snapshot(0, unredacted=True))
             return turn
+        if self.prep_active:
+            self.finalize_prep_phase()
         self._fill_default_actions()
         order = sorted((actor for actor in self.actors.values() if _active(actor)), key=self._sort_key)
+        self.round_start_speeds = {actor.actor_id: self.configured.effective_speed(actor) for actor in order}
         self.last_action_order = [actor.actor_id for actor in order]
         turn.action_order.extend(self.last_action_order)
         self._group = 0
@@ -724,11 +1047,14 @@ class TurnEngine:
                             break
             elif actor.actor_type == _PLAYER and actor.is_auto:
                 default = self.skills.auto_action(actor)
-            self.pending[actor.actor_id] = default if default is not None else self.protocol.message("BattleAction", action_type=_ATTACK)
+            fallback_type = _DEFEND if self.configured.is_physical_forbidden(actor) else _ATTACK
+            self.pending[actor.actor_id] = (
+                default if default is not None else self.protocol.message("BattleAction", action_type=fallback_type)
+            )
 
     def _sort_key(self, actor: Message) -> tuple[int, int, int]:
         action = self.pending.get(actor.actor_id)
-        return (-self.skills.initiative(actor, action), -self._effective_stat(actor, 13), actor.actor_id)
+        return (-self.skills.initiative(actor, action), -self.configured.effective_speed(actor), actor.actor_id)
 
     def _effective_stat(self, actor: Message, kind: int) -> int:
         value = base_stat(actor, kind)
@@ -745,7 +1071,13 @@ class TurnEngine:
                                group_id=group, **fields)
 
     def _execute(self, turn: Message, group: int, actor: Message, action: Message) -> None:
-        if self.effects.has(actor, STUN, FREEZE):
+        if self.configured.execute_prepared_cast_if_ready(actor, turn, group):
+            return
+        if (
+            self.effects.has(actor, STUN, FREEZE)
+            or self.configured.has_state(actor, BattleStateKind.FREEZE)
+            or self.configured.has_state(actor, BattleStateKind.SLEEP)
+        ):
             return
         if action.action_type == _DEFEND:
             actor.is_defending = True
@@ -778,6 +1110,11 @@ class TurnEngine:
             self._execute_skill_with_dropin(turn, group, actor, action)
             return
         if action.action_type == _ATTACK:
+            if (
+                self.configured.has_state(actor, BattleStateKind.SEAL_PHYSICAL)
+                or self.configured.is_physical_forbidden(actor)
+            ):
+                return
             self._attack_target(turn, group, actor, action.target_id)
 
     def _execute_skill_with_dropin(self, turn: Message, group: int, actor: Message, action: Message) -> None:
@@ -873,12 +1210,30 @@ class TurnEngine:
 
     def _basic_attack(self, turn: Message, group: int, actor: Message, target: Message, hit_kind: int = 0) -> None:
         rule = BattleSkill(10, physical=True)
+        events_before = len(turn.events)
         self._event(turn, group, 1, actor, target, hit_kind=hit_kind)
         self._damage(turn, group, actor, target, rule, hit_kind=hit_kind)
         if hit_kind == 0 and _active(actor) and _active(target) and self.rng.percent(actor.combat.combo_rate):
             self._damage(turn, group, actor, target, rule, hit_kind=1, hit_index=1)
-        if (hit_kind == 0 and _active(actor) and _active(target) and not self.effects.has(target, STUN, FREEZE)
-                and self.rng.percent(target.combat.counter_rate)):
+        # 单次物理攻击标记覆盖整次普攻行动（含连击），行动末一次性消耗。
+        if hit_kind == 0 and _active(actor):
+            self.configured.consume_one_shot_attack_modifiers(actor, 1, turn, group)
+            landed_normal = any(
+                ev.event_type == 3 and ev.source_id == actor.actor_id and ev.target_id == target.actor_id and ev.value > 0
+                for ev in turn.events[events_before:]
+            )
+            if landed_normal and _active(target):
+                self.configured.trigger_buffs(actor, target, BattleTrigger.AFTER_BASIC, 1, turn, group)
+        if (
+            hit_kind == 0
+            and _active(actor)
+            and _active(target)
+            and not self.effects.has(target, STUN, FREEZE)
+            and not self.configured.has_state(target, BattleStateKind.FREEZE)
+            and not self.configured.has_state(target, BattleStateKind.SLEEP)
+            and not self.configured.is_physical_forbidden(target)
+            and self.rng.percent(target.combat.counter_rate)
+        ):
             self._group += 1
             self._basic_attack(turn, self._group, target, actor, hit_kind=2)
 
@@ -886,11 +1241,18 @@ class TurnEngine:
         if base <= 0 or not isfinite(base):
             return 0.0
         damage_kind = rule.damage_kind
-        attack = self._effective_stat(actor, 10) if damage_kind == 1 else actor.magic_attack if damage_kind == 0 else 0
+        attack = (
+            self.configured.effective_physical_attack(actor)
+            if damage_kind == 1
+            else self.configured.effective_magic_attack(actor)
+            if damage_kind == 0
+            else 0
+        )
         resist_bonus = target.combat.physical_resist if damage_kind == 1 else target.combat.magic_resist if damage_kind == 0 else 0
         resistance = min(100, target.attributes.resistance + resist_bonus) / 100
         level_factor = 360 + 120 * min(85, max(1, target.level))
-        defense = float(target.attributes.armor) + float(self._effective_stat(target, 11))
+        eff_def = self.configured.effective_defense(target)
+        defense = float(target.attributes.armor) + float(eff_def)
         ratio = max(1.0 - 0.60, level_factor / (defense + level_factor) * (1 - resistance))
         multiplier = rule.attack_multiplier
         if not isfinite(multiplier) or multiplier < 0:
@@ -901,7 +1263,7 @@ class TurnEngine:
         damage = raw * ratio
         if target.HasField("equipment_effects"):
             damage = self.equipment_effects.apply_equipment_resist(
-                target, damage, damage_kind, self._effective_stat(target, 11),
+                target, damage, damage_kind, eff_def,
             )
         return damage * (1.0 if self.pve else 0.3)
 
@@ -939,6 +1301,21 @@ class TurnEngine:
             damage *= 0.5
         if is_primary_focus:
             damage *= PVP_PRIMARY_FOCUS_NUM / PVP_PRIMARY_FOCUS_DEN
+        if hit_kind != 3:
+            typed_out = self.configured.modifier(
+                actor,
+                BattleModifier.OUTGOING_PHYSICAL_DAMAGE if rule.damage_kind == 1 else BattleModifier.OUTGOING_MAGIC_DAMAGE,
+            )
+            one_shot_out = self.configured.modifier(
+                actor,
+                BattleModifier.NEXT_PHYSICAL_ATTACK if rule.damage_kind == 1 else BattleModifier.NEXT_MAGIC_ATTACK,
+            )
+            out_bonus = self.configured.modifier(actor, BattleModifier.OUTGOING_DAMAGE) + typed_out + one_shot_out
+            if out_bonus != 0.0:
+                damage *= max(0.0, 1.0 + out_bonus)
+            in_bonus = self.configured.modifier(target, BattleModifier.INCOMING_DAMAGE) + self.configured.hit_vulnerability_bonus(target)
+            if in_bonus != 0.0:
+                damage *= max(0.0, 1.0 + in_bonus)
         if actor.actor_type == _PET and actor.HasField("pet_cultivation"):
             damage = self.pet_support.apply_pet_damage_bonus(
                 actor, damage, rule.damage_kind, is_direct=(hit_kind != 3), hit_kind=hit_kind,
@@ -988,6 +1365,8 @@ class TurnEngine:
         if (dealt + absorbed) > 0 and hit_kind in (0, 1):
             self.trial_tracker.record_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
             self.encounter.record_player_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
+        if (dealt + absorbed) > 0 and hit_kind != 3 and _active(target):
+            self.configured.increment_hit_vulnerability(target, self.round_index, group)
         if dealt > 0:
             self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
         if not skill_id and hit_kind != 2 and dealt and _active(actor) and _active(target) and self.rng.percent(target.combat.reflect_rate):
@@ -1018,6 +1397,7 @@ class TurnEngine:
             self.defeated_monsters.append(target.monster_table_id)
         target.is_dead = True
         target.is_defending = False
+        target.charging_skill_id = 0
         if target.artifact_states:
             self.equipment_effects.clear_pending_echoes_on_death(target)
         target.ClearField("buffs")
@@ -1036,6 +1416,8 @@ class _Room:
     routing: dict[int, Message]
     action_due_steady_ms: int = 0
     battle_due_steady_ms: int = 0
+    prep_deadline_ms: int = 0
+    prep_due_steady_ms: int = 0
     reward_profile: Message | None = None
     observers: dict[int, _Observer] = field(default_factory=dict)
     connections: dict[int, _Connection] = field(default_factory=dict)
@@ -1197,10 +1579,12 @@ class BattleNode:
         original = self.protocol.message("CreateBattleRequest")
         original.CopyFrom(request)
         routing = {player.player_id: player.routing for player in original.players}
-        room = _Room(engine, original, deadline, now + manual_window_ms, routing,
+        in_prep_phase = engine.is_in_prep_phase
+        room = _Room(engine, original, deadline, 0 if in_prep_phase else (now + manual_window_ms), routing,
                      reward_profile=reward_profile,
                      confirm_until_ms=now + 180_000)
-        if request.record_replay:
+        # 战前 15 秒明牌变阵期延迟录制回放起点至 _finalize_battle_prep 亮牌后再录。
+        if request.record_replay and not in_prep_phase:
             fingerprint = self.tables.fingerprint if self.tables else ""
             room.replay = BattleReplayRecorder(self.protocol, original, fingerprint, engine.snapshot(0))
         assignments = {player: self._assignment(room, player, _PARTICIPANT) for player in routing}
@@ -1209,9 +1593,15 @@ class BattleNode:
         admitted_at = self.now_ms()
         if request.admit_before_ms <= admitted_at:
             return self._error(response, _INVALID)
-        room.action_deadline_ms = admitted_at + manual_window_ms
         armed_at = self._steady_ms()
-        room.action_due_steady_ms = armed_at + manual_window_ms
+        if in_prep_phase:
+            room.action_deadline_ms = 0
+            room.action_due_steady_ms = 0
+            room.prep_deadline_ms = admitted_at + TACTICAL_PREP_TIMEOUT_MS
+            room.prep_due_steady_ms = armed_at + TACTICAL_PREP_TIMEOUT_MS
+        else:
+            room.action_deadline_ms = admitted_at + manual_window_ms
+            room.action_due_steady_ms = armed_at + manual_window_ms
         room.battle_due_steady_ms = armed_at + deadline - now
         self.rooms[request.battle_id] = room
         if self.on_rooms_changed:
@@ -1222,8 +1612,11 @@ class BattleNode:
         for player, route in routing.items():
             if self.on_lobby_push:
                 self._publish(self.on_lobby_push, route, player, 177, assignments[player])
-                start = self.protocol.message("BattleStartS2C", battle_id=request.battle_id,
-                                              state=engine.snapshot(room.action_deadline_ms, player))
+                start = self.protocol.message(
+                    "BattleStartS2C",
+                    battle_id=request.battle_id,
+                    state=engine.snapshot(room.action_deadline_ms, player, prep_deadline_ms=room.prep_deadline_ms),
+                )
                 self._publish(self.on_lobby_push, route, player, 143, start)
             if self.on_confirm:
                 self._publish(self.on_confirm, route, player, request.battle_id, deadline)
@@ -1579,6 +1972,7 @@ class BattleNode:
             162: "SetAutoBattleResponse",
             165: "StopWatchBattleResponse",
             479: "SurrenderBattleResponse",
+            504: "UpdateBattlePrepResponse",
         }
         if message_id not in responses:
             raise BattleError("message_id_not_allowed")
@@ -1594,6 +1988,32 @@ class BattleNode:
         if room.proposed_outcome or room.battle_due_steady_ms <= steady:
             return self._error(response, _UNAVAILABLE)
         engine = room.engine
+        if message_id == 504:
+            if engine.is_in_prep_phase and room.prep_due_steady_ms and steady >= room.prep_due_steady_ms:
+                self._finalize_battle_prep(room)
+            err, prep_state = engine.update_battle_prep(
+                ticket.player_id,
+                request.selected_seal_id,
+                request.selected_pet_id,
+                bool(request.ready),
+                deadline_ms=room.prep_deadline_ms,
+            )
+            if err:
+                return self._error(response, err)
+            response.prep_state.CopyFrom(prep_state)
+            if engine.all_prep_players_ready():
+                self._finalize_battle_prep(room)
+                return response
+            # 仅向同队成员推送 505 变阵同步（各自保留本人可选列表 + 共享本队选择），绝不向对手或观众泄密。
+            actor_team = engine.team_index_of_player(ticket.player_id)
+            if actor_team is not None:
+                for member_id in tuple(room.routing):
+                    if engine.team_index_of_player(member_id) != actor_team:
+                        continue
+                    notify = self.protocol.message("BattlePrepUpdateS2C", battle_id=engine.battle_id)
+                    notify.prep_state.CopyFrom(engine.build_prep_state_for_viewer(member_id, room.prep_deadline_ms))
+                    self._emit(room, member_id, 505, notify)
+            return response
         if message_id == 479:
             visible_before = self._terminal_visibility(room)
             err, vote_state = engine.submit_surrender_vote(ticket.player_id, bool(request.agree))
@@ -1611,6 +2031,11 @@ class BattleNode:
                 room.visible_before_terminal = visible_before
                 self._propose_outcome(room, engine.outcome, self.now_ms())
             return response
+        if engine.is_in_prep_phase:
+            if room.prep_due_steady_ms and steady >= room.prep_due_steady_ms:
+                self._finalize_battle_prep(room)
+            else:
+                return self._error(response, _FEATURE)
         if steady >= room.action_due_steady_ms:
             self._resolve(room)
             return self._error(response, _INVALID)
@@ -1618,6 +2043,8 @@ class BattleNode:
         if not _active(actor):
             return self._error(response, _INACTIVE)
         if message_id == 162:
+            if ticket.player_id in engine.ai_controlled_players:
+                return self._error(response, _INVALID)
             was_ready = not engine.pending_players()
             actor.is_auto = request.enabled
             if request.enabled and not was_ready and not engine.pending_players():
@@ -1633,11 +2060,43 @@ class BattleNode:
                 self._resolve(room)
         return response
 
+    def _finalize_battle_prep(self, room: _Room) -> None:
+        """结束论剑 V3 战前 15 秒明牌变阵：锁阵、启动第 1 回合计时、补录回放起点并向参战者/观众亮牌。"""
+        if room.proposed_outcome or not room.engine.is_in_prep_phase:
+            return
+        room.prep_deadline_ms = 0
+        room.prep_due_steady_ms = 0
+        if not room.engine.finalize_prep_phase():
+            return
+        manual_window_ms = BOSS_TRIAL_ACTION_TIMEOUT_MS if room.engine.is_boss_trial_battle else _ACTION_MS
+        room.action_deadline_ms = self.now_ms() + manual_window_ms
+        room.action_due_steady_ms = self._steady_ms() + manual_window_ms
+        if room.original.record_replay and room.replay is None:
+            fingerprint = self.tables.fingerprint if self.tables else ""
+            room.replay = BattleReplayRecorder(self.protocol, room.original, fingerprint, room.engine.snapshot(0))
+        for player, route in room.routing.items():
+            start = self.protocol.message(
+                "BattleStartS2C",
+                battle_id=room.engine.battle_id,
+                state=room.engine.snapshot(room.action_deadline_ms, player),
+            )
+            if self.on_lobby_push:
+                self._publish(self.on_lobby_push, route, player, 143, start)
+        for observer_id in tuple(room.observers):
+            self._push_observer_state(room, observer_id)
+        if room.spectate.targets():
+            self._spectate_state(room)
+        _LOG.info(
+            "battle tactical prep finalized battle=%s action_deadline_ms=%s",
+            room.engine.battle_id,
+            room.action_deadline_ms,
+        )
+
     @staticmethod
     def _snapshot(room: _Room, viewer: int) -> Message:
         if room.proposed_outcome:
             return room.visible_before_terminal.get(viewer, room.visible_before_terminal[0])
-        return room.engine.snapshot(room.action_deadline_ms, viewer)
+        return room.engine.snapshot(room.action_deadline_ms, viewer, prep_deadline_ms=room.prep_deadline_ms)
 
     def _resolve(self, room: _Room) -> None:
         visible = self._terminal_visibility(room)
@@ -1657,7 +2116,10 @@ class BattleNode:
 
     @staticmethod
     def _terminal_visibility(room: _Room) -> dict[int, Message]:
-        return {viewer: room.engine.snapshot(room.action_deadline_ms, viewer) for viewer in (0, *room.routing)}
+        return {
+            viewer: room.engine.snapshot(room.action_deadline_ms, viewer, prep_deadline_ms=room.prep_deadline_ms)
+            for viewer in (0, *room.routing)
+        }
 
     def _broadcast_turn(self, room: _Room, original: Message) -> None:
         for player in tuple(room.connections):
@@ -1679,6 +2141,8 @@ class BattleNode:
             room.outcome_finished_ms = now
             room.outcome_since_ms = steady
             room.action_deadline_ms = 0
+            room.prep_deadline_ms = 0
+            room.prep_due_steady_ms = 0
             for state in room.visible_before_terminal.values():
                 state.action_deadline_ms = 0
             result = self._result(room)
@@ -1816,10 +2280,15 @@ class BattleNode:
                 elif room.outcome_retry_ms <= steady:
                     self._propose_outcome(room, room.proposed_outcome, now)
             elif room.battle_due_steady_ms <= steady:
+                room.prep_deadline_ms = 0
+                room.prep_due_steady_ms = 0
                 room.visible_before_terminal = self._terminal_visibility(room)
                 if room.replay is not None:
                     room.replay.mark_deadline_draw(room.visible_before_terminal[0])
                 self._propose_outcome(room, 3, now)
+            elif room.engine.is_in_prep_phase:
+                if room.prep_due_steady_ms and room.prep_due_steady_ms <= steady:
+                    self._finalize_battle_prep(room)
             elif room.action_due_steady_ms <= steady:
                 self._resolve(room)
             elif (self.on_confirm and room.confirm_retry_steady_ms

@@ -31,15 +31,25 @@ EQUIP_FROZEN = 28008
 EQUIP_INTERNAL_ERROR = 28010
 EQUIP_MATERIAL_NOT_ENOUGH = 28013
 EQUIP_LEVEL_CHANGED = 28022
+EQUIP_BIND_CONFIRM_REQUIRED = 28027
 
-# 材料自选与游戏日契约（UTC+8 05:00 换日，与 C++ PlayerEquipmentMaterialRewardSystem 一致）。
+# 材料自选与游戏日/周契约（UTC+8 05:00 换日，UTC+8 周一 05:00 换周，与 C++ PlayerEquipmentMaterialRewardSystem 一致）。
 DAY_MS = 86_400_000
+WEEK_MS = 7 * DAY_MS
 DAY_SHIFT_MS = 10_800_000
+FIRST_MONDAY_05_UTC8_MS = 3 * DAY_MS + 21 * 3_600_000
 MATERIAL_REWARD_DAILY_LIMIT = 20
+MATERIAL_REWARD_MIN_STEP_UNITS = 5
 MATERIAL_REWARD_BATTLE_UNITS = 10
+MATERIAL_REWARD_BONUS_UNITS = 5
+MATERIAL_REWARD_LIFETIME_LIMIT = 660
+MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT = 60
+MATERIAL_REWARD_WEEKLY_LIMIT = 150
 CRAFTING_MATERIAL_ID = 3001
 ENHANCEMENT_STONE_ID = 3002
 LEGACY_ENHANCEMENT_STONE_ID = 2001
+UNSEAL_TALISMAN_ID = 3409
+INHERIT_TALISMAN_ID = 3410
 DEFAULT_FORGE_MATERIAL_COUNT = 10
 
 _OUTCOME_UNKNOWN = 0
@@ -48,6 +58,10 @@ _OUTCOME_APPLIED = 2
 
 _OP_CREATE_ITEM = 1
 _OP_INSTALL_AFFIX = 2
+_OP_REFORGE_AFFIX = 3
+_OP_POLISH_AFFIX = 4
+_OP_UNSEAL_TO_TRADABLE = 5
+_OP_INHERIT_ENHANCE = 6
 
 _MAX_SOURCE_BPS = {
     1: 3200, 2: 3200, 5: 3200, 6: 3200,
@@ -65,6 +79,13 @@ class _MaterialRewardState:
     earned_today: int = 0
     available_units: int = 0
     revision: int = 0
+    lifetime_earned: int = 0
+    tradable_earned_total: int = 0
+    available_tradable_units: int = 0
+    week_starts_at_ms: int = 0
+    earned_this_week: int = 0
+    migrated_to_v2: bool = False
+    stage1_tradable_confirmed: int = 0
 
 
 def resolve_game_day(now_ms_val: int) -> tuple[int, int] | None:
@@ -76,6 +97,17 @@ def resolve_game_day(now_ms_val: int) -> tuple[int, int] | None:
     if start > _MAX_UINT64 - DAY_MS:
         return None
     return start, start + DAY_MS
+
+
+def resolve_game_week(now_ms_val: int) -> tuple[int, int] | None:
+    """按 UTC+8 周一 05:00 计算当前游戏周 [start_ms, next_reset_ms)。"""
+    if now_ms_val < FIRST_MONDAY_05_UTC8_MS:
+        return None
+    elapsed = now_ms_val - FIRST_MONDAY_05_UTC8_MS
+    start = FIRST_MONDAY_05_UTC8_MS + (elapsed // WEEK_MS) * WEEK_MS
+    if start > _MAX_UINT64 - WEEK_MS:
+        return None
+    return start, start + WEEK_MS
 
 
 def maximum_source_bps(effect: int) -> int:
@@ -169,6 +201,9 @@ class SceneEquipCraft:
         self._material_rewards: dict[int, _MaterialRewardState] = {}
         self._craft_receipts: dict[tuple[int, int], tuple[int, int]] = {}
         self._reward_receipts: dict[tuple[int, int], int] = {}
+        self._account_stage1_used: dict[int, int] = {}
+        self._account_quota_transport = None
+        self.scene.equip_craft = self
 
     def register(self) -> None:
         """向 SceneNode 注册 5 个装备打造与材料自选 RPC。"""
@@ -285,7 +320,12 @@ class SceneEquipCraft:
         info.item_id = item.item_id
         info.config_id = item.config_id
         info.count = item.size
+        info.bound = bool(item.bound)
         _fill_item(self.tables, info, item.equip if item.HasField("equip") else None)
+        if item.HasField("equip"):
+            info.enhance_pity_count = int(item.equip.enhance_pity_count)
+            info.crafter_name = item.equip.crafter_name
+            info.crafter_player_id = int(item.equip.crafter_player_id)
         self.fill_v1_display(item, info)
 
     def _build_rules(self):
@@ -382,12 +422,26 @@ class SceneEquipCraft:
                     earned_today=mem.earned_today,
                     available_units=mem.available_units,
                     revision=mem.revision,
+                    lifetime_earned=mem.lifetime_earned,
+                    tradable_earned_total=mem.tradable_earned_total,
+                    available_tradable_units=mem.available_tradable_units,
+                    week_starts_at_ms=mem.week_starts_at_ms,
+                    earned_this_week=mem.earned_this_week,
+                    migrated_to_v2=mem.migrated_to_v2,
+                    stage1_tradable_confirmed=mem.stage1_tradable_confirmed,
                 )
             return _MaterialRewardState(
                 day_starts_at_ms=mr.day_starts_at_ms,
                 earned_today=mr.earned_today,
                 available_units=mr.available_units,
                 revision=mr.revision,
+                lifetime_earned=int(getattr(mr, "lifetime_earned", 0)),
+                tradable_earned_total=int(getattr(mr, "tradable_earned_total", 0)),
+                available_tradable_units=int(getattr(mr, "available_tradable_units", 0)),
+                week_starts_at_ms=int(getattr(mr, "week_starts_at_ms", 0)),
+                earned_this_week=int(getattr(mr, "earned_this_week", 0)),
+                migrated_to_v2=bool(getattr(mr, "migrated_to_v2", False)),
+                stage1_tradable_confirmed=int(getattr(mr, "stage1_tradable_confirmed", 0)),
             )
         if mem is None:
             mem = _MaterialRewardState()
@@ -404,6 +458,13 @@ class SceneEquipCraft:
             mr.earned_today = state.earned_today
             mr.available_units = state.available_units
             mr.revision = state.revision
+            mr.lifetime_earned = state.lifetime_earned
+            mr.tradable_earned_total = state.tradable_earned_total
+            mr.available_tradable_units = state.available_tradable_units
+            mr.week_starts_at_ms = state.week_starts_at_ms
+            mr.earned_this_week = state.earned_this_week
+            mr.migrated_to_v2 = state.migrated_to_v2
+            mr.stage1_tradable_confirmed = state.stage1_tradable_confirmed
             if persisted:
                 self._material_rewards.pop(player_id, None)
             elif player_id in self._material_rewards:
@@ -412,9 +473,146 @@ class SceneEquipCraft:
                     earned_today=state.earned_today,
                     available_units=state.available_units,
                     revision=state.revision,
+                    lifetime_earned=state.lifetime_earned,
+                    tradable_earned_total=state.tradable_earned_total,
+                    available_tradable_units=state.available_tradable_units,
+                    week_starts_at_ms=state.week_starts_at_ms,
+                    earned_this_week=state.earned_this_week,
+                    migrated_to_v2=state.migrated_to_v2,
+                    stage1_tradable_confirmed=state.stage1_tradable_confirmed,
                 )
         else:
             self._material_rewards[player_id] = state
+
+    def set_account_quota_sync_transport(self, transport) -> None:
+        """注入账号级阶段一 60 份可交易配额异步同步传输钩子（测试或 data_service 客户端）。"""
+        self._account_quota_transport = transport
+        if transport is None:
+            self._account_stage1_used.clear()
+
+    def known_account_stage1_tradable_used(self, player_id: int, data=None) -> int:
+        """返回当前场景已知的账号级阶段一可交易已用份数（封顶 60）。"""
+        used = 0
+        if data is not None and hasattr(data.client_request_ledger, "material_reward"):
+            mr = data.client_request_ledger.material_reward
+            if mr.migrated_to_v2:
+                used = int(mr.tradable_earned_total)
+        used = max(used, self._account_stage1_used.get(player_id, 0))
+        return min(used, MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT)
+
+    def apply_account_quota_sync_reply(
+        self,
+        player_id: int,
+        data,
+        *,
+        desired_char_total: int,
+        found: bool,
+        account_used_total: int,
+        confirmed_char_total: int,
+    ) -> bool:
+        """应用 data_service 账号目录同步回执：超额未确认可交易额平滑降级为绑定自用，更新 stage1_tradable_confirmed。"""
+        if not found:
+            return False
+        used = min(MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT, int(account_used_total))
+        self._account_stage1_used[player_id] = max(self._account_stage1_used.get(player_id, 0), used)
+        state = self._get_reward_state(player_id, data)
+        if not state.migrated_to_v2:
+            return False
+        confirmed_by_dir = min(int(confirmed_char_total), MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT)
+        changed = False
+        if state.tradable_earned_total > confirmed_by_dir and (
+            confirmed_by_dir < desired_char_total
+            or self._account_stage1_used[player_id] >= MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT
+        ):
+            revoked = state.tradable_earned_total - confirmed_by_dir
+            state.tradable_earned_total = confirmed_by_dir
+            state.available_tradable_units = max(0, state.available_tradable_units - revoked)
+            changed = True
+        next_confirmed = min(
+            state.tradable_earned_total,
+            max(state.stage1_tradable_confirmed, confirmed_by_dir),
+        )
+        if next_confirmed != state.stage1_tradable_confirmed:
+            state.stage1_tradable_confirmed = next_confirmed
+            changed = True
+        if changed:
+            self._save_reward_state(player_id, data, state)
+        return changed
+
+    def credit_battle_material_reward_v2(
+        self,
+        player_id: int,
+        *,
+        is_win: bool,
+        bonus_units: int = 0,
+        now_ms_val: int | None = None,
+        data=None,
+        light_card_active: bool = False,
+        account_stage1_tradable_used: int | None = None,
+    ) -> tuple[int, int]:
+        """两阶段 V2 账本入账（首套 660 份 + 账号级 60 可交易；二阶段每周 150 份 + 轻享卡胜局可交易），返回 (总入账, 可交易入账)。"""
+        stamp = self.clock() if now_ms_val is None else now_ms_val
+        week = resolve_game_week(stamp)
+        if week is None:
+            return 0, 0
+        week_start, _ = week
+        if data is not None:
+            state = self._get_reward_state(player_id, data)
+        else:
+            state = self._material_rewards.get(player_id)
+            if state is None:
+                state = _MaterialRewardState()
+                self._material_rewards[player_id] = state
+        gross_units = MATERIAL_REWARD_BATTLE_UNITS + (MATERIAL_REWARD_BONUS_UNITS if bonus_units > 0 else 0)
+        prev_lifetime = state.lifetime_earned if state.migrated_to_v2 else 0
+        prev_tradable_total = state.tradable_earned_total if state.migrated_to_v2 else 0
+        prev_avail_tradable = state.available_tradable_units if state.migrated_to_v2 else 0
+
+        add_total = 0
+        add_tradable = 0
+        if prev_lifetime < MATERIAL_REWARD_LIFETIME_LIMIT:
+            stage1_remain = MATERIAL_REWARD_LIFETIME_LIMIT - prev_lifetime
+            add_total = min(gross_units, stage1_remain)
+            known_used = (
+                self.known_account_stage1_tradable_used(player_id, data)
+                if account_stage1_tradable_used is None
+                else min(int(account_stage1_tradable_used), MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT)
+            )
+            effective_account_used = max(prev_tradable_total, known_used)
+            if is_win and add_total >= MATERIAL_REWARD_BATTLE_UNITS and effective_account_used < MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT:
+                add_tradable = 1
+            if state.available_units > _MAX_UINT64 - add_total:
+                return 0, 0
+            state.migrated_to_v2 = True
+            state.lifetime_earned = prev_lifetime + add_total
+            state.tradable_earned_total = prev_tradable_total + add_tradable
+            state.available_units += add_total
+            state.available_tradable_units = prev_avail_tradable + add_tradable
+            if add_tradable > 0:
+                self._account_stage1_used[player_id] = min(
+                    MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT,
+                    max(self._account_stage1_used.get(player_id, 0) + 1, state.tradable_earned_total),
+                )
+        else:
+            if week_start < state.week_starts_at_ms:
+                return 0, 0
+            earned_week = 0 if week_start > state.week_starts_at_ms else state.earned_this_week
+            if earned_week >= MATERIAL_REWARD_WEEKLY_LIMIT:
+                return 0, 0
+            add_total = min(gross_units, MATERIAL_REWARD_WEEKLY_LIMIT - earned_week)
+            add_tradable = 1 if (light_card_active and is_win and add_total >= MATERIAL_REWARD_BATTLE_UNITS) else 0
+            if state.available_units > _MAX_UINT64 - add_total:
+                return 0, 0
+            state.migrated_to_v2 = True
+            state.week_starts_at_ms = week_start
+            state.earned_this_week = earned_week + add_total
+            state.available_units += add_total
+            if add_tradable > 0:
+                state.available_tradable_units = prev_avail_tradable + add_tradable
+
+        if data is not None:
+            self._save_reward_state(player_id, data, state)
+        return add_total, add_tradable
 
     def credit_battle_material_reward(
         self,
@@ -481,80 +679,116 @@ class SceneEquipCraft:
     def _available_material(self, data, config_id: int) -> int:
         return self.assets.removable_count(data, config_id)
 
-    def _consume_material(self, data, config_id: int, count: int) -> int:
-        if self.tables["Item"].get(config_id) is not None:
-            return self.assets.consume_items(data, {config_id: count})
+    def _consume_material_tb(self, data, config_id: int, count: int, *, tradable_only: bool = False) -> tuple[int, bool]:
+        """按 T/B 隔离扣减打造/解封/继承材料，返回 (error, consumed_bound)。"""
+        if self.tables["Item"].get(config_id) is not None and hasattr(self.assets, "consume_items_tb"):
+            return self.assets.consume_items_tb(data, {config_id: count}, tradable_only=tradable_only)
         bag = clone(data.bag_component)
         entries = self.assets.entries(bag, 0)
         if not self.assets._usable(entries, bag_capacity(bag, 0)):
-            return INVALID_DATA
+            return INVALID_DATA, False
         held = held_item_count(data, config_id)
         known = sum(
             item.size for _, item in entries
             if item.config_id == config_id and self.assets.countable(item)
+            and (not tradable_only or not item.bound)
         )
         if known < count or (held and count > max(0, known - held)):
-            return BAG_INSUFFICIENT
-        taken, version_skew = self.assets._drain(entries, config_id, count)
-        if taken != count:
-            return FEATURE_UNAVAILABLE if version_skew else BAG_INSUFFICIENT
+            return BAG_INSUFFICIENT, False
+        ordered = sorted(
+            (
+                (entry, item) for entry, item in entries
+                if item.config_id == config_id and self.assets.countable(item)
+                and (not tradable_only or not item.bound)
+            ),
+            key=lambda pair: (1 if pair[1].bound else 0, pair[0].pos, pair[1].acquire_seq, pair[1].item_id),
+        )
+        remaining = count
+        consumed_bound = False
+        for entry, item in ordered:
+            if remaining <= 0:
+                break
+            take = min(remaining, item.size)
+            if take:
+                if item.bound:
+                    consumed_bound = True
+                item.size -= take
+                remaining -= take
+                self.assets.write_entry(entry, item)
+        if remaining:
+            return BAG_INSUFFICIENT, False
         self.assets._drop_empty(bag.items, 0)
+        data.bag_component.CopyFrom(bag)
+        return 0, consumed_bound
+
+    def _consume_material(self, data, config_id: int, count: int) -> int:
+        err, _ = self._consume_material_tb(data, config_id, count, tradable_only=False)
+        return err
+
+    async def _grant_stack_with_bound(self, data, config_id: int, count: int, *, bound: bool, gains: list) -> int:
+        """按 bound 属性分堆发放材料，绝不把可交易堆与绑定堆混合。"""
+        if count <= 0:
+            return 0
+        if self.assets.item_gain_blocked(data, config_id):
+            return BLOCKED
+        row = self.tables["Item"].get(config_id)
+        max_stack = row.max_stack_size if row is not None and row.max_stack_size > 0 else 999
+        bag = clone(data.bag_component)
+        entries = self.assets.entries(bag, 0)
+        cap = bag_capacity(bag, 0)
+        if not self.assets._usable(entries, cap):
+            return INVALID_DATA
+        occupied = {entry.pos for entry, _ in entries}
+        free_slots = (slot for slot in range(cap) if slot not in occupied)
+        remaining = count
+        for entry, item in sorted(entries, key=lambda pair: (pair[1].acquire_seq, pair[1].item_id)):
+            if item.config_id == config_id and bool(item.bound) == bound and self.assets._mergeable(item, max_stack):
+                added = min(remaining, max_stack - item.size)
+                if added:
+                    item.size += added
+                    remaining -= added
+                    self.assets.write_entry(entry, item)
+        plan = []
+        while remaining:
+            slot = next(free_slots, None)
+            if slot is None:
+                return BAG_FULL
+            stack = min(remaining, max_stack)
+            plan.append((slot, stack))
+            remaining -= stack
+        if plan and self.assets.allocate_item_id is None:
+            return UNAVAILABLE
+        ids = self.assets.all_ids(bag)
+        watermark = max((item.acquire_seq for _, item in entries), default=0)
+        for slot, stack in plan:
+            try:
+                guid = await self.assets.allocate_item_id()
+            except (OSError, RuntimeError, ValueError):
+                return UNAVAILABLE
+            if type(guid) is not int or not 1 <= guid <= _MAX_UINT64 or guid in ids:
+                return UNAVAILABLE
+            ids.add(guid)
+            watermark += 1
+            item = self.protocol.message(
+                "ItemComp", item_id=guid, config_id=config_id, size=stack, bound=bound, acquire_seq=watermark,
+            )
+            self.assets.write_entry(bag.items.add(pos=slot, bag_type=0), item)
+        self.assets._order(bag.items)
         data.bag_component.CopyFrom(bag)
         return 0
 
-    async def _grant_materials(self, data, counts: dict[int, int], *, gains: list) -> int:
-        known = {cid: qty for cid, qty in counts.items() if qty > 0 and self.tables["Item"].get(cid) is not None}
-        synthetic = {cid: qty for cid, qty in counts.items() if qty > 0 and cid not in known}
+    async def _grant_materials(self, data, counts: dict[int, int], *, gains: list, bound: bool = False) -> int:
         staged = clone(data)
-        if known:
-            err = await self.assets.add_items(staged, known, gains=gains)
+        for cid, qty in sorted(counts.items()):
+            if qty <= 0:
+                continue
+            if not bound and self.tables["Item"].get(cid) is not None:
+                # 仅合并到未绑定堆，避免普通发放误并入已有绑定堆。
+                err = await self._grant_stack_with_bound(staged, cid, qty, bound=False, gains=gains)
+            else:
+                err = await self._grant_stack_with_bound(staged, cid, qty, bound=bound, gains=gains)
             if err:
                 return err
-        if synthetic:
-            for cid in synthetic:
-                if self.assets.item_gain_blocked(staged, cid):
-                    return BLOCKED
-            bag = clone(staged.bag_component)
-            entries = self.assets.entries(bag, 0)
-            cap = bag_capacity(bag, 0)
-            if not self.assets._usable(entries, cap):
-                return INVALID_DATA
-            occupied = {entry.pos for entry, _ in entries}
-            free_slots = (slot for slot in range(cap) if slot not in occupied)
-            plan = []
-            for cid, amount in sorted(synthetic.items()):
-                remaining = amount
-                for entry, item in sorted(entries, key=lambda pair: (pair[1].acquire_seq, pair[1].item_id)):
-                    if item.config_id == cid and self.assets._mergeable(item, 999):
-                        added = min(remaining, 999 - item.size)
-                        if added:
-                            item.size += added
-                            remaining -= added
-                            self.assets.write_entry(entry, item)
-                while remaining:
-                    slot = next(free_slots, None)
-                    if slot is None:
-                        return BAG_FULL
-                    stack = min(remaining, 999)
-                    plan.append((slot, cid, stack))
-                    remaining -= stack
-            if plan and self.assets.allocate_item_id is None:
-                return UNAVAILABLE
-            ids = self.assets.all_ids(bag)
-            watermark = max((item.acquire_seq for _, item in entries), default=0)
-            for slot, cid, stack in plan:
-                try:
-                    guid = await self.assets.allocate_item_id()
-                except (OSError, RuntimeError, ValueError):
-                    return UNAVAILABLE
-                if type(guid) is not int or not 1 <= guid <= _MAX_UINT64 or guid in ids:
-                    return UNAVAILABLE
-                ids.add(guid)
-                watermark += 1
-                item = self.protocol.message("ItemComp", item_id=guid, config_id=cid, size=stack, acquire_seq=watermark)
-                self.assets.write_entry(bag.items.add(pos=slot, bag_type=0), item)
-            self.assets._order(bag.items)
-            staged.bag_component.CopyFrom(bag)
         data.bag_component.CopyFrom(staged.bag_component)
         return 0
 
@@ -583,7 +817,9 @@ class SceneEquipCraft:
         return 0
 
     def _enrich_bag_snapshot(self, data, bag_type: int, bag_info) -> None:
-        """为 BagInfo 中的装备项补充 V1 fixed_affix_slots 与 artifact 展示信息。"""
+        """为 BagInfo 中的装备项补充 V1 fixed_affix_slots、artifact 与强化 T/B 预览信息。"""
+        if hasattr(self.assets, "enrich_bag_enhance_preview"):
+            self.assets.enrich_bag_enhance_preview(data, bag_type, bag_info)
         by_id = {item.item_id: item for _, item in self.assets.entries(data.bag_component, bag_type)}
         for info in bag_info.items:
             stored = by_id.get(info.item_id)
@@ -592,11 +828,67 @@ class SceneEquipCraft:
 
     # ── 打造试算与校验 ──
 
+    def _locate_equipment(self, data, item_id: int):
+        for bag_type in (0, 2):
+            for _, item in self.assets.entries(data.bag_component, bag_type):
+                if item.item_id == item_id:
+                    return item, bag_type
+        return None, 0
+
+    def _plan_bound_policy(self, data, choice, *, is_create_new: bool, prepared: dict) -> None:
+        """规划装备打造/装条的 T/B 隔离策略，与 C++ PlanBoundPolicy 保持一致。"""
+        mat_id = prepared["material_id"]
+        mat_count = prepared["material_count"]
+        tradable_avail = (
+            self.assets.removable_tradable_count(data, mat_id)
+            if hasattr(self.assets, "removable_tradable_count")
+            else self._available_material(data, mat_id)
+        )
+        total_owned = self._owned_material(data, mat_id)
+        tradable_owned = (
+            self.assets.total_tradable_count(data, mat_id)
+            if hasattr(self.assets, "total_tradable_count")
+            else total_owned
+        )
+        all_tradable_enough = tradable_avail >= mat_count
+        any_countable_bound = total_owned > tradable_owned
+
+        prepared["tradable_only"] = False
+        prepared["will_bind_item"] = False
+        prepared["bind_confirm_blocked"] = False
+
+        if is_create_new:
+            if all_tradable_enough:
+                prepared["tradable_only"] = True
+                prepared["will_bind_item"] = False
+                return
+            prepared["tradable_only"] = False
+            prepared["will_bind_item"] = any_countable_bound
+            return
+
+        if prepared["original"].bound:
+            prepared["tradable_only"] = False
+            prepared["will_bind_item"] = False
+            return
+
+        if all_tradable_enough:
+            prepared["tradable_only"] = True
+            prepared["will_bind_item"] = False
+            return
+        if not choice.allow_bound_materials:
+            prepared["tradable_only"] = True
+            prepared["will_bind_item"] = True
+            prepared["bind_confirm_blocked"] = True
+            return
+        prepared["tradable_only"] = False
+        prepared["will_bind_item"] = any_countable_bound
+
     def _prepare_choice(self, data, choice):
         if carries_unknown(choice):
             return FEATURE_UNAVAILABLE, None
-        if choice.operation == _OP_CREATE_ITEM:
-            if choice.item_id or choice.affix_slot or choice.affix_id:
+        op = choice.operation
+        if op == _OP_CREATE_ITEM:
+            if choice.item_id or choice.affix_slot or choice.affix_id or choice.source_item_id:
                 return INVALID, None
             row = self.tables["Item"].get(choice.config_id)
             if row is None or not self._valid_template(row):
@@ -604,54 +896,149 @@ class SceneEquipCraft:
             result = self.protocol.message("ItemComp", config_id=row.id, size=1)
             result.equip.SetInParent()
             mat_id, mat_count = self._item_forge_material(row)
-            return 0, {
+            prepared = {
                 "result": result,
                 "original": None,
                 "holder": 0,
                 "material_id": mat_id,
                 "material_count": mat_count,
+                "bind_on_consumed_bound": True,
             }
-        if choice.operation != _OP_INSTALL_AFFIX or choice.config_id or not choice.item_id or not choice.affix_id:
-            return INVALID, None
-        found_item = None
-        holder = 0
-        for bag_type in (0, 2):
-            for _, item in self.assets.entries(data.bag_component, bag_type):
-                if item.item_id == choice.item_id:
-                    found_item = item
-                    holder = bag_type
-                    break
-            if found_item is not None:
-                break
-        if found_item is None:
-            return EQUIP_ITEM_NOT_FOUND, None
-        item_row = self.tables["Item"].get(found_item.config_id)
-        affix = self.tables["EquipV1Affix"].get(choice.affix_id)
-        if item_row is None or affix is None or not valid_affix_row(affix):
-            return INVALID, None
-        profile = self._item_profile(item_row)
-        if (
-            pool_for(profile, choice.affix_slot) != affix.pool
-            or found_item.size != 1
-            or not self._valid_selections(found_item, profile)
-        ):
-            return INVALID, None
-        if carries_unknown(found_item) or carries_unknown(found_item.equip):
-            return FEATURE_UNAVAILABLE, None
-        for selected in found_item.equip.fixed_affixes:
-            if carries_unknown(selected):
-                return FEATURE_UNAVAILABLE, None
-            if selected.slot == choice.affix_slot or selected.affix_id == choice.affix_id:
+            self._plan_bound_policy(data, choice, is_create_new=True, prepared=prepared)
+            return 0, prepared
+
+        if op == _OP_INSTALL_AFFIX:
+            if choice.config_id or not choice.item_id or not choice.affix_id or choice.source_item_id:
                 return INVALID, None
-        result = clone(found_item)
-        result.equip.fixed_affixes.add(slot=choice.affix_slot, affix_id=choice.affix_id)
-        return 0, {
-            "result": result,
-            "original": found_item,
-            "holder": holder,
-            "material_id": affix.material_id,
-            "material_count": affix.material_count,
-        }
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            item_row = self.tables["Item"].get(found_item.config_id)
+            affix = self.tables["EquipV1Affix"].get(choice.affix_id)
+            if item_row is None or affix is None or not valid_affix_row(affix):
+                return INVALID, None
+            profile = self._item_profile(item_row)
+            if (
+                pool_for(profile, choice.affix_slot) != affix.pool
+                or found_item.size != 1
+                or not self._valid_selections(found_item, profile)
+            ):
+                return INVALID, None
+            if carries_unknown(found_item) or carries_unknown(found_item.equip):
+                return FEATURE_UNAVAILABLE, None
+            for selected in found_item.equip.fixed_affixes:
+                if carries_unknown(selected):
+                    return FEATURE_UNAVAILABLE, None
+                if selected.slot == choice.affix_slot or selected.affix_id == choice.affix_id:
+                    return INVALID, None
+            result = clone(found_item)
+            result.equip.fixed_affixes.add(slot=choice.affix_slot, affix_id=choice.affix_id)
+            prepared = {
+                "result": result,
+                "original": found_item,
+                "holder": holder,
+                "material_id": affix.material_id,
+                "material_count": affix.material_count,
+                "bind_on_consumed_bound": True,
+            }
+            self._plan_bound_policy(data, choice, is_create_new=False, prepared=prepared)
+            return 0, prepared
+
+        if op == _OP_UNSEAL_TO_TRADABLE:
+            if (
+                choice.config_id or not choice.item_id or choice.affix_slot or choice.affix_id
+                or choice.source_item_id or choice.use_guarantee_charm or choice.proxy_master_player_id
+                or choice.HasField("expected_polish_pity_count")
+            ):
+                return INVALID, None
+            if self.tables["Item"].get(UNSEAL_TALISMAN_ID) is None:
+                return INVALID_DATA, None
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            item_row = self.tables["Item"].get(found_item.config_id)
+            if item_row is None or not item_row.equip_kind or found_item.size != 1 or not found_item.HasField("equip"):
+                return INVALID, None
+            if carries_unknown(found_item) or carries_unknown(found_item.equip):
+                return FEATURE_UNAVAILABLE, None
+            if not found_item.bound:
+                return INVALID, None  # 已是可交易装备无需解封剥离
+            for gem in found_item.equip.gems:
+                if gem.gem_config_id != 0:
+                    return INVALID, None  # 要求先取下所有宝石，防止误销毁
+            result = clone(found_item)
+            result.bound = False
+            result.equip.enhance_level = 0
+            result.equip.enhance_pity_count = 0
+            del result.equip.fixed_affixes[:]
+            result.equip.crafter_name = ""
+            result.equip.crafter_player_id = 0
+            return 0, {
+                "result": result,
+                "original": found_item,
+                "holder": holder,
+                "material_id": UNSEAL_TALISMAN_ID,
+                "material_count": 1,
+                "tradable_only": False,
+                "will_bind_item": False,
+                "bind_confirm_blocked": False,
+                "bind_on_consumed_bound": False,
+            }
+
+        if op == _OP_INHERIT_ENHANCE:
+            if (
+                choice.config_id or not choice.item_id or not choice.source_item_id
+                or choice.source_item_id == choice.item_id or choice.affix_slot or choice.affix_id
+                or choice.use_guarantee_charm or choice.proxy_master_player_id
+                or choice.HasField("expected_polish_pity_count")
+            ):
+                return INVALID, None
+            if self.tables["Item"].get(INHERIT_TALISMAN_ID) is None:
+                return INVALID_DATA, None
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            source_item, _ = self._locate_equipment(data, choice.source_item_id)
+            if source_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            target_row = self.tables["Item"].get(found_item.config_id)
+            source_row = self.tables["Item"].get(source_item.config_id)
+            if (
+                target_row is None or source_row is None or not target_row.equip_kind
+                or target_row.equip_kind != source_row.equip_kind
+                or self._item_profile(target_row) != self._item_profile(source_row)
+                or target_row.equip_level != source_row.equip_level
+                or found_item.size != 1 or source_item.size != 1
+                or not found_item.HasField("equip") or not source_item.HasField("equip")
+            ):
+                return INVALID, None
+            if (
+                carries_unknown(found_item) or carries_unknown(found_item.equip)
+                or carries_unknown(source_item) or carries_unknown(source_item.equip)
+            ):
+                return FEATURE_UNAVAILABLE, None
+            source_level = int(source_item.equip.enhance_level)
+            target_level = int(found_item.equip.enhance_level)
+            if source_level == 0 or source_level <= target_level:
+                return INVALID, None
+            result = clone(found_item)
+            result.equip.enhance_level = source_level
+            result.equip.enhance_pity_count = int(source_item.equip.enhance_pity_count)
+            # 目标副套装备强制绑定仅自用，避免通过流派副套继承复制/洗白多件可交易高强成品。
+            result.bound = True
+            return 0, {
+                "result": result,
+                "original": found_item,
+                "holder": holder,
+                "material_id": INHERIT_TALISMAN_ID,
+                "material_count": 1,
+                "tradable_only": False,
+                "will_bind_item": not found_item.bound,
+                "bind_confirm_blocked": False,
+                "bind_on_consumed_bound": False,
+            }
+
+        return INVALID, None
 
     def _check_availability(self, player, data, prepared) -> int:
         if writable_err := self._writable_error(player):
@@ -668,10 +1055,15 @@ class SceneEquipCraft:
         available = self._available_material(data, prepared["material_id"])
         if available < prepared["material_count"]:
             return EQUIP_MATERIAL_NOT_ENOUGH
+        if prepared.get("bind_confirm_blocked"):
+            return EQUIP_BIND_CONFIRM_REQUIRED
         if prepared["original"] is None:
             # 预检扣料后主背包是否至少有 1 个空位容纳新打造装备。
             staged = clone(data)
-            err = self._consume_material(staged, prepared["material_id"], prepared["material_count"])
+            err, _ = self._consume_material_tb(
+                staged, prepared["material_id"], prepared["material_count"],
+                tradable_only=bool(prepared.get("tradable_only")),
+            )
             if err == BAG_INSUFFICIENT:
                 return EQUIP_MATERIAL_NOT_ENOUGH
             if err:
@@ -720,7 +1112,11 @@ class SceneEquipCraft:
         preview.choice.CopyFrom(request.choice)
         preview.rules_fingerprint = cached.rules_fingerprint
         preview.expected_forge_revision = self._get_forge_revision(player.player_id, data)
-        self._fill_product(prepared["result"], preview.result)
+        preview_item = clone(prepared["result"])
+        if prepared.get("will_bind_item"):
+            preview_item.bound = True
+        preview.will_bind_item = bool(prepared.get("will_bind_item"))
+        self._fill_product(preview_item, preview.result)
         self._fill_material_display(data, prepared["material_id"], prepared["material_count"], preview.material)
         unavailable = self._check_availability(player, data, prepared)
         preview.available = unavailable == 0
@@ -805,12 +1201,16 @@ class SceneEquipCraft:
             return reject(err)
 
         staged = clone(data)
-        consume_err = self._consume_material(staged, prepared["material_id"], prepared["material_count"])
+        consume_err, consumed_bound = self._consume_material_tb(
+            staged, prepared["material_id"], prepared["material_count"],
+            tradable_only=bool(prepared.get("tradable_only")),
+        )
         if consume_err == BAG_INSUFFICIENT:
             return reject(EQUIP_MATERIAL_NOT_ENOUGH)
         if consume_err:
             return reject(consume_err)
 
+        bind_on_consumed_bound = bool(prepared.get("bind_on_consumed_bound"))
         if request.choice.operation == _OP_CREATE_ITEM:
             if self.assets.allocate_item_id is None:
                 return reject(UNAVAILABLE)
@@ -822,15 +1222,20 @@ class SceneEquipCraft:
                 return reject(EQUIP_INTERNAL_ERROR)
             new_item = clone(prepared["result"])
             new_item.item_id = created_guid
+            if bind_on_consumed_bound and consumed_bound:
+                new_item.bound = True
             add_err = await self.assets.add_items(staged, {}, instances=(new_item,))
             if add_err:
                 return reject(add_err)
             target_item_id = created_guid
         else:
             replaced = False
+            final_item = clone(prepared["result"])
+            if bind_on_consumed_bound and consumed_bound:
+                final_item.bound = True
             for entry, stored in self.assets.entries(staged.bag_component, prepared["holder"]):
                 if stored.item_id == request.choice.item_id:
-                    self.assets.write_entry(entry, prepared["result"])
+                    self.assets.write_entry(entry, final_item)
                     replaced = True
                     break
             if not replaced:
@@ -840,6 +1245,10 @@ class SceneEquipCraft:
         next_rev = current_rev + 1
         if hasattr(staged.client_request_ledger, "forge_revision"):
             staged.client_request_ledger.forge_revision = next_rev
+        # 本人打造/装条自然涨 1 点铸器熟练度；解封/继承不涨熟练度。
+        if request.choice.operation in (_OP_CREATE_ITEM, _OP_INSTALL_AFFIX) and not request.choice.proxy_master_player_id:
+            if staged.HasField("craft_component") and staged.craft_component.forge_mastery_exp < (1 << 32) - 1:
+                staged.craft_component.forge_mastery_exp += 1
         client_request.remember(
             staged.client_request_ledger,
             request.client_request_id,
@@ -856,7 +1265,7 @@ class SceneEquipCraft:
         if not saved:
             return reject(UNAVAILABLE, known=False)
         self._set_forge_revision(player.player_id, staged, next_rev)
-        if request.choice.operation == _OP_INSTALL_AFFIX and prepared["holder"] == 2:
+        if request.choice.operation != _OP_CREATE_ITEM and prepared["holder"] == 2:
             attributes = getattr(self.scene, "attributes", None)
             if attributes is not None:
                 attributes.notify(player)
@@ -868,6 +1277,11 @@ class SceneEquipCraft:
         return self._fill_craft_applied(
             player, staged, response, item_id=target_item_id, result_rev=next_rev, replayed=False,
         )
+
+    def _light_card_active(self, data, stamp: int) -> bool:
+        if hasattr(data, "uint64_pb_component"):
+            return int(getattr(data.uint64_pb_component, "afk_pass_expires_at", 0)) > (stamp // 1000)
+        return False
 
     def _fill_material_reward_snapshot(self, player, data, stamp: int, out) -> int:
         out.Clear()
@@ -884,12 +1298,46 @@ class SceneEquipCraft:
         out.available_units = state.available_units
         out.batch_units = min(MATERIAL_REWARD_DAILY_LIMIT, state.available_units)
         out.revision = state.revision
+
+        if state.migrated_to_v2:
+            week = resolve_game_week(stamp)
+            week_start, next_week = week if week is not None else (0, 0)
+            avail_tradable = min(state.available_tradable_units, state.available_units)
+            batch_tradable = min(out.batch_units, avail_tradable)
+            weekly_phase = state.lifetime_earned >= MATERIAL_REWARD_LIFETIME_LIMIT
+            earned_week = state.earned_this_week if (weekly_phase and state.week_starts_at_ms == week_start) else 0
+            out.lifetime_earned = state.lifetime_earned
+            out.lifetime_limit = MATERIAL_REWARD_LIFETIME_LIMIT
+            out.tradable_earned_total = self.known_account_stage1_tradable_used(player.player_id, data)
+            out.tradable_lifetime_limit = MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT
+            out.available_tradable_units = avail_tradable
+            out.batch_tradable_units = batch_tradable
+            out.weekly_phase_active = weekly_phase
+            out.week_starts_at_ms = week_start
+            out.next_week_reset_at_ms = next_week
+            out.earned_this_week = earned_week
+            out.weekly_limit = MATERIAL_REWARD_WEEKLY_LIMIT
+        else:
+            weekly_phase = False
+
         self._fill_material_display(data, CRAFTING_MATERIAL_ID, 0, out.crafting_material)
         self._fill_material_display(data, self._enhancement_stone_id(), 0, out.enhancement_stone)
         writable = self._writable_error(player)
         out.can_claim = out.batch_units > 0 and writable == 0 and state.revision < _MAX_UINT64
         if out.batch_units == 0:
-            out.unavailable_reason = "完成主要战斗可获得材料自选份数，每日最多20份。"
+            if state.migrated_to_v2:
+                light_card = self._light_card_active(data, stamp)
+                out.unavailable_reason = (
+                    (
+                        "完成主要战斗可获得本周材料自选份数（每周上限150份，仙途轻享卡生效中：胜局含1份可交易）。"
+                        if light_card else
+                        "完成主要战斗可获得本周材料自选份数（每周上限150份，全绑定；开通仙途轻享卡可解锁胜局可交易产出）。"
+                    )
+                    if weekly_phase else
+                    "完成主要战斗可获得首套材料自选份数（首套总池660份，无每日限制）。"
+                )
+            else:
+                out.unavailable_reason = "完成主要战斗可获得材料自选份数，每日最多20份。"
         elif writable == EQUIP_IN_BATTLE:
             out.unavailable_reason = "战斗中暂不能领取，请在结算完成后重试。"
         elif writable or not out.can_claim:
@@ -978,21 +1426,68 @@ class SceneEquipCraft:
 
         staged = clone(data)
         gains = []
-        grants = {}
-        if request.crafting_material_count:
-            grants[CRAFTING_MATERIAL_ID] = request.crafting_material_count
-        if request.enhancement_stone_count:
-            stone_id = self._enhancement_stone_id()
-            grants[stone_id] = grants.get(stone_id, 0) + request.enhancement_stone_count
-        grant_err = await self._grant_materials(staged, grants, gains=gains)
-        if grant_err:
-            return reject(grant_err)
+        stone_id = self._enhancement_stone_id()
+        batch_tradable = 0
+        if state.migrated_to_v2:
+            avail_tradable = min(state.available_tradable_units, state.available_units)
+            batch_tradable = min(total, avail_tradable)
+            enforce_account_quota = (
+                self._account_quota_transport is not None
+                or getattr(player, "role_identity", None) is not None
+            )
+            if (
+                enforce_account_quota
+                and batch_tradable > 0
+                and state.tradable_earned_total > state.stage1_tradable_confirmed
+            ):
+                if self._account_quota_transport is not None:
+                    self._account_quota_transport(player.player_id, state.tradable_earned_total, stamp)
+                return reject(UNAVAILABLE, known=False)
+            # 按本批可交易份数拆分：可交易优先分配给打造材料（3001），余量给强化石（3002）；其余全绑定，分堆发放永不混堆。
+            crafting_tradable = min(request.crafting_material_count, batch_tradable)
+            crafting_bound = request.crafting_material_count - crafting_tradable
+            stone_tradable = min(request.enhancement_stone_count, batch_tradable - crafting_tradable)
+            stone_bound = request.enhancement_stone_count - stone_tradable
+            tradable_grants = {}
+            if crafting_tradable:
+                tradable_grants[CRAFTING_MATERIAL_ID] = crafting_tradable
+            if stone_tradable:
+                tradable_grants[stone_id] = tradable_grants.get(stone_id, 0) + stone_tradable
+            bound_grants = {}
+            if crafting_bound:
+                bound_grants[CRAFTING_MATERIAL_ID] = crafting_bound
+            if stone_bound:
+                bound_grants[stone_id] = bound_grants.get(stone_id, 0) + stone_bound
+            if tradable_grants:
+                grant_err = await self._grant_materials(staged, tradable_grants, gains=gains, bound=False)
+                if grant_err:
+                    return reject(grant_err)
+            if bound_grants:
+                grant_err = await self._grant_materials(staged, bound_grants, gains=gains, bound=True)
+                if grant_err:
+                    return reject(grant_err)
+        else:
+            grants = {}
+            if request.crafting_material_count:
+                grants[CRAFTING_MATERIAL_ID] = request.crafting_material_count
+            if request.enhancement_stone_count:
+                grants[stone_id] = grants.get(stone_id, 0) + request.enhancement_stone_count
+            grant_err = await self._grant_materials(staged, grants, gains=gains, bound=False)
+            if grant_err:
+                return reject(grant_err)
 
         next_state = _MaterialRewardState(
             day_starts_at_ms=state.day_starts_at_ms,
             earned_today=state.earned_today,
             available_units=state.available_units - total,
             revision=state.revision + 1,
+            lifetime_earned=state.lifetime_earned,
+            tradable_earned_total=state.tradable_earned_total,
+            available_tradable_units=max(0, state.available_tradable_units - batch_tradable),
+            week_starts_at_ms=state.week_starts_at_ms,
+            earned_this_week=state.earned_this_week,
+            migrated_to_v2=state.migrated_to_v2,
+            stage1_tradable_confirmed=state.stage1_tradable_confirmed,
         )
         if hasattr(staged.client_request_ledger, "material_reward"):
             self._save_reward_state(player.player_id, staged, next_state)

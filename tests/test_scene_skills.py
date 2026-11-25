@@ -36,9 +36,10 @@ def test_scene_skill_catalog_and_partial_upgrade_commit_together(tmp_path, skill
 
             original = service.list_skills(None, player, None, None)
             assert original.HasField("skill_list") and original.currency_balance == 2000
-            assert [entry.skill_table_id for entry in original.catalog] == list(range(1101, 1109))
-            skill_index = skill_id - 1101
-            assert original.catalog[skill_index].rank == 1 and original.catalog[skill_index].rank_limit == 3
+            assert original.HasField("loadout") and len(original.loadout.schemes) == 3
+            owned_ranks = {e.skill_table_id: e.rank for e in original.skill_list.skill_list}
+            assert owned_ranks[skill_id] == 1
+            assert any(entry.skill_table_id == 10002 for entry in original.catalog)
 
             message_id = p.message_ids["SceneSkillClientPlayerUpgradeSkill"]
             body = p.message("UpgradeSkillRequest", skill_table_id=skill_id, expected_rank=1, count=10)
@@ -61,12 +62,14 @@ def test_scene_skill_catalog_and_partial_upgrade_commit_together(tmp_path, skill
                 assert not published and not attribute_updates
             else:
                 assert not response.error_message.id and response.upgraded_count == 2
-                assert response.stop_tip_id == 7010 and response.state.catalog[skill_index].rank == 3
+                after_ranks = {e.skill_table_id: e.rank for e in response.state.skill_list.skill_list}
+                assert response.stop_tip_id == 7010 and after_ranks[skill_id] == 3
                 assert response.state.currency_balance == 680
 
             retry = await upgrade(2)
             assert retry.error_message.id == 7008 and retry.state.currency_balance == 680
-            assert retry.state.catalog[skill_index].rank == 3 and player.pending_save is None
+            retry_ranks = {e.skill_table_id: e.rank for e in retry.state.skill_list.skill_list}
+            assert retry_ranks[skill_id] == 3 and player.pending_save is None
             assert attribute_updates == ([680] if skill_id == 1106 else [])
             await assets.close()
             entry, = published

@@ -134,6 +134,7 @@ from .store import (
     PlayerNameResolver,
 )
 from .trials import GuildTrialCoordinator
+from .war import GuildWarManager
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ CHANGE_ANNOUNCEMENT_CHANGED = 11
 CHANGE_ACTIVITY_CHANGED = 12
 CHANGE_DELIVERY_DONE = 13
 CHANGE_RENAMED = 14
+CHANGE_WAR_UPDATED = 15
 
 
 def _has_session_metadata(context) -> bool:
@@ -205,6 +207,7 @@ class GuildService:
         notifier: GuildNotifier | None = None,
         asset_loop: GuildAssetOpLoop | None = None,
         trials: GuildTrialCoordinator | None = None,
+        war: GuildWarManager | None = None,
         asset_op_enabled: bool = False,
         asset_op_lease_ms: int = 10_000,
         terminal_retention_days: int = 30,
@@ -234,6 +237,13 @@ class GuildService:
         self._quota = _SlidingQuota(application_quota_per_minute)
         self._budget_sec = float(request_budget_sec)
         self._clock_ms = clock_ms
+        self.war: GuildWarManager = war if war is not None else GuildWarManager(
+            protocol,
+            store,
+            player_names=self._player_names,
+            online_resolver=self._online,
+            clock_ms=clock_ms,
+        )
         if self.store.on_asset_finalized is None:
             self.store.on_asset_finalized = self._on_asset_finalized
 
@@ -278,6 +288,17 @@ class GuildService:
                 "ClaimGuildReunion": self.claim_guild_reunion,
                 "StartGuildTrial": self.start_guild_trial,
                 "RespondGuildTrialInvite": self.respond_guild_trial_invite,
+                "GetGuildWarOverview": self.get_guild_war_overview,
+                "SetGuildWarStance": self.set_guild_war_stance,
+                "RegisterGuildWarGarrison": self.register_guild_war_garrison,
+                "StartGuildWarBattle": self.start_guild_war_battle,
+                "ClaimGuildWarMilestone": self.claim_guild_war_milestone,
+                "ClaimGuildWarDividend": self.claim_guild_war_dividend,
+                "PostGuildWarBounty": self.post_guild_war_bounty,
+                "TrackGuildWarBounty": self.track_guild_war_bounty,
+                "GetGuildWarBattleResult": self.get_guild_war_battle_result,
+                "NotifyGuildWarAlert": self.notify_guild_war_alert,
+                "InspectFieldWarTargets": self.inspect_field_war_targets,
             },
             SERVICE_GUILD_INTERNAL: {
                 "ListAppliedAssetOpsSince": self.list_applied_asset_ops_since,
@@ -600,6 +621,7 @@ class GuildService:
                 "guildpb.LeaveGuildResponse", error_message=tip_for_error(self.protocol, exc)
             )
 
+        await self.war.on_member_removed(guild_id, actor.player_id)
         await self._notify_best_effort(
             CHANGE_MEMBER_LEFT,
             guild_id,
@@ -651,6 +673,7 @@ class GuildService:
         except Exception as exc:
             logger.error("guild bury rank failed guild=%d zone=%d err=%s", guild_id, res.zone_id, exc)
 
+        await self.war.on_guild_disbanded(guild_id)
         await self._notify_best_effort(
             CHANGE_DISBANDED,
             guild_id,
@@ -861,6 +884,7 @@ class GuildService:
                 "guildpb.KickGuildMemberResponse", error_message=tip_for_error(self.protocol, exc)
             )
 
+        await self.war.on_member_removed(guild_id, target_id)
         recipients = [m.player_id for m in res.guild.members if m.player_id != actor.player_id] + [target_id]
         await self._notify_best_effort(CHANGE_MEMBER_KICKED, guild_id, actor.player_id, target_id, recipients)
         return self.protocol.message(
@@ -2051,8 +2075,61 @@ class GuildService:
                 "guildpb.RespondGuildTrialInviteResponse", error_message=tip_for_error(self.protocol, exc)
             )
 
+    # -- 帮会全天帮战 V2 RPC（11 个，含 1 个下推桩） ---------------------------------------------
+
+    async def get_guild_war_overview(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.get_overview(actor))
+
+    async def set_guild_war_stance(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.set_stance(actor, request))
+
+    async def register_guild_war_garrison(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.register_garrison(actor, request))
+
+    async def start_guild_war_battle(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.start_battle(actor, request))
+
+    async def claim_guild_war_milestone(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.claim_milestone(actor, request))
+
+    async def claim_guild_war_dividend(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.claim_dividend(actor, request))
+
+    async def post_guild_war_bounty(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.post_bounty(actor, request))
+
+    async def track_guild_war_bounty(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.track_bounty(actor, request))
+
+    async def get_guild_war_battle_result(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.get_battle_result(actor, request))
+
+    async def notify_guild_war_alert(self, request: Message, context, path: str) -> Message:
+        await self._reject_session_metadata(context, "NotifyGuildWarAlert")
+        return self.protocol.message("Empty")
+
+    async def inspect_field_war_targets(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.inspect_field_targets(actor, request))
+
     async def handle_battle_result_event(self, event: Message):
-        """消费战斗结果事件（仅在启用 trials 协调器时处理同道历练结算）。"""
+        """消费战斗结果事件：按 activity_context.kind 分派至全天帮战或同道历练结算。"""
+        if event.HasField("activity_context") and int(event.activity_context.kind) == 3:
+            return await self.war.settle_battle(
+                int(event.battle_id),
+                outcome=int(event.outcome),
+                rounds=int(event.total_rounds),
+                finished_at_ms=int(event.finished_at_ms) or self._clock_ms(),
+            )
         if self._trials is None:
             return None
         return await self._trials.handle_battle_result_event(event)

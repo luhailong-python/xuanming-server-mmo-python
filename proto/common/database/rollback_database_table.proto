@@ -13,12 +13,18 @@ message transaction_log
 {
   option(OptionTableName) = "transaction_log";
   option(OptionPrimaryKey) = "tx_id";
-  // 与 data_service 手写 DDL(transaction_log_store.go)逐条对齐的四条联合索引。
-  // proto2mysql 语义:分号分隔多索引、逗号 = 联合索引;原来的单串
-  // "from_player,to_player,item_uuid,timestamp" 会被解释成一条 4 列联合索引,
-  // 对按 to_player / tx_type 单独过滤的查询没用。
-  option(OptionIndex) = "from_player,timestamp_sec;to_player,timestamp_sec;item_config_id,timestamp_sec;tx_type,timestamp_sec;timestamp_sec";
-  // 雪花主键 + 全服最高频追加写,按 §D3 处方 NONCLUSTERED + 打散(global-data-layer-tidb-decision.md)
+  // proto2mysql 语义:分号分隔多索引、逗号 = 联合索引。
+  // 按时间写的索引在时间列前插 shard(字段 16,2026-11-06,docs/design/audit-pipeline-horizontal-scale-20261106.md §2.C):
+  // timestamp_sec 单调增长,单列时间索引和 tx_type / item_config_id 这类低基数前缀 + 时间的索引,全服的追加写都落在
+  // 索引末尾同一个 TiKV Region;插了 shard 就分成 16 段各自的末尾。没有玩家条件的查询带 shard IN (0..15) 按段扫
+  // (store.auditShardInSQL)。按玩家的两条不分桶:玩家号本身打散。
+  // item_uuid 给 QueryByItemUUID(追物品流向)用,以前没有索引,对全服流水表做全表扫。
+  // (to_player, correlation_id) 给 GM 回收按指令补查同指令流水(2026-11-12,store.TransactionLogQuery.ToPlayerID):
+  // 同一条指令重投再应用时,多出来的那条流水可能落在时间窗外,要按 (收到方, 指令号) 不限时间地查;以前只能按玩家扫完保留期内的全部流水。
+  // 只能追加在末尾:proto2mysql 按位置给索引起名(idx_transaction_log_<序号>),插在中间会让已有库的索引名对不上。
+  option(OptionIndex) = "from_player,timestamp_sec;to_player,timestamp_sec;item_config_id,shard,timestamp_sec;tx_type,shard,timestamp_sec;shard,timestamp_sec;item_uuid;to_player,correlation_id";
+  // 主键 tx_id 是 C++ 从发号器 txlog 号段领的号、经 MixGuid 打散,不单调。行数据按 _tidb_rowid 存,又是全服最高频的追加写,
+  // 所以 §D3 的 NONCLUSTERED + 打散照旧保留(global-data-layer-tidb-decision.md)。
   option(OptionTiDBNonclusteredPK) = true;
   option(OptionTiDBShardRowIDBits) = 4;
   option(OptionTiDBPreSplitRegions) = 4;
@@ -44,6 +50,9 @@ message transaction_log
   // 表已定在全局库一处,没有这一列就分不清同一 tx 来自哪个 zone;
   // data_service 的 Kafka 消费者按列名自动探测,老表缺列时按 0 写入,不需要迁移开关。
   uint32 zone_id = 15;
+  // 分桶号 = tx_id % 16(go/data_service/internal/store/audit_shard.go 的 AuditShard,规则只有那一处),
+  // 由 data_service 落库时算,不在 Kafka 载荷里。只服务于上面按时间的索引与按段清理;业务含义为零。
+  uint32 shard = 16;
 }
 
 // ============================================================================
@@ -61,11 +70,13 @@ message player_snapshot
   // proto2mysql 的 nullable 选项只去掉 NOT NULL、仍保留 DEFAULT 0,且写入路径对未设置的
   // 标量一律绑 0 —— UNIQUE 会让第二条 GM 行就撞键。去重责任在消费者:落库前按
   // snapshot_guid 先查后插(check-then-insert),见 docs/design/node-id-overhaul-plan-20260908.md §2.0c。
-  // (zone_id, created_at) 是 RollbackZone 的扫描键(GetSnapshotPlayerIDsByZone:
-  // WHERE zone_id=? AND created_at<=?)。此前只存在于手写 DDL,proto 里漏了,
-  // 于是 store 侧靠 extraIndexes 兜底建它 —— 补进来之后那段兜底会自行失效
-  // (它按"想要的索引已被覆盖"判断)。
-  option(OptionIndex) = "player_id;snapshot_guid;zone_id,created_at;created_at";
+  // (zone_id, shard, created_at) 是 RollbackZone 的扫描键(GetSnapshotPlayerIDsByZone / GetSnapshotPlayerTimesByZone:
+  // WHERE zone_id=? AND shard IN (0..15) AND created_at<=?);(shard, created_at) 给按时间的清理。
+  // 时间列前的 shard(字段 11)同 transaction_log:created_at 单调增长,不分桶时全服快照写都落在索引末尾同一个
+  // TiKV Region(2026-11-06,docs/design/audit-pipeline-horizontal-scale-20261106.md §2.C)。
+  // snapshot_guid 不用分桶:它是 C++ 从发号器 snapshot 号段领的号、经 MixGuid 打散,不单调,唯一键与普通索引的写入本来就散在
+  // 整个键空间(2026-11-11 核对 snapshot_system.cpp,缺口清单第 15 条;设计 §2.C)。
+  option(OptionIndex) = "player_id;snapshot_guid;zone_id,shard,created_at;shard,created_at";
   // 主键是应用向发号器申请的打散行号(player-data-tidb-scaling-plan.md §6.4),不依赖库的自增。
   // 行数据按 _tidb_rowid 存,所以 §D3 的 NONCLUSTERED + 打散照旧保留。
   option(OptionTiDBNonclusteredPK) = true;
@@ -80,7 +91,7 @@ message player_snapshot
   string reason = 6;         // Reason / description
   string operator = 7;       // GM operator who created it
   bytes  data = 8;           // Serialized snapshot data (proto SnapshotData)
-  // C++ scene 经 Kafka 送来的 PlayerSnapshotEntry.snapshot_id(SnowFlake)。GM 行为 0。
+  // C++ scene 经 Kafka 送来的 PlayerSnapshotEntry.snapshot_id(发号器 snapshot 号段,经 MixGuid 打散,不单调、不能按大小判先后)。GM 行为 0。
   // 不改主键:rollback_audit_log.snapshot_id_used 引用的是 id,换主键等于篡改历史审计。
   uint64 snapshot_guid = 9;
   // 来源:0 = GM/data_service 直接写入(data 列是 Redis 字段图 JSON),
@@ -88,6 +99,9 @@ message player_snapshot
   //           2026-11-05 之前还有一个 player_database_1 blob,字段已 reserved)。
   // 两种格式不兼容,回滚读路径在学会解 proto blob 之前必须先过滤 source=0。
   uint32 source = 10;
+  // 分桶号 = id % 16(行号是发号器打散过的值;规则在 go/data_service/internal/store/audit_shard.go 的 AuditShard),
+  // GM 路径与 Kafka 落库路径都由 data_service 写入时算。只服务于上面按时间的索引与按段清理;业务含义为零。
+  uint32 shard = 11;
 }
 
 // ============================================================================
@@ -188,7 +202,10 @@ message gm_recall_op
   option(OptionPrimaryKey) = "op_id";
   // PLANNED 行没有 seq,stream_epoch = 0、seq = op_id 占唯一键:真实纪元恒非 0,不会和已派发的行撞。
   option(OptionUniqueKey) = "player_id,stream,stream_epoch,seq";
-  option(OptionIndex) = "status,next_attempt_ms;player_id,stream,stream_epoch,status,seq;player_id,status;request_id,op_id";
+  // idx_gm_recall_op_0 = 重投到期扫描 (status, next_attempt_ms, op_id, player_id)(2026-11-11,缺口清单第 25 条):
+  // op_id 让 ORDER BY next_attempt_ms, op_id 直接走索引顺序(TiDB 上主键非聚簇,不带它就要整段读完再排序);
+  // player_id 让按玩家分片的条件在索引上判,别的副本的行不回表。
+  option(OptionIndex) = "status,next_attempt_ms,op_id,player_id;player_id,stream,stream_epoch,status,seq;player_id,status;request_id,op_id";
   option(OptionTiDBNonclusteredPK) = true;
   option(OptionTiDBShardRowIDBits) = 4;
   option(OptionTiDBPreSplitRegions) = 4;
@@ -206,6 +223,10 @@ message gm_recall_op
   uint64 next_attempt_ms = 11;
   uint64 lease_until_ms = 12;
   uint64 lease_token = 13;
+  // last_outcome / last_reason / durable 三列描述同一件事:最后一次 scene 答复(AssetOpOutcome 数值、原因码)。
+  // durable = 1 表示那次答复报告结局已落盘(写进了玩家存档),只有这样的答复才能终结一行。重排按每次答复覆盖三列;
+  // 自动终结写下终结所凭的答复(durable 恒为 1)。人工终结、ROLE_GONE 不是 scene 的答复,三列都不改,终态行上留着最后一次
+  // 投递时 scene 实际回的值,事后核对用。谁终结的看 resolved_by(人工终结写操作人),不看 durable。
   uint32 last_outcome = 14;
   uint32 last_reason = 15;
   uint32 durable = 16;
@@ -352,6 +373,10 @@ message player_name
   // 建角在玩家片提交 account_role 之后,data_service 先复核角色确已提交,再把它置为已绑定。
   // 已绑定的名字 ReleasePlayerName 一律拒绝,只有删角写完墓碑之后由 data_service 释放。
   uint64 bound_ms   = 5;
+  // 保护到期时刻 Unix 毫秒;0 = 不在保护期。角色改名之后,旧名这一行留在原主名下(player_id 不变)到这个时刻为止,
+  // 期间别人登记不了;到期不靠后台扫描,别人来登记时撞上这一行、发现已过期,用一条带条件的 UPDATE 接管
+  // (docs/design/rename-and-content-safety.md §4.2)。原主在保护期内改回这个名字时清回 0。
+  uint64 held_until_ms = 6;
 }
 
 // 玩家分片上「这个角色登记的名字」。BatchGetPlayerName 读它,不用扫全部名字分片;
@@ -383,16 +408,16 @@ message directory_shard
 }
 
 // ============================================================================
-// 路由表(玩家归属与落点映射持久化 D1,docs/design/player-route-mapping-durability-proposal.md §3.2 / §13)。
+// 路由表(玩家归属与落点映射持久化 D1,docs/design/player-route-mapping-durability-proposal.md §15 / §16)。
 //
-// 下面五个 message **只作列漂移守卫的事实源**(与 player_name 同一模式):
+// 下面四个 message **只作列漂移守卫的事实源**(与 player_name 同一模式):
 // 表由 go/data_service/internal/store/schema.go 的 bootstrap DDL 预建(要 VARCHAR、可空列、CHECK、
 // 带片前缀的二级索引,proto2mysql 都生成不了),**不交给 proto2mysql 建表或同步**。迁移期按这里的字段名
 // 查线上表的列齐不齐、按 OptionPrimaryKey 查主键列序(schema.go 的 assertRouteTableShapes)。
 // 所以:改了这里必须同步改 bootstrap DDL,反之亦然,否则启动期迁移直接拒绝。
 //
 // 字段号:player_route 沿用 DDL 列注释里预留的 pb:1..10(route_shard 是 10,player_id 仍是 1);
-// 另外四张的字段号按 DDL 列序新定,并同步写进 DDL 的列注释 pb:N(route_store_test 钉住两边一致)。
+// 另外三张的字段号按 DDL 列序新定,并同步写进 DDL 的列注释 pb:N(route_store_test 钉住两边一致)。
 // 与 §4.3 同规矩:上线后不复用,删字段写 reserved。
 // 库里可为 NULL 的列在这里用零值表达(0 / 空串 = NULL),与 store.RouteRow 的约定一致;
 // 本 message 不是读写载体,读写只在 store 的 SQL 里,所以不用 optional。
@@ -431,6 +456,23 @@ message zone_merged_into
   uint64 merged_at_ms = 4;  // 库时钟 Unix 毫秒
 }
 
+// zone_merge_history:合服 / 撤销合服的历史,只增不改(提案 §16)。zone_merged_into 撤销时整行删除,
+// 没有这张表就查不到「谁、什么时候合过、又撤过」。merge_zone 在写映射的同一个事务里追加一行;
+// 操作员账号对它只有 SELECT、INSERT(tools/scripts/maintenance_drain.ps1 的 MERGE_ZONE_GRANT)。只在目录第 0 片。
+message zone_merge_history
+{
+  option(OptionTableName) = "zone_merge_history";
+  option(OptionPrimaryKey) = "src_zone,event_seq";
+
+  uint32 src_zone      = 1;
+  uint64 event_seq     = 2;  // 本源区的第几次变更,从 1 起,持 route_meta 行锁取最大值 +1
+  string action        = 3;  // "merge" 或 "unmerge"(chk_merge_history_action)
+  uint32 dst_zone      = 4;
+  string run_id        = 5;  // merge 是新映射行的 run_id;unmerge 是被删那一行的 run_id
+  string sql_principal = 6;  // 库侧 CURRENT_USER(),不取工具自报的身份
+  uint64 at_ms         = 7;  // 库时钟 Unix 毫秒
+}
+
 // route_meta:开关表,单行(id=1),库世代与可写开关。
 message route_meta
 {
@@ -452,6 +494,38 @@ message account_directory {
   option(OptionPrimaryKey) = "account";
   string account = 1;
   uint64 created_ms = 2;
+  // 账号注销(docs/design/account-deletion.md §4.1)。状态只在这一行上变,和建角、过户买入的 reserveRef 同一把行锁。
+  uint32 deletion_state = 3;             // 0 正常、1 冷静期、2 执行中(不可撤销),取值同 data_service.AccountDeletionState
+  uint64 deletion_requested_ms = 4;      // 申请时刻(库时钟);状态 0 时为 0
+  uint64 deletion_execute_after_ms = 5;  // 冷静期满的时刻
+  uint64 deletion_lease_until_ms = 6;    // 执行者租约,免得多个 login 副本同时处理同一账号
+  uint32 deletion_source = 7;            // 1 本人申请、2 运维代办(LoginAdmin.ScheduleAccountDeletion)
+  // 国家防沉迷实名认证系统给的用户唯一标识 pi(38 位,前 6 位是出生日期);空串 = 游戏方没给这个账号做过实名。
+  // 只写一次,不存姓名和身份证号(docs/design/real-name-anti-addiction.md §5.1)。
+  string real_name_pi = 8;
+  // 阶段一装备材料自选跨角色终身可交易已用总额（0..60），删角不重置，仅在账号注销完成时随账号行删除。
+  uint32 stage1_tradable_material_used = 9;
+}
+
+// 账号级阶段一可交易装备材料按角色高水位确认表（与 account_directory 同在账号分片，单片事务幂等同步，防删角/多开刷 60 份可交易料）。
+message account_role_tradable_quota {
+  option(OptionTableName) = "account_role_tradable_quota";
+  option(OptionPrimaryKey) = "account,player_id";
+  string account = 1;
+  uint64 player_id = 2;
+  uint32 confirmed_units = 3; // 已记入 account_directory.stage1_tradable_material_used 的本角色确认份数（0..60）
+  uint64 updated_ms = 4;
+}
+
+// 账号注销完成的回执(docs/design/account-deletion.md §4.5),在账号所在分片,和删账号行同一个事务写。
+// 只存账号原字节的 SHA-256,不存原账号:合规留档;同一身份以后再登录建新行时,据此提示一次「之前的账号已注销完成」。
+message account_deletion_receipt {
+  option(OptionTableName) = "account_deletion_receipt";
+  option(OptionPrimaryKey) = "account_digest";
+  bytes account_digest = 1;   // 32 字节
+  uint64 requested_ms = 2;
+  uint64 deleted_ms = 3;
+  uint32 source = 4;          // 同 account_directory.deletion_source
 }
 
 // 账号到角色的索引,放账号所在分片。不变量:ref 集合包含全部归属真相;真相永远是 account_role.account。
@@ -470,6 +544,11 @@ message account_role_ref {
   uint32 home_zone = 6;   // PENDING 是建角时非 0,判陈旧时给墓碑用
   uint64 nonce = 7;       // 每次写换一个随机值。清理按它比较并删除,挡住「读完之后又被重新占用」
   uint64 created_ms = 8;
+  // 后台判陈旧留下等人处理的标记(2026-11-12,docs/design/horizontal-scale-logical-db.md §5.2):PENDING 的建角 ref 角色行不在,
+  // 却有提交过的证据或证据读不全,不写墓碑、不删,标上保留。held_ms 是最近一次判定保留的库时刻(0 = 没标),held_reason 是那次的证据。
+  // 后台扫描跳过标了保留的,只在单独的小复核名额里按 held_ms 轮着重判;改写这条 ref(建角重放、过户第 1 步、补 ACTIVE)时一起清掉。
+  uint64 held_ms = 9;
+  string held_reason = 10;
 }
 
 message account_role {
@@ -504,6 +583,44 @@ message account_role_removal {
   string account = 2;
   uint64 owner_revision = 3;
   uint64 started_ms = 4;
+}
+
+// 角色改名记录(docs/design/rename-and-content-safety.md §4.4):每名玩家一行,只保留最近一次,删角收尾时删除。
+// 它承担三件事:同一个 seq 重发回同一个结局;seq 比记录小的迟到请求一律拒绝;上一次成功的时刻(冷却从它算)。
+// seq 是 scene 按玩家递增发的流水号,不用发号器的 ID(那种 ID 不能比先后)。
+// 手写 DDL(store/account_role_rename.go):名字两列要和 player_name 同列型、同排序规则,还要一条二级索引给后台续做用。
+message account_role_rename {
+  option(OptionTableName) = "account_role_rename";
+  option(OptionPrimaryKey) = "player_id";
+  option(OptionTiDBNonclusteredPK) = true;
+  option(OptionTiDBShardRowIDBits) = 4;
+  option(OptionTiDBPreSplitRegions) = 4;
+  uint64 player_id = 1;
+  uint64 seq = 2;
+  // 1 进行中;2 已提交、未收尾;3 已收尾;4 已拒绝、预留的新名还没清;5 已拒绝。
+  uint32 state = 3;
+  // 状态 4、5 时的结局,取 data_service.RenameRoleResult 的值;其余状态为 0。
+  uint32 result = 4;
+  string new_name = 5;
+  string new_norm = 6;
+  // 提交时被换下的旧名的判重键(收尾按它把旧名行置为保护);没有旧名时为空。
+  string old_norm = 7;
+  // 最近一次改名成功的时刻 Unix 毫秒,0 = 从没改过。新的一次改名覆盖这一行时保留它。
+  uint64 renamed_ms = 8;
+  // 旧名保护到期时刻 Unix 毫秒,提交时算好,收尾写进 player_name.held_until_ms。
+  uint64 held_until_ms = 9;
+  uint64 updated_ms = 10;
+}
+
+// 第三方登录渠道身份(docs/design/rename-and-content-safety.md §6.5):按账号分片保存最近一次登录的
+// channel 与 platform open_id,供 content_guard 调平台内容安全接口(如微信 msgSecCheck)使用。
+message account_channel_identity {
+  option(OptionTableName) = "account_channel_identity";
+  option(OptionPrimaryKey) = "account";
+  string account = 1;
+  string channel = 2;
+  string open_id = 3;
+  uint64 updated_ms = 4;
 }
 
 // listing 级永久冻结收据；取消后保留，旧冻结请求重放不能再次冻结。
@@ -580,7 +697,7 @@ message sql_writer_registry {
   bytes writer_key = 1;
   string generation = 2;
   bytes instance_id = 3;
-  bytes sql_principal = 4; // VARBINARY(288)，永久UNIQUE；每boot主体不得重用。
+  bytes sql_principal = 4; // VARBINARY(288)。槽位账号:同一槽位(StatefulSet 序号)的各代共用,同一时刻至多一代 ACTIVE。
   bytes registration_digest = 5;
   enum State { STATE_UNKNOWN = 0; ACTIVE = 1; REVOKED = 2; }
   State state = 6;
@@ -588,6 +705,9 @@ message sql_writer_registry {
   bytes retirement_request_id = 8;
   bytes retirement_digest = 9;
   uint64 retired_ms = 10;
+  // 这个账号上第几次启动(代次),从 1 起严格递增,允许空洞;(sql_principal, boot_seq) 唯一。
+  // 注册事务要求新一代的号大于这个账号已有的全部号(CAS),见 docs/design/writer-roster-exhaustion-20261106.md §5。
+  uint64 boot_seq = 11;
 }
 message sql_writer_slot {
   option(OptionTableName) = "writer_slot";
@@ -625,6 +745,14 @@ message sql_writer_lifecycle_receipt {
     string deployment_id = 10; // 必须非空且进入永久请求摘要；init绑定真实PodUID，重放不得换部署。
     sql_writer_boot_grant.LockPrimitive lock_primitive = 11;
     bytes lock_qualification_sha256 = 12; // 同REGISTER原件永久绑定，必须精确等boot grant15/16；无I3资格不发grant。
+    // 只用于换代退休:同一槽位的新一代在注册事务里退休上一代时,填那份 REGISTER 的 request_id。
+    // REGISTER、人工退休、排空退休都必须为空;换代退休没有维护 run。
+    bytes successor_request_id = 13;
+    // 只在 REGISTER 里有意义:登记这一代的工作负载在它所在集群里的身份,注册器现场读,名册模板里必须为空。
+    // K8s 里是 k8s-sa:<namespace>/<ServiceAccount 名>/<ServiceAccount UID>(UID 由那个集群的 API server 分配,备份恢复、克隆带不过去);
+    // 集群外登记(本机脚本、调试栈)为空。缩容收尾(writer_authority retire-removed-slots)只结束本集群登记的一代,
+    // 靠它判归属;换代不看它(docs/design/writer-roster-exhaustion-20261106.md §5.9)。
+    string registered_by = 14;
   }
 }
 // 本地启动授权文件的唯一正规消息；不是SQL表。proto JSON用lowerCamelCase，bytes用标准base64。
@@ -969,12 +1097,16 @@ message sql_writer_maintenance_receipt {
   }
 }
 
-// init受限有限授权roster；每entry的身份/主体全预固定，不铸新UUID或复制runtime秘密进grant。
+// 写者槽位名册(init 只读,按原字节 SHA 批准)。一条 entry 是一个槽位,下标就是 StatefulSet 序号;
+// 账号与逻辑库预先固定,每次启动的 writer 身份由注册器现场生成,不复制 runtime 秘密进 grant。
+// 同一个消息也是注册器的启动记录:身份填好之后写进本 Pod 私有目录,init 重跑时原样重发。
 message sql_writer_boot_roster {
-  string format = 1; // SQL_WRITER_BOOT_ROSTER_V1。
-  repeated Entry entries = 2; // 至多现有issuer预算1024，duplicate key/instance/principal/request拒绝。
+  string format = 1; // SQL_WRITER_BOOT_ROSTER_V2。
+  repeated Entry entries = 2; // 槽位数 = 副本数上限,至多 1024;各槽位账号互不相同。
   message Entry {
-    repeated sql_writer_lifecycle_receipt.Request requests = 1; // 这个boot要写的每个逻辑库各一份，同一账号；任一份已被别的boot消费，整条entry就算用掉。
+    // 这个槽位要写的每个逻辑库各一份 REGISTER 模板,同一账号。名册里身份字段(request_id、writer_key、instance_id、
+    // registration_digest、registered_ms、boot_seq、deployment_id)必须为空;启动记录里由注册器填好。
+    repeated sql_writer_lifecycle_receipt.Request requests = 1;
     string runtime_config_path = 2; // 只在受限init input-root内解析，normal只挂选中副本。
     bytes runtime_config_sha256 = 3;
     repeated RuntimeEnvironment runtime_environment = 4; // 仅固定SQL环境变量白名单；原件只存私有文件路径/SHA，不存秘密值。

@@ -33,6 +33,7 @@ from .errors import (
     ERR_MATCH_NO_REGION_WITHIN_LATENCY,
     ERR_MATCH_PROBE_REQUIRED,
     ERR_MATCH_TEAM_SIZE_NOT_CONFIGURED,
+    GuildWarMemberOccupiedError,
     InvalidRoleFenceStateError,
     MatchBusinessError,
     OriginalRoleError,
@@ -41,6 +42,7 @@ from .errors import (
 )
 from .gather import BattleNodeResolver, GatherPipeline, Matchmaker, PresenceProvider, select_battle_node
 from .model import (
+    BATTLE_ACTIVITY_KIND_GUILD_WAR,
     COMPLETION_SOURCE_MANUAL_ABORT,
     MAX_OPERATOR_BYTES,
     MAX_PROBE_REGIONS,
@@ -48,6 +50,8 @@ from .model import (
     MAX_TEAM_SIZE,
     MODE_1V1,
     MODE_5V5,
+    MODE_GUILD_WAR_PVP,
+    MODE_GUILD_WAR_SIEGE,
     MODE_PVE_SOLO,
     MODE_PVE_TEAM,
     MODE_PVP_TEAM,
@@ -177,6 +181,7 @@ class MatchGrpcService:
                 "ResolveStrandedFormation": self.resolve_stranded_formation,
                 "ListPendingBattleScripts": self.list_pending_battle_scripts,
                 "ReviewBattleScript": self.review_battle_script,
+                "StartGuildWarBattle": self.start_guild_war_battle,
             },
             SERVICE_ROLE_FENCE: {
                 "PrepareRoleFreeze": self.prepare_role_freeze,
@@ -836,6 +841,113 @@ class MatchGrpcService:
         resp.battle_id = int(formation.battle_id)
         resp.formation_state = int(formation.state)
         resp.admitted_at_ms = int(formation.created_ms)
+        return resp
+
+    async def start_guild_war_battle(self, request: Message, context, path: str) -> Message:
+        """帮会全天帮战 V2 无匹配池直打入口：支持真人双侧直打（mode=9）与守旗 AI 快照踢馆（mode=10）。"""
+        await self._admit_internal(context, request, path, "guild", self.config.guild_secret)
+        resp = self.protocol.message("match.StartGuildWarBattleResponse")
+        mode = int(request.match_mode)
+        battle_config_id = int(request.battle_config_id)
+        request_id = int(request.request_id)
+        attackers = [int(x) for x in request.attacker_player_ids]
+        defenders = [int(x) for x in request.defender_player_ids]
+        act = request.activity_context
+        gw = act.guild_war if act.HasField("guild_war") else None
+
+        if (
+            battle_config_id == 0
+            or request_id == 0
+            or mode not in (MODE_GUILD_WAR_PVP, MODE_GUILD_WAR_SIEGE)
+            or not 1 <= len(attackers) <= MAX_TEAM_SIZE
+            or len(set(attackers)) != len(attackers)
+            or any(pid == 0 for pid in attackers)
+            or int(act.kind) != BATTLE_ACTIVITY_KIND_GUILD_WAR
+            or gw is None
+            or int(gw.attacker_guild_id) == 0
+        ):
+            resp.reject = 1  # ACTIVITY_BATTLE_REJECT_INVALID_ARGUMENT
+            return resp
+        if mode == MODE_GUILD_WAR_PVP:
+            if (
+                not 1 <= len(defenders) <= MAX_TEAM_SIZE
+                or len(set(defenders)) != len(defenders)
+                or any(pid == 0 for pid in defenders)
+                or set(attackers) & set(defenders)
+            ):
+                resp.reject = 1
+                return resp
+        else:
+            if defenders or len(request.ai_defender_snapshots) > MAX_TEAM_SIZE:
+                resp.reject = 1
+                return resp
+
+        ai_snapshots: list[Message] = []
+        if mode == MODE_GUILD_WAR_SIEGE:
+            for snap in request.ai_defender_snapshots:
+                cloned = self.protocol.message("BattlePlayerSnapshot")
+                cloned.CopyFrom(snap)
+                cloned.team_index = 1
+                cloned.ai_controlled = True
+                ai_snapshots.append(cloned)
+
+        for pid in attackers + defenders:
+            pres = await self.presence.get_presence(pid)
+            if not pres.online:
+                resp.reject = 2  # MEMBER_OFFLINE
+                resp.offender_player_id = pid
+                return resp
+            if pres.in_battle:
+                resp.reject = 3  # MEMBER_IN_BATTLE
+                resp.offender_player_id = pid
+                resp.offender_battle_id = await self.store.active_battle_id_of(pid)
+                return resp
+            if not pres.scene_grpc_endpoint:
+                resp.reject = 4  # MEMBER_NOT_READY
+                resp.offender_player_id = pid
+                return resp
+
+        nodes = await self.battle_nodes.list_nodes(release_track="stable")
+        node = select_battle_node(nodes, release_track="stable")
+        if node is None:
+            resp.reject = 5  # INTERNAL
+            return resp
+
+        try:
+            formation, created = await self.store.start_guild_war_battle(
+                request_id=request_id,
+                battle_config_id=battle_config_id,
+                match_mode=mode,
+                attacker_player_ids=attackers,
+                defender_player_ids=defenders,
+                activity_context_bytes=act.SerializeToString(deterministic=True),
+                battle_node=(node.node_id, node.node_uuid, node.grpc_endpoint, node.physical_region, "stable"),
+                battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+            )
+        except GuildWarMemberOccupiedError as exc:
+            resp.reject = 3 if exc.in_battle else 4
+            resp.offender_player_id = exc.player_id
+            resp.offender_battle_id = exc.battle_id
+            return resp
+        except MatchBusinessError:
+            resp.reject = 4
+            return resp
+        except Exception:
+            logger.error("match StartGuildWarBattle failed request_id=%d", request_id, exc_info=True)
+            resp.reject = 5
+            return resp
+
+        if created:
+            ai_tuple = tuple(ai_snapshots)
+            if self._inline_gather:
+                await self.gather.run_formation(formation, ai_defender_snapshots=ai_tuple)
+            else:
+                self._spawn(
+                    self.gather.run_formation(formation, ai_defender_snapshots=ai_tuple),
+                    name=f"guild-war-gather-{formation.battle_id}",
+                )
+        resp.battle_id = int(formation.battle_id)
+        resp.formation_state = int(formation.state)
         return resp
 
     async def cancel_activity_battle(self, request: Message, context, path: str) -> Message:

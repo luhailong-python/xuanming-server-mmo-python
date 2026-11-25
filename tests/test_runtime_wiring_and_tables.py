@@ -81,8 +81,8 @@ def test_config_tables_loads_synced_tables_with_json_pb_parity():
     assert tip_text
 
     # 战斗/场景表指纹与最新配表基线严格一致（JSON/PB 双格式逐字节同值）。
-    assert battle_table_fingerprint(tables_json) == "31db787f98ca4b18c48e16f4ed0fdf1c"
-    assert battle_table_fingerprint(tables_pb) == "31db787f98ca4b18c48e16f4ed0fdf1c"
+    assert battle_table_fingerprint(tables_json) == "becf67dbc74146f15c4604e4461d1d53"
+    assert battle_table_fingerprint(tables_pb) == "becf67dbc74146f15c4604e4461d1d53"
 
 
 def test_ranked_rule_and_presets_load_from_config_tables_with_fallback():

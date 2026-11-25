@@ -49,11 +49,15 @@ MODE_PVE_TEAM = 5
 MODE_PVP_CHALLENGE = 6
 MODE_PVP_TEAM = 7
 MODE_POLARITY_5V5 = 8
+MODE_GUILD_WAR_PVP = 9
+MODE_GUILD_WAR_SIEGE = 10
 MODE_SEASON_TOURNAMENT = 11
+BATTLE_ACTIVITY_KIND_GUILD_WAR = 3
+GUILD_WAR_MODES = frozenset((MODE_GUILD_WAR_PVP, MODE_GUILD_WAR_SIEGE))
 PVE_MODES = frozenset((MODE_PVE_SOLO, MODE_PVE_TEAM))
 PVP_MODES = frozenset((
     MODE_1V1, MODE_3V3, MODE_5V5, MODE_PVP_CHALLENGE, MODE_PVP_TEAM,
-    MODE_POLARITY_5V5, MODE_SEASON_TOURNAMENT,
+    MODE_POLARITY_5V5, MODE_GUILD_WAR_PVP, MODE_SEASON_TOURNAMENT,
 ))
 
 # QueueState 枚举值
@@ -488,7 +492,9 @@ def pending_settlement_delay_ms(issued_ms: int, now_ms: int) -> int:
 
 
 def spectate_visibility_for(mode: int, has_activity_context: bool) -> int:
-    """判定开局的观战可见性：帮会活动与 PVE 单人私密，PVP 与公开组队公开。"""
+    """判定开局的观战可见性：帮会全天帮战永远公开；其余帮会活动与 PVE 单人私密，PVP 与公开组队公开。"""
+    if mode in GUILD_WAR_MODES:
+        return SPECTATE_VISIBILITY_PUBLIC
     if has_activity_context or mode == MODE_PVE_SOLO:
         return SPECTATE_VISIBILITY_PRIVATE
     return SPECTATE_VISIBILITY_PUBLIC
@@ -553,7 +559,8 @@ def decode_outcome_original(protocol: Protocol, formation: Message | None) -> tu
         return req, "created_before_formation"
     if int(req.deadline_ms) <= int(req.created_at_ms):
         return req, "created_after_deadline"
-    if len(req.players) != len(formation.members):
+    human_players = [p for p in req.players if not getattr(p, "ai_controlled", False)]
+    if len(human_players) != len(formation.members):
         return req, "players_count_mismatch"
     return req, ""
 
@@ -568,6 +575,8 @@ def completable_original(protocol: Protocol, formation: Message) -> tuple[Messag
         raise ValueError(f"create original mismatch: {check}")
     teams: dict[int, int] = {}
     for player in req.players:
+        if getattr(player, "ai_controlled", False):
+            continue
         pid = int(player.player_id)
         if pid == 0 or pid in teams:
             raise ValueError("duplicate or empty player in create original")

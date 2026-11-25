@@ -56,9 +56,13 @@ _DAMAGE_PHYSICAL = 1
 _I64_MAX = (1 << 63) - 1
 _ENGINE_ACTOR_FLAG = 1 << 63
 
-# 行动超时与 PVP V2 / 投降 / 首领试炼 V2 常量（与 C++ turn_battle_constants.h 逐项对齐）
+# 行动超时与 PVP V2 / 投降 / 首领试炼 V2 / 论剑 V3 变阵常量（与 C++ turn_battle_constants.h 逐项对齐）
 ACTION_TIMEOUT_MS = 25_000
 BOSS_TRIAL_ACTION_TIMEOUT_MS = 18_000
+TACTICAL_PREP_TIMEOUT_MS = 15_000
+TACTICAL_PREP_DURATION_SECONDS = 15
+ACTION_TAG_PHYSICAL = 1
+ACTION_TAG_MAGIC = 2
 MATCH_MODE_PVE_SOLO = 4
 MATCH_MODE_PVE_TEAM = 5
 MATCH_MODE_POLARITY_5V5 = 8
@@ -210,6 +214,109 @@ FEATURE_TARGET_THREAT = 2
 FEATURE_IS_SKILL = 3
 FEATURE_PHASE_URGENCY = 4
 FEATURE_TARGET_IS_PLAYER = 5
+
+
+class BattleEffectOp(IntEnum):
+    """配置化战斗效果操作码（与 C++ `BattleEffectOp` 逐值一致）。"""
+
+    NONE = 0
+    DAMAGE = 1
+    HEAL = 2
+    SHIELD = 3
+    DISPEL_ALLY = 4
+    DISPEL_ENEMY = 5
+    MODIFIER = 6
+    PERIODIC_DAMAGE = 7
+    PERIODIC_HEAL = 8
+    DAMAGE_REDUCE = 9
+    REFLECT = 10
+    DAMAGE_SHARE = 11
+    MANA_SHIELD = 12
+    CONTROL = 13
+    CONSUME_PERIODIC = 14
+    EXTEND_PERIODIC = 15
+    DRAIN_MANA = 16
+    RETREAT_PET = 17
+    TEMPORARY_HEALTH = 18
+    MIRROR_SKILL = 19
+    PURSUIT_DAMAGE = 20
+    APPLY_CHILDREN = 21
+    CONDITIONAL_HEAL = 22
+    CONDITIONAL_MANA = 23
+    EVASION_CHARGE = 24
+    GROWING_AURA = 25
+    COPY_TARGET_SKILL = 26
+    PREPARE_CAST = 27
+    HIT_VULNERABILITY = 28
+    CONTROL_IMMUNITY = 29
+
+
+class BattleModifier(IntEnum):
+    """配置化战斗属性/伤害修正项（与 C++ `BattleModifier` 逐值一致）。"""
+
+    NONE = 0
+    PHYSICAL_ATTACK = 1
+    MAGIC_ATTACK = 2
+    DEFENSE = 3
+    SPEED = 4
+    OUTGOING_DAMAGE = 5
+    INCOMING_HEAL = 6
+    OUTGOING_HEAL = 7
+    CRIT_CHANCE = 8
+    MANA_COST = 9
+    MAGIC_REDUCTION = 10
+    RETREAT_RESIST = 11
+    CONTROL_RESIST = 12
+    LATER_HIT_REDUCTION = 13
+    NEXT_DIRECT_DAMAGE = 14
+    ADAPTIVE_DAMAGE = 15
+    INCOMING_DAMAGE = 16
+    OUTGOING_SHIELD = 17
+    OUTGOING_PHYSICAL_DAMAGE = 18
+    OUTGOING_MAGIC_DAMAGE = 19
+    SELF_GROWING_DEFENSE = 20
+    NEXT_PHYSICAL_ATTACK = 21
+    NEXT_MAGIC_ATTACK = 22
+    FORBID_PHYSICAL = 23
+    FORBID_MAGIC = 24
+
+
+class SecondaryTargetPolicy(IntEnum):
+    """多目标战法副目标筛选策略（与 C++ `SecondaryTargetPolicy` 逐值一致）。"""
+
+    RANDOM = 0
+    HIGHEST_PHYSICAL_ATTACK = 1
+    HIGHEST_MAGIC_ATTACK = 2
+    LOWEST_HEALTH_VALUE = 3
+    LOWEST_HEALTH_RATIO = 4
+    LOWEST_PHYSICAL_DEFENSE = 5
+    LOWEST_MAGIC_DEFENSE = 6
+    LOWEST_ROUND_SPEED = 7
+
+
+class BattleStateKind(IntEnum):
+    """配置化控制与异常分型（与 C++ `BattleStateKind` 逐值一致）。"""
+
+    NONE = 0
+    SEAL_PHYSICAL = 1
+    SEAL_MAGIC = 2
+    SEAL_ACTIVE = 3
+    CONFUSION = 4
+    SLEEP = 5
+    FREEZE = 6
+    POISON = 7
+    BURN = 8
+
+
+class BattleTrigger(IntEnum):
+    """配置化被动触发时机（与 C++ `BattleTrigger` 逐值一致）。"""
+
+    NONE = 0
+    AFTER_BASIC = 1
+    AFTER_SKILL = 2
+    BEFORE_DIRECT_DAMAGE = 3
+    AFTER_DIRECT_DAMAGE = 4
+    AFTER_PERIODIC = 5
 
 
 class BossPhaseId(IntEnum):
@@ -2271,9 +2378,20 @@ class TrialFactTracker:
         facts.guard_survived = guard_survived
         facts.self_triggered_shield_break = player_id in self.shield_break_players
         facts.self_triggered_anti_control_or_season_skill = player_id in self.anti_control_or_season_skill_players
-        facts.used_pet_table_id = self._used_pet_table_id.get(player_id, 0)
+        live_pet_table_id = 0
+        for other in self.engine.actors.values():
+            if other.actor_type == _ACTOR_PET and other.owner_player_id == player_id:
+                live_pet_table_id = other.pet_table_id
+                break
+        if live_pet_table_id and not self.engine.uses_free_preset:
+            facts.used_pet_table_id = live_pet_table_id
+        else:
+            facts.used_pet_table_id = self._used_pet_table_id.get(player_id, 0)
         facts.used_artifact_effect_ids.extend(self._used_artifact_effect_ids.get(player_id, ()))
-        facts.used_season_seal_id = self._used_season_seal_id.get(player_id, 0)
+        if actor.HasField("equipment_effects") and actor.equipment_effects.HasField("season_seal"):
+            facts.used_season_seal_id = actor.equipment_effects.season_seal.seal_id
+        else:
+            facts.used_season_seal_id = self._used_season_seal_id.get(player_id, 0)
         facts.teammate_names.extend(self._teammates_by_player.get(player_id, ()))
         facts.boss_wind_hit_unprotected_death = self.boss_wind_hit_unprotected_death
         facts.dealt_yang_bell_physical_damage = self.dealt_yang_bell_physical_damage
@@ -2580,6 +2698,12 @@ class EncounterV2Controller:
             )
             if self.boss_barrier_shield == 0:
                 self.engine.trial_tracker.record_shield_break(source)
+                # 灵障碎障破绽：击破首领灵障护盾立即触发完整「破绽（+35%，至下回合末）」
+                self.apply_boss_exposed(target.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                self.engine.trial_tracker.stance_break_count += 1
+                self.emit_boss_mechanic_event(
+                    turn, group, BOSS_MECHANIC_STANCE_BREAK, source.actor_id, target.actor_id, BOSS_EXPOSED_FULL_PCT,
+                )
         return damage, splash_reduced
 
     def apply_breaker_sunder_on_basic_hit(
@@ -3042,6 +3166,21 @@ class EncounterV2Controller:
                                 turn, grp, BOSS_MECHANIC_STANCE_BREAK, source.actor_id, boss.actor_id, BOSS_EXPOSED_FULL_PCT,
                             )
                         record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "切阵被控打断，触发崩势破绽")
+                    elif entry.intent_kind in (TELEGRAPH_KIND_GUARD_SHIELD, TELEGRAPH_KIND_GUARD_BIND):
+                        self.engine.trial_tracker.stance_break_count += 1
+                        boss = self._find_alive_boss()
+                        if boss is not None:
+                            self.apply_boss_exposed(boss.actor_id, BOSS_EXPOSED_PARTIAL_PCT, self.engine.round_index + 1)
+                            self.emit_boss_mechanic_event(
+                                turn, grp, BOSS_MECHANIC_STANCE_BREAK, source.actor_id, boss.actor_id, BOSS_EXPOSED_PARTIAL_PCT,
+                            )
+                        record_resolved(
+                            entry,
+                            TELEGRAPH_STATUS_CANCELLED_BY_CONTROL,
+                            "灵障护佑被控打断，首领陷入破绽"
+                            if entry.intent_kind == TELEGRAPH_KIND_GUARD_SHIELD
+                            else "缚灵锁脉被控打断，首领陷入破绽",
+                        )
                 continue
 
             kind = entry.intent_kind
@@ -3136,10 +3275,55 @@ class EncounterV2Controller:
                 self.engine._group += 1
                 grp = self.engine._group
                 scale = 1.05 if self.battle_difficulty >= 2 else 0.85
+                if self.is_boss_trial:
+                    if self.boss_momentum_stacks > 0:
+                        scale *= 1.0 + (self.boss_momentum_stacks * BOSS_MOMENTUM_PER_STACK_PCT) / 100.0
+                    if self.boss_phase >= 2:
+                        scale *= 1.10
+                valid_targets = 0
+                parried_targets = 0
                 for tid in targets:
                     target = self.engine.actors.get(tid)
-                    if target is not None and _active(target):
-                        deal_boss_strike(source, target, _DAMAGE_MAGIC, scale, grp)
+                    if target is None or not _active(target):
+                        continue
+                    valid_targets += 1
+                    owner_id = (
+                        target.owner_player_id if target.actor_type == _ACTOR_PET
+                        else (target.actor_id if target.actor_type == _ACTOR_PLAYER else 0)
+                    )
+                    if owner_id and self.is_boss_trial:
+                        self.engine.trial_tracker.self_cleaves_targeted_by_player[owner_id] = (
+                            self.engine.trial_tracker.self_cleaves_targeted_by_player.get(owner_id, 0) + 1
+                        )
+                    was_defending = bool(target.is_defending)
+                    had_protection = self.actor_has_boss_cleave_parry_protection(target, _DAMAGE_MAGIC)
+                    ev_before = len(turn.events)
+                    deal_boss_strike(source, target, _DAMAGE_MAGIC, scale, grp)
+                    triggered_shield_or_reflect = any(
+                        (ev.event_type == _EVENT_SHIELD and ev.target_id == target.actor_id and ev.absorbed > 0)
+                        or (ev.event_type == 3 and ev.hit_kind == _HIT_REFLECT and ev.source_id == target.actor_id)
+                        for ev in turn.events[ev_before:]
+                    )
+                    if was_defending or had_protection or triggered_shield_or_reflect:
+                        parried_targets += 1
+                        if owner_id and self.is_boss_trial:
+                            self.engine.trial_tracker.self_cleaves_parried_by_player[owner_id] = (
+                                self.engine.trial_tracker.self_cleaves_parried_by_player.get(owner_id, 0) + 1
+                            )
+                if self.is_boss_trial:
+                    self.boss_momentum_stacks = 0
+                    if valid_targets > 0 and parried_targets == valid_targets:
+                        self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
+                        self.engine.trial_tracker.cleave_parry_count += 1
+                        self.emit_boss_mechanic_event(
+                            turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
+                        )
+                    elif valid_targets >= 2 and parried_targets * 2 >= valid_targets:
+                        self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_PARTIAL_PCT, self.engine.round_index + 1)
+                        self.engine.trial_tracker.cleave_parry_count += 1
+                        self.emit_boss_mechanic_event(
+                            turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_PARTIAL_PCT,
+                        )
                 record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "玄毒冲击已发动")
             elif kind == TELEGRAPH_KIND_GUARD_HEAL:
                 boss = self._find_alive_boss()
@@ -3312,3 +3496,704 @@ class EncounterV2Controller:
         if self.engine.outcome == 0:
             for entry in self.active_telegraphs:
                 state.telegraphs.add().CopyFrom(entry)
+
+
+# ---------------------------------------------------------------------------
+# 8. 战法 V3 配置化技能与状态控制器（对照 configured_battle_effects.cpp）
+# ---------------------------------------------------------------------------
+
+
+class ConfiguredAbilitiesController:
+    """承载 `battle_model == 1` 战法、策略副目标、蓄力释放、受击易伤、免控与专修禁攻规则。"""
+
+    def __init__(self, engine: TurnEngine):
+        self.engine = engine
+
+    @staticmethod
+    def subject_allowed(actor: Message, rule: BattleSkill) -> bool:
+        """判定单位是否满足战法主体掩码与解锁等级。"""
+        mask = 2 if actor.actor_type == _ACTOR_PET else 1
+        return rule.battle_model == 1 and (rule.caster_mask & mask) != 0 and actor.level >= rule.unlock_level
+
+    def configured_rank(self, actor: Message, rule: BattleSkill) -> int:
+        if not self.subject_allowed(actor, rule):
+            return 0
+        return actor.skill_ranks.get(rule.id if hasattr(rule, "id") else 0, 0)
+
+    def has_state(self, actor: Message, state_kind: int) -> bool:
+        """判定单位是否带有指定 `BattleStateKind` 配置化控制状态。"""
+        rules = self.engine.effects.rules
+        for entry in actor.buffs:
+            row = rules.get(entry.buff_table_id)
+            if row is not None and row.battle_op == BattleEffectOp.CONTROL and row.state_kind == state_kind:
+                return True
+        return False
+
+    def modifier(self, actor: Message, kind: int) -> float:
+        """按最强正项与最强负项之和汇总配置化属性/伤害修正（对照 `ConfiguredModifier`）。"""
+        selected = ModifierSelection()
+        rules = self.engine.effects.rules
+        for entry in actor.buffs:
+            row = rules.get(entry.buff_table_id)
+            if (
+                row is None
+                or row.battle_op not in (BattleEffectOp.MODIFIER, BattleEffectOp.GROWING_AURA)
+                or row.modifier_stat != kind
+            ):
+                continue
+            if row.require_living_caster:
+                caster = self.engine.actors.get(entry.caster_id)
+                if caster is None or not _active(caster):
+                    continue
+            stacks = entry.stacks if row.battle_op == BattleEffectOp.GROWING_AURA else 1
+            value = row.ratio * stacks
+            selected.consider(value)
+        return selected.total()
+
+    def is_physical_forbidden(self, actor: Message) -> bool:
+        return self.modifier(actor, BattleModifier.FORBID_PHYSICAL) > 0.0
+
+    def is_magic_forbidden(self, actor: Message) -> bool:
+        return self.modifier(actor, BattleModifier.FORBID_MAGIC) > 0.0
+
+    def effective_physical_attack(self, actor: Message) -> int:
+        base = self.engine._effective_stat(actor, 10)
+        mult = max(0.1, 1.0 + self.modifier(actor, BattleModifier.PHYSICAL_ATTACK))
+        return PetAndSupportEffects.whole(float(base) * mult)
+
+    def effective_magic_attack(self, actor: Message) -> int:
+        mult = max(0.1, 1.0 + self.modifier(actor, BattleModifier.MAGIC_ATTACK))
+        return PetAndSupportEffects.whole(float(actor.magic_attack) * mult)
+
+    def effective_defense(self, actor: Message) -> int:
+        base = self.engine._effective_stat(actor, 11)
+        mult = max(0.1, 1.0 + self.modifier(actor, BattleModifier.DEFENSE))
+        return PetAndSupportEffects.whole(float(base) * mult)
+
+    def effective_speed(self, actor: Message) -> int:
+        base = self.engine._effective_stat(actor, 13)
+        mult = max(0.1, 1.0 + self.modifier(actor, BattleModifier.SPEED))
+        return PetAndSupportEffects.whole(float(base) * mult)
+
+    def effective_mitigation_score(self, actor: Message, *, is_magic: bool) -> float:
+        """计算物理/法术等效防御厚度分（1 - received），供最低防御副目标策略升序选脆皮。"""
+        resist_bonus = actor.combat.magic_resist if is_magic else actor.combat.physical_resist
+        equip_resist = (
+            (actor.equipment_effects.magic_resist_bps if is_magic else actor.equipment_effects.physical_resist_bps)
+            if actor.HasField("equipment_effects")
+            else 0
+        )
+        legacy_resist = min(U64_MAX, actor.attributes.resistance + resist_bonus)
+        received = received_ratio(
+            actor.attributes.armor,
+            self.effective_defense(actor),
+            float(legacy_resist) * 100.0 + float(equip_resist),
+            actor.level,
+        )
+        return 1.0 - max(0.0, min(1.0, received))
+
+    def sync_charging_skill_id(self, actor: Message) -> None:
+        """同步 `BattleActorState.charging_skill_id` 字段与当前明牌蓄力状态。"""
+        rules = self.engine.effects.rules
+        charging_id = 0
+        for entry in actor.buffs:
+            row = rules.get(entry.buff_table_id)
+            if row is not None and row.battle_op == BattleEffectOp.PREPARE_CAST:
+                charging_id = entry.source_skill_id
+                break
+        actor.charging_skill_id = charging_id
+
+    def remove_buff(self, actor: Message, buff_id: int, turn: Message, group: int) -> bool:
+        """按实例号移除 Buff、发出移除事件并在需要时刷新 `charging_skill_id`。"""
+        for idx, entry in enumerate(actor.buffs):
+            if entry.buff_id != buff_id:
+                continue
+            row = self.engine.effects.rules.get(entry.buff_table_id)
+            caster_id = entry.caster_id
+            table_id = entry.buff_table_id
+            del actor.buffs[idx]
+            if row is not None and row.battle_op == BattleEffectOp.PREPARE_CAST:
+                self.sync_charging_skill_id(actor)
+            turn.events.add(
+                event_type=_EVENT_BUFF_REMOVE,
+                source_id=caster_id,
+                target_id=actor.actor_id,
+                buff_table_id=table_id,
+                buff_instance_id=buff_id,
+                group_id=group,
+            )
+            return True
+        return False
+
+    def try_consume_control_immunity(
+        self, caster: Message, target: Message, incoming_buff_id: int, turn: Message, group: int, hit: int = 0,
+    ) -> bool:
+        """若目标持有免控护阵（`ControlImmunity`），消耗 1 次次数并阻挡敌方硬控。"""
+        rules = self.engine.effects.rules
+        for idx, entry in enumerate(target.buffs):
+            guard = rules.get(entry.buff_table_id)
+            if guard is None or guard.battle_op != BattleEffectOp.CONTROL_IMMUNITY:
+                continue
+            guard_id = entry.buff_id
+            if entry.remaining_hits <= 1:
+                self.remove_buff(target, guard_id, turn, group)
+            else:
+                target.buffs[idx].remaining_hits = entry.remaining_hits - 1
+            if target.actor_type == _ACTOR_PLAYER:
+                self.engine.trial_tracker.record_anti_control_or_season_skill(target)
+            turn.events.add(
+                event_type=_EVENT_RESIST,
+                source_id=caster.actor_id,
+                target_id=target.actor_id,
+                buff_table_id=incoming_buff_id,
+                group_id=group,
+                hit_index=hit,
+            )
+            return True
+        return False
+
+    def increment_hit_vulnerability(self, target: Message, round_index: int, group_id: int) -> None:
+        """目标受直伤/追击时叠加「连击破绽」易伤层数（同行动 group 至多叠 1 层）。"""
+        rules = self.engine.effects.rules
+        for entry in target.buffs:
+            row = rules.get(entry.buff_table_id)
+            if row is None or row.battle_op != BattleEffectOp.HIT_VULNERABILITY:
+                continue
+            if entry.last_trigger_round == round_index and entry.secondary_value == group_id:
+                continue
+            cap = max(1, row.stack_limit)
+            if entry.stacks >= cap:
+                continue
+            entry.stacks += 1
+            entry.last_trigger_round = round_index
+            entry.secondary_value = group_id
+
+    def hit_vulnerability_bonus(self, target: Message) -> float:
+        """计算目标当前全部受击叠层易伤总比例。"""
+        rules = self.engine.effects.rules
+        bonus = 0.0
+        for entry in target.buffs:
+            row = rules.get(entry.buff_table_id)
+            if row is None or row.battle_op != BattleEffectOp.HIT_VULNERABILITY:
+                continue
+            if entry.stacks > 0 and math.isfinite(row.ratio):
+                bonus += row.ratio * float(entry.stacks)
+        return bonus
+
+    def consume_one_shot_attack_modifiers(self, source: Message, damage_type: int, turn: Message, group: int) -> None:
+        """一次性消耗攻击方身上的单次物理/法术攻击修正标记（如截锋令 / 授锋战印）。"""
+        target_stat = (
+            BattleModifier.NEXT_PHYSICAL_ATTACK
+            if damage_type == _DAMAGE_PHYSICAL
+            else BattleModifier.NEXT_MAGIC_ATTACK
+        )
+        rules = self.engine.effects.rules
+        to_remove = [
+            entry.buff_id
+            for entry in source.buffs
+            if (row := rules.get(entry.buff_table_id)) is not None
+            and row.battle_op == BattleEffectOp.MODIFIER
+            and row.modifier_stat == target_stat
+        ]
+        for buff_id in to_remove:
+            self.remove_buff(source, buff_id, turn, group)
+
+    def target_allowed(self, actor: Message, target: Message, rule: BattleSkill) -> bool:
+        """校验目标是否符合配置化战法阵营、存活、禁复制与劝退限制。"""
+        if target.fled or (target.is_dead and not rule.allow_dead_target):
+            return False
+        if rule.target_team == 3:
+            return target.actor_id == actor.actor_id
+        if (target.team_index == actor.team_index) != (rule.target_team == 2):
+            return False
+        if rule.health_cost_mode == 2 and actor.actor_id == target.actor_id:
+            return False
+        rules = self.engine.effects.rules
+        for eff_id in rule.effects:
+            eff = rules.get(eff_id)
+            if eff is None:
+                continue
+            if eff.battle_op == BattleEffectOp.RETREAT_PET and target.actor_type != _ACTOR_PET:
+                return False
+            if eff.battle_op == BattleEffectOp.COPY_TARGET_SKILL and target.is_boss:
+                return False
+        return True
+
+    def check_skill(self, actor: Message, action: Message, rule: BattleSkill) -> int:
+        """校验配置化战法的封印/专修禁攻、蓄力防重、冷却、次数、耗蓝与目标合法性。"""
+        if not self.subject_allowed(actor, rule) or not rule.castable:
+            return 7004
+        if (
+            self.has_state(actor, BattleStateKind.SEAL_ACTIVE)
+            or ((self.has_state(actor, BattleStateKind.SEAL_PHYSICAL) or self.is_physical_forbidden(actor))
+                and (rule.action_tags & ACTION_TAG_PHYSICAL))
+            or ((self.has_state(actor, BattleStateKind.SEAL_MAGIC) or self.is_magic_forbidden(actor))
+                and (rule.action_tags & ACTION_TAG_MAGIC))
+        ):
+            return 7004
+        if actor.charging_skill_id != 0:
+            for eff_id in rule.effects:
+                eff = self.engine.effects.rules.get(eff_id)
+                if eff is not None and eff.battle_op == BattleEffectOp.PREPARE_CAST:
+                    return 7004
+        if actor.skill_cooldown_rounds.get(action.skill_table_id, 0) > 0:
+            return 7003
+        if rule.max_battle_uses > 0 and actor.ability_use_counts.get(action.skill_table_id, 0) >= rule.max_battle_uses:
+            return 7004
+        if rule.health_cost_mode == 1 and actor.attributes.health <= 1:
+            return 7004
+        from .battle_skills import mana_cost as _mana_cost
+        cost = _mana_cost(actor, rule)
+        if actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
+            cost = self.engine.equipment_effects.discount_skill_mana(actor, rule, cost)
+        if cost > actor.attributes.mana:
+            return 7004
+        if action.target_id != 0:
+            target = self.engine.actors.get(action.target_id)
+            return 0 if (target is not None and self.target_allowed(actor, target, rule)) else 7002
+        return 0
+
+    def _compare_secondary(self, policy: int, lhs: Message, rhs: Message) -> int:
+        if policy == SecondaryTargetPolicy.HIGHEST_PHYSICAL_ATTACK:
+            a, b = self.effective_physical_attack(lhs), self.effective_physical_attack(rhs)
+            return 1 if a > b else (-1 if a < b else 0)
+        if policy == SecondaryTargetPolicy.HIGHEST_MAGIC_ATTACK:
+            a, b = self.effective_magic_attack(lhs), self.effective_magic_attack(rhs)
+            return 1 if a > b else (-1 if a < b else 0)
+        if policy == SecondaryTargetPolicy.LOWEST_HEALTH_VALUE:
+            a, b = lhs.attributes.health, rhs.attributes.health
+            return 1 if a < b else (-1 if a > b else 0)
+        if policy == SecondaryTargetPolicy.LOWEST_HEALTH_RATIO:
+            a = (lhs.attributes.health / lhs.max_health) if lhs.max_health > 0 else 1.0
+            b = (rhs.attributes.health / rhs.max_health) if rhs.max_health > 0 else 1.0
+            if abs(a - b) <= 1e-12:
+                return 0
+            return 1 if a < b else -1
+        if policy == SecondaryTargetPolicy.LOWEST_PHYSICAL_DEFENSE:
+            a = self.effective_mitigation_score(lhs, is_magic=False)
+            b = self.effective_mitigation_score(rhs, is_magic=False)
+            if abs(a - b) <= 1e-9:
+                return 0
+            return 1 if a < b else -1
+        if policy == SecondaryTargetPolicy.LOWEST_MAGIC_DEFENSE:
+            a = self.effective_mitigation_score(lhs, is_magic=True)
+            b = self.effective_mitigation_score(rhs, is_magic=True)
+            if abs(a - b) <= 1e-9:
+                return 0
+            return 1 if a < b else -1
+        if policy == SecondaryTargetPolicy.LOWEST_ROUND_SPEED:
+            frozen = self.engine.round_start_speeds
+            a = frozen.get(lhs.actor_id, self.effective_speed(lhs))
+            b = frozen.get(rhs.actor_id, self.effective_speed(rhs))
+            return 1 if a < b else (-1 if a > b else 0)
+        return 0
+
+    def select_targets(self, actor: Message, rule: BattleSkill, primary_id: int) -> list[Message]:
+        """按策略模式选择配置化战法主目标与确定性副目标（并列用确定性 RNG 打破平局）。"""
+        subject_max = (rule.pet_max_targets or rule.max_targets) if actor.actor_type == _ACTOR_PET else rule.max_targets
+        count = max(1, subject_max)
+        targets: list[Message] = []
+        candidates: list[Message] = []
+        for candidate in self.engine.actors.values():
+            if not self.target_allowed(actor, candidate, rule):
+                continue
+            if candidate.actor_id == primary_id:
+                targets.append(candidate)
+            else:
+                candidates.append(candidate)
+
+        policy = rule.secondary_target_policy
+        if policy == SecondaryTargetPolicy.RANDOM:
+            while len(targets) < count and candidates:
+                idx = 0 if len(candidates) == 1 else int(self.engine.rng.next() % len(candidates))
+                targets.append(candidates.pop(idx))
+            return targets
+
+        while len(targets) < count and candidates:
+            best_indices: list[int] = []
+            for idx, cand in enumerate(candidates):
+                if not best_indices:
+                    best_indices.append(idx)
+                    continue
+                cmp = self._compare_secondary(policy, cand, candidates[best_indices[0]])
+                if cmp > 0:
+                    best_indices = [idx]
+                elif cmp == 0:
+                    best_indices.append(idx)
+            if not best_indices:
+                break
+            chosen_pos = (
+                best_indices[0]
+                if len(best_indices) == 1
+                else best_indices[int(self.engine.rng.next() % len(best_indices))]
+            )
+            targets.append(candidates.pop(chosen_pos))
+        return targets
+
+    def initialize_abilities(self) -> None:
+        """在阵容最终锁定后初始化全部配置化被动、触发器与开场光环（对照 `InitializeConfiguredAbilities`）。"""
+        ignored = self.engine.protocol.message("TurnResultS2C")
+        for actor in self.engine.actors.values():
+            for skill_id in sorted(actor.skill_ranks):
+                rule = self.engine.skills.rules.get(skill_id)
+                if rule is None or rule.battle_model != 1 or not self.subject_allowed(actor, rule):
+                    continue
+                if skill_id not in actor.runtime_skills:
+                    actor.runtime_skills.append(skill_id)
+                if not rule.init_effects:
+                    continue
+                rank = max(1, actor.skill_ranks.get(skill_id, 1))
+                if rule.ability_kind == 4:
+                    primary = actor.owner_player_id if actor.actor_type == _ACTOR_PET else actor.actor_id
+                    targets = self.select_targets(actor, rule, primary)
+                else:
+                    targets = [actor]
+                primary_id = targets[0].actor_id if targets else 0
+                for target in targets:
+                    for effect_id in rule.init_effects:
+                        self.apply_effect(
+                            actor, target, effect_id, rule=rule, skill_id=skill_id, rank=rank,
+                            primary_target_id=primary_id, turn=ignored, group=0, hit=0,
+                        )
+
+    def apply_effect(
+        self,
+        caster: Message,
+        target: Message,
+        buff_id: int,
+        *,
+        rule: BattleSkill | None,
+        skill_id: int,
+        rank: int,
+        primary_target_id: int,
+        turn: Message,
+        group: int,
+        hit: int,
+        is_multi_target: bool = False,
+        primary_focus_bonus: bool = False,
+        depth: int = 0,
+    ) -> None:
+        """执行单条配置化 Buff/技能子效果（对照 `ApplyConfiguredEffect` 核心分支）。"""
+        row = self.engine.effects.rules.get(buff_id)
+        if row is None or depth > 8:
+            return
+        op = row.battle_op
+        if op == BattleEffectOp.NONE:
+            self.engine.effects.add(target, buff_id, caster.actor_id, turn, group, hit, depth=depth)
+            return
+        receiver = caster if row.effect_target in (1, 3) else target
+        if receiver.fled or receiver.is_dead:
+            return
+        hostile = receiver.team_index != caster.team_index
+        if hostile and self.has_state(receiver, BattleStateKind.FREEZE):
+            return
+
+        if op == BattleEffectOp.DAMAGE:
+            if rule is None:
+                return
+            base = self.engine.skills._base_damage(caster, rule)
+            if base <= 0.0 and (row.flat_value > 0 or row.per_level > 0):
+                base = row.flat_value + row.per_level * caster.level
+            if base <= 0.0:
+                base = 10.0
+            is_primary = receiver.actor_id == primary_target_id
+            self.engine._damage(
+                turn, group, caster, receiver, rule, skill_id=skill_id, hit_kind=0, hit_index=hit,
+                base=base, rank=rank, is_multi_target=is_multi_target,
+                is_primary_target=is_primary, is_primary_focus=(primary_focus_bonus and is_primary),
+            )
+            return
+
+        if op == BattleEffectOp.HEAL:
+            raw = 0.0
+            if rule is not None and (rule.heal_multiplier > 0 or rule.heal_per_level > 0):
+                raw = self.engine.skills._heal_amount(caster, receiver, rule, rank)
+            else:
+                basis = float(caster.magic_attack) if row.value_basis == 2 else float(receiver.max_health) if row.value_basis == 4 else float(caster.physical_attack)
+                raw = PetAndSupportEffects.support_base_value(row.flat_value, row.per_level, caster.level, basis, row.ratio, rank)
+            if getattr(self.engine, "escalation_stacks", 0) > 0:
+                raw *= self.engine.escalation_support_pct / 100.0
+            value = landed_heal(receiver, raw)
+            if value > 0:
+                receiver.attributes.health += value
+                self.engine._event(
+                    turn, group, _EVENT_HEAL, caster, receiver, skill_table_id=skill_id, hit_index=hit,
+                    value=value, target_health_after=receiver.attributes.health, target_mana_after=receiver.attributes.mana,
+                )
+            return
+
+        if op == BattleEffectOp.SHIELD:
+            basis = float(caster.magic_attack) if row.value_basis == 2 else float(receiver.max_health) if row.value_basis == 4 else float(caster.physical_attack)
+            raw = PetAndSupportEffects.support_base_value(row.flat_value, row.per_level, caster.level, basis, row.ratio, rank)
+            if raw <= 0.0:
+                raw = max(1.0, float(receiver.max_health) * 0.1)
+            self.engine.equipment_effects.grant_shield(
+                receiver, raw, source=caster, buff_table_id=buff_id,
+                remain_rounds=row.config_duration_rounds or row.duration_rounds or 2,
+                round_index=self.engine.round_index, turn=turn, group=group, commit_artifacts=(hit == 0),
+            )
+            return
+
+        if op == BattleEffectOp.DISPEL_ALLY:
+            self.engine.encounter.clear_sunder_on_ally_dispel(caster, receiver)
+            self.engine.effects.dispel(receiver, max(1, rule.dispel_count if rule else 1), turn, group, hit)
+            return
+
+        if op == BattleEffectOp.DISPEL_ENEMY:
+            self.engine.encounter.try_dispel_boss_stance(caster, receiver, turn, group)
+            return
+
+        # 持久化 Buff / 控制 / 蓄力 / 易伤 / 免控分支
+        if hostile and op == BattleEffectOp.CONTROL and 1 <= row.state_kind <= 6:
+            if self.try_consume_control_immunity(caster, receiver, buff_id, turn, group, hit):
+                return
+            base_chance = row.application_chance if row.application_chance > 0.0 else 1.0
+            if not self.engine.equipment_effects.roll_ailment_with_equipment(
+                caster, receiver, base_chance, row.state_kind, buff_id, self.engine.round_index, turn, group,
+                is_primary=(receiver.actor_id == primary_target_id),
+            ):
+                return
+        elif hostile and op == BattleEffectOp.MODIFIER and 0.0 < row.application_chance < 1.0:
+            if self.engine.rng.unit() >= row.application_chance:
+                turn.events.add(
+                    event_type=_EVENT_RESIST, source_id=caster.actor_id, target_id=receiver.actor_id,
+                    buff_table_id=buff_id, group_id=group, hit_index=hit,
+                )
+                return
+
+        instance_id = self.engine.effects.next_buff_id()
+        remain = row.config_duration_rounds if row.config_duration_rounds > 0 else (0 if row.infinite else row.duration_rounds)
+        entry = receiver.buffs.add(
+            buff_id=instance_id,
+            buff_table_id=buff_id,
+            caster_id=caster.actor_id,
+            layer=1,
+            remain_rounds=remain,
+            applied_round=self.engine.round_index,
+            source_skill_id=skill_id,
+        )
+        if row.hit_limit > 0:
+            entry.remaining_hits = row.hit_limit
+        if op == BattleEffectOp.MODIFIER:
+            entry.stat_percent = row.ratio
+        if op == BattleEffectOp.PREPARE_CAST:
+            entry.secondary_value = primary_target_id
+            self.sync_charging_skill_id(receiver)
+        turn.events.add(
+            event_type=_EVENT_BUFF_ADD,
+            source_id=caster.actor_id,
+            target_id=receiver.actor_id,
+            buff_table_id=buff_id,
+            buff_instance_id=instance_id,
+            value=1,
+            group_id=group,
+            hit_index=hit,
+        )
+        if row.trigger_event == 0 and op not in (BattleEffectOp.PURSUIT_DAMAGE, BattleEffectOp.PREPARE_CAST):
+            for child in row.sub_buffs:
+                if not any(b.buff_id == instance_id for b in receiver.buffs):
+                    break
+                self.apply_effect(
+                    caster, receiver, child, rule=rule, skill_id=skill_id, rank=rank,
+                    primary_target_id=primary_target_id, turn=turn, group=group, hit=hit, depth=depth + 1,
+                )
+
+    def execute_skill(self, actor: Message, action: Message, rule: BattleSkill, turn: Message, group: int) -> None:
+        """执行 `battle_model == 1` 配置化主动战法（含副目标策略、蓄力入态与一次性攻击标记消耗）。"""
+        skill_id = action.skill_table_id
+        if self.check_skill(actor, action, rule) != 0:
+            if rule.target_team == 1 and not self.is_physical_forbidden(actor):
+                self.engine._attack_target(turn, group, actor, action.target_id)
+            return
+        targets = self.select_targets(actor, rule, action.target_id)
+        if not targets:
+            return
+        rank = max(1, actor.skill_ranks.get(skill_id, 1))
+        if rule.cooldown_rounds > 0:
+            actor.skill_cooldown_rounds[skill_id] = rule.cooldown_rounds + 1
+        if rule.max_battle_uses > 0:
+            actor.ability_use_counts[skill_id] = actor.ability_use_counts.get(skill_id, 0) + 1
+        self.engine._event(turn, group, 2, actor, targets[0], skill_table_id=skill_id)
+        from .battle_skills import mana_cost as _mana_cost
+        cost = _mana_cost(actor, rule)
+        if cost > 0:
+            cost = min(cost, actor.attributes.mana)
+            actor.attributes.mana -= cost
+            self.engine.skills._mana_event(turn, group, 0, actor, actor, skill_id, -cost)
+
+        subject_max = (rule.pet_max_targets or rule.max_targets) if actor.actor_type == _ACTOR_PET else rule.max_targets
+        is_multi = subject_max > 1
+        primary_focus = (
+            self.engine.is_competitive_pvp_battle
+            and actor.actor_type == _ACTOR_PLAYER
+            and subject_max > 1
+            and action.target_id != 0
+            and targets[0].actor_id == action.target_id
+            and len(targets) < subject_max
+        )
+        effects_begin = len(turn.events)
+        primary_target_id = targets[0].actor_id
+        for idx, target in enumerate(targets):
+            if target.fled or (target.is_dead and not rule.allow_dead_target):
+                continue
+            for eff_id in rule.effects:
+                eff = self.engine.effects.rules.get(eff_id)
+                if eff is None:
+                    continue
+                if idx > 0 and eff.effect_target == 1:
+                    continue
+                self.apply_effect(
+                    actor, target, eff_id, rule=rule, skill_id=skill_id, rank=rank,
+                    primary_target_id=primary_target_id, turn=turn, group=group, hit=idx,
+                    is_multi_target=is_multi, primary_focus_bonus=primary_focus,
+                )
+
+        hit_directly = False
+        landed_direct_strike = False
+        for ev in turn.events[effects_begin:]:
+            if (
+                ev.event_type == 3
+                and ev.source_id == actor.actor_id
+                and ev.skill_table_id == skill_id
+                and ev.damage_origin == 0
+            ):
+                if ev.value > 0:
+                    hit_directly = True
+                if ev.value > 0 or ev.absorbed > 0:
+                    landed_direct_strike = True
+        if landed_direct_strike and _active(actor):
+            self.consume_one_shot_attack_modifiers(actor, rule.damage_kind, turn, group)
+        if hit_directly and _active(actor):
+            self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_SKILL, rule.damage_kind, turn, group, skill_id=skill_id)
+
+    def execute_prepared_cast_if_ready(self, actor: Message, turn: Message, group: int) -> bool:
+        """若单位在上回合进入蓄力且本回合未被控制/封印打断，则自动释放蓄力战法（对照 `ExecutePreparedCastIfReady`）。"""
+        rules = self.engine.effects.rules
+        prepare_entry = None
+        for entry in actor.buffs:
+            row = rules.get(entry.buff_table_id)
+            if row is not None and row.battle_op == BattleEffectOp.PREPARE_CAST and entry.applied_round < self.engine.round_index:
+                prepare_entry = entry
+                break
+        if prepare_entry is None:
+            return False
+
+        saved_buff_id = prepare_entry.buff_id
+        saved_table_id = prepare_entry.buff_table_id
+        saved_skill_id = prepare_entry.source_skill_id
+        saved_primary_id = prepare_entry.secondary_value
+        prepare_row = rules.get(saved_table_id)
+        skill_row = self.engine.skills.rules.get(saved_skill_id)
+
+        blocked = (
+            prepare_row is None
+            or skill_row is None
+            or self.engine.effects.has(actor, STUN, FREEZE)
+            or self.has_state(actor, BattleStateKind.FREEZE)
+            or self.has_state(actor, BattleStateKind.SLEEP)
+            or self.has_state(actor, BattleStateKind.CONFUSION)
+            or self.has_state(actor, BattleStateKind.SEAL_ACTIVE)
+            or (
+                (skill_row.action_tags & ACTION_TAG_PHYSICAL) != 0
+                and (self.has_state(actor, BattleStateKind.SEAL_PHYSICAL) or self.is_physical_forbidden(actor))
+            )
+            or (
+                (skill_row.action_tags & ACTION_TAG_MAGIC) != 0
+                and (self.has_state(actor, BattleStateKind.SEAL_MAGIC) or self.is_magic_forbidden(actor))
+            )
+        )
+        # 无论释放或被打断，蓄力状态均在本回合窗口消耗清除（打断不退蓝、不退冷却）。
+        self.remove_buff(actor, saved_buff_id, turn, group)
+        if blocked:
+            return False
+
+        targets = self.select_targets(actor, skill_row, saved_primary_id)
+        if not targets:
+            return True
+        rank = max(1, actor.skill_ranks.get(saved_skill_id, 1))
+        subject_max = (skill_row.pet_max_targets or skill_row.max_targets) if actor.actor_type == _ACTOR_PET else skill_row.max_targets
+        is_multi = subject_max > 1
+        primary_focus = (
+            self.engine.is_competitive_pvp_battle
+            and actor.actor_type == _ACTOR_PLAYER
+            and subject_max > 1
+            and saved_primary_id != 0
+            and targets[0].actor_id == saved_primary_id
+            and len(targets) < subject_max
+        )
+        self.engine._event(turn, group, 2, actor, targets[0], skill_table_id=saved_skill_id, hit_kind=0)
+        effects_begin = len(turn.events)
+        primary_target_id = targets[0].actor_id
+        for idx, target in enumerate(targets):
+            if target.fled:
+                continue
+            for child_buff_id in prepare_row.sub_buffs:
+                self.apply_effect(
+                    actor, target, child_buff_id, rule=skill_row, skill_id=saved_skill_id, rank=rank,
+                    primary_target_id=primary_target_id, turn=turn, group=group, hit=idx,
+                    is_multi_target=is_multi, primary_focus_bonus=primary_focus, depth=1,
+                )
+
+        hit_directly = any(
+            ev.event_type == 3
+            and ev.source_id == actor.actor_id
+            and ev.skill_table_id == saved_skill_id
+            and ev.value > 0
+            and ev.damage_origin == 0
+            for ev in turn.events[effects_begin:]
+        )
+        if hit_directly and _active(actor):
+            self.consume_one_shot_attack_modifiers(actor, skill_row.damage_kind, turn, group)
+            self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_SKILL, skill_row.damage_kind, turn, group, skill_id=saved_skill_id)
+        return True
+
+    def trigger_buffs(
+        self, owner: Message, other: Message, trigger: int, damage_type: int, turn: Message, group: int,
+        *, skill_id: int = 0,
+    ) -> None:
+        """触发普攻后/战法后的配置化监听被动（如 E05 截灵追击 / E06 封锋追击）。"""
+        if not _active(owner) or not _active(other):
+            return
+        rules = self.engine.effects.rules
+        ids = [entry.buff_id for entry in owner.buffs]
+        for bid in ids:
+            idx = next((i for i, e in enumerate(owner.buffs) if e.buff_id == bid), -1)
+            if idx < 0 or not _active(owner):
+                continue
+            saved = owner.buffs[idx]
+            row = rules.get(saved.buff_table_id)
+            if row is None or row.battle_op == 0 or row.trigger_event != trigger:
+                continue
+            if row.damage_filter == 1 and damage_type != _DAMAGE_PHYSICAL:
+                continue
+            if row.damage_filter == 2 and damage_type != _DAMAGE_MAGIC:
+                continue
+            if (
+                row.per_round_limit > 0
+                and saved.last_trigger_round == self.engine.round_index
+                and saved.trigger_count >= row.per_round_limit
+            ):
+                continue
+            if 0.0 < row.trigger_chance < 1.0 and self.engine.rng.unit() >= row.trigger_chance:
+                continue
+            saved.trigger_count = (saved.trigger_count + 1) if saved.last_trigger_round == self.engine.round_index else 1
+            saved.last_trigger_round = self.engine.round_index
+            src_skill = self.engine.skills.rules.get(saved.source_skill_id)
+            rank = max(1, owner.skill_ranks.get(saved.source_skill_id, 1))
+            if row.battle_op in (BattleEffectOp.APPLY_CHILDREN, BattleEffectOp.EVASION_CHARGE):
+                for child in row.sub_buffs:
+                    self.apply_effect(
+                        owner, owner, child, rule=src_skill, skill_id=saved.source_skill_id, rank=rank,
+                        primary_target_id=owner.actor_id, turn=turn, group=group, hit=0, depth=1,
+                    )
+                for child in row.target_sub_buffs:
+                    self.apply_effect(
+                        owner, other, child, rule=src_skill, skill_id=saved.source_skill_id, rank=rank,
+                        primary_target_id=other.actor_id, turn=turn, group=group, hit=0, depth=1,
+                    )
+            cur_idx = next((i for i, e in enumerate(owner.buffs) if e.buff_id == bid), -1)
+            if cur_idx >= 0 and owner.buffs[cur_idx].remaining_hits > 0:
+                if owner.buffs[cur_idx].remaining_hits == 1:
+                    self.remove_buff(owner, bid, turn, group)
+                else:
+                    owner.buffs[cur_idx].remaining_hits -= 1

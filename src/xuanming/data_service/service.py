@@ -62,6 +62,7 @@ from .model import (
     RECALL_OP_PENDING,
     RECALL_OP_PLANNED,
     ROUTE_HOME_ZONE_MAX,
+    STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT,
     MergedZones,
     valid_admission,
     valid_instance,
@@ -244,6 +245,7 @@ class DataService:
             "RenameRole": self.rename_role,
             "BatchGetPlayerDisplay": self.batch_get_player_display,
             "UpdateRoleAppearance": self.update_role_appearance,
+            "SyncAccountStage1Tradable": self.sync_account_stage1_tradable,
             # 已落盘账本与物品封禁只读
             "GetPlayerAssetOpLedger": self.get_player_asset_op_ledger,
             "GetPlayerInboxLedger": self.get_player_inbox_ledger,
@@ -1327,6 +1329,25 @@ class DataService:
             await context.abort(CODE.INVALID_ARGUMENT, "player_id and appearance_id must be valid")
         updated = await self._run(context, self.store.update_role_appearance(request.player_id, appearance_id))
         return self.protocol.message("data_service.UpdateRoleAppearanceResponse", updated=updated)
+
+    async def sync_account_stage1_tradable(self, request, context, path):
+        """同步账号级阶段一可交易装备材料终身 60 份配额（仅认 scene 调用证明）。"""
+        if self.store is None or not hasattr(self.store, "sync_account_stage1_tradable") or not self.secrets:
+            await context.abort(CODE.UNAVAILABLE, "account tradable material quota service is unavailable")
+        await self._admit(context, request, path, ("scene",))
+        player_id = int(request.player_id)
+        desired = int(request.desired_char_total)
+        if not player_id or desired > STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT:
+            await context.abort(CODE.INVALID_ARGUMENT, "player_id and desired_char_total must be valid")
+        found, confirmed, used = await self._run(
+            context, self.store.sync_account_stage1_tradable(player_id, desired),
+        )
+        return self.protocol.message(
+            "data_service.SyncAccountStage1TradableResponse",
+            found=found,
+            confirmed_char_total=confirmed,
+            account_used_total=used,
+        )
 
     # -- id segments ---------------------------------------------------------------------------------
     async def allocate_id_segment(self, request, context, path):

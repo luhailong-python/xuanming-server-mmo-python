@@ -31,6 +31,7 @@ from .errors import (
     ActivityIntentConflictError,
     ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
+    GuildWarMemberOccupiedError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
     ERR_MATCH_BATTLE_SCRIPT_LIMIT_REACHED,
@@ -438,6 +439,19 @@ class MatchStore(TypingProtocol):
         battle_node: tuple[int, str, str, int, str],
         battle_deadline_ms: int,
     ) -> tuple[Message, bool]: ...
+    async def start_guild_war_battle(
+        self,
+        *,
+        request_id: int,
+        battle_config_id: int,
+        match_mode: int,
+        attacker_player_ids: list[int],
+        defender_player_ids: list[int],
+        activity_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]: ...
+    async def active_battle_id_of(self, player_id: int) -> int: ...
     async def cancel_activity_battle(self, request_id: int) -> tuple[int, bool, int, int]: ...
 
     # Battle Outcome, Terminal Decision & Outbox
@@ -726,6 +740,9 @@ class _MemState:
     ranked_player_seasons: dict[tuple[int, int], RankedPlayerSeasonRow] = field(default_factory=dict)  # (season_id, pid)
     ranked_rewards: dict[tuple[int, int, int], RankedRewardRow] = field(default_factory=dict)  # (pid, season_id, reward_kind)
     ranked_battles: dict[tuple[int, int], tuple[int, int, bytes]] = field(default_factory=dict)  # (bid, pid) -> (season_id, settled_ms, summary)
+
+    # Guild War V2
+    guild_war_intents: dict[int, int] = field(default_factory=dict)  # request_id -> battle_id
 
 
 class MemoryMatchStore:
@@ -2580,6 +2597,93 @@ class MemoryMatchStore:
                 )
             s.formations[battle_id] = formation
             s.activity_intents[request_id] = (battle_id, False)
+            return self._clone_msg(formation), True
+
+        return await self._run_tx(work)
+
+    async def active_battle_id_of(self, player_id: int) -> int:
+        async with self._lock:
+            tk = self._state.tickets.get(int(player_id))
+            if tk is not None and int(tk.state) in (TICKET_STATE_FORMING, TICKET_STATE_READY):
+                return int(tk.formation_id)
+            return 0
+
+    async def start_guild_war_battle(
+        self,
+        *,
+        request_id: int,
+        battle_config_id: int,
+        match_mode: int,
+        attacker_player_ids: list[int],
+        defender_player_ids: list[int],
+        activity_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        """帮会全天帮战 V2 无匹配池直打：按 request_id 幂等，对全部真人参与者原子抢占票据。"""
+        now = await self.now_ms()
+        all_humans = list(attacker_player_ids) + list(defender_player_ids)
+
+        def work(s: _MemState):
+            prev_bid = s.guild_war_intents.get(request_id)
+            if prev_bid is not None:
+                return self._clone_msg(s.formations[prev_bid]), False
+            for pid in all_humans:
+                tk = s.tickets.get(pid)
+                if tk is not None and int(tk.state) in (TICKET_STATE_QUEUED, TICKET_STATE_FORMING, TICKET_STATE_READY):
+                    in_battle = int(tk.state) in (TICKET_STATE_FORMING, TICKET_STATE_READY) and int(tk.formation_id) > 0
+                    raise GuildWarMemberOccupiedError(
+                        pid,
+                        int(tk.formation_id) if in_battle else 0,
+                        in_battle=in_battle,
+                    )
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            battle_id = self._alloc_id_locked()
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id,
+                operation_id=op_id,
+                state=FORMATION_STATE_PREPARING,
+                physical_region=b_region,
+                target_node_id=b_node_id,
+                target_instance_id=b_uuid,
+                target_endpoint=b_endpoint,
+                mode=match_mode,
+                config_id=battle_config_id,
+                created_ms=now,
+                deadline_ms=now + battle_deadline_ms,
+                retry_at_ms=now + 60_000,
+                activity_context=activity_context_bytes,
+                requeue_on_failure=False,
+                release_track=b_track,
+            )
+            for team_idx, side in ((0, attacker_player_ids), (1, defender_player_ids)):
+                for idx, pid in enumerate(side):
+                    tk_id = f"gwar-{battle_id}-{pid}"
+                    formation.members.add(player_id=pid, ticket=tk_id, team_index=team_idx, captain=(idx == 0))
+                    occ = s.occupancies.get(pid)
+                    fence = s.role_fences.get(pid)
+                    acct = occ.account if occ else (fence.account if fence else f"acct:{pid}")
+                    rev = occ.owner_revision if occ else (fence.owner_revision if fence else 1)
+                    s.tickets[pid] = self.protocol.message(
+                        "match.MatchAuthorityTicketRecord",
+                        player_id=pid,
+                        ticket=tk_id,
+                        request_id=op_id,
+                        mode=match_mode,
+                        config_id=battle_config_id,
+                        team_size=len(side),
+                        state=TICKET_STATE_FORMING,
+                        enqueued_ms=now,
+                        formation_id=battle_id,
+                        expires_ms=now + battle_deadline_ms,
+                        selected_region=b_region,
+                        owner_account=acct,
+                        owner_revision=rev,
+                    )
+            s.formations[battle_id] = formation
+            s.guild_war_intents[request_id] = battle_id
             return self._clone_msg(formation), True
 
         return await self._run_tx(work)

@@ -21,6 +21,8 @@ def _strip_live(state: Message) -> None:
     state.ClearField("pending_actor_ids")
     state.ClearField("self_items")
     state.ClearField("surrender_vote")
+    if "prep_state" in state.DESCRIPTOR.fields_by_name:
+        state.ClearField("prep_state")
     for actor in state.actors:
         actor.ClearField("combat")
         actor.ClearField("skill_cooldown_rounds")

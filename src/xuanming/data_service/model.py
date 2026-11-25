@@ -15,6 +15,7 @@ INITIAL_OWNER_EPOCH = INITIAL_SAVE_SEQ = 1
 SCHEMA_GEN = 1                        # shared/generated/persistschema.Gen
 MAX_TRADE_HOLDERS = 256               # accountdirectory.MaxTradeHolders
 MAX_APPEARANCE_ID_BYTES = 64          # server.maxAppearanceIDBytes
+STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT = 60  # store.Stage1TradableMaterialLifetimeLimit（跨角色/删角终身硬上限）
 MAX_UINT64 = (1 << 64) - 1
 REMOVAL_TOKEN_BIT = 1 << 63           # rolefence.RemovalToken 最高位标识删角准备令牌
 
@@ -228,3 +229,26 @@ class MergedZones:
                 return zone
             zone = self.mapping[zone]
         return zone
+
+
+class Stage1TradableQuotaLedger:
+    """账号级阶段一可交易装备材料终身配额内存账本（对齐 Go account_tradable_quota.go）。"""
+
+    def __init__(self) -> None:
+        self.account_used: dict[str, int] = {}
+        self.role_confirmed: dict[tuple[str, int], int] = {}
+
+    def sync(self, account: str, player_id: int, desired_char_total: int) -> tuple[int, int]:
+        """在单账号终身 60 份硬上限内幂等确认单角色份数并返回 (confirmed_char, account_used)。"""
+        used = min(int(self.account_used.get(account, 0)), STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT)
+        key = (account, int(player_id))
+        prev = int(self.role_confirmed.get(key, 0))
+        confirmed, total_used = prev, used
+        if desired_char_total > prev and used < STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT:
+            grant = min(int(desired_char_total) - prev, STAGE1_TRADABLE_MATERIAL_LIFETIME_LIMIT - used)
+            if grant > 0:
+                confirmed = prev + grant
+                total_used = used + grant
+                self.role_confirmed[key] = confirmed
+                self.account_used[account] = total_used
+        return confirmed, total_used

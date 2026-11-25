@@ -1,6 +1,6 @@
 # 玄冥服务端 · Python
 
-这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `2f0e62225`（完整 SHA：`2f0e62225c8aaab4aac209bebe69e3804d073020`，2026-11-25；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
+这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `0f9bc81d6`（完整 SHA：`0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9`，2026-11-25；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
 
 | 节点 | 当前运行路径 |
 | --- | --- |

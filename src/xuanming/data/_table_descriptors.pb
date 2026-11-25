@@ -659,6 +659,59 @@ limitCount"9
 GuildShopTableData#
 data (2.GuildShopTableRdataB@
 com.game.tableBGuildShopTableOuterClassPZgenerated/pb/tablebproto3
+Í
+(table_wire/guildwarmilestone_table.proto"ƒ
+GuildWarMilestoneTable
+id (Rid0
+required_guild_merit (RrequiredGuildMerit&
+reward_item1_id (RrewardItem1Id,
+reward_item1_count (RrewardItem1Count&
+reward_item2_id (RrewardItem2Id,
+reward_item2_count (RrewardItem2Count#
+reward_silver (RrewardSilver/
+reward_contribution (RrewardContribution%
+reward_preview	 (	RrewardPreview"I
+GuildWarMilestoneTableData+
+data (2.GuildWarMilestoneTableRdataBH
+com.game.tableB GuildWarMilestoneTableOuterClassPZgenerated/pb/tablebproto3
+Ê
+#table_wire/guildwarrule_table.proto"”
+GuildWarRuleTable
+id (Rid
+	min_level (RminLevel,
+peace_cooldown_sec (RpeaceCooldownSec5
+post_battle_protect_sec (RpostBattleProtectSec1
+leyline_max_banner_hp (RleylineMaxBannerHp5
+leyline_capture_init_hp (RleylineCaptureInitHp,
+leyline_shield_sec (RleylineShieldSec1
+pvp_win_banner_damage (RpvpWinBannerDamage3
+pvp_defend_banner_heal	 (RpvpDefendBannerHeal5
+siege_win_banner_damage
+ (RsiegeWinBannerDamage,
+garrison_max_slots (RgarrisonMaxSlotsA
+garrison_refresh_cooldown_sec (RgarrisonRefreshCooldownSec,
+frenzy_start_round (RfrenzyStartRound0
+bounty_normal_silver (RbountyNormalSilver.
+bounty_heavy_silver (RbountyHeavySilver$
+bounty_tax_bps (RbountyTaxBps.
+bounty_public_funds (RbountyPublicFunds9
+bounty_public_daily_limit (RbountyPublicDailyLimit$
+bounty_ttl_sec (RbountyTtlSec,
+bounty_protect_sec (RbountyProtectSec7
+bounty_counter_kill_tear (RbountyCounterKillTear9
+bounty_daily_payout_limit (RbountyDailyPayoutLimit,
+track_cooldown_sec (RtrackCooldownSec.
+diminish_window_sec (RdiminishWindowSec2
+dividend_interval_sec (RdividendIntervalSec9
+dividend_guild_weekly_cap (RdividendGuildWeeklyCap;
+dividend_player_weekly_cap (RdividendPlayerWeeklyCap=
+dividend_min_personal_merit (RdividendMinPersonalMerit(
+battle_config_id (RbattleConfigId=
+gold_leyline_multiplier_bps (RgoldLeylineMultiplierBps*
+rivalry_bonus_bps (RrivalryBonusBps"?
+GuildWarRuleTableData&
+data (2.GuildWarRuleTableRdataBC
+com.game.tableBGuildWarRuleTableOuterClassPZgenerated/pb/tablebproto3
 ä
 table_wire/item_table.proto"Y
 Itembase_attr 
@@ -869,13 +922,18 @@ nameMaxLen(
 PetRuleTableData!
 data (2.PetRuleTableRdataB>
 com.game.tableBPetRuleTableOuterClassPZgenerated/pb/tablebproto3
-€
-table_wire/pettier_table.proto"_
+î
+table_wire/pettier_table.proto"Ì
 PetTierTable
 id (Rid
 name (	Rname
 art_key (	RartKey
-desc (	Rdesc"5
+desc (	Rdesc-
+ascend_cost_item_id (RascendCostItemId3
+ascend_cost_item_count (RascendCostItemCount(
+ascend_cost_gold (RascendCostGold/
+ascend_min_pet_level (RascendMinPetLevel,
+bonus_entry_points	 (RbonusEntryPoints"5
 PetTierTableData!
 data (2.PetTierTableRdataB>
 com.game.tableBPetTierTableOuterClassPZgenerated/pb/tablebproto3
@@ -1022,7 +1080,7 @@ ends_at_ms (RendsAtMs
 SeasonSealTableData$
 data (2.SeasonSealTableRdataBA
 com.game.tableBSeasonSealTableOuterClassPZgenerated/pb/tablebproto3
-û
+Ü
 table_wire/skill_table.proto"r
 Skillrequired_item,
 required_item_type (RrequiredItemType.
@@ -1032,7 +1090,7 @@ ends_at_ms (RendsAtMs
 required_resource_value (RrequiredResourceValue"l
 Skillcost_resource(
 cost_resource_id (RcostResourceId,
-cost_resource_cost (RcostResourceCost"ö
+cost_resource_cost (RcostResourceCost"×
 
 SkillTable
 id (Rid
@@ -1106,7 +1164,9 @@ forbidCopy
 	season_id: (RseasonId
 	scroll_id; (RscrollId
 rarity_tier< (R
-rarityTier8
+rarityTier6
+secondary_target_policy= (RsecondaryTargetPolicy'
+exclusive_group> (RexclusiveGroup8
 required_item (2.Skillrequired_itemRrequiredItemD
 required_resource (2.Skillrequired_resourceRrequiredResource8
 cost_resource (2.Skillcost_resourceRcostResource"1
@@ -2319,6 +2379,53 @@ item_count (R	itemCount+
 limit_period (RlimitPeriod
 limit_count	 (R
 limitCount:)Š¦	GuildShop’¦GuildShop.xlsxš¦id°¦bproto3
+£
+guildwarmilestone_table.protommorpg.cfgtable.v1cfg_options.proto"Ò
+GuildWarMilestoneTable
+id (Rid0
+required_guild_merit (RrequiredGuildMerit0
+reward_item1_id (Bò¬ItemRrewardItem1Id,
+reward_item1_count (RrewardItem1Count0
+reward_item2_id (Bò¬ItemRrewardItem2Id,
+reward_item2_count (RrewardItem2Count#
+reward_silver (RrewardSilver/
+reward_contribution (RrewardContribution%
+reward_preview	 (	RrewardPreview:9Š¦GuildWarMilestone’¦GuildWarMilestone.xlsxš¦id°¦bproto3
+ž
+guildwarrule_table.protommorpg.cfgtable.v1cfg_options.proto"Ò
+GuildWarRuleTable
+id (Rid
+	min_level (RminLevel,
+peace_cooldown_sec (RpeaceCooldownSec5
+post_battle_protect_sec (RpostBattleProtectSec1
+leyline_max_banner_hp (RleylineMaxBannerHp5
+leyline_capture_init_hp (RleylineCaptureInitHp,
+leyline_shield_sec (RleylineShieldSec1
+pvp_win_banner_damage (RpvpWinBannerDamage3
+pvp_defend_banner_heal	 (RpvpDefendBannerHeal5
+siege_win_banner_damage
+ (RsiegeWinBannerDamage,
+garrison_max_slots (RgarrisonMaxSlotsA
+garrison_refresh_cooldown_sec (RgarrisonRefreshCooldownSec,
+frenzy_start_round (RfrenzyStartRound0
+bounty_normal_silver (RbountyNormalSilver.
+bounty_heavy_silver (RbountyHeavySilver$
+bounty_tax_bps (RbountyTaxBps.
+bounty_public_funds (RbountyPublicFunds9
+bounty_public_daily_limit (RbountyPublicDailyLimit$
+bounty_ttl_sec (RbountyTtlSec,
+bounty_protect_sec (RbountyProtectSec7
+bounty_counter_kill_tear (RbountyCounterKillTear9
+bounty_daily_payout_limit (RbountyDailyPayoutLimit,
+track_cooldown_sec (RtrackCooldownSec.
+diminish_window_sec (RdiminishWindowSec2
+dividend_interval_sec (RdividendIntervalSec9
+dividend_guild_weekly_cap (RdividendGuildWeeklyCap;
+dividend_player_weekly_cap (RdividendPlayerWeeklyCap=
+dividend_min_personal_merit (RdividendMinPersonalMerit5
+battle_config_id (Bò¬DungeonRbattleConfigId=
+gold_leyline_multiplier_bps (RgoldLeylineMultiplierBps*
+rivalry_bonus_bps (RrivalryBonusBps:/Š¦GuildWarRule’¦GuildWarRule.xlsxš¦id°¦bproto3
 ý
 item_table.protommorpg.cfgtable.v1cfg_options.proto"Y
 Itembase_attr 
@@ -2497,13 +2604,18 @@ nameMaxLen(
 entry_config_version (RentryConfigVersion,
 entry_total_points (RentryTotalPoints0
 entry_max_directions	 (RentryMaxDirections:!Š¦PetRule’¦PetRule.xlsxš¦idbproto3
-Í
-pettier_table.protommorpg.cfgtable.v1cfg_options.proto"†
+º
+pettier_table.protommorpg.cfgtable.v1cfg_options.proto"ó
 PetTierTable
 id (Rid
 name (	Rname
 art_key (	RartKey
-desc (	Rdesc:%Š¦PetTier’¦PetTier.xlsxš¦id¨¦bproto3
+desc (	Rdesc-
+ascend_cost_item_id (RascendCostItemId3
+ascend_cost_item_count (RascendCostItemCount(
+ascend_cost_gold (RascendCostGold/
+ascend_min_pet_level (RascendMinPetLevel,
+bonus_entry_points	 (RbonusEntryPoints:%Š¦PetTier’¦PetTier.xlsxš¦id¨¦bproto3
 Ô
 playmode_table.protommorpg.cfgtable.v1cfg_options.proto"Œ
 PlayModeTable
@@ -2630,7 +2742,7 @@ SeasonRuleRseasonId
 active_rounds (RactiveRounds0
 health_threshold_bps (RhealthThresholdBps:+Š¦
 SeasonSeal’¦SeasonSeal.xlsxš¦id°¦bproto3
-Á
+¢
 skill_table.protommorpg.cfgtable.v1cfg_options.proto"l
 Skillcost_resource(
 cost_resource_id (RcostResourceId,
@@ -2640,7 +2752,7 @@ SeasonSeal’¦SeasonSeal.xlsxš¦id°¦bproto3
 required_item_value (RrequiredItemValue"†
 Skillrequired_resource4
 required_resource_type (RrequiredResourceType6
-required_resource_value (RrequiredResourceValue"‘
+required_resource_value (RrequiredResourceValue"ò
 
 SkillTable
 id (Rid#
@@ -2717,7 +2829,9 @@ forbidCopy
 	season_id: (RseasonId
 	scroll_id; (RscrollId
 rarity_tier< (R
-rarityTier:!Š¦Skill’¦
+rarityTier6
+secondary_target_policy= (RsecondaryTargetPolicy'
+exclusive_group> (RexclusiveGroup:!Š¦Skill’¦
 Skill.xlsxš¦id°¦bproto3
 Õ
 skillpermission_table.protommorpg.cfgtable.v1cfg_options.proto"†

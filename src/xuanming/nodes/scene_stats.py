@@ -14,6 +14,13 @@ PASSIVE_NAMES = {
 UINT64_MAX = (1 << 64) - 1
 UINT32_MAX = (1 << 32) - 1
 
+# 人物战法构筑装配常量（与 C++ skill_loadout_rules.h 对齐）。
+LOADOUT_MAX_SCHEMES = 3
+LOADOUT_MAX_ROLE_TAG = 3
+LOADOUT_MAX_PASSIVE_SLOTS = 3
+LOADOUT_MAX_PURSUIT_SLOTS = 1
+LOADOUT_MAX_OPENING_SLOTS = 1
+
 
 def rank_limit(level, row) -> int:
     return min(row.max_rank, 1 + (level - row.unlock_level) // 2) if level >= row.unlock_level else 0
@@ -23,22 +30,195 @@ def class_id(data) -> int:
     return getattr(data.uint32_pb_component, "class")
 
 
-def battle_skills(tables, data, snapshot) -> None:
-    level, cls = effective_level(data), class_id(data)
-    has_class = any(row.class_id == cls for row in tables["Skill"].rows()) if cls else False
-    for item in data.skill_list.skill_list:
-        row = tables["Skill"].get(item.skill_table_id)
+def is_class_skill(row) -> bool:
+    """需要等级与现代规则判定的技能（含 legacy 职业技与 battle_model=1 自由战法）。"""
+    return bool(row.class_id or getattr(row, "battle_model", 0) == 1)
+
+
+def is_free_skill_for(row, caster_mask: int) -> bool:
+    """判断是否为指定施法者掩码（1=人物, 2=宝宝）可用的自由战法。"""
+    return getattr(row, "battle_model", 0) == 1 and bool(getattr(row, "caster_mask", 0) & caster_mask)
+
+
+def is_passive_skill(row) -> bool:
+    """判断技能是否为非主动/被动技能。"""
+    if getattr(row, "battle_model", 0) == 1:
+        return getattr(row, "ability_kind", 0) != 1
+    return bool(row.passive_stat)
+
+
+def is_turn_battle_castable(row) -> bool:
+    """判断技能是否可作为回合制战斗中的主动施放动作。"""
+    battle_model = getattr(row, "battle_model", 0)
+    if battle_model != 0:
+        return battle_model == 1 and getattr(row, "ability_kind", 0) == 1
+    return not is_passive_skill(row) and not {0, 2, 3}.intersection(row.skill_type)
+
+
+def is_skill_active_for(row, cls: int, class_has_class_skills: bool) -> bool:
+    """判断技能行对当前角色是否生效（与 C++ IsActiveFor 一致）。"""
+    if getattr(row, "battle_model", 0) != 0:
+        return is_free_skill_for(row, 1)
+    if is_class_skill(row):
+        return row.class_id == cls
+    return not class_has_class_skills
+
+
+def is_skill_usable(row, entry, cls: int, class_has_class_skills: bool, level: int) -> bool:
+    """判断角色已持有的技能条目当前是否可用（与 C++ IsUsable 一致）。"""
+    if not is_skill_active_for(row, cls, class_has_class_skills):
+        return False
+    return not is_class_skill(row) or min(entry.rank, rank_limit(level, row)) > 0
+
+
+def collect_equipped_non_active_skills(
+    tables,
+    skill_list_comp,
+    cls: int,
+    class_has_class_skills: bool,
+    level: int,
+) -> set[int]:
+    """计算当前生效的非主动战法集合（被动/追击/开场），对齐 C++ CollectEquippedNonActiveSkills。"""
+    equipped: set[int] = set()
+    occupied_groups: set[int] = set()
+    by_id = {}
+    for entry in skill_list_comp.skill_list:
+        by_id.setdefault(entry.skill_table_id, entry)
+
+    def can_use(skill_id: int):
+        row = tables["Skill"].get(skill_id)
+        if (
+            row is None
+            or getattr(row, "battle_model", 0) != 1
+            or getattr(row, "season_id", 0) != 0
+            or getattr(row, "ability_kind", 0) <= 1
+        ):
+            return None
+        entry = by_id.get(skill_id)
+        if entry is None or not is_skill_usable(row, entry, cls, class_has_class_skills, level):
+            return None
+        return row
+
+    active_scheme_id = int(getattr(skill_list_comp, "active_loadout_scheme_id", 0))
+    if 1 <= active_scheme_id <= LOADOUT_MAX_SCHEMES:
+        scheme = next(
+            (item for item in skill_list_comp.loadout_schemes if item.scheme_id == active_scheme_id),
+            None,
+        )
+        if scheme is None:
+            return equipped
+
+        def add_from(ids, expected_kind: int, limit: int) -> None:
+            count = 0
+            for skill_id in ids:
+                if count >= limit:
+                    break
+                row = can_use(skill_id)
+                if row is None or getattr(row, "ability_kind", 0) != expected_kind:
+                    continue
+                group = int(getattr(row, "exclusive_group", 0))
+                if group and group in occupied_groups:
+                    continue
+                if skill_id not in equipped:
+                    if group:
+                        occupied_groups.add(group)
+                    equipped.add(skill_id)
+                    count += 1
+
+        add_from(scheme.passive_skill_ids, 2, LOADOUT_MAX_PASSIVE_SLOTS)
+        add_from(scheme.pursuit_skill_ids, 3, LOADOUT_MAX_PURSUIT_SLOTS)
+        add_from(scheme.opening_skill_ids, 4, LOADOUT_MAX_OPENING_SLOTS)
+        return equipped
+
+    # 未启用自定义方案时的兼容态：按 ID 升序全部生效，仅拦截同 exclusive_group 互斥冲突。
+    learned_ids = sorted(
+        entry.skill_table_id
+        for entry in by_id.values()
+        if can_use(entry.skill_table_id) is not None
+    )
+    for skill_id in learned_ids:
+        row = tables["Skill"].get(skill_id)
         if row is None:
             continue
-        if row.class_id:
-            rank = min(item.rank, rank_limit(level, row))
-            if cls != row.class_id or not rank:
-                continue
-            snapshot.skill_ranks[row.id] = rank
-        elif has_class:
+        group = int(getattr(row, "exclusive_group", 0))
+        if group and group in occupied_groups:
             continue
-        if not row.passive_stat and not {0, 2, 3}.intersection(row.skill_type):
+        if group:
+            occupied_groups.add(group)
+        equipped.add(skill_id)
+    return equipped
+
+
+def try_auto_slot_newly_learned(tables, skill_list_comp, row) -> None:
+    """新学非主动战法时，若当前启用了自定义方案且对应分类尚有空位且无互斥冲突，则自动装配。"""
+    active_scheme_id = int(getattr(skill_list_comp, "active_loadout_scheme_id", 0))
+    if (
+        getattr(row, "battle_model", 0) != 1
+        or getattr(row, "season_id", 0) != 0
+        or getattr(row, "ability_kind", 0) <= 1
+        or not 1 <= active_scheme_id <= LOADOUT_MAX_SCHEMES
+    ):
+        return
+    scheme = next(
+        (item for item in skill_list_comp.loadout_schemes if item.scheme_id == active_scheme_id),
+        None,
+    )
+    if scheme is None:
+        scheme = skill_list_comp.loadout_schemes.add(scheme_id=active_scheme_id, role_tag=0)
+    kind = int(getattr(row, "ability_kind", 0))
+    if kind == 2:
+        slot_list, limit = scheme.passive_skill_ids, LOADOUT_MAX_PASSIVE_SLOTS
+    elif kind == 3:
+        slot_list, limit = scheme.pursuit_skill_ids, LOADOUT_MAX_PURSUIT_SLOTS
+    else:
+        slot_list, limit = scheme.opening_skill_ids, LOADOUT_MAX_OPENING_SLOTS
+    if len(slot_list) >= limit or row.id in slot_list:
+        return
+    group = int(getattr(row, "exclusive_group", 0))
+    if group:
+        all_existing = (*scheme.passive_skill_ids, *scheme.pursuit_skill_ids, *scheme.opening_skill_ids)
+        for existing_id in all_existing:
+            existing = tables["Skill"].get(existing_id)
+            if existing is not None and int(getattr(existing, "exclusive_group", 0)) == group:
+                return
+    updated = sorted((*slot_list, row.id))
+    del slot_list[:]
+    slot_list.extend(updated)
+
+
+def battle_skills(tables, data, snapshot, *, active_season_id: int = 0) -> None:
+    """向 BattlePlayerSnapshot 填充生效技能与等级（过滤未装配的非主动战法）。"""
+    level, cls = effective_level(data), class_id(data)
+    has_class = any(row.class_id == cls for row in tables["Skill"].rows()) if cls else False
+    equipped_non_active = collect_equipped_non_active_skills(tables, data.skill_list, cls, has_class, level)
+    if hasattr(snapshot, "active_season_id"):
+        snapshot.active_season_id = active_season_id
+    for item in data.skill_list.skill_list:
+        row = tables["Skill"].get(item.skill_table_id)
+        if row is None or getattr(row, "season_id", 0) != 0:
+            continue
+        if not is_skill_usable(row, item, cls, has_class, level):
+            continue
+        if (
+            getattr(row, "battle_model", 0) == 1
+            and getattr(row, "ability_kind", 0) > 1
+            and row.id not in equipped_non_active
+        ):
+            continue
+        if is_class_skill(row):
+            snapshot.skill_ranks[row.id] = min(item.rank, rank_limit(level, row))
+        if is_turn_battle_castable(row):
             snapshot.skill_table_ids.append(row.id)
+    if active_season_id:
+        for row in sorted(tables["Skill"].rows(), key=lambda r: r.id):
+            if getattr(row, "season_id", 0) != active_season_id or not is_free_skill_for(row, 1):
+                continue
+            eff_rank = rank_limit(level, row)
+            if not eff_rank:
+                continue
+            snapshot.skill_ranks[row.id] = eff_rank
+            if is_turn_battle_castable(row):
+                snapshot.skill_table_ids.append(row.id)
 
 
 def _class(tables, data):
@@ -135,12 +315,24 @@ def player_stats(protocol, tables, data):
                 for key in STATS:
                     values[key] += standard[key] * max(0, getattr(ratio, key)) * factor
     passives = Counter()
+    cls = class_id(data)
+    has_class = any(r.class_id == cls for r in tables["Skill"].rows()) if cls else False
+    equipped_non_active = collect_equipped_non_active_skills(tables, data.skill_list, cls, has_class, level)
     for item in data.skill_list.skill_list:
         skill = tables["Skill"].get(item.skill_table_id)
-        if skill is not None and skill.class_id and skill.class_id == class_id(data) and skill.passive_stat:
-            rank = min(item.rank, rank_limit(level, skill))
-            if rank:
-                passives[skill.passive_stat] += skill.passive_percent * (1 + .05 * (rank - 1))
+        if skill is None or getattr(skill, "season_id", 0) != 0 or not skill.passive_stat:
+            continue
+        if not is_skill_usable(skill, item, cls, has_class, level):
+            continue
+        if (
+            getattr(skill, "battle_model", 0) == 1
+            and getattr(skill, "ability_kind", 0) > 1
+            and skill.id not in equipped_non_active
+        ):
+            continue
+        rank = min(item.rank, rank_limit(level, skill))
+        if rank:
+            passives[skill.passive_stat] += skill.passive_percent * (1 + .05 * (rank - 1))
     for passive, key in PASSIVE_NAMES.items():
         values[key] = (values[key] + min(UINT64_MAX, flat[key])) * (1 + passives[passive])
     crit = max(0, math.floor(passives["crit"] * 100 + 1e-9))

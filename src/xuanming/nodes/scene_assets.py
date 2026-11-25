@@ -14,15 +14,16 @@ from ..data import StoreRejected, StoreUnavailable
 from ..data.asset_anomaly import AssetAnomaly
 from ..data.asset_audit import AssetAudit
 from ..data.asset_inventory import (
-    BAG_FULL, BAG_INSUFFICIENT, BLOCKED, FEATURE_UNAVAILABLE, INSUFFICIENT,
-    INVALID, UNAVAILABLE, AssetInventory, balance, carries_unknown, clone,
+    BAG_CAPACITY, BAG_FULL, BAG_INSUFFICIENT, BLOCKED, FEATURE_UNAVAILABLE, INSUFFICIENT,
+    INVALID, INVALID_DATA, UNAVAILABLE, AssetInventory, bag_capacity, balance, carries_unknown,
+    clone, held_item_count,
 )
 from ..data.asset_ledger import (
     CALLERS, INSTANCE_LIMIT, INT64_MAX, Outcome, authorized, classify,
     find_receipt, find_stream, receipt_matches, record, valid,
 )
 from ..data import client_request
-from .scene_player import _bag
+from .scene_player import _bag, _scaled
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,12 @@ _ENHANCE_MAX = 28012
 _ENHANCE_MATERIAL = 28013
 _ENHANCE_GOLD = 28014
 _ENHANCE_LEVEL_CHANGED = 28022
+_EQUIP_BIND_CONFIRM_REQUIRED = 28027
+_V1_GUARANTEED_MAX_ENHANCE_LEVEL = 10
+_V1_MAX_ENHANCE_LEVEL = 11
+_V1_ENHANCE_BONUS_PER_LEVEL = 200
+_V1_TOP_ENHANCE_BONUS_PERMYRIAD = 2400
+_PERMYRIAD_BASE = 10_000
 _GEM_INVALID = 28015
 _GEM_NOT_OWNED = 28016
 _SOCKET_INVALID = 28017
@@ -148,6 +155,23 @@ class SceneAssets(AssetInventory):
         register("SceneBagClientPlayer", "EnhanceEquip", self._enhance_rpc, mutating=True)
         register("SceneBagClientPlayer", "InlayGem", self._gem_rpc, mutating=True)
         register("SceneBagClientPlayer", "RemoveGem", self._gem_rpc, mutating=True)
+        # 包装默认 GetBag 处理器，补充 bound / V1 强化预览 / will_bind_on_enhance / tradable_material_available。
+        bag_handlers = getattr(self.scene, "_handlers", {}).get("SceneBagClientPlayer")
+        if isinstance(bag_handlers, dict) and "GetBag" in bag_handlers and not getattr(bag_handlers["GetBag"], "_tb_wrapped", False):
+            orig_get_bag = bag_handlers["GetBag"]
+
+            def _wrapped_get_bag(world, player, route, request):
+                resp = orig_get_bag(world, player, route, request)
+                if not resp.error_message.id and resp.HasField("bag"):
+                    data = self.scene.rows.assemble(player.snapshot)
+                    self.enrich_bag_enhance_preview(data, request.bag_type, resp.bag)
+                    equip_craft = getattr(self.scene, "equip_craft", None)
+                    if equip_craft is not None:
+                        equip_craft._enrich_bag_snapshot(data, request.bag_type, resp.bag)
+                return resp
+
+            _wrapped_get_bag._tb_wrapped = True
+            bag_handlers["GetBag"] = _wrapped_get_bag
 
     async def debit(self, request):
         return await self._handle("debit", request)
@@ -758,41 +782,316 @@ class SceneAssets(AssetInventory):
             response.success, response.enhance_level = success, level
         return response
 
+    # ── T/B 可交易隔离扣除与强化预览补齐 ──
+
+    def removable_tradable_count(self, data, config: int, *, except_hold_id: int = 0) -> int:
+        """返回人物背包中当前可移除的纯可交易（bound=False）材料数量（不含战斗预留）。"""
+        entries = self.entries(data.bag_component, 0)
+        tradable = sum(
+            item.size for _, item in entries
+            if item.config_id == config and self.countable(item) and not item.bound
+        )
+        total = sum(
+            item.size for _, item in entries
+            if item.config_id == config and self.countable(item)
+        )
+        held = held_item_count(data, config, except_hold_id=except_hold_id)
+        return min(tradable, max(0, total - held))
+
+    def total_tradable_count(self, data, config: int, *, bag_type: int = 0) -> int:
+        """返回指定背包中指定物品的纯可交易总数量。"""
+        return sum(
+            item.size for _, item in self.entries(data.bag_component, bag_type)
+            if item.config_id == config and not item.bound
+        )
+
+    def consume_items_tb(
+        self,
+        data,
+        counts,
+        *,
+        bag_type: int = 0,
+        except_hold_id: int = 0,
+        tradable_only: bool = False,
+    ) -> tuple[int, bool]:
+        """按 T/B 隔离语义原子扣减背包物品，返回 (error, consumed_any_bound)。"""
+        if not 0 <= bag_type < len(BAG_CAPACITY):
+            return INVALID, False
+        bag = clone(data.bag_component)
+        entries = self.entries(bag, bag_type)
+        if not self._usable(entries, bag_capacity(bag, bag_type)):
+            return INVALID_DATA, False
+        consumed_bound = False
+        skew = False
+        for config, amount in sorted(counts.items()):
+            if not 0 < amount <= 0xFFFFFFFF or self.tables["Item"].get(config) is None:
+                return INVALID, False
+            held = held_item_count(data, config, except_hold_id=except_hold_id) if bag_type == 0 else 0
+            matching = [(entry, item) for entry, item in entries if item.config_id == config]
+            total_all = sum(item.size for _, item in matching if not tradable_only or not item.bound)
+            known_all = sum(
+                item.size for _, item in matching
+                if self.countable(item) and (not tradable_only or not item.bound)
+            )
+            if bag_type == 0:
+                avail = (
+                    self.removable_tradable_count(data, config, except_hold_id=except_hold_id)
+                    if tradable_only else self.removable_count(data, config, except_hold_id=except_hold_id)
+                )
+                if held and known_all >= amount and amount > avail:
+                    return BAG_INSUFFICIENT, False
+            if known_all < amount:
+                if total_all >= amount:
+                    skew = True
+                    continue
+                return BAG_INSUFFICIENT, False
+            # 优先扣纯可交易堆，再扣绑定堆；任一扣到绑定堆即标 consumed_bound=True。
+            ordered = sorted(
+                (
+                    (entry, item) for entry, item in matching
+                    if self.countable(item) and (not tradable_only or not item.bound)
+                ),
+                key=lambda pair: (1 if pair[1].bound else 0, pair[0].pos, pair[1].acquire_seq, pair[1].item_id),
+            )
+            remaining = amount
+            for entry, item in ordered:
+                if remaining <= 0:
+                    break
+                take = min(remaining, item.size)
+                if take:
+                    if item.bound:
+                        consumed_bound = True
+                    item.size -= take
+                    remaining -= take
+                    self.write_entry(entry, item)
+            if remaining:
+                return BAG_INSUFFICIENT, False
+        if skew:
+            return FEATURE_UNAVAILABLE, False
+        self._drop_empty(bag.items, bag_type)
+        data.bag_component.CopyFrom(bag)
+        return 0, consumed_bound
+
+    @staticmethod
+    def _enhance_row_level(row) -> int:
+        return int(getattr(row, "level", 0) or row.id)
+
+    def _enhance_row(self, profile: int, level: int):
+        table = self.tables["EquipEnhance"]
+        if profile == 0:
+            row = table.get(level)
+            if row is not None and int(getattr(row, "profile_id", 0)) == 0 and getattr(row, "level", 0) in (0, level):
+                return row
+            return None
+        found = None
+        for row in table.rows():
+            if int(getattr(row, "profile_id", 0)) != profile:
+                continue
+            if self._enhance_row_level(row) != level:
+                continue
+            if found is not None:
+                return None
+            found = row
+        return found
+
+    def _max_enhance_level(self, profile: int) -> int:
+        level = 0
+        while self._enhance_row(profile, level + 1) is not None:
+            level += 1
+        return level
+
+    def _enhance_row_available(self, row) -> bool:
+        profile = int(getattr(row, "profile_id", 0))
+        if profile == 0:
+            return row.success_rate > 0
+        if profile != 1:
+            return False
+        level = self._enhance_row_level(row)
+        material = self.tables["Item"].get(row.material_id) if row.material_id else None
+        base_ok = (
+            row.fail_level_loss == 0
+            and row.cost_gold == 0
+            and row.material_id != 0
+            and row.material_count > 0
+            and material is not None
+            and not material.equip_kind
+            and not material.battle_usable
+        )
+        if not base_ok or not 1 <= level <= _V1_MAX_ENHANCE_LEVEL:
+            return False
+        pity_limit = int(getattr(row, "pity_limit", 0))
+        if level <= _V1_GUARANTEED_MAX_ENHANCE_LEVEL:
+            return (
+                row.bonus_permyriad == _V1_ENHANCE_BONUS_PER_LEVEL * level
+                and row.success_rate == _PERMYRIAD_BASE
+                and pity_limit == 0
+            )
+        return (
+            level == _V1_MAX_ENHANCE_LEVEL
+            and row.bonus_permyriad == _V1_TOP_ENHANCE_BONUS_PERMYRIAD
+            and 0 < row.success_rate < _PERMYRIAD_BASE
+            and pity_limit > 0
+        )
+
+    def enrich_bag_enhance_preview(self, data, bag_type: int, bag_info) -> None:
+        """为 BagInfo 装备项补齐 bound、V1 分型强化预览、保底进度与 T/B 染毒提示字段。"""
+        by_id = {item.item_id: item for _, item in self.entries(data.bag_component, bag_type)}
+        for info in bag_info.items:
+            stored = by_id.get(info.item_id)
+            if stored is None:
+                continue
+            info.bound = bool(stored.bound)
+            row = self.tables["Item"].get(stored.config_id)
+            if row is not None and row.equip_kind and stored.HasField("equip"):
+                info.enhance_pity_count = int(stored.equip.enhance_pity_count)
+                info.crafter_name = stored.equip.crafter_name
+                info.crafter_player_id = int(stored.equip.crafter_player_id)
+                profile = int(getattr(row, "equip_profile", 0))
+                if profile != 0:
+                    max_lvl = self._max_enhance_level(profile)
+                    level = min(int(stored.equip.enhance_level), max_lvl)
+                    cur_row = self._enhance_row(profile, level) if level else None
+                    bonus = cur_row.bonus_permyriad if cur_row is not None else 0
+                    info.enhance_level = level
+                    info.enhance_max_level = max_lvl
+                    info.enhance_bonus_permyriad = bonus
+                    next_row = self._enhance_row(profile, level + 1) if level < max_lvl else None
+                    if next_row is not None and not self._enhance_row_available(next_row):
+                        next_row = None
+                    if next_row is not None:
+                        preview = info.enhance_next
+                        preview.Clear()
+                        preview.next_level = self._enhance_row_level(next_row)
+                        preview.success_rate = next_row.success_rate
+                        preview.cost_gold = next_row.cost_gold
+                        preview.bonus_permyriad = next_row.bonus_permyriad
+                        preview.fail_level_loss = next_row.fail_level_loss
+                        if next_row.material_id and next_row.material_count:
+                            preview.material_config_id = next_row.material_id
+                            preview.material_count = next_row.material_count
+                            mat = self.tables["Item"].get(next_row.material_id)
+                            if mat is not None:
+                                preview.material_name = mat.name
+                                preview.material_icon_key = mat.icon_key
+                        pity_limit = int(getattr(next_row, "pity_limit", 0))
+                        cur_pity = int(stored.equip.enhance_pity_count) if pity_limit else 0
+                        preview.pity_limit = pity_limit
+                        preview.current_pity_count = cur_pity
+                        preview.pity_guaranteed_next = bool(pity_limit and cur_pity + 1 >= pity_limit)
+                        for idx, base in enumerate(row.base_attr):
+                            if idx < len(info.base_attrs):
+                                val = _scaled(base.base_attr_value, bonus)
+                                info.base_attrs[idx].value = val
+                                info.base_attrs[idx].enhance_bonus = val - base.base_attr_value
+                                info.base_attrs[idx].enhance_next_value = _scaled(
+                                    base.base_attr_value, next_row.bonus_permyriad,
+                                )
+                    else:
+                        info.ClearField("enhance_next")
+                elif info.HasField("enhance_next"):
+                    next_row = self._enhance_row(0, info.enhance_next.next_level)
+                    pity_limit = int(getattr(next_row, "pity_limit", 0)) if next_row is not None else 0
+                    cur_pity = int(stored.equip.enhance_pity_count) if pity_limit else 0
+                    info.enhance_next.pity_limit = pity_limit
+                    info.enhance_next.current_pity_count = cur_pity
+                    info.enhance_next.pity_guaranteed_next = bool(pity_limit and cur_pity + 1 >= pity_limit)
+            if info.HasField("enhance_next") and info.enhance_next.material_config_id and info.enhance_next.material_count:
+                mat_id = info.enhance_next.material_config_id
+                mat_count = info.enhance_next.material_count
+                tradable_avail = self.removable_tradable_count(data, mat_id)
+                total_avail = self.removable_count(data, mat_id)
+                info.enhance_next.tradable_material_available = tradable_avail
+                info.enhance_next.will_bind_on_enhance = (
+                    not stored.bound and tradable_avail < mat_count and total_avail >= mat_count
+                )
+
     def _enhance(self, data, request) -> tuple[int, bool, int]:
-        error, _, item, _ = self._equipment_entry(data, request.item_id)
+        error, _, item, item_row = self._equipment_entry(data, request.item_id)
         if error:
             return error, False, 0
-        table = self.tables["EquipEnhance"]
-        maximum = 0
-        while maximum < len(table) and table.get(maximum + 1) is not None:
-            maximum += 1
-        if not maximum or not item.HasField("equip"):
+        if not item.HasField("equip"):
             return _ENHANCE_UNAVAILABLE, False, 0
-        current = min(item.equip.enhance_level, maximum)
-        if request.expected_level != current:
+        profile = int(getattr(item_row, "equip_profile", 0))
+        maximum = self._max_enhance_level(profile)
+        if not maximum:
+            return _ENHANCE_UNAVAILABLE, False, 0
+        current = min(int(item.equip.enhance_level), maximum)
+        current_pity = int(item.equip.enhance_pity_count)
+        if request.expected_level != current or (
+            request.HasField("expected_pity_count") and request.expected_pity_count != current_pity
+        ):
             return _ENHANCE_LEVEL_CHANGED, False, 0
         if current >= maximum:
             return _ENHANCE_MAX, False, 0
-        rule = table.get(current + 1)
-        if not rule.success_rate:
+        rule = self._enhance_row(profile, current + 1)
+        if rule is None:
+            return _EQUIP_INTERNAL, False, 0
+        if not self._enhance_row_available(rule):
             return _ENHANCE_UNAVAILABLE, False, 0
-        if rule.material_id and rule.material_count:
-            material = self.tables["Item"].get(rule.material_id)
-            if material is None or material.equip_kind:
+
+        material_id = int(rule.material_id)
+        material_count = int(rule.material_count)
+        needs_material = material_id != 0 and material_count > 0
+        equip_currently_bound = bool(item.bound)
+        tradable_only = False
+        if needs_material:
+            material = self.tables["Item"].get(material_id)
+            if material is None or material.equip_kind or (profile != 0 and material.battle_usable):
                 return _EQUIP_INTERNAL, False, 0
-            error = self.consume_items(data, {rule.material_id: rule.material_count})
+            # 检查背包总量与预留。
+            total_avail = self.removable_count(data, material_id)
+            if total_avail < material_count:
+                raw_total = sum(
+                    it.size for _, it in self.entries(data.bag_component, 0)
+                    if it.config_id == material_id
+                )
+                held = held_item_count(data, material_id)
+                if raw_total >= material_count and held:
+                    return FEATURE_UNAVAILABLE, False, 0
+                if raw_total >= material_count:
+                    return FEATURE_UNAVAILABLE, False, 0
+                return _ENHANCE_MATERIAL, False, 0
+            # 可交易装备强化 T/B 隔离：可交易石充足时始终严格仅扣可交易石；
+            # 可交易石不足时默认拒回 28027，须玩家显式传 allow_bound_materials=true 才放行并按实际扣除绑定堆传染。
+            if not equip_currently_bound:
+                tradable_avail = self.removable_tradable_count(data, material_id)
+                if tradable_avail >= material_count:
+                    tradable_only = True
+                elif not request.allow_bound_materials:
+                    return _EQUIP_BIND_CONFIRM_REQUIRED, False, 0
+
+        cost_gold = int(rule.cost_gold)
+        if cost_gold > 0 and (cost_gold > INT64_MAX or balance(data, 0) < cost_gold):
+            return _ENHANCE_GOLD, False, 0
+
+        pity_limit = int(getattr(rule, "pity_limit", 0))
+        if pity_limit > 0 and current_pity + 1 >= pity_limit:
+            success, next_pity = True, 0
+        else:
+            success = randbelow(_PERMYRIAD_BASE) < rule.success_rate
+            next_pity = 0 if success else (current_pity + 1 if pity_limit > 0 else 0)
+
+        if cost_gold > 0 and self.deduct_currency(data, 0, cost_gold):
+            return _ENHANCE_GOLD, False, 0
+
+        consumed_bound = False
+        if needs_material:
+            error, consumed_bound = self.consume_items_tb(
+                data, {material_id: material_count}, tradable_only=tradable_only,
+            )
             if error == BAG_INSUFFICIENT:
                 return _ENHANCE_MATERIAL, False, 0
             if error:
                 return error, False, 0
-        if rule.cost_gold and self.deduct_currency(data, 0, rule.cost_gold):
-            return _ENHANCE_GOLD, False, 0
+
         error, entry, item, _ = self._equipment_entry(data, request.item_id)
         if error:
             return _EQUIP_INTERNAL, False, 0
-        success = randbelow(10_000) < rule.success_rate
         level = current + 1 if success else max(0, current - rule.fail_level_loss)
         item.equip.enhance_level = level
+        item.equip.enhance_pity_count = next_pity
+        if not equip_currently_bound and consumed_bound:
+            item.bound = True
         self.write_entry(entry, item)
         return 0, success, level
 
@@ -871,8 +1170,11 @@ class SceneAssets(AssetInventory):
         second = _bag(self.scene, self.tables, player, bag_type)
         response = self._client_answer(route, first.error_message.id or second.error_message.id)
         if not response.error_message.id:
+            data = self.scene.rows.assemble(player.snapshot)
             response.bag.CopyFrom(first.bag)
             getattr(response, field).CopyFrom(second.bag)
+            self.enrich_bag_enhance_preview(data, 0, response.bag)
+            self.enrich_bag_enhance_preview(data, bag_type, getattr(response, field))
         return response
 
     def _bag_reply(self, route, player, bag_type, *, changed=None):
@@ -880,6 +1182,8 @@ class SceneAssets(AssetInventory):
         response = self._client_answer(route, result.error_message.id)
         if result.HasField("bag"):
             response.bag.CopyFrom(result.bag)
+            data = self.scene.rows.assemble(player.snapshot)
+            self.enrich_bag_enhance_preview(data, bag_type, response.bag)
         if changed is not None:
             response.changed = changed
         return response
