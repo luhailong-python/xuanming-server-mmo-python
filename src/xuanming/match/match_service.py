@@ -137,6 +137,8 @@ class MatchGrpcService:
         self.tournament = tournament if tournament is not None else TournamentManager(protocol, clock_ms=self._clock_ms)
         if self.gather.on_tournament_profiles is None:
             self.gather.on_tournament_profiles = self.tournament.sync_member_profiles
+        if getattr(self.gather, "on_tournament_captains", None) is None:
+            self.gather.on_tournament_captains = self.tournament.load_squad_captains
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -182,6 +184,8 @@ class MatchGrpcService:
                 "StartTournamentWarmup": self.start_tournament_warmup,
                 "PredictTournamentMatch": self.predict_tournament_match,
                 "GetTournamentPredictionBoard": self.get_tournament_prediction_board,
+                "BanTournamentLeyline": self.ban_tournament_leyline,
+                "GetTournamentHighlights": self.get_tournament_highlights,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -565,10 +569,13 @@ class MatchGrpcService:
         resp = self.protocol.message("match.GetBattleReportResponse")
         battle_id = int(request.battle_id)
         try:
+            allow_public = self.tournament.is_public_knockout_replay_allowed(battle_id)
+            if not allow_public:
+                allow_public = await self.store.is_featured_ranked_replay_allowed(battle_id)
             env = await self.store.get_battle_report(
                 caller.player_id,
                 battle_id,
-                allow_public=self.tournament.is_public_knockout_replay_allowed(battle_id),
+                allow_public=allow_public,
             )
             resp.replay.CopyFrom(env)
             return resp
@@ -686,6 +693,14 @@ class MatchGrpcService:
     async def get_tournament_prediction_board(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         return await self.tournament.get_tournament_prediction_board(caller, request)
+
+    async def ban_tournament_leyline(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return self.tournament.ban_tournament_leyline(caller, request)
+
+    async def get_tournament_highlights(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return self.tournament.get_tournament_highlights(caller, request)
 
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 

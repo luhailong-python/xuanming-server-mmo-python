@@ -30,6 +30,8 @@ MAX_APPLICATIONS_PER_TEAM = 20
 INVITE_TTL_MS = 300_000
 APPLICATION_TTL_MS = 300_000
 TEAM_IDLE_TTL_MS = 24 * 3_600_000
+RECALL_COOLDOWN_MS = 15_000
+VALID_TEAM_FOLLOW_FORMATIONS = frozenset((0, 1, 2))
 MAX_PROBE_REGIONS = 16
 MAX_BATTLE_REPORTS = 100
 MAX_COMPLETION_BYTES = 960 * 1024
@@ -224,6 +226,7 @@ class PlayerPresence:
     class_id: int = 0
     gender: int = 0
     appearance_id: str = ""
+    hosted: bool = False
 
 
 # -- UUID 与文本校验工具 -----------------------------------------------------------------------------
@@ -509,14 +512,22 @@ def has_custom_duel_rules(rules: Message | None) -> bool:
         or getattr(rules, "allow_public_spectate", False)
         or int(getattr(rules, "challenger_character_preset_id", 0))
         or int(getattr(rules, "challenger_pet_preset_id", 0))
+        or int(getattr(rules, "skill_ban_slots_per_team", 0))
     )
 
 
 def validate_custom_duel_rules(rules: Message | None) -> bool:
-    """校验道友切磋坊自定义规则白名单（回合上限仅允许 0/8/12/20）。"""
+    """校验道友切磋坊自定义规则白名单（回合上限 0/8/12/20；禁招槽位仅 0 或 3 且与免费预设互斥）。"""
     if rules is None:
         return True
-    return int(getattr(rules, "round_limit_override", 0)) in VALID_CUSTOM_DUEL_ROUND_LIMITS
+    if int(getattr(rules, "round_limit_override", 0)) not in VALID_CUSTOM_DUEL_ROUND_LIMITS:
+        return False
+    ban_slots = int(getattr(rules, "skill_ban_slots_per_team", 0))
+    if ban_slots not in (0, 3):
+        return False
+    if ban_slots > 0 and bool(getattr(rules, "use_free_preset", False)):
+        return False
+    return True
 
 
 def spectate_visibility_for(

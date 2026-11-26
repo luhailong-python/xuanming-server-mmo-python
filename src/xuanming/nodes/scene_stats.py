@@ -14,12 +14,18 @@ PASSIVE_NAMES = {
 UINT64_MAX = (1 << 64) - 1
 UINT32_MAX = (1 << 32) - 1
 
-# 人物战法构筑装配常量（与 C++ skill_loadout_rules.h 对齐）。
-LOADOUT_MAX_SCHEMES = 3
+# 人物战法构筑装配常量（与 C++ skill_loadout_rules.h 对齐：免费 3 套，仙途轻享卡生效扩展至 6 套）。
+LOADOUT_BASE_MAX_SCHEMES = 3
+LOADOUT_MAX_SCHEMES = 6
 LOADOUT_MAX_ROLE_TAG = 3
 LOADOUT_MAX_PASSIVE_SLOTS = 3
 LOADOUT_MAX_PURSUIT_SLOTS = 1
 LOADOUT_MAX_OPENING_SLOTS = 1
+
+
+def unlocked_skill_schemes(light_card_active: bool) -> int:
+    """返回当前可用的战法构筑方案槽位数（免费 3 套；仙途轻享卡生效 6 套）。"""
+    return LOADOUT_MAX_SCHEMES if light_card_active else LOADOUT_BASE_MAX_SCHEMES
 
 
 def rank_limit(level, row) -> int:

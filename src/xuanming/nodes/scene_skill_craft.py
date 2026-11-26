@@ -31,11 +31,14 @@ _MAX_UINT32 = (1 << 32) - 1
 _CLIENT_REQUEST_KIND_SKILL_SCROLL_CRAFT = 14
 _CLIENT_REQUEST_KIND_LEARN_SKILL_BOOK = 15
 _CLIENT_REQUEST_KIND_DISMANTLE_SKILL_BOOK = 16
+_CLIENT_REQUEST_KIND_SEAL_SKILL_BOOK = 22
+_CLIENT_REQUEST_KIND_UNSEAL_SKILL_BOOK = 23
 
 # 物品配置 ID（与 C++ equip_craft_quality_rules.h 对齐）。
 SCROLL_FRAGMENT_ITEM_ID = 3406
 RARE_SCROLL_PAGE_ITEM_ID = 3407
 RARE_SCROLL_INK_ITEM_ID = 3408
+SEALED_SKILL_BOOK_ITEM_ID = 3414
 
 # 手艺熟练度档位常量。
 MASTERY_APPRENTICE = 1
@@ -177,11 +180,13 @@ class SceneSkillCraft:
         )
 
     def register(self) -> None:
-        """向 SceneNode 注册 6 条技能制书与代打摊位客户端 RPC。"""
+        """向 SceneNode 注册 8 条技能制书、封卷/开卷与代打摊位客户端 RPC。"""
         self.scene.register(_SERVICE, "GetSkillCraftingState", self.get_state)
         self.scene.register(_SERVICE, "CraftSkillBook", self.craft_skill_book, mutating=True)
         self.scene.register(_SERVICE, "LearnSkillBook", self.learn_skill_book, mutating=True)
         self.scene.register(_SERVICE, "DismantleSkillBook", self.dismantle_skill_book, mutating=True)
+        self.scene.register(_SERVICE, "SealSkillBook", self.seal_skill_book, mutating=True)
+        self.scene.register(_SERVICE, "UnsealSkillBook", self.unseal_skill_book, mutating=True)
         self.scene.register(_SERVICE, "SetCraftProxyStall", self.set_proxy_stall, mutating=True)
         self.scene.register(_SERVICE, "ListCraftProxyStalls", self.list_proxy_stalls)
 
@@ -324,7 +329,7 @@ class SceneSkillCraft:
                 total += item.size
         return total
 
-    def _consume_materials(self, data, counts: dict[int, int]) -> tuple[int, bool]:
+    def _consume_materials(self, data, counts: dict[int, int], *, tradable_only: bool = False) -> tuple[int, bool]:
         """原子扣减所需材料，返回 (err, consumed_any_bound)。"""
         if not counts:
             return 0, False
@@ -340,12 +345,17 @@ class SceneSkillCraft:
             known = sum(
                 item.size for _, item in entries
                 if item.config_id == cid and self.assets.countable(item)
+                and (not tradable_only or not item.bound)
             )
             if known < need or (held and need > max(0, known - held)):
                 return SKILL_CRAFT_MATERIAL_NOT_ENOUGH, False
             # 优先扣非绑定，再扣绑定；任一扣到绑定即标 consumed_bound=True（防洗白）。
             ordered = sorted(
-                ((e, it) for e, it in entries if it.config_id == cid and self.assets.countable(it)),
+                (
+                    (e, it) for e, it in entries
+                    if it.config_id == cid and self.assets.countable(it)
+                    and (not tradable_only or not it.bound)
+                ),
                 key=lambda pair: (1 if pair[1].bound else 0, pair[1].acquire_seq, pair[1].item_id),
             )
             remaining = need
@@ -580,17 +590,35 @@ class SceneSkillCraft:
             proxy_master_name = self._display_name(proxy_master_data, proxy_master_id)
             effective_tier = MASTERY_MASTER
 
-        total_gold = base_gold + proxy_fee_gold
-        if total_gold > 0 and self._gold_balance(data) < total_gold:
-            return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+        # 防洗白硬隔离：代工费(proxy_fee_gold)永远只扣流通银两；仅稀世绝学定向制书的系统手续费允许优先抵扣绑定银两。
+        allow_bind_for_base_fee = mode == CRAFT_MODE_TARGETED_RARE
+        strict_gold = proxy_fee_gold + (0 if allow_bind_for_base_fee else base_gold)
+        prefer_bind_gold = base_gold if allow_bind_for_base_fee else 0
+        if strict_gold > 0 or prefer_bind_gold > 0:
+            if hasattr(self.assets, "can_afford_split_gold"):
+                if not self.assets.can_afford_split_gold(data, strict_gold, prefer_bind_gold):
+                    return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+            elif self._gold_balance(data) < strict_gold + prefer_bind_gold:
+                return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+
+        # 常规卷宗可交易残页充足时优先纯耗可交易残页，避免返还的少量绑定残页误染毒后续可交易技能书。
+        prefer_tradable_only = (
+            mode != CRAFT_MODE_TARGETED_RARE
+            and hasattr(self.assets, "removable_tradable_count")
+            and self.assets.removable_tradable_count(data, scroll.fragment_item_id) >= consumed[scroll.fragment_item_id]
+        )
 
         staged = clone(data)
-        consume_err, consumed_bound = self._consume_materials(staged, consumed)
+        consume_err, consumed_bound = self._consume_materials(staged, consumed, tradable_only=prefer_tradable_only)
         if consume_err:
             return self._finish(response, data, consume_err)
 
-        if not self._deduct_gold(staged, total_gold):
-            return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+        if strict_gold > 0 or prefer_bind_gold > 0:
+            if hasattr(self.assets, "deduct_split_gold"):
+                if self.assets.deduct_split_gold(staged, strict_gold, prefer_bind_gold):
+                    return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+            elif not self._deduct_gold(staged, strict_gold + prefer_bind_gold):
+                return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
 
         bonus_fragments = 0
         if scroll.rarity_tier == 0:
@@ -820,6 +848,215 @@ class SceneSkillCraft:
             player.player_id, book.book_id, scroll.dismantle_fragment_count,
         )
         response.refunded_fragments = int(scroll.dismantle_fragment_count)
+        return self._finish(response, staged)
+
+    async def seal_skill_book(self, _world, player, _route, request):
+        """将书架中未绑定的常规技能书封卷入包（3414 封卷道籍），供西市流通。"""
+        response = self.protocol.message(
+            "SealSkillBookResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if not request.client_request_id or not request.book_id:
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(ledger, request, _CLIENT_REQUEST_KIND_SEAL_SKILL_BOOK)
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            response.item_id = int(prior.sealed_book_item_id)
+            response.skill_table_id = int(prior.crafted_skill_table_id)
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+
+        book_idx = next((i for i, b in enumerate(craft.skill_books) if b.book_id == request.book_id), -1)
+        if book_idx < 0:
+            return self._finish(response, data, SKILL_BOOK_NOT_FOUND)
+        book = craft.skill_books[book_idx]
+        # 防洗白硬隔离：仅未绑定常规技能书允许封卷入包流通；稀世绝学或绑定书一律拒绝。
+        if (
+            book.bound
+            or book.rarity_tier != 0
+            or not book.skill_table_id
+            or self.tables["Skill"].get(book.skill_table_id) is None
+        ):
+            return self._finish(response, data, INVALID)
+        sealed_row = self.tables["Item"].get(SEALED_SKILL_BOOK_ITEM_ID)
+        if sealed_row is None or sealed_row.max_stack_size != 1 or sealed_row.equip_kind != 0:
+            return self._finish(response, data, INVALID_TABLE_ID)
+
+        if self.assets.allocate_item_id is None:
+            return self._finish(response, data, UNAVAILABLE)
+        staged = clone(data)
+        try:
+            created_guid = await self.assets.allocate_item_id()
+        except (OSError, RuntimeError, ValueError):
+            return self._finish(response, data, UNAVAILABLE)
+        if type(created_guid) is not int or not 1 <= created_guid <= _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+
+        sealed_item = self.protocol.message(
+            "ItemComp",
+            item_id=created_guid,
+            config_id=SEALED_SKILL_BOOK_ITEM_ID,
+            size=1,
+            bound=False,
+        )
+        sealed_meta = sealed_item.sealed_skill_book
+        sealed_meta.skill_table_id = int(book.skill_table_id)
+        sealed_meta.scroll_id = int(book.scroll_id)
+        sealed_meta.rarity_tier = 0
+        if book.crafter_name:
+            sealed_meta.crafter_name = book.crafter_name
+        if book.crafter_player_id:
+            sealed_meta.crafter_player_id = int(book.crafter_player_id)
+
+        add_err = await self.assets.add_items(staged, {}, instances=(sealed_item,))
+        if add_err:
+            return self._finish(response, data, add_err)
+
+        sc = staged.craft_component
+        del sc.skill_books[book_idx]
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_SEAL_SKILL_BOOK,
+            fingerprint,
+            crafted_skill_book_id=book.book_id,
+            crafted_skill_table_id=book.skill_table_id,
+            scroll_craft_revision=next_rev,
+            sealed_book_item_id=created_guid,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill book sealed player_id=%s book_id=%s item_id=%s skill_id=%s",
+            player.player_id, book.book_id, created_guid, book.skill_table_id,
+        )
+        response.item_id = created_guid
+        response.skill_table_id = int(book.skill_table_id)
+        return self._finish(response, staged)
+
+    async def unseal_skill_book(self, _world, player, _route, request):
+        """将主背包中的 3414 封卷道籍开卷入书架，严格继承原道具绑定状态（防洗白）。"""
+        response = self.protocol.message(
+            "UnsealSkillBookResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if not request.client_request_id or not request.item_id:
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(ledger, request, _CLIENT_REQUEST_KIND_UNSEAL_SKILL_BOOK)
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            found = next((b for b in data.craft_component.skill_books if b.book_id == prior.crafted_skill_book_id), None)
+            if found is not None:
+                response.unsealed_book.CopyFrom(found)
+            else:
+                response.unsealed_book.book_id = prior.crafted_skill_book_id
+                response.unsealed_book.skill_table_id = prior.crafted_skill_table_id
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64 or craft.next_book_seq == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+
+        target_entry_idx = -1
+        target_item = None
+        for idx, entry in enumerate(data.bag_component.items):
+            if entry.bag_type != 0:
+                continue
+            inst = self.assets.item(entry)
+            if inst.item_id == request.item_id:
+                target_entry_idx = idx
+                target_item = inst
+                break
+        if target_item is None:
+            return self._finish(response, data, SKILL_BOOK_NOT_FOUND)
+        if (
+            target_item.config_id != SEALED_SKILL_BOOK_ITEM_ID
+            or target_item.size != 1
+            or not target_item.HasField("sealed_skill_book")
+        ):
+            return self._finish(response, data, INVALID)
+        sealed = target_item.sealed_skill_book
+        if (
+            not sealed.skill_table_id
+            or sealed.rarity_tier != 0
+            or self.tables["Skill"].get(sealed.skill_table_id) is None
+        ):
+            return self._finish(response, data, INVALID)
+        if not self.assets.countable(target_item) or held_item_count(data, SEALED_SKILL_BOOK_ITEM_ID):
+            return self._finish(response, data, FEATURE_UNAVAILABLE)
+
+        staged = clone(data)
+        del staged.bag_component.items[target_entry_idx]
+        sc = staged.craft_component
+        book_id = sc.next_book_seq or 1
+        new_book = sc.skill_books.add(
+            book_id=book_id,
+            skill_table_id=int(sealed.skill_table_id),
+            scroll_id=int(sealed.scroll_id),
+            rarity_tier=0,
+            bound=bool(target_item.bound),
+        )
+        if sealed.crafter_name:
+            new_book.crafter_name = sealed.crafter_name
+        if sealed.crafter_player_id:
+            new_book.crafter_player_id = int(sealed.crafter_player_id)
+        sc.next_book_seq = book_id + 1
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_UNSEAL_SKILL_BOOK,
+            fingerprint,
+            crafted_skill_book_id=book_id,
+            crafted_skill_table_id=int(sealed.skill_table_id),
+            scroll_craft_revision=next_rev,
+            sealed_book_item_id=request.item_id,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill book unsealed player_id=%s item_id=%s book_id=%s skill_id=%s bound=%s",
+            player.player_id, request.item_id, book_id, sealed.skill_table_id, new_book.bound,
+        )
+        response.unsealed_book.CopyFrom(new_book)
         return self._finish(response, staged)
 
     async def set_proxy_stall(self, _world, player, _route, request):

@@ -31,6 +31,8 @@ from .errors import (
     ActivityIntentConflictError,
     ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
+    ERR_INVALID_PARAMETER,
+    ERR_RATE_LIMIT_EXCEEDED,
     GuildWarMemberOccupiedError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
@@ -103,6 +105,7 @@ from .model import (
     OUTCOME_DECISION_ABORT,
     OUTCOME_DECISION_COMPLETE,
     OUTCOME_DECISION_UNKNOWN,
+    RECALL_COOLDOWN_MS,
     ROLE_BLOCKER_OCCUPANCY,
     ROLE_BLOCKER_SETTLEMENT,
     ROLE_BLOCKER_SPECTATOR,
@@ -127,6 +130,7 @@ from .model import (
     TICKET_STATE_FORMING,
     TICKET_STATE_QUEUED,
     TICKET_STATE_READY,
+    VALID_TEAM_FOLLOW_FORMATIONS,
     CallerIdentity,
     RoleFenceRow,
     build_battle_report_summary,
@@ -145,10 +149,13 @@ from .model import (
 )
 from .ranked import (
     RANKED_SEASON_ACTIVE,
+    RankedFeaturedBuildRow,
     RankedPlayerPrefsRow,
     RankedPlayerSeasonRow,
     RankedRewardRow,
+    RankedRivalryRow,
     RankedSeasonRow,
+    is_rivalry_revenge_target,
 )
 from .rating import (
     DEFAULT_RATING_CENTI,
@@ -183,9 +190,11 @@ class TeamMutationOutcome:
     kept: tuple[int, ...] = ()
     left: tuple[int, ...] = ()
     leader_changed: bool = False
+    formation_changed: bool = False
     invited_player: int = 0
     rejected_applicant: int = 0
     revoked_invitees: tuple[int, ...] = ()
+    recall_recipients: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +331,19 @@ class MatchStore(TypingProtocol):
         char_preset: int,
         pet_preset: int,
         rule_version: int,
+        request_id: str,
+    ) -> TeamMutationOutcome: ...
+    async def set_team_formation(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
+        formation: int,
+        request_id: str,
+    ) -> TeamMutationOutcome: ...
+    async def recall_team_members(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
         request_id: str,
     ) -> TeamMutationOutcome: ...
     async def start_team_match(
@@ -614,6 +636,38 @@ class MatchStore(TypingProtocol):
         win_milestone: tuple[int, int, int, str] | None = None,
     ) -> tuple[RankedPlayerSeasonRow, list[RankedRewardRow], bytes]: ...
     async def get_ranked_battle_result(self, player_id: int, battle_id: int = 0) -> bytes | None: ...
+    async def get_ranked_rivalry(
+        self, season_id: int, player_id: int, opponent_id: int,
+    ) -> RankedRivalryRow | None: ...
+    async def upsert_ranked_rivalry(self, row: RankedRivalryRow) -> RankedRivalryRow: ...
+    async def list_ranked_top_rivals(
+        self, season_id: int, player_id: int, *, limit: int = 8,
+    ) -> list[RankedRivalryRow]: ...
+    async def load_rivalry_encounters(
+        self, season_id: int, members: list[tuple[int, int]],
+    ) -> list[Message]: ...
+    async def upsert_ranked_featured_build(
+        self,
+        *,
+        season_id: int,
+        build_key: str,
+        season_seal_id: int,
+        starter_pet_table_id: int,
+        core_skill_ids_csv: str,
+        tier_qingfeng_centi: int,
+        battle_id: int,
+        player_id: int,
+        player_name: str,
+        after_rating_centi: int,
+        team_size: int,
+        total_rounds: int,
+        player_won: bool,
+        settled_at_ms: int,
+    ) -> RankedFeaturedBuildRow: ...
+    async def list_ranked_featured_builds(
+        self, season_id: int, *, limit: int = 5,
+    ) -> list[RankedFeaturedBuildRow]: ...
+    async def is_featured_ranked_replay_allowed(self, battle_id: int) -> bool: ...
 
 
 # -- 内存快照状态容器 --------------------------------------------------------------------------------
@@ -752,6 +806,8 @@ class _MemState:
     ranked_player_seasons: dict[tuple[int, int], RankedPlayerSeasonRow] = field(default_factory=dict)  # (season_id, pid)
     ranked_rewards: dict[tuple[int, int, int], RankedRewardRow] = field(default_factory=dict)  # (pid, season_id, reward_kind)
     ranked_battles: dict[tuple[int, int], tuple[int, int, bytes]] = field(default_factory=dict)  # (bid, pid) -> (season_id, settled_ms, summary)
+    ranked_rivalries: dict[tuple[int, int, int], RankedRivalryRow] = field(default_factory=dict)  # (season_id, pid, opp_id)
+    ranked_featured_builds: dict[tuple[int, str], RankedFeaturedBuildRow] = field(default_factory=dict)  # (season_id, build_key)
 
     # Guild War V2
     guild_war_intents: dict[int, int] = field(default_factory=dict)  # request_id -> battle_id
@@ -1772,6 +1828,101 @@ class MemoryMatchStore:
                 kept=tuple(member_ids),
             )
             self._save_receipt(s, caller.player_id, request_id, 10, payload, caller, outcome)
+            return outcome
+
+        return await self._run_tx(work)
+
+    async def set_team_formation(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
+        formation: int,
+        request_id: str,
+    ) -> TeamMutationOutcome:
+        if formation not in VALID_TEAM_FOLLOW_FORMATIONS:
+            raise TeamBusinessError(ERR_INVALID_PARAMETER)
+        now = await self.now_ms()
+        payload = f"formation:{expected_team_id}:{formation}".encode()
+
+        def work(s: _MemState) -> TeamMutationOutcome:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            cached = self._check_receipt(s, caller.player_id, request_id, 11, payload, caller)
+            if cached is not None:
+                return cached
+            mem = s.memberships.get(caller.player_id)
+            if mem is None or mem.team_id == 0 or (expected_team_id and mem.team_id != expected_team_id):
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            row = s.teams.get(mem.team_id)
+            if row is None or row.state != TEAM_STATE_ACTIVE:
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            rec = row.data.record
+            if int(rec.leader_id) != caller.player_id:
+                raise TeamBusinessError(ERR_TEAM_NOT_LEADER)
+            if self._team_locked(rec, now):
+                raise TeamBusinessError(ERR_TEAM_IN_MATCH)
+            member_ids = [int(m.player_id) for m in rec.members]
+            changed = int(rec.follow_formation) != formation
+            if changed:
+                rec.follow_formation = formation
+                row.version += 1
+            outcome = TeamMutationOutcome(
+                team_id=row.team_id,
+                version=row.version,
+                record=self._clone_msg(rec),
+                epochs=self._epochs_for(s, member_ids),
+                reason=18 if changed else 0,  # TEAM_CHANGE_REASON_FORMATION_CHANGED
+                actor_id=caller.player_id,
+                now_ms=now,
+                kept=tuple(member_ids),
+                formation_changed=changed,
+            )
+            self._save_receipt(s, caller.player_id, request_id, 11, payload, caller, outcome)
+            return outcome
+
+        return await self._run_tx(work)
+
+    async def recall_team_members(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
+        request_id: str,
+    ) -> TeamMutationOutcome:
+        now = await self.now_ms()
+        payload = f"recall:{expected_team_id}".encode()
+
+        def work(s: _MemState) -> TeamMutationOutcome:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            cached = self._check_receipt(s, caller.player_id, request_id, 12, payload, caller)
+            if cached is not None:
+                return cached
+            mem = s.memberships.get(caller.player_id)
+            if mem is None or mem.team_id == 0 or (expected_team_id and mem.team_id != expected_team_id):
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            row = s.teams.get(mem.team_id)
+            if row is None or row.state != TEAM_STATE_ACTIVE:
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            rec = row.data.record
+            if int(rec.leader_id) != caller.player_id:
+                raise TeamBusinessError(ERR_TEAM_NOT_LEADER)
+            last_recall = int(rec.last_recall_at_ms)
+            if last_recall > 0 and now < last_recall + RECALL_COOLDOWN_MS:
+                raise TeamBusinessError(ERR_RATE_LIMIT_EXCEEDED)
+            rec.last_recall_at_ms = now
+            row.version += 1
+            member_ids = [int(m.player_id) for m in rec.members]
+            recipients = tuple(pid for pid in member_ids if pid != caller.player_id)
+            outcome = TeamMutationOutcome(
+                team_id=row.team_id,
+                version=row.version,
+                record=self._clone_msg(rec),
+                epochs=self._epochs_for(s, member_ids),
+                reason=0,
+                actor_id=caller.player_id,
+                now_ms=now,
+                kept=tuple(member_ids),
+                recall_recipients=recipients,
+            )
+            self._save_receipt(s, caller.player_id, request_id, 12, payload, caller, outcome)
             return outcome
 
         return await self._run_tx(work)
@@ -3884,6 +4035,8 @@ class MemoryMatchStore:
             milestone_bits = prev.milestone_bits if prev else 0
             honor_bits = prev.honor_bits if prev else 0
             final_rank = prev.final_rank if prev else 0
+            cur_streak = prev.current_win_streak if prev else 0
+            best_streak = prev.best_win_streak if prev else 0
 
             if participated:
                 valid_matches += 1
@@ -3892,10 +4045,15 @@ class MemoryMatchStore:
                     qualified_at_ms = settled_at_ms
                 if outcome_kind == 1:
                     wins += 1
+                    cur_streak += 1
+                    if cur_streak > best_streak:
+                        best_streak = cur_streak
                 elif outcome_kind == 2:
                     losses += 1
+                    cur_streak = 0
                 elif outcome_kind == 3:
                     draws += 1
+                    cur_streak = 0
 
             if qualified:
                 if peak_rating == 0 or rating_centi > peak_rating:
@@ -3952,11 +4110,14 @@ class MemoryMatchStore:
                 honor_bits=honor_bits,
                 final_rank=final_rank,
                 updated_ms=settled_at_ms,
+                current_win_streak=cur_streak,
+                best_win_streak=best_streak,
             )
             s.ranked_player_seasons[(season_id, player_id)] = prog
 
             final_summary = self._clone_msg(summary_template)
             final_summary.season_valid_matches_after = valid_matches
+            final_summary.win_streak_after = cur_streak
             for rew in unlocked:
                 final_summary.newly_unlocked_rewards.add(
                     season_id=rew.season_id,
@@ -3985,3 +4146,149 @@ class MemoryMatchStore:
                 return None
             matches.sort(key=lambda x: (x[0], x[1]), reverse=True)
             return matches[0][2]
+
+    async def get_ranked_rivalry(
+        self, season_id: int, player_id: int, opponent_id: int,
+    ) -> RankedRivalryRow | None:
+        async with self._lock:
+            return self._state.ranked_rivalries.get((season_id, player_id, opponent_id))
+
+    async def upsert_ranked_rivalry(self, row: RankedRivalryRow) -> RankedRivalryRow:
+        def work(s: _MemState) -> RankedRivalryRow:
+            key = (row.season_id, row.player_id, row.opponent_id)
+            prev = s.ranked_rivalries.get(key)
+            name = row.opponent_name or (prev.opponent_name if prev else "")
+            stored = RankedRivalryRow(
+                season_id=row.season_id,
+                player_id=row.player_id,
+                opponent_id=row.opponent_id,
+                opponent_name=name,
+                wins=row.wins,
+                losses=row.losses,
+                draws=row.draws,
+                last_outcome=row.last_outcome,
+                last_battle_id=row.last_battle_id,
+                updated_ms=row.updated_ms,
+            )
+            s.ranked_rivalries[key] = stored
+            return stored
+
+        return await self._run_tx(work)
+
+    async def list_ranked_top_rivals(
+        self, season_id: int, player_id: int, *, limit: int = 8,
+    ) -> list[RankedRivalryRow]:
+        async with self._lock:
+            rows = [
+                r for r in self._state.ranked_rivalries.values()
+                if r.season_id == season_id and r.player_id == player_id and (r.wins + r.losses + r.draws) > 0
+            ]
+            rows.sort(key=lambda r: (-(r.wins + r.losses), -r.updated_ms, r.opponent_id))
+            return rows[:limit]
+
+    async def load_rivalry_encounters(
+        self, season_id: int, members: list[tuple[int, int]],
+    ) -> list[Message]:
+        if season_id == 0 or len(members) < 2:
+            return []
+        async with self._lock:
+            out: list[Message] = []
+            for pid_a, team_a in members:
+                for pid_b, team_b in members:
+                    if not pid_a or not pid_b or team_a == team_b:
+                        continue
+                    rec = self._state.ranked_rivalries.get((season_id, pid_a, pid_b))
+                    if rec is None or (rec.wins + rec.losses) == 0:
+                        continue
+                    out.append(
+                        self.protocol.message(
+                            "RankedRivalryEncounter",
+                            player_id=rec.player_id,
+                            opponent_id=rec.opponent_id,
+                            opponent_name=rec.opponent_name,
+                            wins=rec.wins,
+                            losses=rec.losses,
+                            revenge_target=is_rivalry_revenge_target(rec),
+                        )
+                    )
+            out.sort(key=lambda e: (int(e.player_id), int(e.opponent_id)))
+            return out
+
+    async def upsert_ranked_featured_build(
+        self,
+        *,
+        season_id: int,
+        build_key: str,
+        season_seal_id: int,
+        starter_pet_table_id: int,
+        core_skill_ids_csv: str,
+        tier_qingfeng_centi: int,
+        battle_id: int,
+        player_id: int,
+        player_name: str,
+        after_rating_centi: int,
+        team_size: int,
+        total_rounds: int,
+        player_won: bool,
+        settled_at_ms: int,
+    ) -> RankedFeaturedBuildRow:
+        def work(s: _MemState) -> RankedFeaturedBuildRow:
+            key = (season_id, build_key)
+            prev = s.ranked_featured_builds.get(key)
+            high_tier_min = tier_qingfeng_centi if tier_qingfeng_centi > 0 else 152_000
+            appearances = (prev.appearances if prev else 0) + 1
+            wins = (prev.wins if prev else 0) + (1 if player_won else 0)
+            high_tier_wins = (prev.high_tier_wins if prev else 0) + (
+                1 if (player_won and after_rating_centi >= high_tier_min) else 0
+            )
+            f_bid = prev.featured_battle_id if prev else 0
+            f_pid = prev.featured_player_id if prev else 0
+            f_pname = prev.featured_player_name if prev else ""
+            f_rating = prev.featured_rating_centi if prev else 0
+            f_tsize = prev.featured_team_size if prev else 0
+            f_rounds = prev.featured_total_rounds if prev else 0
+            if player_won and (f_bid == 0 or after_rating_centi >= f_rating):
+                f_bid = battle_id
+                f_pid = player_id
+                f_pname = player_name
+                f_rating = after_rating_centi
+                f_tsize = team_size
+                f_rounds = total_rounds
+            row = RankedFeaturedBuildRow(
+                season_id=season_id,
+                build_key=build_key,
+                season_seal_id=season_seal_id,
+                starter_pet_table_id=starter_pet_table_id,
+                core_skill_ids=core_skill_ids_csv,
+                appearances=appearances,
+                wins=wins,
+                high_tier_wins=high_tier_wins,
+                featured_battle_id=f_bid,
+                featured_player_id=f_pid,
+                featured_player_name=f_pname,
+                featured_rating_centi=f_rating,
+                featured_team_size=f_tsize,
+                featured_total_rounds=f_rounds,
+                updated_ms=settled_at_ms,
+            )
+            s.ranked_featured_builds[key] = row
+            return row
+
+        return await self._run_tx(work)
+
+    async def list_ranked_featured_builds(
+        self, season_id: int, *, limit: int = 5,
+    ) -> list[RankedFeaturedBuildRow]:
+        async with self._lock:
+            rows = [
+                r for r in self._state.ranked_featured_builds.values()
+                if r.season_id == season_id and r.wins > 0
+            ]
+            rows.sort(key=lambda r: (-r.high_tier_wins, -r.wins, -r.featured_rating_centi, -r.updated_ms))
+            return rows[:limit]
+
+    async def is_featured_ranked_replay_allowed(self, battle_id: int) -> bool:
+        if battle_id <= 0:
+            return False
+        async with self._lock:
+            return any(r.featured_battle_id == battle_id for r in self._state.ranked_featured_builds.values())

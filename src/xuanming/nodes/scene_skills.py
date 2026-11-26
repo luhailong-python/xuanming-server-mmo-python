@@ -1,6 +1,7 @@
-"""Scene 技能书、修习升级、战法构筑装配（3 套方案）及实时施放入口。"""
+"""Scene 技能书、修习升级、战法构筑装配（免费 3 套 / 轻享卡 6 套）及实时施放入口。"""
 
 import logging
+import time
 from inspect import isawaitable
 
 from ..data import StoreRejected, StoreUnavailable
@@ -8,6 +9,7 @@ from ..data.asset_inventory import balance, clone
 from .battle_tables import rounds_from_seconds
 from .scene_skill_casts import SceneSkillCasts
 from .scene_stats import (
+    LOADOUT_BASE_MAX_SCHEMES,
     LOADOUT_MAX_OPENING_SLOTS,
     LOADOUT_MAX_PASSIVE_SLOTS,
     LOADOUT_MAX_PURSUIT_SLOTS,
@@ -25,6 +27,7 @@ from .scene_stats import (
     player_stats,
     rank_limit,
     try_auto_slot_newly_learned,
+    unlocked_skill_schemes,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,8 +47,8 @@ _SEASON_NO_UPGRADE = 34010
 _REQUEST_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 
 
-def _valid_loadout_scheme_id(scheme_id: int) -> bool:
-    return 1 <= scheme_id <= LOADOUT_MAX_SCHEMES
+def _valid_loadout_scheme_id(scheme_id: int, max_allowed: int = LOADOUT_MAX_SCHEMES) -> bool:
+    return 1 <= scheme_id <= max_allowed
 
 
 def _valid_loadout_role_tag(role_tag: int) -> bool:
@@ -170,6 +173,38 @@ class SceneSkills:
         skill_craft = getattr(self.scene, "skill_craft", None)
         return bool(getattr(skill_craft, "_craft_unlock_gate", False)) if skill_craft is not None else False
 
+    def unlocked_loadout_scheme_count(self, data) -> int:
+        """返回玩家当前可用战法构筑方案数（基础 3 套，轻享卡生效期 6 套）。"""
+        afk_pass = getattr(self.scene, "afk_pass", None)
+        if afk_pass is not None and hasattr(afk_pass, "is_active_data"):
+            return unlocked_skill_schemes(bool(afk_pass.is_active_data(data)))
+        expires = int(getattr(data.uint64_pb_component, "afk_pass_expires_at", 0)) if data.HasField("uint64_pb_component") else 0
+        return unlocked_skill_schemes(expires > int(time.time()))
+
+    def try_switch_linked_loadout(self, data, scheme_id: int) -> tuple[bool, str]:
+        """供装备流派一键联动切换战法方案（原地修改 data，不改写独立 request_id 幂等回执）。"""
+        if not self._present(data):
+            return False, "技能数据尚未就绪"
+        unlocked = self.unlocked_loadout_scheme_count(data)
+        if not _valid_loadout_scheme_id(scheme_id, unlocked):
+            return False, f"战法方案 {scheme_id} 未解锁或编号无效"
+        skill_list = data.skill_list
+        current_ver = _loadout_version(int(skill_list.loadout_state_version))
+        if current_ver >= UINT64_MAX:
+            return False, "战法方案版本号已饱和"
+        if int(skill_list.active_loadout_scheme_id) == scheme_id:
+            return True, ""
+        old_stats = player_stats(self.protocol, self.tables, data)
+        _find_or_create_loadout_scheme(skill_list, scheme_id)
+        skill_list.active_loadout_scheme_id = scheme_id
+        skill_list.loadout_state_version = current_ver + 1
+        stats = player_stats(self.protocol, self.tables, data)
+        attrs = data.derived_attributes_component
+        attrs.health = _rescale(attrs.health, old_stats.max_health, stats.max_health)
+        attrs.mana = _rescale(attrs.mana, old_stats.max_mana, stats.max_mana)
+        attrs.speed = stats.speed
+        return True, ""
+
     def _usable(self, data, row) -> bool:
         cls = class_id(data)
         entry = next((item for item in data.skill_list.skill_list if item.skill_table_id == row.id), None)
@@ -203,11 +238,13 @@ class SceneSkills:
         equipped = collect_equipped_non_active_skills(self.tables, data.skill_list, cls, has_class, level)
         return skill_table_id in equipped
 
-    def _fill_loadout_snapshot(self, skill_list_comp, cls: int, has_class: bool, level: int, out) -> None:
-        """填充人物战法构筑 3 方案快照；未自定义前为方案 1 生成建议初始装配。"""
+    def _fill_loadout_snapshot(
+        self, skill_list_comp, cls: int, has_class: bool, level: int, unlocked_schemes: int, out,
+    ) -> None:
+        """填充人物战法构筑方案快照（免费 3 套 / 轻享卡 6 套）；未自定义前为方案 1 生成建议初始装配。"""
         out.Clear()
         active_id = int(skill_list_comp.active_loadout_scheme_id)
-        custom_enabled = _valid_loadout_scheme_id(active_id)
+        custom_enabled = _valid_loadout_scheme_id(active_id, LOADOUT_MAX_SCHEMES)
         out.custom_enabled = custom_enabled
         out.active_scheme_id = active_id if custom_enabled else 1
         out.state_version = _loadout_version(int(skill_list_comp.loadout_state_version))
@@ -215,10 +252,14 @@ class SceneSkills:
         out.max_pursuit_slots = LOADOUT_MAX_PURSUIT_SLOTS
         out.max_opening_slots = LOADOUT_MAX_OPENING_SLOTS
         out.last_request_id = skill_list_comp.loadout_last_request_id
+        out.unlocked_schemes = max(LOADOUT_BASE_MAX_SCHEMES, min(LOADOUT_MAX_SCHEMES, unlocked_schemes))
+        out.max_schemes = LOADOUT_MAX_SCHEMES
 
         for scheme_id in range(1, LOADOUT_MAX_SCHEMES + 1):
-            info = out.schemes.add(scheme_id=scheme_id)
             stored = _find_loadout_scheme(skill_list_comp, scheme_id)
+            if scheme_id > out.unlocked_schemes and stored is None:
+                continue
+            info = out.schemes.add(scheme_id=scheme_id)
             if stored is not None:
                 info.role_tag = stored.role_tag
                 info.passive_skill_ids.extend(stored.passive_skill_ids)
@@ -258,12 +299,18 @@ class SceneSkills:
                     if added and group:
                         groups.add(group)
 
+    def _spendable_gold(self, data) -> int:
+        assets = getattr(self.scene, "assets", None)
+        if assets is not None and hasattr(assets, "spendable_gold_with_bind"):
+            return assets.spendable_gold_with_bind(data)
+        return min(UINT64_MAX, balance(data, _GOLD) + balance(data, 3))
+
     def _book(self, player, data):
         response = self.protocol.message("ListSkillsResponse")
         if not self._present(data):
             response.error_message.id = _UNAVAILABLE
             return response
-        cls, level, gold = class_id(data), effective_level(data), balance(data, _GOLD)
+        cls, level, gold = class_id(data), effective_level(data), self._spendable_gold(data)
         has_class = bool(self.catalogs.get(cls))
         active_season = self._active_season_id()
         response.class_id, response.player_level, response.currency_balance = cls, level, gold
@@ -313,7 +360,9 @@ class SceneSkills:
         equipped_non_active = collect_equipped_non_active_skills(
             self.tables, data.skill_list, cls, has_class, level,
         )
-        self._fill_loadout_snapshot(data.skill_list, cls, has_class, level, response.loadout)
+        self._fill_loadout_snapshot(
+            data.skill_list, cls, has_class, level, self.unlocked_loadout_scheme_count(data), response.loadout,
+        )
 
         for row in rows:
             is_seasonal = int(getattr(row, "season_id", 0)) != 0
@@ -397,7 +446,7 @@ class SceneSkills:
             return finish(_CRAFT_BOOK_REQUIRED)
         if rank != request.expected_rank:
             return finish(_RANK_CHANGED)
-        level, gold = effective_level(data), balance(data, _GOLD)
+        level, gold = effective_level(data), self._spendable_gold(data)
         total_cost, final_rank, stop = 0, rank, 0
         for _ in range(request.count):
             stop = _blocked(row, level, final_rank, gold - total_cost)
@@ -411,7 +460,11 @@ class SceneSkills:
         if assets is None:
             return finish(_UNAVAILABLE)
         before = clone(data) if assets.audit_enabled else None
-        error = assets.deduct_currency(data, _GOLD, total_cost)
+        error = (
+            assets.deduct_gold_prefer_bind(data, total_cost)
+            if hasattr(assets, "deduct_gold_prefer_bind")
+            else assets.deduct_currency(data, _GOLD, total_cost)
+        )
         if error:
             return finish(error)
         recalc_stats = is_passive_skill(row)
@@ -460,9 +513,11 @@ class SceneSkills:
         passive_ids: list[int],
         pursuit_ids: list[int],
         opening_ids: list[int],
+        *,
+        unlocked_schemes: int = LOADOUT_BASE_MAX_SCHEMES,
     ) -> int:
         """校验单套战法构筑装配方案，返回 0 或权威错误 tip 码（对齐 skill_loadout_rules.h）。"""
-        if not _valid_loadout_scheme_id(scheme_id) or not _valid_loadout_role_tag(role_tag):
+        if not _valid_loadout_scheme_id(scheme_id, unlocked_schemes) or not _valid_loadout_role_tag(role_tag):
             return _LOADOUT_SCHEME_INVALID
         if (
             len(passive_ids) > LOADOUT_MAX_PASSIVE_SLOTS
@@ -546,9 +601,11 @@ class SceneSkills:
         passive_ids = list(request.passive_skill_ids)
         pursuit_ids = list(request.pursuit_skill_ids)
         opening_ids = list(request.opening_skill_ids)
+        unlocked = self.unlocked_loadout_scheme_count(data)
         if err := self._validate_loadout_scheme(
             skill_list, cls, has_class, level,
             request.scheme_id, request.role_tag, passive_ids, pursuit_ids, opening_ids,
+            unlocked_schemes=unlocked,
         ):
             return finish(err)
 
@@ -610,7 +667,8 @@ class SceneSkills:
             return finish(_UNAVAILABLE)
         if not _valid_loadout_request_id(request.request_id):
             return finish(_INVALID_PARAM)
-        if not _valid_loadout_scheme_id(request.scheme_id):
+        unlocked = self.unlocked_loadout_scheme_count(data)
+        if not _valid_loadout_scheme_id(request.scheme_id, unlocked):
             return finish(_LOADOUT_SCHEME_INVALID)
 
         skill_list = data.skill_list

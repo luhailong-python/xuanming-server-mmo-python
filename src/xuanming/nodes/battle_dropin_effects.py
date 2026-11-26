@@ -48,6 +48,7 @@ _EVENT_SHIELD = 20
 _EVENT_ARTIFACT = 21
 EVENT_BOSS_MECHANIC = 22
 EVENT_WUXING_SYNERGY = 23
+EVENT_SUMMON_PET = 24
 
 _HIT_COUNTER = 2
 _HIT_REFLECT = 3
@@ -59,17 +60,30 @@ _DAMAGE_PHYSICAL = 1
 _I64_MAX = (1 << 63) - 1
 _ENGINE_ACTOR_FLAG = 1 << 63
 
-# 行动超时与 PVP V2 / 投降 / 首领试炼 V2 / 论剑 V3 变阵常量（与 C++ turn_battle_constants.h 逐项对齐）
+# 行动超时与 PVP V2 / 投降 / 首领试炼 V2 / 论剑 V3~V5 变阵禁招常量（与 C++ turn_battle_constants.h 逐项对齐）
 ACTION_TIMEOUT_MS = 25_000
 BOSS_TRIAL_ACTION_TIMEOUT_MS = 18_000
 TACTICAL_PREP_TIMEOUT_MS = 15_000
 TACTICAL_PREP_DURATION_SECONDS = 15
+TACTICAL_PREP_WITH_BAN_TIMEOUT_MS = 25_000
+TACTICAL_PREP_WITH_BAN_DURATION_SECONDS = 25
+PREP_SKILL_BAN_SLOTS_PER_TEAM = 3
+MAX_BATTLE_PINGS_PER_ROUND = 2
+PVP_SUMMON_PET_UNLOCK_ROUND = 2
+MIN_WIN_STREAK_HIGHLIGHT = 3
+CLUTCH_COMEBACK_MIN_ESCALATION_STACKS = 2
+CLUTCH_COMEBACK_LOW_HP_DENOMINATOR = 4
+HIGHLIGHT_CONTROL_MIN_COUNT = 2
+ERR_SKILL_BANNED_IN_BATTLE = 7028
+ERR_RATE_LIMIT_EXCEEDED = 1008
 ACTION_TAG_PHYSICAL = 1
 ACTION_TAG_MAGIC = 2
 MATCH_MODE_PVE_SOLO = 4
 MATCH_MODE_PVE_TEAM = 5
 MATCH_MODE_PVP_CHALLENGE = 6
 MATCH_MODE_POLARITY_5V5 = 8
+MATCH_MODE_GUILD_WAR_PVP = 9
+MATCH_MODE_GUILD_WAR_SIEGE = 10
 MATCH_MODE_SEASON_TOURNAMENT = 11
 
 # 锦标赛 V2 & 五行幻境共享五行灵脉枚举（与 TournamentLeylineElement 逐项一致）
@@ -108,6 +122,9 @@ BOSS_TRIAL_KIND_GUARDIAN_RESCUE = 5
 BOSS_TRIAL_KIND_POLARITY_5V5 = 6
 BOSS_TRIAL_KIND_FESTIVAL_BEAST = 7
 BOSS_TRIAL_KIND_BREAK_DUAL_GUARD = 8
+BOSS_TRIAL_KIND_PRACTICE_DUMMY = 9
+BOSS_TRIAL_KIND_TACTICAL_PUZZLE = 10
+BOSS_TRIAL_KIND_CHARACTER_TALE = 11
 
 BOSS_STANCE_NONE = 0
 BOSS_STANCE_PHYSICAL = 1
@@ -137,6 +154,89 @@ BOSS_MECHANIC_MOMENTUM_GAIN = 6
 BOSS_MECHANIC_BREAKER_SUNDER = 7
 BOSS_MECHANIC_REJUV_CLEANSE = 8
 BOSS_MECHANIC_ANTI_HEAL_DISHEARTEN = 9
+BOSS_MECHANIC_WEEKLY_AFFIX_TRIGGER = 10
+
+# 首领试炼周常五行词缀常量与纯规则（与 C++ boss_trial_weekly_affix_rules.h 逐项一致）
+BOSS_AFFIX_NONE = 0
+BOSS_AFFIX_METAL = 1
+BOSS_AFFIX_WOOD = 2
+BOSS_AFFIX_WATER = 3
+BOSS_AFFIX_FIRE = 4
+BOSS_AFFIX_EARTH = 5
+BOSS_AFFIX_MAX_ID = 5
+
+BOSS_AFFIX_METAL_EXPOSED_CRIT_BONUS_PCT = 15
+BOSS_AFFIX_METAL_EXPOSED_PRIMARY_BONUS_PCT = 10
+BOSS_AFFIX_METAL_ENEMY_OPENING_SHIELD_PCT = 8
+BOSS_AFFIX_WOOD_DISPEL_MANA_REGEN_PCT = 12
+BOSS_AFFIX_WOOD_TEAM_DAMAGE_BONUS_PCT = 10
+BOSS_AFFIX_WOOD_BOSS_REGEN_HP_PCT = 4
+BOSS_AFFIX_WATER_CHARGE_OR_PERIODIC_DAMAGE_BONUS_PCT = 20
+BOSS_AFFIX_WATER_MANA_KEEP_PCT = 80
+BOSS_AFFIX_FIRE_PET_OR_FOLLOWUP_DAMAGE_BONUS_PCT = 18
+BOSS_AFFIX_FIRE_EXPOSED_BURN_MAX_HP_PCT = 3
+BOSS_AFFIX_FIRE_EXPOSED_BURN_CAP = 1200
+BOSS_AFFIX_FIRE_BOSS_PHASE_TWO_HP_PCT = 60
+BOSS_AFFIX_EARTH_PARRY_TEAM_SHIELD_PCT = 8
+BOSS_AFFIX_EARTH_PARRY_NEXT_ROUND_DAMAGE_BONUS_PCT = 12
+BOSS_AFFIX_EARTH_BOSS_CLEAVE_MULTIPLIER = 1.12
+
+_BOSS_AFFIX_DAY_MS = 86_400_000
+_BOSS_AFFIX_WEEK_MS = 7 * _BOSS_AFFIX_DAY_MS
+_BOSS_AFFIX_FIRST_MONDAY_05_UTC8_MS = 3 * _BOSS_AFFIX_DAY_MS + 21 * 3_600_000
+
+
+def is_valid_boss_affix_override(affix_id: int) -> bool:
+    """校验显式指定的首领试炼周常五行词缀是否合法（0..5）。"""
+    return 0 <= affix_id <= BOSS_AFFIX_MAX_ID
+
+
+def boss_affix_id_for_timestamp(now_ms_val: int) -> int:
+    """按 UTC+8 周一 05:00 切周基准确定性计算当周首领试炼词缀（1..5，早于基准返回 0）。"""
+    if now_ms_val < _BOSS_AFFIX_FIRST_MONDAY_05_UTC8_MS:
+        return BOSS_AFFIX_NONE
+    week_index = (now_ms_val - _BOSS_AFFIX_FIRST_MONDAY_05_UTC8_MS) // _BOSS_AFFIX_WEEK_MS
+    return int((week_index % BOSS_AFFIX_MAX_ID) + 1)
+
+
+def resolve_boss_weekly_affix(
+    is_boss_trial: bool,
+    has_tower_context: bool,
+    created_at_ms: int,
+    explicit_affix_id: int,
+) -> int:
+    """裁决本场战斗生效的首领试炼周常词缀（仅真实首领试炼且非爬塔生效）。"""
+    if not is_boss_trial or has_tower_context:
+        return BOSS_AFFIX_NONE
+    if 1 <= explicit_affix_id <= BOSS_AFFIX_MAX_ID:
+        return explicit_affix_id
+    return boss_affix_id_for_timestamp(created_at_ms)
+
+
+def is_wood_regen_round(round_index: int) -> bool:
+    """木周首领回合末回血回合（第 2/5/8... 回合）。"""
+    return round_index >= 2 and ((round_index - 2) % 3) == 0
+
+
+def is_water_momentum_round(round_index: int) -> bool:
+    """水周首领回合末蓄势回合（第 2/4/6... 偶数回合）。"""
+    return round_index >= 2 and (round_index % 2) == 0
+
+
+def discount_water_mana_cost(original_cost: int) -> int:
+    """水周蓄力/毒火技能法力消耗 8 折（最低保留 1 点）。"""
+    if original_cost <= 0:
+        return 0
+    discounted = (original_cost * BOSS_AFFIX_WATER_MANA_KEEP_PCT) // 100
+    return discounted if discounted > 0 else 1
+
+
+def is_health_at_or_below_pct(health: int, max_health: int, pct: int) -> bool:
+    """溢出安全的气血比例门槛判定：`health / max_health <= pct / 100`。"""
+    if max_health <= 0:
+        return False
+    threshold = (max_health // 100) * pct + ((max_health % 100) * pct) // 100
+    return health <= threshold
 
 TELEGRAPH_KIND_SLOW_CLEAVE = 1
 TELEGRAPH_KIND_GUARD_HEAL = 2
@@ -291,6 +391,10 @@ class BattleModifier(IntEnum):
     NEXT_MAGIC_ATTACK = 22
     FORBID_PHYSICAL = 23
     FORBID_MAGIC = 24
+    SELF_GROWING_DIRECT_DAMAGE = 25
+    DEFENSE_PENETRATION = 26
+    PERIODIC_DAMAGE_BONUS = 27
+    ALL_CONTROL_RESIST = 28
 
 
 class SecondaryTargetPolicy(IntEnum):
@@ -329,6 +433,10 @@ class BattleTrigger(IntEnum):
     BEFORE_DIRECT_DAMAGE = 3
     AFTER_DIRECT_DAMAGE = 4
     AFTER_PERIODIC = 5
+    ROUND_START = 6
+    AFTER_DIRECT_ATTACK = 7
+    AFTER_CONTROL_ATTEMPT = 8
+    AFTER_SUPPORT_CAST = 9
 
 
 class BossPhaseId(IntEnum):
@@ -482,6 +590,100 @@ class SeasonBattleRules:
     HARD_MAX_PROGRESS_POINTS = SEASON_HARD_MAX_PROGRESS_POINTS
     HARD_MAX_CATCHUP_PRICE = SEASON_HARD_MAX_CATCHUP_PRICE
     MAX_VALID_CURRENCY_TYPE = SEASON_MAX_VALID_CURRENCY_TYPE
+
+    # 赛季周词缀轮换常量（与 C++ season_rules.h 逐项一致）
+    WEEKLY_AFFIX_NONE = 0
+    WEEKLY_AFFIX_SHIELD_OVERLOAD = 1
+    WEEKLY_AFFIX_SPIRIT_RECOVERY = 2
+    WEEKLY_AFFIX_OPENING_GUARD = 3
+    WEEKLY_AFFIX_SHARP_TEMPO = 4
+    WEEKLY_AFFIX_COUNT = 4
+    WEEKLY_AFFIX_WEEK_MS = 7 * 86_400_000
+    SHIELD_OVERLOAD_BONUS_PCT = 15
+    SPIRIT_RECOVERY_DEFEND_MANA_BPS = 300
+    OPENING_GUARD_DAMAGE_REDUCE_PCT = 8
+    OPENING_GUARD_MAX_ROUND = 2
+    SHARP_TEMPO_UNSHIELDED_BONUS_PCT = 5
+
+    @classmethod
+    def is_valid_weekly_affix_id(cls, affix_id: int) -> bool:
+        """校验赛季周词缀 ID 是否在 1..4 范围内。"""
+        return 1 <= affix_id <= cls.WEEKLY_AFFIX_COUNT
+
+    @classmethod
+    def compute_season_week_index(cls, starts_at_ms: int, now_ms: int) -> int:
+        """按赛季开启时间计算当前周序号（从 1 开始）。"""
+        if now_ms <= starts_at_ms:
+            return 1
+        return int((now_ms - starts_at_ms) // cls.WEEKLY_AFFIX_WEEK_MS) + 1
+
+    @classmethod
+    def weekly_affix_for_week(cls, season_id: int, week_index: int) -> int:
+        """确定性计算指定赛季第 N 周的周词缀 ID（1..4）。"""
+        if season_id == 0:
+            return cls.WEEKLY_AFFIX_NONE
+        zero_based = max(0, week_index - 1)
+        return ((season_id - 1 + zero_based) % cls.WEEKLY_AFFIX_COUNT) + 1
+
+    @classmethod
+    def weekly_affix_at(cls, season_id: int, starts_at_ms: int, now_ms: int) -> int:
+        if season_id == 0:
+            return cls.WEEKLY_AFFIX_NONE
+        return cls.weekly_affix_for_week(season_id, cls.compute_season_week_index(starts_at_ms, now_ms))
+
+    @classmethod
+    def shield_overload_bonus_pct(cls, affix_id: int) -> int:
+        return cls.SHIELD_OVERLOAD_BONUS_PCT if affix_id == cls.WEEKLY_AFFIX_SHIELD_OVERLOAD else 0
+
+    @classmethod
+    def defend_bonus_mana_regen_bps(cls, affix_id: int) -> int:
+        return cls.SPIRIT_RECOVERY_DEFEND_MANA_BPS if affix_id == cls.WEEKLY_AFFIX_SPIRIT_RECOVERY else 0
+
+    @classmethod
+    def opening_guard_damage_reduce_pct(cls, affix_id: int, round_index: int) -> int:
+        if affix_id == cls.WEEKLY_AFFIX_OPENING_GUARD and 1 <= round_index <= cls.OPENING_GUARD_MAX_ROUND:
+            return cls.OPENING_GUARD_DAMAGE_REDUCE_PCT
+        return 0
+
+    @classmethod
+    def sharp_tempo_damage_bonus_pct(cls, affix_id: int, target_has_shield: bool) -> int:
+        if affix_id == cls.WEEKLY_AFFIX_SHARP_TEMPO and not target_has_shield:
+            return cls.SHARP_TEMPO_UNSHIELDED_BONUS_PCT
+        return 0
+
+    # 赛季玩法 V3：S1「破阵之季」四组「技印共鸣」（零面板属性、零速度控制，对齐 C++ season_rules.h）
+    SEASON_1_ID = 1
+    SEAL_POZHEN_RUIYIN = 101
+    SEAL_POZHEN_XUANYIN = 102
+    SEAL_GUZHEN_SHOUYIN = 103
+    SEAL_JUXI_YUANYIN = 104
+
+    SKILL_POZHEN_LIEFENG = 15001
+    SKILL_POZHEN_LINGLEI = 15002
+    SKILL_GUZHEN_LINGZHANG = 15003
+    SKILL_POZHEN_XUSHI = 15004
+
+    RESONANCE_EVENT_SHARP_MANA_REFUND = 101
+    RESONANCE_EVENT_MYSTIC_EXTEND_DEBUFF = 102
+    RESONANCE_EVENT_GUARD_SHIELD_BOOST = 103
+    RESONANCE_EVENT_BREATH_HALF_MANA = 104
+
+    RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT = 30
+    RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS = 1
+    RESONANCE_GUARD_SHIELD_BONUS_PCT = 10
+
+    @classmethod
+    def resonance_sharp_mana_refund(cls, paid_mana: int) -> int:
+        if paid_mana <= 0:
+            return 0
+        q, r = divmod(paid_mana, 100)
+        return q * cls.RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT + (
+            r * cls.RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT + 99
+        ) // 100
+
+    @staticmethod
+    def resonance_half_mana_cost(base_cost: int) -> int:
+        return max(0, base_cost) // 2
 
     @staticmethod
     def is_window_active(starts_at_ms: int, ends_at_ms: int, enabled: bool, now_ms: int) -> bool:
@@ -935,6 +1137,18 @@ class ActorCombatBonus:
     battle_start_shield: int = 0
 
 
+@dataclass(slots=True)
+class SeasonSealRuntimeState:
+    """赛季玩法 V3：每名参战玩家的赛季印局内共鸣窗口与本场功劳统计（纯引擎内状态）。"""
+
+    guard_resonance_ready_round: int = 0
+    guard_resonance_consumed: bool = False
+    defend_resonance_ready_round: int = 0
+    contribution_value: int = 0
+    trigger_count: int = 0
+    resonance_count: int = 0
+
+
 class EquipmentBattleEffects:
     """管理单场战斗内装备词条、法宝触发次数、护盾吸收与吸血效果。"""
 
@@ -942,6 +1156,79 @@ class EquipmentBattleEffects:
         self.engine = engine
         self._extra_bonuses: dict[int, ActorCombatBonus] = {}
         self._next_shield_buff_id: int = 1 << 40
+        self._season_seal_runtime: dict[int, SeasonSealRuntimeState] = {}
+        self.pending_mystic_extend_caster_id: int = 0
+        self.pending_mystic_extend_target_id: int = 0
+        self.active_guard_shield_resonance_caster_id: int = 0
+        self.active_guard_shield_resonance_extra: int = 0
+
+    def season_seal_runtime(self, actor_id: int) -> SeasonSealRuntimeState:
+        rt = self._season_seal_runtime.get(actor_id)
+        if rt is None:
+            rt = SeasonSealRuntimeState()
+            self._season_seal_runtime[actor_id] = rt
+        return rt
+
+    def find_season_seal_runtime(self, actor_id: int) -> SeasonSealRuntimeState | None:
+        return self._season_seal_runtime.get(actor_id)
+
+    def clear_season_seal_runtime(self, actor_id: int) -> None:
+        self._season_seal_runtime.pop(actor_id, None)
+
+    def record_season_seal_use(self, actor_id: int, value: int) -> None:
+        rt = self.season_seal_runtime(actor_id)
+        rt.trigger_count += 1
+        rt.contribution_value = min(U64_MAX, rt.contribution_value + max(0, int(value)))
+
+    def has_any_regular_shield(self, target: Message) -> bool:
+        rules = self.engine.effects.rules
+        for entry in target.buffs:
+            if entry.remaining_capacity <= 0:
+                continue
+            row = rules.get(entry.buff_table_id)
+            if row is None or row.hit_limit == 0:
+                return True
+        return False
+
+    def is_defend_breath_resonance_ready(self, actor: Message, skill_id: int, round_index: int) -> bool:
+        if (
+            actor.actor_type != _ACTOR_PLAYER
+            or skill_id != SeasonBattleRules.SKILL_POZHEN_XUSHI
+            or not actor.HasField("equipment_effects")
+            or not actor.equipment_effects.HasField("season_seal")
+        ):
+            return False
+        seal = actor.equipment_effects.season_seal
+        if seal.season_id != SeasonBattleRules.SEASON_1_ID or seal.seal_id != SeasonBattleRules.SEAL_JUXI_YUANYIN:
+            return False
+        rt = self._season_seal_runtime.get(actor.actor_id)
+        return rt is not None and rt.defend_resonance_ready_round == round_index
+
+    def emit_season_resonance(
+        self,
+        actor: Message,
+        target_id: int,
+        resonance_effect_id: int,
+        value: int,
+        turn: Message,
+        group: int,
+    ) -> None:
+        if not actor.HasField("equipment_effects") or not actor.equipment_effects.HasField("season_seal"):
+            return
+        seal = actor.equipment_effects.season_seal
+        rt = self.season_seal_runtime(actor.actor_id)
+        rt.resonance_count += 1
+        turn.events.add(
+            event_type=_EVENT_ARTIFACT,
+            source_id=actor.actor_id,
+            target_id=target_id,
+            group_id=group,
+            artifact_item_id=0,
+            artifact_effect_id=resonance_effect_id,
+            season_seal_id=seal.seal_id,
+            value=value,
+            success=True,
+        )
 
     def set_actor_bonus(
         self,
@@ -1230,6 +1517,12 @@ class EquipmentBattleEffects:
             if gain > 0:
                 total += gain
                 SeasonBattleRules.use_seal(actor, actor.actor_id, gain, round_index, turn, group)
+                self.record_season_seal_use(actor.actor_id, gain)
+                if (
+                    seal.season_id == SeasonBattleRules.SEASON_1_ID
+                    and seal.seal_id == SeasonBattleRules.SEAL_JUXI_YUANYIN
+                ):
+                    self.season_seal_runtime(actor.actor_id).defend_resonance_ready_round = round_index + 1
         if total <= 0:
             return 0
         actor.attributes.mana = before + total
@@ -1286,6 +1579,14 @@ class EquipmentBattleEffects:
                 if part > 0:
                     reduction += part
                     SeasonBattleRules.use_seal(target, target.actor_id, part, round_index, turn, group)
+                    self.record_season_seal_use(target.actor_id, part)
+                    if (
+                        seal.season_id == SeasonBattleRules.SEASON_1_ID
+                        and seal.seal_id == SeasonBattleRules.SEAL_GUZHEN_SHOUYIN
+                    ):
+                        rt = self.season_seal_runtime(target.actor_id)
+                        if not rt.guard_resonance_consumed:
+                            rt.guard_resonance_ready_round = round_index + 1
         return max(0, damage - reduction)
 
     def grant_shield(
@@ -1300,6 +1601,8 @@ class EquipmentBattleEffects:
         turn: Message | None = None,
         group: int = 0,
         commit_artifacts: bool = False,
+        skill_id: int = 0,
+        is_mirror: bool = False,
     ) -> int:
         """为目标附加独立容量护盾，自动结算施放方护盾容量词条/宠物修炼/法宝 5。"""
         caster = source if source is not None else actor
@@ -1319,14 +1622,34 @@ class EquipmentBattleEffects:
             capacity_float = PetAndSupportEffects.apply_bonus(base_capacity, bonus)
         if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WOOD:
             capacity_float *= 110.0 / 100.0
+        season_shield_pct = SeasonBattleRules.shield_overload_bonus_pct(
+            getattr(self.engine, "active_season_weekly_affix_id", 0),
+        )
+        if season_shield_pct > 0:
+            capacity_float *= (100.0 + season_shield_pct) / 100.0
         support_bonus_pct = getattr(self.engine, "wuxing_support_bonus_pct", lambda _a: 0)(caster)
         if support_bonus_pct > 0:
             capacity_float *= (100.0 + support_bonus_pct) / 100.0
         if getattr(self.engine, "escalation_stacks", 0) > 0:
             capacity_float *= self.engine.escalation_support_pct / 100.0
+        guard_resonance_gain = 0
+        if (
+            not is_mirror
+            and skill_id == SeasonBattleRules.SKILL_GUZHEN_LINGZHANG
+            and self.active_guard_shield_resonance_caster_id == caster.actor_id
+        ):
+            before_shield = PetAndSupportEffects.whole(capacity_float)
+            capacity_float *= (100.0 + SeasonBattleRules.RESONANCE_GUARD_SHIELD_BONUS_PCT) / 100.0
+            after_shield = PetAndSupportEffects.whole(capacity_float)
+            if after_shield > before_shield:
+                guard_resonance_gain = after_shield - before_shield
         capacity = PetAndSupportEffects.whole(capacity_float)
         if capacity <= 0:
             return 0
+        if guard_resonance_gain > 0:
+            self.active_guard_shield_resonance_extra = min(
+                U64_MAX, self.active_guard_shield_resonance_extra + guard_resonance_gain,
+            )
         buff_id = self._next_shield_buff_id
         self._next_shield_buff_id += 1
         actor.buffs.add(
@@ -1337,6 +1660,14 @@ class EquipmentBattleEffects:
             remain_rounds=remain_rounds,
             remaining_capacity=capacity,
         )
+        owner_id = (
+            caster.actor_id if caster.actor_type == _ACTOR_PLAYER
+            else (caster.owner_player_id if caster.actor_type == _ACTOR_PET else 0)
+        )
+        if owner_id and hasattr(self.engine, "total_shield_granted_by_player"):
+            self.engine.total_shield_granted_by_player[owner_id] = min(
+                U64_MAX, self.engine.total_shield_granted_by_player.get(owner_id, 0) + capacity,
+            )
         if commit_artifacts and turn is not None:
             for idx in contributions:
                 self.use_artifact(
@@ -1421,6 +1752,9 @@ class EquipmentBattleEffects:
         turn: Message,
         group: int,
         shield_ids: Sequence[int],
+        *,
+        skill_id: int = 0,
+        paid_mana: int = 0,
     ) -> int:
         """执行破盾法宝/赛季印（`effect_id == 1` 物理削盾 / `2` 法术削盾，对照 `EquipmentBreakShields`）。"""
         if not _active(target) or damage <= 0 or not shield_ids or not source.HasField("equipment_effects"):
@@ -1492,7 +1826,44 @@ class EquipmentBattleEffects:
             if removed > 0:
                 total_removed += removed
                 SeasonBattleRules.use_seal(source, target.actor_id, removed, round_index, turn, group)
+                self.record_season_seal_use(source.actor_id, removed)
                 self.engine.trial_tracker.record_shield_break(source)
+                if seal.season_id == SeasonBattleRules.SEASON_1_ID:
+                    if (
+                        seal.seal_id == SeasonBattleRules.SEAL_POZHEN_RUIYIN
+                        and skill_id == SeasonBattleRules.SKILL_POZHEN_LIEFENG
+                        and not self.has_any_regular_shield(target)
+                    ):
+                        mana_before = source.attributes.mana
+                        missing_mana = max(0, source.max_mana - mana_before)
+                        refund = min(missing_mana, SeasonBattleRules.resonance_sharp_mana_refund(paid_mana))
+                        if refund > 0:
+                            source.attributes.mana = mana_before + refund
+                            turn.events.add(
+                                event_type=_EVENT_MANA,
+                                source_id=source.actor_id,
+                                target_id=source.actor_id,
+                                group_id=group,
+                                skill_table_id=skill_id,
+                                value=refund,
+                                mana_delta=min(refund, _I64_MAX),
+                                target_health_after=source.attributes.health,
+                                target_mana_after=source.attributes.mana,
+                            )
+                            self.emit_season_resonance(
+                                source,
+                                source.actor_id,
+                                SeasonBattleRules.RESONANCE_EVENT_SHARP_MANA_REFUND,
+                                refund,
+                                turn,
+                                group,
+                            )
+                    elif (
+                        seal.seal_id == SeasonBattleRules.SEAL_POZHEN_XUANYIN
+                        and skill_id == SeasonBattleRules.SKILL_POZHEN_LINGLEI
+                    ):
+                        self.pending_mystic_extend_caster_id = source.actor_id
+                        self.pending_mystic_extend_target_id = target.actor_id
 
         return total_removed
 
@@ -1605,6 +1976,8 @@ class EquipmentBattleEffects:
             resist += 100.0 * combat.resist_forget
         if ailment_kind in (4, 5):
             resist += 10_000.0 * self.engine.configured.modifier(target, BattleModifier.CONTROL_RESIST)
+        if 1 <= ailment_kind <= 6:
+            resist += 10_000.0 * self.engine.configured.modifier(target, BattleModifier.ALL_CONTROL_RESIST)
         if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WATER:
             resist += 800.0
         wuxing_ctrl_resist = getattr(self.engine, "wuxing_control_resist_pct", lambda _a: 0)(target)
@@ -2473,6 +2846,15 @@ class EncounterV2Controller:
         self.active_telegraphs: list[Message] = []
         self.last_resolved_telegraphs: list[Message] = []
         self.telegraph_state_version: int = 0
+        self.boss_weekly_affix_id: int = resolve_boss_weekly_affix(
+            is_boss_trial_kind(boss_trial_kind),
+            engine.tower_context is not None,
+            int(getattr(request, "created_at_ms", 0)),
+            int(getattr(request, "boss_weekly_affix_id", 0)),
+        )
+        self.weekly_affix_wood_team_boost_until_round: int = 0
+        self.weekly_affix_wood_mana_triggered_actors: set[int] = set()
+        self.weekly_affix_earth_team_boost_until_round: int = 0
 
     @property
     def is_festival_beast(self) -> bool:
@@ -2709,12 +3091,38 @@ class EncounterV2Controller:
         if self.is_boss_trial and source.team_index != target.team_index and target.team_index == 1:
             vuln_pct = 0
             exp = self.exposed_actors.get(target.actor_id)
-            if exp is not None and exp[1] >= self.engine.round_index:
+            target_exposed = exp is not None and exp[1] >= self.engine.round_index
+            if target_exposed:
                 vuln_pct += exp[0]
             if target.is_boss and self.boss_phase >= 2:
                 vuln_pct += BOSS_PHASE_TWO_VULN_PCT
             if vuln_pct > 0:
                 damage = (damage * (100 + vuln_pct)) // 100
+            # 首领试炼周常五行词缀攻方增伤（与破绽独立乘算）
+            if source.team_index == 0 and damage > 0:
+                if (
+                    self.boss_weekly_affix_id == BOSS_AFFIX_METAL
+                    and is_direct_primary
+                    and is_primary_target
+                    and target_exposed
+                ):
+                    damage = (damage * (100 + BOSS_AFFIX_METAL_EXPOSED_PRIMARY_BONUS_PCT)) // 100
+                elif (
+                    self.boss_weekly_affix_id == BOSS_AFFIX_WOOD
+                    and self.weekly_affix_wood_team_boost_until_round >= self.engine.round_index
+                ):
+                    damage = (damage * (100 + BOSS_AFFIX_WOOD_TEAM_DAMAGE_BONUS_PCT)) // 100
+                elif (
+                    self.boss_weekly_affix_id == BOSS_AFFIX_FIRE
+                    and is_direct_primary
+                    and source.actor_type == _ACTOR_PET
+                ):
+                    damage = (damage * (100 + BOSS_AFFIX_FIRE_PET_OR_FOLLOWUP_DAMAGE_BONUS_PCT)) // 100
+                elif (
+                    self.boss_weekly_affix_id == BOSS_AFFIX_EARTH
+                    and self.weekly_affix_earth_team_boost_until_round >= self.engine.round_index
+                ):
+                    damage = (damage * (100 + BOSS_AFFIX_EARTH_PARRY_NEXT_ROUND_DAMAGE_BONUS_PCT)) // 100
         # 5. 灵障首领：灵障护盾吸收
         if self.boss_trial_kind == BOSS_TRIAL_KIND_BARRIER and target.is_boss and self.boss_barrier_shield > 0 and damage > 0:
             absorbed = min(damage, self.boss_barrier_shield)
@@ -2753,9 +3161,95 @@ class EncounterV2Controller:
             self.sunder_until_round[target.actor_id] = self.engine.round_index + 2
             self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_BREAKER_SUNDER, attacker.actor_id, target.actor_id, 20)
 
-    def clear_sunder_on_ally_dispel(self, caster: Message, target: Message) -> None:
+    def clear_sunder_on_ally_dispel(
+        self, caster: Message, target: Message, turn: Message | None = None, group: int = 0,
+    ) -> None:
         if self.sunder_until_round.pop(target.actor_id, None) is not None:
             self.engine.trial_tracker.record_effective_contribution(caster)
+            if turn is not None:
+                self.on_boss_weekly_affix_dispel_triggered(caster.actor_id, turn, group)
+
+    def is_actor_exposed(self, actor_id: int) -> bool:
+        """判定指定单位当前回合是否处于首领试炼破绽状态。"""
+        if not actor_id:
+            return False
+        exp = self.exposed_actors.get(actor_id)
+        return exp is not None and exp[0] > 0 and exp[1] >= self.engine.round_index
+
+    def is_weekly_water_discount_skill(self, rule: BattleSkill) -> bool:
+        """判定技能是否满足水周（水·蓄势聚灵）蓄力/毒火耗蓝减免与增伤条件。"""
+        buff_rules = self.engine.effects.rules
+        for effect_buff_id in rule.effects:
+            buff_row = buff_rules.get(effect_buff_id)
+            if buff_row is None:
+                continue
+            if (
+                buff_row.battle_op in (
+                    BattleEffectOp.PREPARE_CAST,
+                    BattleEffectOp.PERIODIC_DAMAGE,
+                    BattleEffectOp.CONSUME_PERIODIC,
+                    BattleEffectOp.EXTEND_PERIODIC,
+                )
+                or buff_row.buff_type in (50, 51)
+            ):
+                return True
+        return False
+
+    def on_boss_weekly_affix_dispel_triggered(self, caster_actor_id: int, turn: Message, group: int) -> None:
+        """木周（木·灵脉涤尘）：成功驱散/净化时，赋予全队增伤至下回合末并每人限一次回复 12% 法力。"""
+        if self.boss_weekly_affix_id != BOSS_AFFIX_WOOD or not caster_actor_id:
+            return
+        caster = self.engine.actors.get(caster_actor_id)
+        if caster is None or caster.team_index != 0 or not _active(caster):
+            return
+        self.weekly_affix_wood_team_boost_until_round = max(
+            self.weekly_affix_wood_team_boost_until_round, self.engine.round_index + 1,
+        )
+        if caster.max_mana <= 0 or caster_actor_id in self.weekly_affix_wood_mana_triggered_actors:
+            return
+        self.weekly_affix_wood_mana_triggered_actors.add(caster_actor_id)
+        raw_gain = max(1, (caster.max_mana * BOSS_AFFIX_WOOD_DISPEL_MANA_REGEN_PCT) // 100)
+        cur_mana = caster.attributes.mana
+        missing = max(0, caster.max_mana - cur_mana)
+        gained = min(raw_gain, missing)
+        if gained > 0:
+            caster.attributes.mana = cur_mana + gained
+            turn.events.add(
+                event_type=_EVENT_MANA,
+                source_id=caster_actor_id,
+                target_id=caster_actor_id,
+                group_id=group,
+                value=gained,
+                mana_delta=min(gained, _I64_MAX),
+                target_health_after=caster.attributes.health,
+                target_mana_after=caster.attributes.mana,
+            )
+        self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_WEEKLY_AFFIX_TRIGGER, caster_actor_id, caster_actor_id, gained)
+
+    def on_boss_weekly_affix_parry_triggered(self, boss_actor_id: int, turn: Message, group: int) -> None:
+        """土周（土·守御反震）：成功化劲触发破绽时，赐予我方全体 8% 最大气血开场护盾及下回合全伤 +12%。"""
+        if self.boss_weekly_affix_id != BOSS_AFFIX_EARTH:
+            return
+        self.weekly_affix_earth_team_boost_until_round = max(
+            self.weekly_affix_earth_team_boost_until_round, self.engine.round_index + 1,
+        )
+        shielded_count = 0
+        for actor in self.engine.actors.values():
+            if actor.team_index != 0 or not _active(actor) or actor.max_health <= 0:
+                continue
+            gain = max(1, (actor.max_health * BOSS_AFFIX_EARTH_PARRY_TEAM_SHIELD_PCT) // 100)
+            pool = min(U64_MAX, self.engine.opening_shield_by_actor.get(actor.actor_id, 0) + gain)
+            self.engine.opening_shield_by_actor[actor.actor_id] = pool
+            turn.events.add(
+                event_type=_EVENT_SHIELD,
+                source_id=actor.actor_id,
+                target_id=actor.actor_id,
+                group_id=group,
+                shield_after=pool,
+            )
+            shielded_count += 1
+        if shielded_count > 0:
+            self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_WEEKLY_AFFIX_TRIGGER, boss_actor_id, boss_actor_id, shielded_count)
 
     def trigger_rejuv_backlash(self, source_id: int, boss: Message, turn: Message, group: int) -> None:
         if not _active(boss):
@@ -2883,8 +3377,9 @@ class EncounterV2Controller:
             if self.boss_stance_remain_rounds == 0:
                 self.boss_stance_type = BOSS_STANCE_NONE
 
-        # 3. 二阶段决战姿态（破釜）：全部特殊护卫阵亡或首领气血 <= 50%，仅触发一次
-        if self.boss_phase < 2 and (not any_special_guard_alive or boss.attributes.health * 2 <= boss.max_health):
+        # 3. 二阶段决战姿态（破釜）：全部特殊护卫阵亡或首领气血 <= 50%（火周提前至 <= 60%），仅触发一次
+        phase_two_hp_pct = BOSS_AFFIX_FIRE_BOSS_PHASE_TWO_HP_PCT if self.boss_weekly_affix_id == BOSS_AFFIX_FIRE else 50
+        if self.boss_phase < 2 and (not any_special_guard_alive or is_health_at_or_below_pct(boss.attributes.health, boss.max_health, phase_two_hp_pct)):
             self.boss_phase = 2
             has_next_round_cleave = any(
                 e.source_actor_id == boss.actor_id and e.execute_round == self.engine.round_index + 1
@@ -2894,6 +3389,37 @@ class EncounterV2Controller:
                 self.engine.round_index + 2 if has_next_round_cleave else self.engine.round_index + 1
             )
             self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_PHASE_TWO_ENRAGE, boss.actor_id, boss.actor_id, 2)
+
+        # 4. 首领试炼周常五行词缀回合末首领压迫（木周 R2/5/8 回 4% 血；水周偶数回合 +1 层蓄势）
+        if (
+            self.boss_weekly_affix_id == BOSS_AFFIX_WOOD
+            and is_wood_regen_round(self.engine.round_index)
+            and boss.max_health > 0
+            and boss.attributes.health < boss.max_health
+        ):
+            raw_regen = max(1, (boss.max_health * BOSS_AFFIX_WOOD_BOSS_REGEN_HP_PCT) // 100)
+            healed = landed_heal(boss, float(raw_regen))
+            if healed > 0:
+                boss.attributes.health += healed
+                turn.events.add(
+                    event_type=_EVENT_HEAL,
+                    source_id=boss.actor_id,
+                    target_id=boss.actor_id,
+                    group_id=group,
+                    value=healed,
+                    target_health_after=boss.attributes.health,
+                    target_mana_after=boss.attributes.mana,
+                )
+                self.emit_boss_mechanic_event(turn, group, BOSS_MECHANIC_WEEKLY_AFFIX_TRIGGER, boss.actor_id, boss.actor_id, healed)
+        elif (
+            self.boss_weekly_affix_id == BOSS_AFFIX_WATER
+            and is_water_momentum_round(self.engine.round_index)
+            and self.boss_momentum_stacks < BOSS_MOMENTUM_MAX_STACKS
+        ):
+            self.boss_momentum_stacks += 1
+            self.emit_boss_mechanic_event(
+                turn, group, BOSS_MECHANIC_MOMENTUM_GAIN, boss.actor_id, boss.actor_id, self.boss_momentum_stacks,
+            )
 
     def refresh_encounter_telegraphs(self) -> None:
         round_idx = self.engine.round_index
@@ -3243,6 +3769,8 @@ class EncounterV2Controller:
                         scale *= 1.0 + (self.boss_momentum_stacks * BOSS_MOMENTUM_PER_STACK_PCT) / 100.0
                     if self.boss_phase >= 2:
                         scale *= 1.10
+                    if self.boss_weekly_affix_id == BOSS_AFFIX_EARTH:
+                        scale *= BOSS_AFFIX_EARTH_BOSS_CLEAVE_MULTIPLIER
                 valid_targets = 0
                 invalid_targets = 0
                 parried_targets = 0
@@ -3293,12 +3821,14 @@ class EncounterV2Controller:
                             self.emit_boss_mechanic_event(
                                 turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
                             )
+                            self.on_boss_weekly_affix_parry_triggered(source.actor_id, turn, grp)
                         elif len(target_ids) >= 2 and parried_targets >= 1:
                             self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_PARTIAL_PCT, self.engine.round_index + 1)
                             self.engine.trial_tracker.cleave_parry_count += 1
                             self.emit_boss_mechanic_event(
                                 turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_PARTIAL_PCT,
                             )
+                            self.on_boss_weekly_affix_parry_triggered(source.actor_id, turn, grp)
                         record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "慢速重劈已发动")
             elif kind == TELEGRAPH_KIND_BOSS_VENOM_AOE:
                 targets = self._collect_alive_enemies(source)
@@ -3312,6 +3842,8 @@ class EncounterV2Controller:
                         scale *= 1.0 + (self.boss_momentum_stacks * BOSS_MOMENTUM_PER_STACK_PCT) / 100.0
                     if self.boss_phase >= 2:
                         scale *= 1.10
+                    if self.boss_weekly_affix_id == BOSS_AFFIX_EARTH:
+                        scale *= BOSS_AFFIX_EARTH_BOSS_CLEAVE_MULTIPLIER
                 valid_targets = 0
                 parried_targets = 0
                 for tid in targets:
@@ -3350,12 +3882,14 @@ class EncounterV2Controller:
                         self.emit_boss_mechanic_event(
                             turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
                         )
+                        self.on_boss_weekly_affix_parry_triggered(source.actor_id, turn, grp)
                     elif valid_targets >= 2 and parried_targets * 2 >= valid_targets:
                         self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_PARTIAL_PCT, self.engine.round_index + 1)
                         self.engine.trial_tracker.cleave_parry_count += 1
                         self.emit_boss_mechanic_event(
                             turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_PARTIAL_PCT,
                         )
+                        self.on_boss_weekly_affix_parry_triggered(source.actor_id, turn, grp)
                 record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "玄毒冲击已发动")
             elif kind == TELEGRAPH_KIND_GUARD_HEAL:
                 boss = self._find_alive_boss()
@@ -3493,6 +4027,7 @@ class EncounterV2Controller:
             dispelled_any = True
         if dispelled_any:
             self.engine.trial_tracker.record_effective_contribution(source)
+            self.on_boss_weekly_affix_dispel_triggered(source.actor_id, turn, group)
 
     def advance_round_cleanup(self) -> None:
         round_idx = self.engine.round_index
@@ -3514,6 +4049,8 @@ class EncounterV2Controller:
         if self.is_boss_trial:
             state.boss_phase = self.boss_phase
             state.boss_momentum_stacks = self.boss_momentum_stacks
+            if self.boss_weekly_affix_id != BOSS_AFFIX_NONE:
+                state.boss_weekly_affix_id = self.boss_weekly_affix_id
             if self.boss_stance_type != BOSS_STANCE_NONE and self.boss_stance_remain_rounds > 0:
                 state.boss_stance_type = self.boss_stance_type
                 state.boss_stance_remain_rounds = self.boss_stance_remain_rounds
@@ -3758,9 +4295,11 @@ class ConfiguredAbilitiesController:
         """判定当前战场是否存在至少一名满足该配置化战法目标条件的单位。"""
         return any(self.target_allowed(caster, cand, rule) for cand in self.engine.actors.values())
 
-    def is_skill_copyable_for(self, caster: Message, rule: BattleSkill) -> bool:
+    def is_skill_copyable_for(self, caster: Message, rule: BattleSkill, skill_id: int = 0) -> bool:
         """判定指定技能是否可被 A41 玄镜映法镜像复制（对照 `IsSkillCopyableFor`）。"""
         if rule.battle_model != 1 or rule.ability_kind != 1:
+            return False
+        if skill_id and self.engine.is_skill_banned(skill_id):
             return False
         if rule.forbid_copy or rule.health_cost_mode != 0 or rule.max_battle_uses != 0:
             return False
@@ -3782,7 +4321,7 @@ class ConfiguredAbilitiesController:
             return False
         for sid in target.skill_table_ids:
             cand = self.engine.skills.rules.get(sid)
-            if cand is not None and self.is_skill_copyable_for(caster, cand):
+            if cand is not None and self.is_skill_copyable_for(caster, cand, sid):
                 return True
         return False
 
@@ -3791,13 +4330,13 @@ class ConfiguredAbilitiesController:
         planned_action = self.engine.pending.get(target.actor_id)
         if planned_action is not None and planned_action.action_type == _ACTION_SKILL:
             planned = self.engine.skills.rules.get(planned_action.skill_table_id)
-            if planned is not None and self.is_skill_copyable_for(caster, planned):
+            if planned is not None and self.is_skill_copyable_for(caster, planned, planned_action.skill_table_id):
                 return planned_action.skill_table_id
         candidates = sorted({
             sid
             for sid in target.skill_table_ids
             if (cand := self.engine.skills.rules.get(sid)) is not None
-            and self.is_skill_copyable_for(caster, cand)
+            and self.is_skill_copyable_for(caster, cand, sid)
         })
         if not candidates:
             return None
@@ -3805,9 +4344,11 @@ class ConfiguredAbilitiesController:
         return candidates[pick]
 
     def check_skill(self, actor: Message, action: Message, rule: BattleSkill) -> int:
-        """校验配置化战法的封印/专修禁攻、蓄力防重、冷却、次数、耗蓝与目标合法性。"""
+        """校验配置化战法的禁招、封印/专修禁攻、蓄力防重、冷却、次数、耗蓝与目标合法性。"""
         if not self.subject_allowed(actor, rule) or not rule.castable:
             return 7004
+        if self.engine.is_skill_banned(action.skill_table_id):
+            return ERR_SKILL_BANNED_IN_BATTLE
         if getattr(self.engine, "ban_control_skills", False) and self.engine.is_control_skill(rule):
             return 7004
         if (
@@ -3833,6 +4374,16 @@ class ConfiguredAbilitiesController:
         cost = _mana_cost(actor, rule)
         if actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
             cost = self.engine.equipment_effects.discount_skill_mana(actor, rule, cost)
+        if (
+            actor.team_index == 0
+            and self.engine.encounter.boss_weekly_affix_id == BOSS_AFFIX_WATER
+            and self.engine.encounter.is_weekly_water_discount_skill(rule)
+        ):
+            cost = discount_water_mana_cost(cost)
+        if self.engine.equipment_effects.is_defend_breath_resonance_ready(
+            actor, action.skill_table_id, self.engine.round_index
+        ):
+            cost = SeasonBattleRules.resonance_half_mana_cost(cost)
         if cost > actor.attributes.mana:
             return 7004
         if action.target_id != 0:
@@ -3917,31 +4468,48 @@ class ConfiguredAbilitiesController:
             targets.append(candidates.pop(chosen_pos))
         return targets
 
+    def initialize_abilities_for_actor(self, actor: Message, turn: Message, group: int = 0) -> None:
+        """为单个单位初始化配置化被动、触发器与开场光环（供开局与临阵唤灵复用）。"""
+        for skill_id in sorted(actor.skill_ranks):
+            rule = self.engine.skills.rules.get(skill_id)
+            if rule is None or rule.battle_model != 1 or not self.subject_allowed(actor, rule):
+                continue
+            if skill_id not in actor.runtime_skills:
+                actor.runtime_skills.append(skill_id)
+            if not rule.init_effects:
+                continue
+            rank = max(1, actor.skill_ranks.get(skill_id, 1))
+            if rule.ability_kind == 4:
+                primary = actor.owner_player_id if actor.actor_type == _ACTOR_PET else actor.actor_id
+                targets = self.select_targets(actor, rule, primary)
+            else:
+                targets = [actor]
+            primary_id = targets[0].actor_id if targets else 0
+            for target in targets:
+                for effect_id in rule.init_effects:
+                    self.apply_effect(
+                        actor, target, effect_id, rule=rule, skill_id=skill_id, rank=rank,
+                        primary_target_id=primary_id, turn=turn, group=group, hit=0,
+                    )
+
     def initialize_abilities(self) -> None:
         """在阵容最终锁定后初始化全部配置化被动、触发器与开场光环（对照 `InitializeConfiguredAbilities`）。"""
         ignored = self.engine.protocol.message("TurnResultS2C")
         for actor in self.engine.actors.values():
-            for skill_id in sorted(actor.skill_ranks):
-                rule = self.engine.skills.rules.get(skill_id)
-                if rule is None or rule.battle_model != 1 or not self.subject_allowed(actor, rule):
-                    continue
-                if skill_id not in actor.runtime_skills:
-                    actor.runtime_skills.append(skill_id)
-                if not rule.init_effects:
-                    continue
-                rank = max(1, actor.skill_ranks.get(skill_id, 1))
-                if rule.ability_kind == 4:
-                    primary = actor.owner_player_id if actor.actor_type == _ACTOR_PET else actor.actor_id
-                    targets = self.select_targets(actor, rule, primary)
-                else:
-                    targets = [actor]
-                primary_id = targets[0].actor_id if targets else 0
-                for target in targets:
-                    for effect_id in rule.init_effects:
-                        self.apply_effect(
-                            actor, target, effect_id, rule=rule, skill_id=skill_id, rank=rank,
-                            primary_target_id=primary_id, turn=ignored, group=0, hit=0,
-                        )
+            self.initialize_abilities_for_actor(actor, ignored, 0)
+
+    def reset_volatile_growing_stacks(self, actor: Message) -> None:
+        """单位阵亡时重置非 `keep_on_death` 成长光环层数（对照 `ResetVolatileGrowingStacks`）。"""
+        rules = self.engine.effects.rules
+        for entry in actor.buffs:
+            row = rules.get(entry.buff_table_id)
+            if (
+                row is not None
+                and row.battle_op == BattleEffectOp.GROWING_AURA
+                and not row.keep_on_death
+                and entry.stacks > 0
+            ):
+                entry.stacks = 0
 
     def apply_effect(
         self,
@@ -3961,6 +4529,7 @@ class ConfiguredAbilitiesController:
         scale: float = 1.0,
         is_mirror: bool = False,
         depth: int = 0,
+        paid_mana: int = 0,
     ) -> None:
         """执行单条配置化 Buff/技能子效果（对照 `ApplyConfiguredEffect` 核心分支）。"""
         row = self.engine.effects.rules.get(buff_id)
@@ -4044,6 +4613,7 @@ class ConfiguredAbilitiesController:
                 is_primary_target=is_primary, is_primary_focus=(primary_focus_bonus and is_primary),
                 damage_scale=scale,
                 damage_origin=(_DAMAGE_ORIGIN_MIRROR if is_mirror else 0),
+                paid_mana=paid_mana,
             )
             return
 
@@ -4103,12 +4673,16 @@ class ConfiguredAbilitiesController:
                 receiver, raw, source=caster, buff_table_id=buff_id,
                 remain_rounds=row.config_duration_rounds or row.duration_rounds or 2,
                 round_index=self.engine.round_index, turn=turn, group=group, commit_artifacts=(hit == 0 and not is_mirror),
+                skill_id=skill_id, is_mirror=is_mirror,
             )
             return
 
         if op == BattleEffectOp.DISPEL_ALLY:
-            self.engine.encounter.clear_sunder_on_ally_dispel(caster, receiver)
-            self.engine.effects.dispel(receiver, max(1, rule.dispel_count if rule else 1), turn, group, hit)
+            self.engine.encounter.clear_sunder_on_ally_dispel(caster, receiver, turn, group)
+            removed = self.engine.effects.dispel(receiver, max(1, rule.dispel_count if rule else 1), turn, group, hit)
+            if removed:
+                self.engine.record_dispel_landed(caster.actor_id, removed)
+                self.engine.encounter.on_boss_weekly_affix_dispel_triggered(caster.actor_id, turn, group)
             return
 
         if op == BattleEffectOp.DISPEL_ENEMY:
@@ -4145,6 +4719,21 @@ class ConfiguredAbilitiesController:
 
         instance_id = self.engine.effects.next_buff_id()
         remain = row.config_duration_rounds if row.config_duration_rounds > 0 else (0 if row.infinite else row.duration_rounds)
+        mystic_resonance_extended = False
+        eq = self.engine.equipment_effects
+        if (
+            hostile
+            and op == BattleEffectOp.MODIFIER
+            and remain > 0
+            and not is_mirror
+            and skill_id == SeasonBattleRules.SKILL_POZHEN_LINGLEI
+            and caster.actor_id == eq.pending_mystic_extend_caster_id
+            and receiver.actor_id == eq.pending_mystic_extend_target_id
+        ):
+            remain += SeasonBattleRules.RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS
+            eq.pending_mystic_extend_caster_id = 0
+            eq.pending_mystic_extend_target_id = 0
+            mystic_resonance_extended = True
         entry = receiver.buffs.add(
             buff_id=instance_id,
             buff_table_id=buff_id,
@@ -4171,6 +4760,15 @@ class ConfiguredAbilitiesController:
             group_id=group,
             hit_index=hit,
         )
+        if mystic_resonance_extended:
+            eq.emit_season_resonance(
+                caster,
+                receiver.actor_id,
+                SeasonBattleRules.RESONANCE_EVENT_MYSTIC_EXTEND_DEBUFF,
+                SeasonBattleRules.RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS,
+                turn,
+                group,
+            )
         if row.trigger_event == 0 and op not in (BattleEffectOp.PURSUIT_DAMAGE, BattleEffectOp.PREPARE_CAST):
             for child in row.sub_buffs:
                 if not any(b.buff_id == instance_id for b in receiver.buffs):
@@ -4212,13 +4810,43 @@ class ConfiguredAbilitiesController:
             skill_table_id=skill_id,
             hit_kind=(_HIT_MIRROR if is_mirror else 0),
         )
+        paid_mana = 0
+        eq = self.engine.equipment_effects
         if not is_mirror:
             from .battle_skills import mana_cost as _mana_cost
             cost = _mana_cost(actor, rule)
+            if actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
+                cost = eq.discount_skill_mana(actor, rule, cost)
+            if (
+                actor.team_index == 0
+                and self.engine.encounter.boss_weekly_affix_id == BOSS_AFFIX_WATER
+                and self.engine.encounter.is_weekly_water_discount_skill(rule)
+            ):
+                cost = discount_water_mana_cost(cost)
+            full_cost = cost
+            consume_breath_resonance = eq.is_defend_breath_resonance_ready(actor, skill_id, self.engine.round_index)
+            if consume_breath_resonance:
+                cost = SeasonBattleRules.resonance_half_mana_cost(cost)
+            paid_mana = cost
             if cost > 0:
                 cost = min(cost, actor.attributes.mana)
+                paid_mana = cost
                 actor.attributes.mana -= cost
                 self.engine.skills._mana_event(turn, group, 0, actor, actor, skill_id, -cost)
+            if consume_breath_resonance:
+                rt = eq.season_seal_runtime(actor.actor_id)
+                rt.defend_resonance_ready_round = 0
+                saved = max(0, full_cost - paid_mana)
+                if saved > 0:
+                    rt.contribution_value = min(U64_MAX, rt.contribution_value + saved)
+                    eq.emit_season_resonance(
+                        actor,
+                        actor.actor_id,
+                        SeasonBattleRules.RESONANCE_EVENT_BREATH_HALF_MANA,
+                        saved,
+                        turn,
+                        group,
+                    )
 
         subject_max = (rule.pet_max_targets or rule.max_targets) if actor.actor_type == _ACTOR_PET else rule.max_targets
         is_multi = subject_max > 1
@@ -4231,6 +4859,23 @@ class ConfiguredAbilitiesController:
             and targets[0].actor_id == action.target_id
             and len(targets) < subject_max
         )
+        guard_resonance_active = False
+        if (
+            not is_mirror
+            and actor.actor_type == _ACTOR_PLAYER
+            and skill_id == SeasonBattleRules.SKILL_GUZHEN_LINGZHANG
+            and actor.HasField("equipment_effects")
+            and actor.equipment_effects.HasField("season_seal")
+        ):
+            seal = actor.equipment_effects.season_seal
+            if seal.season_id == SeasonBattleRules.SEASON_1_ID and seal.seal_id == SeasonBattleRules.SEAL_GUZHEN_SHOUYIN:
+                rt = eq.season_seal_runtime(actor.actor_id)
+                if not rt.guard_resonance_consumed and rt.guard_resonance_ready_round == self.engine.round_index:
+                    rt.guard_resonance_consumed = True
+                    rt.guard_resonance_ready_round = 0
+                    guard_resonance_active = True
+                    eq.active_guard_shield_resonance_caster_id = actor.actor_id
+                    eq.active_guard_shield_resonance_extra = 0
         effects_begin = len(turn.events)
         primary_target_id = targets[0].actor_id
         for idx, target in enumerate(targets):
@@ -4246,7 +4891,24 @@ class ConfiguredAbilitiesController:
                     actor, target, eff_id, rule=rule, skill_id=skill_id, rank=rank,
                     primary_target_id=primary_target_id, turn=turn, group=group, hit=idx,
                     is_multi_target=is_multi, primary_focus_bonus=primary_focus,
-                    scale=scale, is_mirror=is_mirror,
+                    scale=scale, is_mirror=is_mirror, paid_mana=paid_mana,
+                )
+            eq.pending_mystic_extend_caster_id = 0
+            eq.pending_mystic_extend_target_id = 0
+        if guard_resonance_active and eq.active_guard_shield_resonance_caster_id == actor.actor_id:
+            extra_shield = eq.active_guard_shield_resonance_extra
+            eq.active_guard_shield_resonance_caster_id = 0
+            eq.active_guard_shield_resonance_extra = 0
+            if extra_shield > 0:
+                rt = eq.season_seal_runtime(actor.actor_id)
+                rt.contribution_value = min(U64_MAX, rt.contribution_value + extra_shield)
+                eq.emit_season_resonance(
+                    actor,
+                    actor.actor_id,
+                    SeasonBattleRules.RESONANCE_EVENT_GUARD_SHIELD_BOOST,
+                    extra_shield,
+                    turn,
+                    group,
                 )
 
         if is_mirror:
@@ -4268,6 +4930,21 @@ class ConfiguredAbilitiesController:
             self.consume_one_shot_attack_modifiers(actor, rule.damage_kind, turn, group)
         if hit_directly and _active(actor):
             self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_SKILL, rule.damage_kind, turn, group, skill_id=skill_id)
+            self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_DIRECT_ATTACK, rule.damage_kind, turn, group, skill_id=skill_id)
+        if _active(actor):
+            if any(
+                (eff := self.engine.effects.rules.get(eid)) is not None
+                and eff.battle_op == BattleEffectOp.CONTROL
+                and 1 <= eff.state_kind <= 6
+                for eid in rule.effects
+            ):
+                self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_CONTROL_ATTEMPT, rule.damage_kind, turn, group, skill_id=skill_id)
+            if any(
+                (eff := self.engine.effects.rules.get(eid)) is not None
+                and eff.battle_op in (BattleEffectOp.HEAL, BattleEffectOp.SHIELD, BattleEffectOp.DISPEL_ALLY)
+                for eid in rule.effects
+            ):
+                self.trigger_buffs(actor, targets[0], BattleTrigger.AFTER_SUPPORT_CAST, rule.damage_kind, turn, group, skill_id=skill_id)
 
     def execute_prepared_cast_if_ready(self, actor: Message, turn: Message, group: int) -> bool:
         """若单位在上回合进入蓄力且本回合未被控制/封印打断，则自动释放蓄力战法（对照 `ExecutePreparedCastIfReady`）。"""
@@ -4327,6 +5004,14 @@ class ConfiguredAbilitiesController:
         self.engine._event(turn, group, 2, actor, targets[0], skill_table_id=saved_skill_id, hit_kind=0)
         effects_begin = len(turn.events)
         primary_target_id = targets[0].actor_id
+        charge_scale = (
+            (100.0 + BOSS_AFFIX_WATER_CHARGE_OR_PERIODIC_DAMAGE_BONUS_PCT) / 100.0
+            if (
+                actor.team_index == 0
+                and self.engine.encounter.boss_weekly_affix_id == BOSS_AFFIX_WATER
+            )
+            else 1.0
+        )
         for idx, target in enumerate(targets):
             if target.fled:
                 continue
@@ -4334,7 +5019,7 @@ class ConfiguredAbilitiesController:
                 self.apply_effect(
                     actor, target, child_buff_id, rule=skill_row, skill_id=saved_skill_id, rank=rank,
                     primary_target_id=primary_target_id, turn=turn, group=group, hit=idx,
-                    is_multi_target=is_multi, primary_focus_bonus=primary_focus, depth=1,
+                    is_multi_target=is_multi, primary_focus_bonus=primary_focus, scale=charge_scale, depth=1,
                 )
 
         hit_directly = any(
@@ -4383,7 +5068,11 @@ class ConfiguredAbilitiesController:
             saved.last_trigger_round = self.engine.round_index
             src_skill = self.engine.skills.rules.get(saved.source_skill_id)
             rank = max(1, owner.skill_ranks.get(saved.source_skill_id, 1))
-            if row.battle_op in (BattleEffectOp.APPLY_CHILDREN, BattleEffectOp.EVASION_CHARGE):
+            if row.battle_op == BattleEffectOp.GROWING_AURA:
+                cap = max(1, row.stack_limit)
+                if saved.stacks < cap:
+                    saved.stacks += 1
+            elif row.battle_op in (BattleEffectOp.APPLY_CHILDREN, BattleEffectOp.EVASION_CHARGE):
                 for child in row.sub_buffs:
                     self.apply_effect(
                         owner, owner, child, rule=src_skill, skill_id=saved.source_skill_id, rank=rank,

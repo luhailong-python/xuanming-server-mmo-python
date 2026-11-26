@@ -129,14 +129,17 @@ class BattleEffects:
             if configured is not None:
                 configured.sync_charging_skill_id(target)
 
-    def dispel(self, target: Message, count: int, turn: Message, group: int, hit: int) -> None:
+    def dispel(self, target: Message, count: int, turn: Message, group: int, hit: int) -> int:
         index = 0
+        removed = 0
         while index < len(target.buffs) and count:
             if self.is_debuff(target.buffs[index]):
                 self._remove(target, index, turn, group, hit)
                 count -= 1
+                removed += 1
             else:
                 index += 1
+        return removed
 
     def _index(self, target: Message, buff_id: int) -> int | None:
         return next((index for index, entry in enumerate(target.buffs) if entry.buff_id == buff_id), None)
@@ -159,18 +162,24 @@ class BattleEffects:
             turn.events.add(event_type=15, source_id=caster_id, target_id=target.actor_id,
                             buff_table_id=table_id, group_id=group, hit_index=hit)
             return
+        removed_by_tag = 0
         if rule.dispel_tags:
             for index in range(len(target.buffs) - 1, -1, -1):
                 existing_rule = self.rules.get(target.buffs[index].buff_table_id)
                 if existing_rule is not None and rule.dispel_tags & existing_rule.tags:
                     self._remove(target, index, turn, group, hit)
+                    removed_by_tag += 1
+        if removed_by_tag and hasattr(self.engine, "record_dispel_landed"):
+            self.engine.record_dispel_landed(caster_id, removed_by_tag)
         caster = self.engine.actors.get(caster_id)
         encounter = getattr(self.engine, "encounter", None)
         if caster is not None and encounter is not None:
             if (rule.buff_type == 35 or rule.battle_op == 5) and caster.team_index != target.team_index:
                 encounter.try_dispel_boss_stance(caster, target, turn, group)
             elif rule.battle_op == 4 and caster.team_index == target.team_index:
-                encounter.clear_sunder_on_ally_dispel(caster, target)
+                encounter.clear_sunder_on_ally_dispel(caster, target, turn, group)
+            if removed_by_tag:
+                encounter.on_boss_weekly_affix_dispel_triggered(caster.actor_id, turn, group)
         if rule.buff_type == 35:
             return
         for entry in target.buffs:

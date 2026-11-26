@@ -116,6 +116,8 @@ class _MilestoneRow:
     grant_appearance_id: str = ""
     reward_id: int = 0
     enabled: bool = True
+    grant_pet_cosmetic_id: int = 0
+    grant_skill_vfx_id: int = 0
 
 
 # 默认卷一目录与位图下标（与 C++ generated/tables/trialjournal*.json 及 *_bit_index.h 严格一致；
@@ -311,6 +313,22 @@ class SceneTrialJournal:
     def initialize_on_load(self, data) -> None:
         """角色载入时确保 trial_journal_component 存在，原样保留位图未知高位。"""
         data.trial_journal_component.SetInParent()
+
+    def validate_tables(self) -> bool:
+        """校验试炼志里程碑独占外观/灵宠外观/技能特效外键合法性（禁止商业化可购条目冒充试炼专属）。"""
+        for milestone in self._milestones():
+            if not milestone.enabled:
+                continue
+            if not self._is_valid_exclusive_appearance(getattr(milestone, "grant_appearance_id", "")):
+                logger.error("TrialJournal table validation failed: milestone_id=%s invalid appearance", milestone.id)
+                return False
+            if not self._is_valid_exclusive_pet_cosmetic(int(getattr(milestone, "grant_pet_cosmetic_id", 0))):
+                logger.error("TrialJournal table validation failed: milestone_id=%s invalid pet_cosmetic", milestone.id)
+                return False
+            if not self._is_valid_exclusive_skill_vfx(int(getattr(milestone, "grant_skill_vfx_id", 0))):
+                logger.error("TrialJournal table validation failed: milestone_id=%s invalid skill_vfx", milestone.id)
+                return False
+        return True
 
     # ── 目录与位图映射解析（优先配表，缺表时回退到权威默认目录） ──
 
@@ -522,6 +540,80 @@ class SceneTrialJournal:
         if bit_idx is not None:
             data.profile_component.appearance_owned_bits = set_packed_bit(
                 data.profile_component.appearance_owned_bits, bit_idx,
+            )
+
+    def _find_pet_cosmetic_name(self, cosmetic_id: int) -> str:
+        if not cosmetic_id or "PetCosmetic" not in self.tables.tables:
+            return ""
+        row = self.tables["PetCosmetic"].get(int(cosmetic_id))
+        return row.name if row is not None else ""
+
+    def _is_valid_exclusive_pet_cosmetic(self, cosmetic_id: int) -> bool:
+        if not cosmetic_id:
+            return True
+        if "PetCosmetic" not in self.tables.tables:
+            return False
+        row = self.tables["PetCosmetic"].get(int(cosmetic_id))
+        return (
+            row is not None
+            and bool(getattr(row, "enabled", 0))
+            and not getattr(row, "card_item_id", 0)
+            and not getattr(row, "mall_sku_id", 0)
+            and not getattr(row, "spirit_shop_goods_id", 0)
+        )
+
+    def _grant_pet_cosmetic(self, data, cosmetic_id: int) -> None:
+        if not cosmetic_id or "PetCosmetic" not in self.tables.tables:
+            return
+        table = self.tables["PetCosmetic"]
+        target = table.get(int(cosmetic_id))
+        if target is None:
+            return
+        try:
+            bit_idx = table.bit_index(target.id)
+        except KeyError:
+            ordered = sorted(row.id for row in table.rows())
+            bit_idx = ordered.index(target.id)
+        if bit_idx is not None:
+            data.profile_component.pet_cosmetic_owned_bits = set_packed_bit(
+                bytes(getattr(data.profile_component, "pet_cosmetic_owned_bits", b"")), bit_idx,
+            )
+
+    def _find_skill_vfx_name(self, cosmetic_id: int) -> str:
+        if not cosmetic_id or "SkillVfxCosmetic" not in self.tables.tables:
+            return ""
+        row = self.tables["SkillVfxCosmetic"].get(int(cosmetic_id))
+        return row.name if row is not None else ""
+
+    def _is_valid_exclusive_skill_vfx(self, cosmetic_id: int) -> bool:
+        if not cosmetic_id:
+            return True
+        if "SkillVfxCosmetic" not in self.tables.tables:
+            return False
+        row = self.tables["SkillVfxCosmetic"].get(int(cosmetic_id))
+        return (
+            row is not None
+            and bool(getattr(row, "enabled", 0))
+            and not getattr(row, "card_item_id", 0)
+            and not getattr(row, "mall_sku_id", 0)
+            and not getattr(row, "spirit_shop_goods_id", 0)
+        )
+
+    def _grant_skill_vfx(self, data, cosmetic_id: int) -> None:
+        if not cosmetic_id or "SkillVfxCosmetic" not in self.tables.tables:
+            return
+        table = self.tables["SkillVfxCosmetic"]
+        target = table.get(int(cosmetic_id))
+        if target is None:
+            return
+        try:
+            bit_idx = table.bit_index(target.id)
+        except KeyError:
+            ordered = sorted(row.id for row in table.rows())
+            bit_idx = ordered.index(target.id)
+        if bit_idx is not None:
+            data.profile_component.skill_vfx_owned_bits = set_packed_bit(
+                bytes(getattr(data.profile_component, "skill_vfx_owned_bits", b"")), bit_idx,
             )
 
     # ── 背包协作原语（优先走 scene.assets；表未同步 3403/3404/3301..3308 时保持同口径原子语义） ──
@@ -933,6 +1025,10 @@ class SceneTrialJournal:
                 commentary_body=row.commentary_body,
                 grant_appearance_id=row.grant_appearance_id,
                 grant_appearance_name=self._find_appearance_name(row.grant_appearance_id),
+                grant_pet_cosmetic_id=getattr(row, "grant_pet_cosmetic_id", 0),
+                grant_pet_cosmetic_name=self._find_pet_cosmetic_name(getattr(row, "grant_pet_cosmetic_id", 0)),
+                grant_skill_vfx_id=getattr(row, "grant_skill_vfx_id", 0),
+                grant_skill_vfx_name=self._find_skill_vfx_name(getattr(row, "grant_skill_vfx_id", 0)),
                 reached=reached,
                 claimed=claimed,
                 claimable=reached and not claimed and writable_err == 0,
@@ -988,8 +1084,13 @@ class SceneTrialJournal:
                 getattr(prior, "trial_milestone_voucher_count", 0)
                 or (row.bound_artifact_voucher_count if row is not None else 0)
             )
-            if row is not None and row.grant_appearance_id:
-                response.granted_appearance_id = row.grant_appearance_id
+            if row is not None:
+                if row.grant_appearance_id:
+                    response.granted_appearance_id = row.grant_appearance_id
+                if getattr(row, "grant_pet_cosmetic_id", 0):
+                    response.granted_pet_cosmetic_id = row.grant_pet_cosmetic_id
+                if getattr(row, "grant_skill_vfx_id", 0):
+                    response.granted_skill_vfx_id = row.grant_skill_vfx_id
             return self._finish(response, player, data, stamp)
 
         if self.assets is None:
@@ -1013,7 +1114,13 @@ class SceneTrialJournal:
         )
         if current_seals < milestone.required_seals:
             return self._finish(response, player, data, stamp, TRIAL_JOURNAL_MILESTONE_NOT_REACHED)
-        if not self._is_valid_exclusive_appearance(milestone.grant_appearance_id):
+        grant_pet_id = getattr(milestone, "grant_pet_cosmetic_id", 0)
+        grant_vfx_id = getattr(milestone, "grant_skill_vfx_id", 0)
+        if (
+            not self._is_valid_exclusive_appearance(milestone.grant_appearance_id)
+            or not self._is_valid_exclusive_pet_cosmetic(grant_pet_id)
+            or not self._is_valid_exclusive_skill_vfx(grant_vfx_id)
+        ):
             return self._finish(response, player, data, stamp, TRIAL_JOURNAL_UNAVAILABLE)
 
         grant_counts: dict[int, int] = {}
@@ -1049,6 +1156,10 @@ class SceneTrialJournal:
             )
         if milestone.grant_appearance_id:
             self._grant_appearance(data, milestone.grant_appearance_id)
+        if grant_pet_id:
+            self._grant_pet_cosmetic(data, grant_pet_id)
+        if grant_vfx_id:
+            self._grant_skill_vfx(data, grant_vfx_id)
         _bump_revision(data.trial_journal_component)
         client_request.remember(
             data.client_request_ledger,
@@ -1079,6 +1190,10 @@ class SceneTrialJournal:
         response.granted_voucher_count = milestone.bound_artifact_voucher_count
         if milestone.grant_appearance_id:
             response.granted_appearance_id = milestone.grant_appearance_id
+        if grant_pet_id:
+            response.granted_pet_cosmetic_id = grant_pet_id
+        if grant_vfx_id:
+            response.granted_skill_vfx_id = grant_vfx_id
         return self._finish(response, player, data, stamp)
 
     def _remember_redeem(self, player_id: int, request_id: int, item_id: int, config_id: int) -> None:

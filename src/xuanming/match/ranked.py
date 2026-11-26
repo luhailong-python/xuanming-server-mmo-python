@@ -173,6 +173,8 @@ class RankedRuleConfig:
     tier_yunzhang_centi: int = 160_000
     tier_tianshu_centi: int = 172_000
     tier_wushuang_centi: int = 185_000
+    skill_ban_slots_per_team: int = 3
+    skill_ban_min_rating_centi: int = 160_000
 
     @classmethod
     def from_row(cls, row: Message) -> RankedRuleConfig:
@@ -202,6 +204,10 @@ class RankedRuleConfig:
             tier_yunzhang_centi=int(row.tier_yunzhang_centi) or defaults.tier_yunzhang_centi,
             tier_tianshu_centi=int(row.tier_tianshu_centi) or defaults.tier_tianshu_centi,
             tier_wushuang_centi=int(row.tier_wushuang_centi) or defaults.tier_wushuang_centi,
+            skill_ban_slots_per_team=int(getattr(row, "skill_ban_slots_per_team", defaults.skill_ban_slots_per_team)),
+            skill_ban_min_rating_centi=(
+                int(getattr(row, "skill_ban_min_rating_centi", 0)) or defaults.skill_ban_min_rating_centi
+            ),
         )
 
     @classmethod
@@ -356,6 +362,112 @@ class RankedPlayerSeasonRow:
     honor_bits: int
     final_rank: int
     updated_ms: int
+    current_win_streak: int = 0
+    best_win_streak: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RankedRivalryRow:
+    """``match_ranked_rivalry`` 表行模型（论剑 V6 赛季宿敌交手账本）。"""
+
+    season_id: int
+    player_id: int
+    opponent_id: int
+    opponent_name: str
+    wins: int
+    losses: int
+    draws: int
+    last_outcome: int  # 1=win, 2=loss, 3=draw
+    last_battle_id: int
+    updated_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class RankedFeaturedBuildRow:
+    """``match_ranked_featured_build`` 表行模型（论剑 V6 问道名局热门流派聚合）。"""
+
+    season_id: int
+    build_key: str
+    season_seal_id: int
+    starter_pet_table_id: int
+    core_skill_ids: str
+    appearances: int
+    wins: int
+    high_tier_wins: int
+    featured_battle_id: int
+    featured_player_id: int
+    featured_player_name: str
+    featured_rating_centi: int
+    featured_team_size: int
+    featured_total_rounds: int
+    updated_ms: int
+
+
+def is_rivalry_revenge_target(rec: RankedRivalryRow | None) -> bool:
+    """判定宿敌是否处于可复仇态（上次负于对手，或本季总败场 > 胜场）。"""
+    if rec is None or (rec.wins + rec.losses) == 0:
+        return False
+    return rec.last_outcome == 2 or rec.losses > rec.wins
+
+
+def next_rivalry_row(
+    season_id: int,
+    player_id: int,
+    opponent_id: int,
+    opponent_name: str,
+    prior: RankedRivalryRow | None,
+    *,
+    is_draw: bool,
+    player_won: bool,
+    battle_id: int,
+    stamp: int,
+) -> RankedRivalryRow:
+    """纯函数推进单条宿敌交手账本行。"""
+    wins = prior.wins if prior else 0
+    losses = prior.losses if prior else 0
+    draws = prior.draws if prior else 0
+    name = opponent_name or (prior.opponent_name if prior else "")
+    if is_draw:
+        draws += 1
+        last_outcome = 3
+    elif player_won:
+        wins += 1
+        last_outcome = 1
+    else:
+        losses += 1
+        last_outcome = 2
+    return RankedRivalryRow(
+        season_id=season_id,
+        player_id=player_id,
+        opponent_id=opponent_id,
+        opponent_name=name,
+        wins=wins,
+        losses=losses,
+        draws=draws,
+        last_outcome=last_outcome,
+        last_battle_id=battle_id,
+        updated_ms=stamp,
+    )
+
+
+def canonical_build_key(seal_id: int, pet_table_id: int, skill_ids: list[int] | tuple[int, ...]) -> tuple[str, str, list[int]]:
+    """归一化构筑签名键：`seal_id:pet_table_id:s1,s2,s3,s4`（升序去重最多 4 招）。"""
+    norm = sorted({int(sid) for sid in skill_ids if int(sid) > 0})[:4]
+    if seal_id == 0 and pet_table_id == 0 and not norm:
+        return "", "", []
+    csv = ",".join(str(sid) for sid in norm)
+    return f"{int(seal_id)}:{int(pet_table_id)}:{csv}", csv, norm
+
+
+def parse_core_skill_ids(csv: str) -> list[int]:
+    if not csv.strip():
+        return []
+    out: list[int] = []
+    for token in csv.split(","):
+        t = token.strip()
+        if t.isdigit() and int(t) > 0:
+            out.append(int(t))
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -579,6 +691,8 @@ class RankedManager:
             milestone_bits=row.milestone_bits,
             final_rank=row.final_rank,
             champion_awarded=bool(row.honor_bits & HONOR_BIT_CHAMPION),
+            current_win_streak=row.current_win_streak,
+            best_win_streak=row.best_win_streak,
         )
 
     def _fill_presets(self, repeated_field) -> None:
@@ -679,6 +793,36 @@ class RankedManager:
                             end_ms=0,
                         )
                     resp.history.add().CopyFrom(self._player_season_proto(s_meta, hist, hist.rating_centi))
+
+            for fb in await self.store.list_ranked_featured_builds(season.season_id, limit=5):
+                entry = resp.featured_builds.add(
+                    build_key=fb.build_key,
+                    season_seal_id=fb.season_seal_id,
+                    starter_pet_table_id=fb.starter_pet_table_id,
+                    appearances=fb.appearances,
+                    wins=fb.wins,
+                    high_tier_wins=fb.high_tier_wins,
+                    featured_battle_id=fb.featured_battle_id,
+                    featured_player_id=fb.featured_player_id,
+                    featured_player_name=fb.featured_player_name,
+                    featured_rating_centi=fb.featured_rating_centi,
+                    featured_team_size=fb.featured_team_size,
+                    featured_total_rounds=fb.featured_total_rounds,
+                    updated_ms=fb.updated_ms,
+                )
+                entry.core_skill_ids.extend(parse_core_skill_ids(fb.core_skill_ids))
+
+            for rv in await self.store.list_ranked_top_rivals(season.season_id, caller.player_id, limit=8):
+                resp.top_rivals.add(
+                    opponent_id=rv.opponent_id,
+                    opponent_name=rv.opponent_name,
+                    wins=rv.wins,
+                    losses=rv.losses,
+                    draws=rv.draws,
+                    last_outcome=rv.last_outcome,
+                    last_battle_id=rv.last_battle_id,
+                    updated_ms=rv.updated_ms,
+                )
 
             resp.server_time_ms = now_ms
             return resp
@@ -823,8 +967,11 @@ class RankedManager:
         character_preset_id: int = DEFAULT_CHARACTER_PRESET_ID,
         pet_preset_id: int = DEFAULT_PET_PRESET_ID,
         settled_at_ms: int | None = None,
+        ended_opponent_streak: int = 0,
+        opponents: list[tuple[int, str]] | None = None,
+        settlement_data: Message | None = None,
     ) -> Message:
-        """幂等落账单名玩家单局排位进度、里程碑展示权益与结算摘要视图。"""
+        """幂等落账单名玩家单局排位进度、连胜、宿敌复仇、热门构筑、里程碑展示权益与结算摘要视图。"""
         now_ms = int(settled_at_ms if settled_at_ms is not None else await self.store.now_ms())
         season = await self.ensure_current_season()
         season_key = season.season_key if season.season_id == season_id else f"s{season_id}"
@@ -848,6 +995,65 @@ class RankedManager:
         tier_after = tier_for_rating(rating_after_centi, qualified=will_qualify, rule=self.rule)
         newly_qualified = (not was_qualified) and will_qualify
 
+        revenged_rival = False
+        revenged_opponent_name = ""
+        revenged_wins_after = 0
+        revenged_losses_after = 0
+        if status == RANKED_MATCH_RATING_CONFIRMED and total_rounds >= 1 and opponents:
+            is_draw = outcome_kind == 3
+            player_won = outcome_kind == 1
+            best_revenge: RankedRivalryRow | None = None
+            for opp_id, opp_name in opponents:
+                if opp_id <= 0 or opp_id == player_id:
+                    continue
+                prior = await self.store.get_ranked_rivalry(season_id, player_id, opp_id)
+                if player_won and is_rivalry_revenge_target(prior):
+                    assert prior is not None
+                    if best_revenge is None or (prior.losses, prior.wins, -prior.opponent_id) > (
+                        best_revenge.losses, best_revenge.wins, -best_revenge.opponent_id,
+                    ):
+                        best_revenge = prior
+                nxt = next_rivalry_row(
+                    season_id, player_id, opp_id, opp_name, prior,
+                    is_draw=is_draw, player_won=player_won, battle_id=battle_id, stamp=now_ms,
+                )
+                await self.store.upsert_ranked_rivalry(nxt)
+            if best_revenge is not None:
+                revenged_rival = True
+                revenged_opponent_name = best_revenge.opponent_name or next(
+                    (n for oid, n in opponents if oid == best_revenge.opponent_id and n), ""
+                )
+                revenged_wins_after = best_revenge.wins + 1
+                revenged_losses_after = best_revenge.losses
+
+        if (
+            status == RANKED_MATCH_RATING_CONFIRMED
+            and total_rounds >= 1
+            and settlement_data is not None
+            and not bool(getattr(settlement_data, "use_free_preset", False))
+        ):
+            seal_id = int(getattr(settlement_data, "final_season_seal_id", 0))
+            pet_tid = int(getattr(settlement_data, "starter_pet_table_id", 0))
+            core_skills = [int(x) for x in getattr(settlement_data, "core_skill_ids", ())]
+            build_key, csv, _ = canonical_build_key(seal_id, pet_tid, core_skills)
+            if build_key:
+                await self.store.upsert_ranked_featured_build(
+                    season_id=season_id,
+                    build_key=build_key,
+                    season_seal_id=seal_id,
+                    starter_pet_table_id=pet_tid,
+                    core_skill_ids_csv=csv,
+                    tier_qingfeng_centi=self.rule.tier_qingfeng_centi,
+                    battle_id=battle_id,
+                    player_id=player_id,
+                    player_name=str(getattr(settlement_data, "player_display_name", "")),
+                    after_rating_centi=rating_after_centi,
+                    team_size=team_size,
+                    total_rounds=total_rounds,
+                    player_won=(outcome_kind == 1),
+                    settled_at_ms=now_ms,
+                )
+
         summary = self.protocol.message(
             "match.RankedBattleSettlementView",
             battle_id=battle_id,
@@ -868,6 +1074,11 @@ class RankedManager:
             settled_at_ms=now_ms,
             character_preset_id=character_preset_id,
             pet_preset_id=pet_preset_id,
+            ended_opponent_streak=ended_opponent_streak,
+            revenged_rival=revenged_rival,
+            revenged_opponent_name=revenged_opponent_name,
+            revenged_wins_after=revenged_wins_after,
+            revenged_losses_after=revenged_losses_after,
         )
 
         updated_row, unlocked_rewards, final_bytes = await self.store.save_ranked_battle_settlement(

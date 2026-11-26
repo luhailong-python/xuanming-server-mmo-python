@@ -17,19 +17,36 @@ from typing import TYPE_CHECKING
 from google.protobuf.message import DecodeError, Message
 
 from .battle_dropin_effects import (
+    BOSS_AFFIX_FIRE,
+    BOSS_AFFIX_FIRE_EXPOSED_BURN_CAP,
+    BOSS_AFFIX_FIRE_EXPOSED_BURN_MAX_HP_PCT,
+    BOSS_AFFIX_METAL,
+    BOSS_AFFIX_METAL_ENEMY_OPENING_SHIELD_PCT,
+    BOSS_AFFIX_METAL_EXPOSED_CRIT_BONUS_PCT,
+    BOSS_AFFIX_WATER,
+    BOSS_AFFIX_WATER_CHARGE_OR_PERIODIC_DAMAGE_BONUS_PCT,
     BOSS_TRIAL_ACTION_TIMEOUT_MS,
     BOSS_TRIAL_KIND_FESTIVAL_BEAST,
     BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
     BOSS_TRIAL_KIND_NONE,
     BOSS_TRIAL_KIND_POLARITY_5V5,
+    CLUTCH_COMEBACK_LOW_HP_DENOMINATOR,
+    CLUTCH_COMEBACK_MIN_ESCALATION_STACKS,
+    ERR_RATE_LIMIT_EXCEEDED,
     ERR_SURRENDER_ALREADY_VOTED,
     ERR_SURRENDER_COOLDOWN,
     ERR_SURRENDER_NOT_ALLOWED,
     ERR_SURRENDER_TOO_EARLY,
+    EVENT_SUMMON_PET,
+    EVENT_WUXING_SYNERGY,
+    HIGHLIGHT_CONTROL_MIN_COUNT,
     MATCH_MODE_POLARITY_5V5,
     MATCH_MODE_PVE_SOLO,
     MATCH_MODE_SEASON_TOURNAMENT,
+    MAX_BATTLE_PINGS_PER_ROUND,
+    MIN_WIN_STREAK_HIGHLIGHT,
     POLARITY_DEFAULT_MAX_ROUNDS,
+    PREP_SKILL_BAN_SLOTS_PER_TEAM,
     PVP_ESCALATION_DAMAGE_STEP_PCT,
     PVP_ESCALATION_LEAD_ROUNDS,
     PVP_ESCALATION_MIN_MAX_ROUNDS,
@@ -37,14 +54,16 @@ from .battle_dropin_effects import (
     PVP_ESCALATION_SUPPORT_STEP_PCT,
     PVP_PRIMARY_FOCUS_DEN,
     PVP_PRIMARY_FOCUS_NUM,
+    PVP_SUMMON_PET_UNLOCK_ROUND,
     PVP_SURRENDER_EXPIRE_COOLDOWN_ROUNDS,
     PVP_SURRENDER_IDLE_EXCLUDE_ROUNDS,
     PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS,
     PVP_SURRENDER_UNLOCK_ROUND,
     RANKED_DEFAULT_MAX_ROUNDS,
-    EVENT_WUXING_SYNERGY,
     TACTICAL_PREP_DURATION_SECONDS,
     TACTICAL_PREP_TIMEOUT_MS,
+    TACTICAL_PREP_WITH_BAN_DURATION_SECONDS,
+    TACTICAL_PREP_WITH_BAN_TIMEOUT_MS,
     TOURNAMENT_LEYLINE_EARTH,
     TOURNAMENT_LEYLINE_FIRE,
     TOURNAMENT_LEYLINE_METAL,
@@ -71,15 +90,19 @@ from .battle_dropin_effects import (
     aggregate_tower_sigils,
     are_elements_mutually_generating,
     choose_monster_action,
+    discount_water_mana_cost,
     element_of_class,
     element_of_pet,
+    floor_bps,
     formation_counter_bonus_pct,
     formation_of,
     is_boss_trial_kind,
     is_synergy_round,
+    is_valid_boss_affix_override,
     is_valid_custom_duel_round_limit,
     is_valid_formation_id,
     is_valid_tower_sigil_id,
+    mix_seed_u64,
     tower_monster_attack_pct,
     tower_monster_health_pct,
 )
@@ -101,7 +124,7 @@ _PET_ACTOR_BASE = _ENGINE_ACTOR_FLAG | (2 << 32)
 _PVE_MODES = {4, 5}
 _PLAYER, _MONSTER, _PET = 1, 2, 3
 _PARTICIPANT, _OBSERVER = 1, 2
-_ATTACK, _SKILL, _DEFEND, _ITEM, _FLEE = 1, 2, 3, 4, 5
+_ATTACK, _SKILL, _DEFEND, _ITEM, _FLEE, _SUMMON_PET = 1, 2, 3, 4, 5, 8
 _INVALID_TABLE, _UNAVAILABLE, _MISSING, _INVALID, _FEATURE = range(1002, 1007)
 _AT_CAPACITY, _INACTIVE = 1008, 1009
 _INVALID_TARGET, _WRONG_TARGET = 7001, 7002
@@ -114,7 +137,8 @@ _UUID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 
 CLIENT_REQUESTS = {140: "GetBattleStateRequest", 149: "SubmitBattleActionRequest",
                    162: "SetAutoBattleRequest", 165: "StopWatchBattleRequest",
-                   479: "SurrenderBattleRequest", 504: "UpdateBattlePrepRequest"}
+                   479: "SurrenderBattleRequest", 504: "UpdateBattlePrepRequest",
+                   532: "SendBattlePingRequest"}
 
 
 class BattleError(ValueError):
@@ -160,16 +184,18 @@ class _ObserverReceipt:
 
 @dataclass(slots=True)
 class _PrepPlayerOptions:
-    """论剑 V3 战前 15 秒明牌变阵单人可选配置与锁定态（对照 C++ `PrepPlayerOptions`）。"""
+    """论剑 V3~V5 战前明牌变阵与 3-Ban 单人可选配置与锁定态（对照 C++ `PrepPlayerOptions`）。"""
 
     team_index: int
     active_season_id: int
     ai_controlled: bool
+    is_team_captain: bool = False
     selected_seal_id: int = 0
     selected_pet_id: int = 0
     ready: bool = False
     available_seals: list[Message] = field(default_factory=list)
     available_pets: list[Message] = field(default_factory=list)
+    nominated_ban_skill_ids: list[int] = field(default_factory=list)
 
 
 def _uuid(value: str) -> bool:
@@ -212,8 +238,15 @@ class TurnEngine:
         if self.custom_duel_rules is not None:
             if not is_valid_custom_duel_round_limit(self.custom_duel_rules.round_limit_override):
                 raise BattleError("invalid custom duel round_limit_override")
+            ban_slots = int(getattr(self.custom_duel_rules, "skill_ban_slots_per_team", 0))
+            if ban_slots not in (0, PREP_SKILL_BAN_SLOTS_PER_TEAM):
+                raise BattleError("invalid custom duel skill_ban_slots_per_team")
+            if ban_slots > 0 and bool(self.custom_duel_rules.use_free_preset):
+                raise BattleError("custom duel skill ban cannot be enabled with use_free_preset")
             if self.custom_duel_rules.round_limit_override > 0:
                 max_rounds = self.custom_duel_rules.round_limit_override
+        if not is_valid_boss_affix_override(int(getattr(request, "boss_weekly_affix_id", 0))):
+            raise BattleError("invalid boss_weekly_affix_id")
         self.battle_id = request.battle_id
         self.match_mode = request.match_mode
         self.pve = request.match_mode in _PVE_MODES
@@ -311,6 +344,41 @@ class TurnEngine:
         self.round_start_speeds: dict[int, int] = {}
         self.ai_controlled_players: set[int] = set()
         self.prep_active: bool = False
+        self.prep_skill_ban_slots_per_team: int = 0
+        self.ban_candidate_skill_ids: list[int] = []
+        self.ban_candidate_skill_set: set[int] = set()
+        self.team_a_banned_skill_ids: list[int] = []
+        self.team_b_banned_skill_ids: list[int] = []
+        self.banned_skill_ids: list[int] = []
+        self.banned_skill_set: set[int] = set()
+        self.validated_pets_by_player: dict[int, list[Message]] = {}
+        self.standby_pet_pool_by_player: dict[int, list[Message]] = {}
+        self.summon_pet_remaining_by_player: dict[int, int] = {}
+        self.team_pings: list[dict[int, Message]] = [{}, {}]
+        self.round_ping_count_by_player: dict[int, int] = {}
+        self.active_season_weekly_affix_id: int = 0
+        if (
+            self.tower_context is None
+            and self.custom_duel_rules is None
+            and self.active_leyline == TOURNAMENT_LEYLINE_UNSPECIFIED
+            and boss_trial_kind != BOSS_TRIAL_KIND_FESTIVAL_BEAST
+            and not has_festival_activity
+            and request.players
+        ):
+            unanimous_affix = 0
+            consistent = True
+            for snap in request.players:
+                cand = int(getattr(snap, "season_weekly_affix_id", 0))
+                if not SeasonBattleRules.is_valid_weekly_affix_id(cand):
+                    consistent = False
+                    break
+                if unanimous_affix == 0:
+                    unanimous_affix = cand
+                elif unanimous_affix != cand:
+                    consistent = False
+                    break
+            if consistent and SeasonBattleRules.is_valid_weekly_affix_id(unanimous_affix):
+                self.active_season_weekly_affix_id = unanimous_affix
         self._next_pet_actor_index: int = 0
         self.prep_options_by_player: dict[int, _PrepPlayerOptions] = {}
         self.team_formation_ids: list[int] = [0, 0]
@@ -319,6 +387,12 @@ class TurnEngine:
         self.total_damage_dealt_by_player: dict[int, int] = {}
         self.total_healing_done_by_player: dict[int, int] = {}
         self.total_controls_landed_by_player: dict[int, int] = {}
+        self.primary_focus_damage_by_player: dict[int, int] = {}
+        self.total_shield_granted_by_player: dict[int, int] = {}
+        self.total_dispels_landed_by_player: dict[int, int] = {}
+        self.damage_taken_by_player: dict[int, int] = {}
+        self.low_hp_experienced_players: set[int] = set()
+        self.peak_escalation_stacks: int = 0
         self._group = 0
         self._team_slots = [0, 0]
         slots = self._team_slots
@@ -340,6 +414,10 @@ class TurnEngine:
                     actor.equipped_skill_vfx[int(skill_id)] = int(vfx_id)
             actor.class_id = player.class_id
             actor.gender = player.gender
+            if self.is_ranked_battle and self.ranked_context is not None:
+                streak = int(self.ranked_context.member_win_streaks.get(actor_id, 0))
+                if streak >= MIN_WIN_STREAK_HIGHLIGHT:
+                    actor.win_streak = streak
             if bool(getattr(player, "ai_controlled", False)):
                 actor.is_auto = True
                 self.ai_controlled_players.add(actor_id)
@@ -419,8 +497,9 @@ class TurnEngine:
         self.effects.sanitize()
         self.scripts = BattleScriptRuntime(self, request, monster_ids)
         self.monster_ai.bind_actors()
-        # 战前 15 秒明牌变阵期间延迟到 finalize_prep_phase 锁阵后再初始化开场光环/被动，防止替换首发宠残留旧光环。
+        # 战前明牌变阵期间延迟到 finalize_prep_phase 锁阵后再初始化开场光环/被动与中局唤灵池，防止替换首发宠残留旧光环。
         if not self.prep_active:
+            self.rebuild_mid_battle_standby_pools()
             self.configured.initialize_abilities()
         self.trial_tracker.initialize(request)
         self.encounter.init_special_encounter_state()
@@ -428,8 +507,35 @@ class TurnEngine:
 
     @property
     def is_in_prep_phase(self) -> bool:
-        """当前是否处于论剑 V3 战前 15 秒明牌变阵期。"""
+        """当前是否处于战前明牌变阵/3-Ban 期。"""
         return self.prep_active
+
+    @property
+    def prep_timeout_ms(self) -> int:
+        return TACTICAL_PREP_WITH_BAN_TIMEOUT_MS if self.prep_skill_ban_slots_per_team > 0 else TACTICAL_PREP_TIMEOUT_MS
+
+    @property
+    def prep_duration_seconds(self) -> int:
+        return (
+            TACTICAL_PREP_WITH_BAN_DURATION_SECONDS
+            if self.prep_skill_ban_slots_per_team > 0
+            else TACTICAL_PREP_DURATION_SECONDS
+        )
+
+    def is_skill_banned(self, skill_id: int) -> bool:
+        return skill_id != 0 and skill_id in self.banned_skill_set
+
+    @property
+    def is_summon_pet_enabled(self) -> bool:
+        return (
+            not self.pve
+            and not self.uses_free_preset
+            and (self.is_ranked_battle or self.match_mode == MATCH_MODE_SEASON_TOURNAMENT)
+        )
+
+    @property
+    def summon_pet_unlock_round(self) -> int:
+        return PVP_SUMMON_PET_UNLOCK_ROUND if self.is_summon_pet_enabled else 0
 
     def _build_pet_actor(
         self, owner_snapshot: Message, pet: Message, actor_id: int, formation_slot: int,
@@ -475,18 +581,58 @@ class TurnEngine:
         return actor
 
     def _init_tactical_prep(self, request: Message) -> None:
-        """初始化论剑 V3 战前 15 秒明牌变阵配置（对照 C++ `InitTacticalPrep`）。"""
+        """初始化论剑 V3~V5 战前明牌变阵与 3-Ban 禁招配置（对照 C++ `InitTacticalPrep`）。"""
         self.prep_active = False
+        self.prep_skill_ban_slots_per_team = 0
+        self.ban_candidate_skill_ids.clear()
+        self.ban_candidate_skill_set.clear()
+        self.team_a_banned_skill_ids.clear()
+        self.team_b_banned_skill_ids.clear()
+        self.banned_skill_ids.clear()
+        self.banned_skill_set.clear()
         self.prep_options_by_player.clear()
+        self.validated_pets_by_player.clear()
+        self.standby_pet_pool_by_player.clear()
+        self.summon_pet_remaining_by_player.clear()
 
-        # 仅正式自养论剑与赛季战队锦标赛开启战前 15 秒明牌变阵；PVE / 免费预设娱乐场 / 切磋 / 帮战零打扰。
-        mode_eligible = (
+        is_formal_competitive = (
             not self.pve
             and not self.uses_free_preset
             and (self.is_ranked_battle or request.match_mode == MATCH_MODE_SEASON_TOURNAMENT)
         )
-        if not mode_eligible:
+        requested_ban_slots = 0
+        if not self.pve and not self.uses_free_preset:
+            if request.match_mode == MATCH_MODE_SEASON_TOURNAMENT and self.tournament_context is not None:
+                requested_ban_slots = int(getattr(self.tournament_context, "skill_ban_slots_per_team", 0))
+            elif self.is_ranked_battle and self.ranked_context is not None:
+                requested_ban_slots = int(getattr(self.ranked_context, "skill_ban_slots_per_team", 0))
+            elif self.custom_duel_rules is not None and not self.custom_duel_rules.use_free_preset:
+                requested_ban_slots = int(getattr(self.custom_duel_rules, "skill_ban_slots_per_team", 0))
+        if requested_ban_slots > PREP_SKILL_BAN_SLOTS_PER_TEAM:
+            raise BattleError("invalid skill_ban_slots_per_team")
+        is_custom_duel_ban = not is_formal_competitive and requested_ban_slots > 0
+        if not is_formal_competitive and not is_custom_duel_ban:
             return
+
+        if requested_ban_slots > 0:
+            battle_active_season_id = 0
+            for snap in request.players:
+                if snap.active_season_id:
+                    battle_active_season_id = int(snap.active_season_id)
+                    break
+            for sid, rule in sorted(self.skills.rules.items()):
+                if rule.battle_model != 1 or rule.ability_kind != 1 or not (1 <= rule.ban_pool_category <= 4):
+                    continue
+                if rule.season_id != 0 and (battle_active_season_id == 0 or rule.season_id != battle_active_season_id):
+                    continue
+                if self.ban_control_skills and self.is_control_skill(rule):
+                    continue
+                if sid not in self.ban_candidate_skill_set:
+                    self.ban_candidate_skill_set.add(sid)
+                    self.ban_candidate_skill_ids.append(sid)
+            self.ban_candidate_skill_ids.sort()
+            if self.ban_candidate_skill_ids:
+                self.prep_skill_ban_slots_per_team = requested_ban_slots
 
         all_battle_pet_ids = {
             actor.pet_id
@@ -500,64 +646,105 @@ class TurnEngine:
                 team_index=snapshot.team_index,
                 active_season_id=snapshot.active_season_id,
                 ai_controlled=ai_ctrl,
+                is_team_captain=bool(getattr(snapshot, "is_team_captain", False)),
                 ready=ai_ctrl,
             )
-            seen_seal_ids: set[int] = set()
-            if snapshot.HasField("equipment_effects") and snapshot.equipment_effects.HasField("season_seal"):
-                equipped_seal = snapshot.equipment_effects.season_seal
-                opt.selected_seal_id = equipped_seal.seal_id
-                if equipped_seal.seal_id not in seen_seal_ids:
-                    seen_seal_ids.add(equipped_seal.seal_id)
-                    opt.available_seals.append(equipped_seal)
-            for seal in getattr(snapshot, "available_season_seals", ()):
-                if not SeasonBattleRules.valid_seal_effect(
-                    seal.season_id,
-                    seal.seal_id,
-                    seal.effect_id,
-                    seal.bonus_bps,
-                    seal.cap_bps,
-                    seal.per_round_limit,
-                    seal.battle_limit,
-                    seal.active_rounds,
-                    seal.health_threshold_bps,
-                ):
-                    raise BattleError("invalid available_season_seal snapshot")
-                if snapshot.active_season_id != 0 and seal.season_id != snapshot.active_season_id:
-                    raise BattleError("available_season_seal season mismatch")
-                if seal.seal_id not in seen_seal_ids:
-                    seen_seal_ids.add(seal.seal_id)
-                    opt.available_seals.append(seal)
-            opt.available_seals.sort(key=lambda s: s.seal_id)
+            if is_formal_competitive:
+                seen_seal_ids: set[int] = set()
+                if snapshot.HasField("equipment_effects") and snapshot.equipment_effects.HasField("season_seal"):
+                    equipped_seal = snapshot.equipment_effects.season_seal
+                    opt.selected_seal_id = equipped_seal.seal_id
+                    if equipped_seal.seal_id not in seen_seal_ids:
+                        seen_seal_ids.add(equipped_seal.seal_id)
+                        opt.available_seals.append(equipped_seal)
+                for seal in getattr(snapshot, "available_season_seals", ()):
+                    if not SeasonBattleRules.valid_seal_effect(
+                        seal.season_id,
+                        seal.seal_id,
+                        seal.effect_id,
+                        seal.bonus_bps,
+                        seal.cap_bps,
+                        seal.per_round_limit,
+                        seal.battle_limit,
+                        seal.active_rounds,
+                        seal.health_threshold_bps,
+                    ):
+                        raise BattleError("invalid available_season_seal snapshot")
+                    if snapshot.active_season_id != 0 and seal.season_id != snapshot.active_season_id:
+                        raise BattleError("available_season_seal season mismatch")
+                    if seal.seal_id not in seen_seal_ids:
+                        seen_seal_ids.add(seal.seal_id)
+                        opt.available_seals.append(seal)
+                opt.available_seals.sort(key=lambda s: s.seal_id)
 
-            if snapshot.pets:
-                opt.available_pets.append(snapshot.pets[0])
-                opt.selected_pet_id = snapshot.pets[0].pet_id
-            for standby in getattr(snapshot, "standby_pets", ()):
-                if bool(getattr(standby, "competitive_temporary", False)) or standby.pet_id == 0:
-                    raise BattleError("invalid standby pet id or temporary flag")
-                if standby.owner_player_id not in (0, snapshot.player_id):
-                    raise BattleError("standby pet ownership mismatch")
-                if standby.HasField("pet_cultivation") and not PetAndSupportEffects.valid_pet_cultivation(standby.pet_cultivation):
-                    raise BattleError("invalid standby pet_cultivation")
-                if standby.pet_id == opt.selected_pet_id:
-                    continue
-                if standby.pet_id in all_battle_pet_ids:
-                    raise BattleError("duplicate standby pet_id across battle")
-                all_battle_pet_ids.add(standby.pet_id)
-                opt.available_pets.append(standby)
+                if snapshot.pets:
+                    opt.available_pets.append(snapshot.pets[0])
+                    opt.selected_pet_id = snapshot.pets[0].pet_id
+                for standby in getattr(snapshot, "standby_pets", ()):
+                    if bool(getattr(standby, "competitive_temporary", False)) or standby.pet_id == 0:
+                        raise BattleError("invalid standby pet id or temporary flag")
+                    if standby.owner_player_id not in (0, snapshot.player_id):
+                        raise BattleError("standby pet ownership mismatch")
+                    if standby.HasField("pet_cultivation") and not PetAndSupportEffects.valid_pet_cultivation(standby.pet_cultivation):
+                        raise BattleError("invalid standby pet_cultivation")
+                    if standby.pet_id == opt.selected_pet_id:
+                        continue
+                    if standby.pet_id in all_battle_pet_ids:
+                        raise BattleError("duplicate standby pet_id across battle")
+                    all_battle_pet_ids.add(standby.pet_id)
+                    opt.available_pets.append(standby)
 
             if not opt.ai_controlled and (
-                len(opt.available_seals) > 1
+                self.prep_skill_ban_slots_per_team > 0
+                or len(opt.available_seals) > 1
                 or len(opt.available_pets) > 1
                 or (opt.selected_pet_id == 0 and len(opt.available_pets) > 0)
             ):
                 has_any_choice = True
+            if is_formal_competitive and not opt.ai_controlled and opt.available_pets:
+                self.validated_pets_by_player[snapshot.player_id] = list(opt.available_pets)
             self.prep_options_by_player[snapshot.player_id] = opt
 
         if has_any_choice:
             self.prep_active = True
         else:
+            self.prep_skill_ban_slots_per_team = 0
+            self.ban_candidate_skill_ids.clear()
+            self.ban_candidate_skill_set.clear()
             self.prep_options_by_player.clear()
+
+    def aggregate_team_bans(self, team_index: int) -> list[int]:
+        """按队内得票 → 顺位 → 队长优先 → SplitMix64(seed^sid) → sid 确定性聚合本队禁招。"""
+        if self.prep_skill_ban_slots_per_team == 0:
+            return []
+        tally: dict[int, list[int | bool]] = {}
+        for opt in self.prep_options_by_player.values():
+            if opt.ai_controlled or opt.team_index != team_index:
+                continue
+            for idx, sid in enumerate(opt.nominated_ban_skill_ids):
+                entry = tally.get(sid)
+                if entry is None:
+                    tally[sid] = [1, idx, opt.is_team_captain]
+                else:
+                    entry[0] = int(entry[0]) + 1
+                    if idx < int(entry[1]):
+                        entry[1] = idx
+                    if opt.is_team_captain:
+                        entry[2] = True
+        if not tally:
+            return []
+        seed = int(self.create_request.seed)
+        ordered = sorted(
+            tally.items(),
+            key=lambda item: (
+                -int(item[1][0]),
+                int(item[1][1]),
+                not bool(item[1][2]),
+                mix_seed_u64(seed ^ item[0]),
+                item[0],
+            ),
+        )
+        return [sid for sid, _ in ordered[: self.prep_skill_ban_slots_per_team]]
 
     def all_prep_players_ready(self) -> bool:
         """判定全部非 AI 参战者是否已完成变阵锁定。"""
@@ -573,18 +760,22 @@ class TurnEngine:
         ready: bool,
         *,
         deadline_ms: int = 0,
+        update_banned_skills: bool = False,
+        banned_skill_ids: Iterable[int] = (),
     ) -> tuple[int, Message | None]:
-        """处理单个参战者的战前变阵提交（换赛季印/换首发宠/锁定），返回 `(tip_error, viewer_prep_state)`。"""
+        """处理单个参战者的战前变阵与 3-Ban 提名提交，返回 `(tip_error, viewer_prep_state)`。"""
         if self.outcome != 0 or not self.prep_active:
             return _FEATURE, None
         opt = self.prep_options_by_player.get(player_id)
         if opt is None or opt.ai_controlled:
             return _INVALID, None
 
+        ban_list = [int(sid) for sid in banned_skill_ids]
         if opt.ready:
             seal_changed = selected_seal_id != 0 and selected_seal_id != opt.selected_seal_id
             pet_changed = selected_pet_id != 0 and selected_pet_id != opt.selected_pet_id
-            if seal_changed or pet_changed:
+            ban_changed = update_banned_skills and ban_list != opt.nominated_ban_skill_ids
+            if seal_changed or pet_changed or ban_changed:
                 return _FEATURE, None
             return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
 
@@ -592,19 +783,39 @@ class TurnEngine:
             return _INVALID, None
         if selected_pet_id != 0 and not any(p.pet_id == selected_pet_id for p in opt.available_pets):
             return _INVALID, None
+        if update_banned_skills:
+            if self.prep_skill_ban_slots_per_team == 0:
+                if ban_list:
+                    return _FEATURE, None
+            else:
+                if len(ban_list) > self.prep_skill_ban_slots_per_team:
+                    return _INVALID, None
+                seen_bans: set[int] = set()
+                for sid in ban_list:
+                    if sid not in self.ban_candidate_skill_set or sid in seen_bans:
+                        return _INVALID, None
+                    seen_bans.add(sid)
 
         if selected_seal_id != 0:
             opt.selected_seal_id = selected_seal_id
         if selected_pet_id != 0:
             opt.selected_pet_id = selected_pet_id
+        if update_banned_skills:
+            opt.nominated_ban_skill_ids = ban_list
         if ready:
             opt.ready = True
         return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
 
     def finalize_prep_phase(self) -> bool:
-        """锁定战前变阵：应用赛季印、原地替换或补发首发宠，并一次性初始化全部开场光环/被动。"""
+        """锁定战前变阵与双方 3-Ban：应用赛季印、首发宠，重建中局唤灵池并初始化全部开场光环/被动。"""
         if not self.prep_active:
             return False
+
+        if self.prep_skill_ban_slots_per_team > 0:
+            self.team_a_banned_skill_ids = self.aggregate_team_bans(0)
+            self.team_b_banned_skill_ids = self.aggregate_team_bans(1)
+            self.banned_skill_set = set(self.team_a_banned_skill_ids) | set(self.team_b_banned_skill_ids)
+            self.banned_skill_ids = sorted(self.banned_skill_set)
 
         snap_by_player = {snap.player_id: snap for snap in self.create_request.players}
         for player_id, opt in sorted(self.prep_options_by_player.items()):
@@ -620,6 +831,7 @@ class TurnEngine:
                             ):
                                 actor.equipment_effects.season_seal.CopyFrom(seal)
                                 actor.ClearField("season_seal_state")
+                                self.equipment_effects.clear_season_seal_runtime(player_id)
                             break
 
             # 2. 替换或补发首发灵宠（原地保留局内 actor_id 与阵位）。
@@ -646,18 +858,173 @@ class TurnEngine:
                         self.actors[new_actor_id] = added
 
         self.prep_active = False
+        self.round_ping_count_by_player.clear()
+        self.rebuild_mid_battle_standby_pools()
         self.configured.initialize_abilities()
         self._init_opening_shields()
         return True
 
+    @staticmethod
+    def _populate_pet_option(pet: Message, dst: Message) -> None:
+        dst.pet_id = pet.pet_id
+        dst.pet_table_id = pet.pet_table_id
+        dst.pet_name = pet.pet_name
+        dst.level = pet.level
+        dst.max_health = pet.max_health or pet.base_attributes.health
+        dst.speed = pet.base_attributes.speed
+        dst.physical_attack = pet.physical_attack
+        dst.magic_attack = pet.magic_attack
+        dst.defense = pet.defense
+        dst.skill_table_ids.extend(pet.skill_table_ids)
+
+    def rebuild_mid_battle_standby_pools(self) -> None:
+        """战前锁阵后构建每名自养竞技玩家的中局备选灵宠池与单局限 1 次唤灵配额。"""
+        self.standby_pet_pool_by_player.clear()
+        self.summon_pet_remaining_by_player.clear()
+        if not self.is_summon_pet_enabled:
+            return
+        for player_id, all_pets in self.validated_pets_by_player.items():
+            active_pet_id = next(
+                (a.pet_id for a in self.actors.values() if a.actor_type == _PET and a.owner_player_id == player_id and a.pet_id),
+                0,
+            )
+            reserve = [p for p in all_pets if p.pet_id and p.pet_id != active_pet_id]
+            if reserve:
+                self.standby_pet_pool_by_player[player_id] = reserve
+                self.summon_pet_remaining_by_player[player_id] = 1
+
+    def summon_pet_remaining(self, player_id: int) -> int:
+        if self.prep_active or not self.is_summon_pet_enabled:
+            return 0
+        return self.summon_pet_remaining_by_player.get(player_id, 0)
+
+    def check_summon_pet(self, actor: Message, summon_pet_id: int) -> int:
+        """校验第 2 回合起中局临阵唤灵动作合法性（对照 C++ `CheckSummonPet`）。"""
+        if actor.actor_type != _PLAYER:
+            return _INVALID
+        if not self.is_summon_pet_enabled or self.round_index < PVP_SUMMON_PET_UNLOCK_ROUND:
+            return _FEATURE
+        if self.summon_pet_remaining(actor.actor_id) == 0:
+            return _FEATURE
+        if not summon_pet_id:
+            return _INVALID
+        pool = self.standby_pet_pool_by_player.get(actor.actor_id)
+        if not pool:
+            return _FEATURE
+        if not any(p.pet_id == summon_pet_id for p in pool):
+            return _INVALID
+        if any(a.actor_type == _PET and a.owner_player_id == actor.actor_id and a.pet_id == summon_pet_id for a in self.actors.values()):
+            return _INVALID
+        return 0
+
+    def execute_summon_pet(self, actor: Message, summon_pet_id: int, turn: Message, group: int) -> None:
+        """执行中局临阵唤灵：以新 actor_id 原位替换旧宠、清旧宠待执行动作并初始化新宠被动/光环。"""
+        if self.check_summon_pet(actor, summon_pet_id) != 0:
+            return
+        owner_id = actor.actor_id
+        owner_snap = next((s for s in self.create_request.players if s.player_id == owner_id), None)
+        pool = self.standby_pet_pool_by_player.get(owner_id)
+        if owner_snap is None or not pool:
+            return
+        chosen_pet = next((p for p in pool if p.pet_id == summon_pet_id), None)
+        if chosen_pet is None:
+            return
+        existing_pet = next(
+            (a for a in self.actors.values() if a.actor_type == _PET and a.owner_player_id == owner_id),
+            None,
+        )
+        if existing_pet is not None:
+            formation_slot = existing_pet.formation_slot
+            self.pending.pop(existing_pet.actor_id, None)
+            del self.actors[existing_pet.actor_id]
+        else:
+            formation_slot = self._team_slots[actor.team_index]
+            self._team_slots[actor.team_index] += 1
+        new_actor_id = _PET_ACTOR_BASE + self._next_pet_actor_index
+        self._next_pet_actor_index += 1
+        summoned = self._build_pet_actor(owner_snap, chosen_pet, new_actor_id, formation_slot)
+        self.actors[new_actor_id] = summoned
+        self.summon_pet_remaining_by_player[owner_id] = 0
+        self.standby_pet_pool_by_player.pop(owner_id, None)
+        self.trial_tracker.record_effective_contribution(actor)
+        self._event(
+            turn, group, EVENT_SUMMON_PET, actor, summoned,
+            skill_table_id=summoned.pet_table_id,
+            success=True,
+            target_health_after=summoned.attributes.health,
+            target_mana_after=summoned.attributes.mana,
+        )
+        self.configured.initialize_abilities_for_actor(summoned, turn, group)
+
+    def fill_summon_state_for_viewer(self, state: Message, viewer_player_id: int) -> None:
+        state.ClearField("self_standby_pets")
+        state.ClearField("self_summon_pet_remaining")
+        if not viewer_player_id or self.prep_active or not self.is_summon_pet_enabled:
+            return
+        remaining = self.summon_pet_remaining(viewer_player_id)
+        state.self_summon_pet_remaining = remaining
+        if remaining == 0:
+            return
+        for pet in self.standby_pet_pool_by_player.get(viewer_player_id, ()):
+            self._populate_pet_option(pet, state.self_standby_pets.add())
+
+    def submit_battle_ping(self, player_id: int, target_actor_id: int, kind: int) -> tuple[int, Message | None]:
+        """队内一键战术标点（532/533）：每回合限 2 次，仅同队可见且校验目标阵营。"""
+        if self.outcome != 0:
+            return _FEATURE, None
+        sender = self.actors.get(player_id)
+        if sender is None or sender.actor_type != _PLAYER or sender.fled or sender.team_index > 1:
+            return _INVALID, None
+        sender_team = sender.team_index
+        team_player_count = sum(
+            1 for a in self.actors.values() if a.actor_type == _PLAYER and a.team_index == sender_team
+        )
+        if team_player_count < 2:
+            return _FEATURE, None
+        if kind not in (1, 2, 3, 4):
+            return _INVALID, None
+        target = self.actors.get(target_actor_id)
+        if target is None or not _active(target):
+            return _INVALID, None
+        if kind in (1, 2) and target.team_index == sender_team:
+            return _INVALID, None
+        if kind == 3 and target.team_index != sender_team:
+            return _INVALID, None
+        used = self.round_ping_count_by_player.get(player_id, 0)
+        if used >= MAX_BATTLE_PINGS_PER_ROUND:
+            return ERR_RATE_LIMIT_EXCEEDED, None
+        self.round_ping_count_by_player[player_id] = used + 1
+        ping = self.protocol.message(
+            "BattleTacticalPing",
+            sender_player_id=player_id,
+            target_actor_id=target_actor_id,
+            kind=kind,
+            round_index=0 if self.prep_active else self.round_index,
+        )
+        self.team_pings[sender_team][player_id] = ping
+        out = self.protocol.message("BattleTacticalPing")
+        out.CopyFrom(ping)
+        return 0, out
+
+    def fill_team_pings_for_viewer(self, state: Message, viewer_player_id: int) -> None:
+        state.ClearField("team_pings")
+        if not viewer_player_id or self.outcome != 0:
+            return
+        team = self.team_index_of_player(viewer_player_id)
+        if team is None or team > 1:
+            return
+        for _, ping in sorted(self.team_pings[team].items()):
+            state.team_pings.add().CopyFrom(ping)
+
     def build_prep_state_for_viewer(self, viewer_player_id: int, deadline_ms: int = 0) -> Message:
-        """按收信视角脱敏构建 `BattlePrepState`（本人看全部可选+同队态，观众仅看倒计时）。"""
+        """按收信视角脱敏构建 `BattlePrepState`（本人看全部可选+同队态+宿敌提示，观众仅看倒计时）。"""
         out = self.protocol.message("BattlePrepState")
         if not self.prep_active:
             return out
         out.active = True
         out.deadline_ms = deadline_ms
-        out.duration_seconds = TACTICAL_PREP_DURATION_SECONDS
+        out.duration_seconds = self.prep_duration_seconds
+        out.skill_ban_slots_per_team = self.prep_skill_ban_slots_per_team
         if not viewer_player_id:
             return out
         self_opt = self.prep_options_by_player.get(viewer_player_id)
@@ -666,18 +1033,8 @@ class TurnEngine:
         for seal in self_opt.available_seals:
             out.self_available_seals.add(seal_id=seal.seal_id, effect_id=seal.effect_id, name=seal.name)
         for pet in self_opt.available_pets:
-            dst = out.self_available_pets.add(
-                pet_id=pet.pet_id,
-                pet_table_id=pet.pet_table_id,
-                pet_name=pet.pet_name,
-                level=pet.level,
-                max_health=pet.max_health or pet.base_attributes.health,
-                speed=pet.base_attributes.speed,
-                physical_attack=pet.physical_attack,
-                magic_attack=pet.magic_attack,
-                defense=pet.defense,
-            )
-            dst.skill_table_ids.extend(pet.skill_table_ids)
+            self._populate_pet_option(pet, out.self_available_pets.add())
+        out.ban_candidate_skill_ids.extend(self.ban_candidate_skill_ids)
         for member_id, opt in sorted(self.prep_options_by_player.items()):
             if opt.team_index != self_opt.team_index:
                 continue
@@ -688,11 +1045,24 @@ class TurnEngine:
                 selected_pet_id=opt.selected_pet_id,
                 ready=opt.ready,
             )
+            ps.nominated_ban_skill_ids.extend(opt.nominated_ban_skill_ids)
             if opt.selected_pet_id != 0:
                 chosen = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
                 if chosen is not None:
                     ps.selected_pet_table_id = chosen.pet_table_id
                     ps.selected_pet_name = chosen.pet_name
+        out.team_effective_ban_skill_ids.extend(self.aggregate_team_bans(self_opt.team_index))
+        if self.ranked_context is not None:
+            for enc in getattr(self.ranked_context, "rivalry_encounters", ()):
+                if enc.player_id != viewer_player_id or not enc.opponent_id:
+                    continue
+                opp = self.actors.get(enc.opponent_id)
+                if opp is None or opp.actor_type != _PLAYER or opp.team_index == self_opt.team_index:
+                    continue
+                dst = out.self_rivalries.add()
+                dst.CopyFrom(enc)
+                if not dst.opponent_name and opp.name:
+                    dst.opponent_name = opp.name
         return out
 
     def fill_prep_state_for_viewer(self, state: Message, viewer_player_id: int, deadline_ms: int = 0) -> None:
@@ -736,6 +1106,7 @@ class TurnEngine:
     def _init_opening_shields(self) -> None:
         self.opening_shield_by_actor.clear()
         earth_leyline = self.active_leyline == TOURNAMENT_LEYLINE_EARTH
+        metal_boss_affix = self.encounter.boss_weekly_affix_id == BOSS_AFFIX_METAL
         for actor in self.actors.values():
             if not _active(actor) or actor.max_health <= 0:
                 continue
@@ -744,8 +1115,18 @@ class TurnEngine:
                 pct += formation_of(self.team_formation_ids[actor.team_index]).opening_shield_pct
             if actor.team_index == 0 and self.tower_context is not None:
                 pct += self.tower_sigil_bonuses.opening_shield_pct
+            if metal_boss_affix and actor.team_index == 1:
+                pct += BOSS_AFFIX_METAL_ENEMY_OPENING_SHIELD_PCT
             if pct > 0:
                 self.opening_shield_by_actor[actor.actor_id] = max(1, (actor.max_health * pct) // 100)
+
+    def has_any_active_shield(self, actor: Message) -> bool:
+        """判定单位是否持有任意未耗尽护盾（含配置盾/开场盾/首领灵障盾）。"""
+        if self.opening_shield_by_actor.get(actor.actor_id, 0) > 0:
+            return True
+        if actor.is_boss and self.encounter.boss_barrier_shield > 0:
+            return True
+        return any(e.remaining_capacity > 0 for e in actor.buffs)
 
     def _absorb_opening_shield(self, actor_id: int, remaining: int) -> tuple[int, int]:
         if remaining <= 0 or not self.opening_shield_by_actor:
@@ -833,9 +1214,40 @@ class TurnEngine:
             return BattleStateKind.SEAL_ACTIVE <= row.state_kind <= BattleStateKind.FREEZE
         return False
 
+    def record_dispel_landed(self, caster_actor_id: int, count: int) -> None:
+        if count <= 0 or not caster_actor_id:
+            return
+        caster = self.actors.get(caster_actor_id)
+        if caster is None:
+            return
+        owner_id = (
+            caster.actor_id if caster.actor_type == _PLAYER
+            else (caster.owner_player_id if caster.actor_type == _PET else 0)
+        )
+        if owner_id:
+            self.total_dispels_landed_by_player[owner_id] = (
+                self.total_dispels_landed_by_player.get(owner_id, 0) + count
+            )
+
     def _accumulate_round_mvp_metrics(self, turn: Message) -> None:
+        if self.escalation_stacks > self.peak_escalation_stacks:
+            self.peak_escalation_stacks = self.escalation_stacks
         for ev in turn.events:
             source = self.actors.get(ev.source_id)
+            target = self.actors.get(ev.target_id)
+            et = ev.event_type
+            # 承伤与残血绝境记录（以受击者归属玩家计）
+            if target is not None and et in (3, 7):
+                t_owner = (
+                    target.actor_id if target.actor_type == _PLAYER
+                    else (target.owner_player_id if target.actor_type == _PET else 0)
+                )
+                if t_owner and (source is None or source.team_index != target.team_index):
+                    taken = min(U64_MAX, ev.value + (ev.absorbed if et == 3 else 0))
+                    if taken > 0:
+                        self.damage_taken_by_player[t_owner] = min(
+                            U64_MAX, self.damage_taken_by_player.get(t_owner, 0) + taken,
+                        )
             if source is None:
                 continue
             if source.actor_type == _PLAYER:
@@ -846,8 +1258,6 @@ class TurnEngine:
                 continue
             if not owner_id:
                 continue
-            target = self.actors.get(ev.target_id)
-            et = ev.event_type
             if et == 3:  # BATTLE_EVENT_DAMAGE
                 if target is None or target.team_index != source.team_index:
                     dealt = min(U64_MAX, ev.value + ev.absorbed)
@@ -855,6 +1265,10 @@ class TurnEngine:
                         self.total_damage_dealt_by_player[owner_id] = min(
                             U64_MAX, self.total_damage_dealt_by_player.get(owner_id, 0) + dealt,
                         )
+                        if ev.is_primary_focus:
+                            self.primary_focus_damage_by_player[owner_id] = min(
+                                U64_MAX, self.primary_focus_damage_by_player.get(owner_id, 0) + dealt,
+                            )
             elif et in (4, 20):  # BATTLE_EVENT_HEAL, BATTLE_EVENT_SHIELD
                 if ev.value > 0 and (target is None or target.team_index == source.team_index):
                     self.total_healing_done_by_player[owner_id] = min(
@@ -880,6 +1294,52 @@ class TurnEngine:
                     self.total_controls_landed_by_player[owner_id] = (
                         self.total_controls_landed_by_player.get(owner_id, 0) + 1
                     )
+        for actor in self.actors.values():
+            if (
+                actor.actor_type == _PLAYER
+                and _active(actor)
+                and actor.max_health > 0
+                and actor.attributes.health * CLUTCH_COMEBACK_LOW_HP_DENOMINATOR <= actor.max_health
+            ):
+                self.low_hp_experienced_players.add(actor.actor_id)
+
+    def compute_highlight_kind(self, player_id: int, team_index: int, player_won: bool, is_dead: bool) -> int:
+        """按 C++ `ComputeHighlightKind` 口径计算单局高光标签枚举（0..5）。"""
+        if player_won and (
+            self.peak_escalation_stacks >= CLUTCH_COMEBACK_MIN_ESCALATION_STACKS
+            or (not is_dead and player_id in self.low_hp_experienced_players)
+        ):
+            return 5  # BATTLE_HIGHLIGHT_CLUTCH_COMEBACK
+
+        def ctrl_plus_dispel(pid: int) -> int:
+            return self.total_controls_landed_by_player.get(pid, 0) + self.total_dispels_landed_by_player.get(pid, 0)
+
+        max_focus = 0
+        max_ctrl = 0
+        max_support = 0
+        max_taken = 0
+        for member in self.actors.values():
+            if member.actor_type != _PLAYER or member.team_index != team_index:
+                continue
+            pid = member.actor_id
+            max_focus = max(max_focus, self.primary_focus_damage_by_player.get(pid, 0))
+            max_ctrl = max(max_ctrl, ctrl_plus_dispel(pid))
+            max_support = max(max_support, self.total_healing_done_by_player.get(pid, 0))
+            max_taken = max(max_taken, self.damage_taken_by_player.get(pid, 0))
+
+        self_focus = self.primary_focus_damage_by_player.get(player_id, 0)
+        if self_focus > 0 and self_focus == max_focus:
+            return 1  # BATTLE_HIGHLIGHT_PRIMARY_FOCUS
+        self_ctrl = ctrl_plus_dispel(player_id)
+        if self_ctrl >= HIGHLIGHT_CONTROL_MIN_COUNT and self_ctrl == max_ctrl:
+            return 2  # BATTLE_HIGHLIGHT_TACTICAL_CONTROL
+        self_support = self.total_healing_done_by_player.get(player_id, 0)
+        if self_support > 0 and self_support == max_support:
+            return 3  # BATTLE_HIGHLIGHT_SAVIOR_SUPPORT
+        self_taken = self.damage_taken_by_player.get(player_id, 0)
+        if self_taken > 0 and self_taken == max_taken:
+            return 4  # BATTLE_HIGHLIGHT_IRON_GUARD
+        return 0  # BATTLE_HIGHLIGHT_NONE
 
     def build_tower_settlement_echo(self) -> Message | None:
         """构建五行幻境单层结算回传载荷（非幻境局返回 None）。"""
@@ -1091,10 +1551,21 @@ class TurnEngine:
             state.custom_duel_rules.CopyFrom(self.custom_duel_rules)
         if self.has_any_active_synergy_this_round():
             state.wuxing_synergy_active_this_round = True
+        if self.active_season_weekly_affix_id:
+            state.season_weekly_affix_id = self.active_season_weekly_affix_id
+        if self.banned_skill_ids:
+            state.banned_skill_ids.extend(self.banned_skill_ids)
+        if self.team_a_banned_skill_ids:
+            state.team_a_banned_skill_ids.extend(self.team_a_banned_skill_ids)
+        if self.team_b_banned_skill_ids:
+            state.team_b_banned_skill_ids.extend(self.team_b_banned_skill_ids)
+        if self.summon_pet_unlock_round:
+            state.summon_pet_unlock_round = self.summon_pet_unlock_round
         if unredacted:
             if self.prep_active:
                 state.prep_state.active = True
-                state.prep_state.duration_seconds = TACTICAL_PREP_DURATION_SECONDS
+                state.prep_state.duration_seconds = self.prep_duration_seconds
+                state.prep_state.skill_ban_slots_per_team = self.prep_skill_ban_slots_per_team
                 if prep_deadline_ms:
                     state.prep_state.deadline_ms = prep_deadline_ms
         else:
@@ -1113,11 +1584,16 @@ class TurnEngine:
         state.ClearField("self_items")
         state.ClearField("surrender_vote")
         state.ClearField("prep_state")
+        state.ClearField("team_pings")
+        state.ClearField("self_standby_pets")
+        state.ClearField("self_summon_pet_remaining")
         for item in sorted(self.items.get(viewer, ()), key=lambda entry: entry.item_table_id):
             if item.count:
                 state.self_items.add().CopyFrom(item)
         if viewer:
             self.fill_surrender_vote_for_viewer(state, viewer)
+            self.fill_team_pings_for_viewer(state, viewer)
+            self.fill_summon_state_for_viewer(state, viewer)
         if self.prep_active:
             self.fill_prep_state_for_viewer(state, viewer, prep_deadline_ms)
 
@@ -1157,6 +1633,8 @@ class TurnEngine:
             if self.is_festival_beast_battle:
                 return _INVALID
             return self._validate_item(actor, action.item_table_id, action.target_id)
+        if action_type == _SUMMON_PET:
+            return self.check_summon_pet(actor, int(getattr(action, "summon_pet_id", 0)))
         return _INVALID
 
     def _validate_item(self, actor: Message, item_id: int, target_id: int) -> int:
@@ -1293,6 +1771,9 @@ class TurnEngine:
         self.pending.clear()
         if not self.outcome:
             self._expire_surrender_votes_for_round_advance()
+            self.round_ping_count_by_player.clear()
+            self.team_pings[0].clear()
+            self.team_pings[1].clear()
             self.round_index += 1
             self.encounter.advance_round_cleanup()
         else:
@@ -1316,6 +1797,31 @@ class TurnEngine:
                     if extra > 0:
                         target.attributes.health -= extra
                         event.value += extra
+                        event.target_health_after = target.attributes.health
+                        self._death(turn, event.group_id, target, caster.actor_id)
+            if rule.buff_type in (50, 51) and not target.is_dead:
+                periodic_bonus = self.configured.modifier(caster, BattleModifier.PERIODIC_DAMAGE_BONUS)
+                if periodic_bonus > 0.0:
+                    extra_pb = landed_damage(target, float(event.value) * periodic_bonus)
+                    if extra_pb > 0:
+                        target.attributes.health -= extra_pb
+                        event.value += extra_pb
+                        event.target_health_after = target.attributes.health
+                        self._death(turn, event.group_id, target, caster.actor_id)
+                if (
+                    not target.is_dead
+                    and self.is_boss_trial_battle
+                    and caster.team_index == 0
+                    and target.team_index == 1
+                    and self.encounter.boss_weekly_affix_id == BOSS_AFFIX_WATER
+                ):
+                    extra_water = min(
+                        target.attributes.health,
+                        (event.value * BOSS_AFFIX_WATER_CHARGE_OR_PERIODIC_DAMAGE_BONUS_PCT) // 100,
+                    )
+                    if extra_water > 0:
+                        target.attributes.health -= extra_water
+                        event.value += extra_water
                         event.target_health_after = target.attributes.health
                         self._death(turn, event.group_id, target, caster.actor_id)
             if rule.buff_type in (50, 51) and self.is_boss_trial_battle and target.team_index == 1 and not target.is_dead:
@@ -1393,6 +1899,21 @@ class TurnEngine:
             self._event(turn, group, 9, actor, actor)
             if actor.HasField("equipment_effects"):
                 self.equipment_effects.on_defend(actor, self.round_index, turn, group)
+            affix_mana_bps = SeasonBattleRules.defend_bonus_mana_regen_bps(self.active_season_weekly_affix_id)
+            if affix_mana_bps > 0 and actor.max_mana > 0 and actor.attributes.mana < actor.max_mana:
+                entry_max_mana = actor.entry_max_mana or actor.max_mana
+                gain = min(actor.max_mana - actor.attributes.mana, floor_bps(entry_max_mana, affix_mana_bps))
+                if gain > 0:
+                    actor.attributes.mana += gain
+                    self._event(
+                        turn, group, 14, actor, actor,
+                        value=gain, mana_delta=gain,
+                        target_health_after=actor.attributes.health,
+                        target_mana_after=actor.attributes.mana,
+                    )
+            return
+        if action.action_type == _SUMMON_PET:
+            self.execute_summon_pet(actor, int(getattr(action, "summon_pet_id", 0)), turn, group)
             return
         if action.action_type == _FLEE:
             if self.is_boss_trial_battle and actor.actor_type == _PLAYER:
@@ -1567,7 +2088,8 @@ class TurnEngine:
         resistance = min(100, target.attributes.resistance + resist_bonus) / 100
         level_factor = 360 + 120 * min(85, max(1, target.level))
         eff_def = self.configured.effective_defense(target)
-        defense = float(target.attributes.armor) + float(eff_def)
+        penetration = max(0.0, min(0.5, self.configured.modifier(actor, BattleModifier.DEFENSE_PENETRATION)))
+        defense = (float(target.attributes.armor) + float(eff_def)) * (1.0 - penetration)
         ratio = max(1.0 - 0.60, level_factor / (defense + level_factor) * (1 - resistance))
         multiplier = rule.attack_multiplier
         if not isfinite(multiplier) or multiplier < 0:
@@ -1619,9 +2141,17 @@ class TurnEngine:
                 base: float | None = None, rank: int = 0,
                 is_multi_target: bool = False, is_primary_target: bool = True,
                 is_primary_focus: bool = False, damage_scale: float = 1.0,
-                damage_origin: int = 0) -> None:
+                damage_origin: int = 0, paid_mana: int = 0) -> None:
         damage = self._damage_before_critical(actor, target, rule, rule.base_damage if base is None else base)
         critical_rate = self._critical_chance(actor, rule)
+        if (
+            self.is_boss_trial_battle
+            and self.encounter.boss_weekly_affix_id == BOSS_AFFIX_METAL
+            and actor.team_index == 0
+            and target.team_index == 1
+            and self.encounter.is_actor_exposed(target.actor_id)
+        ):
+            critical_rate = min(1.0, critical_rate + BOSS_AFFIX_METAL_EXPOSED_CRIT_BONUS_PCT / 100.0)
         critical = critical_rate > 0 and self.rng.unit() < critical_rate
         if critical:
             crit_mult = 2.0
@@ -1648,12 +2178,29 @@ class TurnEngine:
                 if damage_origin == 0
                 else 0.0
             )
-            out_bonus = self.configured.modifier(actor, BattleModifier.OUTGOING_DAMAGE) + typed_out + one_shot_out
+            out_bonus = (
+                self.configured.modifier(actor, BattleModifier.OUTGOING_DAMAGE)
+                + self.configured.modifier(actor, BattleModifier.SELF_GROWING_DIRECT_DAMAGE)
+                + typed_out
+                + one_shot_out
+            )
             if out_bonus != 0.0:
                 damage *= max(0.0, 1.0 + out_bonus)
             in_bonus = self.configured.modifier(target, BattleModifier.INCOMING_DAMAGE) + self.configured.hit_vulnerability_bonus(target)
             if in_bonus != 0.0:
                 damage *= max(0.0, 1.0 + in_bonus)
+            # 赛季周词缀：首两回合减伤（3）与无盾增伤（4）
+            if self.active_season_weekly_affix_id:
+                open_guard_pct = SeasonBattleRules.opening_guard_damage_reduce_pct(
+                    self.active_season_weekly_affix_id, self.round_index,
+                )
+                if open_guard_pct > 0:
+                    damage *= (100.0 - open_guard_pct) / 100.0
+                sharp_pct = SeasonBattleRules.sharp_tempo_damage_bonus_pct(
+                    self.active_season_weekly_affix_id, self.has_any_active_shield(target),
+                )
+                if sharp_pct > 0:
+                    damage *= (100.0 + sharp_pct) / 100.0
             # 五行阵法 / 阵法克制环 / 人宠五行相生 / 五行幻境符印直伤与受击减伤修正。
             wuxing_out_pct = 0
             if actor.team_index in (0, 1):
@@ -1726,6 +2273,7 @@ class TurnEngine:
                 self.equipment_effects.break_shields(
                     actor, target, dealt + buff_absorbed, rule.damage_kind,
                     self.round_index, turn, group, original_shields,
+                    skill_id=skill_id, paid_mana=paid_mana,
                 )
         opening_absorbed = 0
         if dealt > 0 and self.opening_shield_by_actor:
@@ -1747,6 +2295,24 @@ class TurnEngine:
             self.configured.increment_hit_vulnerability(target, self.round_index, group)
         if dealt > 0:
             self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
+        if (
+            hit_kind != 3
+            and dealt > 0
+            and self.is_boss_trial_battle
+            and self.encounter.boss_weekly_affix_id == BOSS_AFFIX_FIRE
+            and actor.team_index == 0
+            and target.team_index == 1
+            and _active(target)
+            and target.max_health > 0
+            and self.encounter.is_actor_exposed(target.actor_id)
+        ):
+            fire_burn = min(
+                target.attributes.health,
+                BOSS_AFFIX_FIRE_EXPOSED_BURN_CAP,
+                max(1, (target.max_health * BOSS_AFFIX_FIRE_EXPOSED_BURN_MAX_HP_PCT) // 100),
+            )
+            if fire_burn > 0:
+                self._apply_damage(turn, group, actor, target, fire_burn, hit_kind=hit_kind, hit_index=hit_index)
         if hit_kind != 3 and dealt > 0 and self.tower_context is not None:
             sb = self.tower_sigil_bonuses
             # 403 祝融烈焰：暴击附加目标最大气血 3% 灼伤（单段封顶 1500）。
@@ -1801,7 +2367,23 @@ class TurnEngine:
         target.charging_skill_id = 0
         if target.artifact_states:
             self.equipment_effects.clear_pending_echoes_on_death(target)
-        target.ClearField("buffs")
+        has_configured = any(
+            (r := self.effects.rules.get(b.buff_table_id)) is not None and r.battle_op != 0
+            for b in target.buffs
+        )
+        if not has_configured:
+            target.ClearField("buffs")
+        else:
+            keep = []
+            for entry in target.buffs:
+                row = self.effects.rules.get(entry.buff_table_id)
+                if row is not None and (row.keep_on_death or row.trigger_event != 0 or "Passive" in row.tags):
+                    copy = type(entry)()
+                    copy.CopyFrom(entry)
+                    keep.append(copy)
+            target.ClearField("buffs")
+            target.buffs.extend(keep)
+            self.configured.reset_volatile_growing_stacks(target)
         self.trial_tracker.record_death(target)
         self.monster_ai.notify_dead(target.actor_id)
         self._event(turn, group, 8, target, target, hit_index=hit)
@@ -1931,7 +2513,14 @@ class BattleNode:
             return self._error(response, _UNAVAILABLE)
         if request.admit_before_ms <= now or not request.battle_id or not request.players:
             return self._error(response, _INVALID)
-        if any(not player.routing.gate_instance_id or not player.routing.scene_instance_id for player in request.players):
+        human_count = 0
+        for player in request.players:
+            if bool(getattr(player, "ai_controlled", False)):
+                continue
+            human_count += 1
+            if not player.routing.gate_instance_id or not player.routing.scene_instance_id:
+                return self._error(response, _INVALID)
+        if human_count == 0:
             return self._error(response, _INVALID)
         if self.on_outcome is None:
             return self._error(response, _FEATURE)
@@ -1979,12 +2568,16 @@ class BattleNode:
         manual_window_ms = BOSS_TRIAL_ACTION_TIMEOUT_MS if engine.is_boss_trial_battle else _ACTION_MS
         original = self.protocol.message("CreateBattleRequest")
         original.CopyFrom(request)
-        routing = {player.player_id: player.routing for player in original.players}
+        routing = {
+            player.player_id: player.routing
+            for player in original.players
+            if player.routing.gate_instance_id and player.routing.scene_instance_id
+        }
         in_prep_phase = engine.is_in_prep_phase
         room = _Room(engine, original, deadline, 0 if in_prep_phase else (now + manual_window_ms), routing,
                      reward_profile=reward_profile,
                      confirm_until_ms=now + 180_000)
-        # 战前 15 秒明牌变阵期延迟录制回放起点至 _finalize_battle_prep 亮牌后再录。
+        # 战前明牌变阵期延迟录制回放起点至 _finalize_battle_prep 亮牌后再录。
         if request.record_replay and not in_prep_phase:
             fingerprint = self.tables.fingerprint if self.tables else ""
             room.replay = BattleReplayRecorder(self.protocol, original, fingerprint, engine.snapshot(0))
@@ -1997,10 +2590,11 @@ class BattleNode:
             return self._error(response, _INVALID)
         armed_at = self._steady_ms()
         if in_prep_phase:
+            prep_timeout_ms = engine.prep_timeout_ms
             room.action_deadline_ms = 0
             room.action_due_steady_ms = 0
-            room.prep_deadline_ms = admitted_at + TACTICAL_PREP_TIMEOUT_MS
-            room.prep_due_steady_ms = armed_at + TACTICAL_PREP_TIMEOUT_MS
+            room.prep_deadline_ms = admitted_at + prep_timeout_ms
+            room.prep_due_steady_ms = armed_at + prep_timeout_ms
         else:
             room.action_deadline_ms = admitted_at + manual_window_ms
             room.action_due_steady_ms = armed_at + manual_window_ms
@@ -2375,6 +2969,7 @@ class BattleNode:
             165: "StopWatchBattleResponse",
             479: "SurrenderBattleResponse",
             504: "UpdateBattlePrepResponse",
+            532: "SendBattlePingResponse",
         }
         if message_id not in responses:
             raise BattleError("message_id_not_allowed")
@@ -2390,6 +2985,20 @@ class BattleNode:
         if room.proposed_outcome or room.battle_due_steady_ms <= steady:
             return self._error(response, _UNAVAILABLE)
         engine = room.engine
+        if message_id == 532:
+            if engine.is_in_prep_phase and room.prep_due_steady_ms and steady >= room.prep_due_steady_ms:
+                self._finalize_battle_prep(room)
+            err, ping = engine.submit_battle_ping(ticket.player_id, request.target_actor_id, int(request.kind))
+            if err:
+                return self._error(response, err)
+            response.ping.CopyFrom(ping)
+            actor_team = engine.team_index_of_player(ticket.player_id)
+            if actor_team is not None:
+                notify = self.protocol.message("BattlePingS2C", battle_id=engine.battle_id, ping=ping)
+                for member_id in tuple(room.routing):
+                    if engine.team_index_of_player(member_id) == actor_team:
+                        self._emit(room, member_id, 533, notify)
+            return response
         if message_id == 504:
             if engine.is_in_prep_phase and room.prep_due_steady_ms and steady >= room.prep_due_steady_ms:
                 self._finalize_battle_prep(room)
@@ -2399,6 +3008,8 @@ class BattleNode:
                 request.selected_pet_id,
                 bool(request.ready),
                 deadline_ms=room.prep_deadline_ms,
+                update_banned_skills=bool(getattr(request, "update_banned_skills", False)),
+                banned_skill_ids=getattr(request, "banned_skill_ids", ()),
             )
             if err:
                 return self._error(response, err)
@@ -2615,6 +3226,20 @@ class BattleNode:
         for player in sorted(room.routing):
             actor = engine.actors[player]
             teams.setdefault(actor.team_index, []).append(player)
+            player_won = (
+                (actor.team_index == 0 and room.proposed_outcome == 1)
+                or (actor.team_index == 1 and room.proposed_outcome == 2)
+            )
+            highlight_kind = engine.compute_highlight_kind(player, actor.team_index, player_won, actor.is_dead)
+            ended_opponent_streak = 0
+            if player_won:
+                for other in engine.actors.values():
+                    if (
+                        other.actor_type == _PLAYER
+                        and other.team_index != actor.team_index
+                        and other.win_streak >= MIN_WIN_STREAK_HIGHLIGHT
+                    ):
+                        ended_opponent_streak = max(ended_opponent_streak, int(other.win_streak))
             settlement = event.settlements.add(
                 battle_id=engine.battle_id, player_id=player, outcome=room.proposed_outcome,
                 player_team_index=actor.team_index, health=actor.attributes.health, mana=actor.attributes.mana,
@@ -2630,7 +3255,63 @@ class BattleNode:
                 total_damage_dealt=engine.total_damage_dealt_by_player.get(player, 0),
                 total_healing_done=engine.total_healing_done_by_player.get(player, 0),
                 total_controls_landed=engine.total_controls_landed_by_player.get(player, 0),
+                primary_focus_damage_dealt=engine.primary_focus_damage_by_player.get(player, 0),
+                total_shield_granted=engine.total_shield_granted_by_player.get(player, 0),
+                total_dispels_landed=engine.total_dispels_landed_by_player.get(player, 0),
+                damage_taken=engine.damage_taken_by_player.get(player, 0),
+                highlight_kind=highlight_kind,
+                ended_opponent_streak=ended_opponent_streak,
+                player_display_name=actor.name,
             )
+            if actor.HasField("equipment_effects") and actor.equipment_effects.HasField("season_seal"):
+                settlement.final_season_seal_id = actor.equipment_effects.season_seal.seal_id
+                seal_rt = engine.equipment_effects.find_season_seal_runtime(player)
+                if seal_rt is not None:
+                    settlement.season_seal_contribution_value = seal_rt.contribution_value
+                    settlement.season_seal_trigger_count = seal_rt.trigger_count
+                    settlement.season_seal_resonance_count = seal_rt.resonance_count
+            if engine.is_ranked_battle and engine.ranked_context is not None:
+                if player_won and rounds > 0:
+                    best_revenge = None
+                    best_revenge_name = ""
+                    for enc in getattr(engine.ranked_context, "rivalry_encounters", ()):
+                        if enc.player_id != player or not enc.revenge_target or not enc.opponent_id:
+                            continue
+                        opp = engine.actors.get(enc.opponent_id)
+                        if opp is None or opp.actor_type != _PLAYER or opp.team_index == actor.team_index:
+                            continue
+                        if best_revenge is None or (enc.losses, enc.wins, -enc.opponent_id) > (
+                            best_revenge.losses, best_revenge.wins, -best_revenge.opponent_id,
+                        ):
+                            best_revenge = enc
+                            best_revenge_name = enc.opponent_name or opp.name
+                    if best_revenge is not None:
+                        settlement.revenged_rival = True
+                        settlement.revenged_opponent_name = best_revenge_name
+                        settlement.revenged_wins_after = best_revenge.wins + 1
+                        settlement.revenged_losses_after = best_revenge.losses
+                if not engine.uses_free_preset:
+                    starter_pet_table_id = 0
+                    opt = engine.prep_options_by_player.get(player)
+                    if opt is not None and opt.selected_pet_id:
+                        chosen = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
+                        if chosen is not None:
+                            starter_pet_table_id = chosen.pet_table_id
+                    if starter_pet_table_id == 0:
+                        pet_actor = next(
+                            (a for a in engine.actors.values() if a.actor_type == _PET and a.owner_player_id == player and a.pet_table_id),
+                            None,
+                        )
+                        if pet_actor is not None:
+                            starter_pet_table_id = pet_actor.pet_table_id
+                    settlement.starter_pet_table_id = starter_pet_table_id
+                    seen_skills: set[int] = set()
+                    for sid in actor.skill_table_ids:
+                        if sid and sid not in seen_skills:
+                            seen_skills.add(sid)
+                            settlement.core_skill_ids.append(sid)
+                            if len(settlement.core_skill_ids) >= 4:
+                                break
             if (tower_echo := engine.build_tower_settlement_echo()) is not None:
                 settlement.tower_settlement.CopyFrom(tower_echo)
             if engine.is_festival_beast_battle:

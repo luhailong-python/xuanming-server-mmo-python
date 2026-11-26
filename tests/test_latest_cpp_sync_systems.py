@@ -100,16 +100,16 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 76
-    assert len(pb_tables.tables) == 76
+    assert len(json_tables.tables) == 82
+    assert len(pb_tables.tables) == 82
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {
         "EquipAffixQuality": 5,
         "FestivalBeastActivity": 1,
         "FestivalBeastTier": 8,
-        "SkillScrollCraft": 6,
-        "TournamentReward": 7,
+        "SkillScrollCraft": 7,
+        "TournamentReward": 9,
         "TournamentRule": 1,
         "TrialJournalEntry": 12,
         "TrialJournalMilestone": 11,
@@ -208,7 +208,7 @@ def test_tournament_all_eleven_rpcs_full_season_lifecycle():
             assert ov0.current_season.season_id == 1
             assert ov0.current_season.stage == STAGE_REGISTRATION
             assert ov0.current_season.battle_team_size == 3
-            assert len(ov0.reward_tiers) == 7
+            assert len(ov0.reward_tiers) == 9
 
             # 2. CreateTournamentSquad：非法名拒绝、正常建队、重名/双队拒绝。
             bad_name = await call(1, "CreateTournamentSquad", squad_name="A")
@@ -474,7 +474,7 @@ def test_skill_craft_six_rpcs_and_proxy_stall(tmp_path):
             # 1. GetSkillCraftingState
             st0 = await rpc(1, "SceneSkillClientPlayer", "GetSkillCraftingState")
             assert not st0.error_message.id
-            assert len(st0.state.scrolls) == 6
+            assert len(st0.state.scrolls) == 7
             assert st0.state.gold_balance == 1000 and st0.state.fragment_owned == 60
 
             # 2. SetCraftProxyStall & ListCraftProxyStalls

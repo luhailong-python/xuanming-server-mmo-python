@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 from dataclasses import dataclass
 
 from ..data import StoreRejected, StoreUnavailable, client_request
@@ -14,6 +15,17 @@ from ..data.asset_inventory import (
 from .scene_mission import effective_level, now_ms
 from .scene_player import _bag, _fill_item
 from .scene_season import valid_artifact_definition
+from .scene_skill_craft import (
+    MASTERY_APPRENTICE,
+    MASTERY_ARTISAN,
+    MASTERY_MASTER,
+    forge_top_quality_rate_bps,
+    mastery_next_exp,
+    mastery_tier_for_exp,
+    mastery_tier_name,
+    proxy_net_gold,
+    valid_proxy_fee,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +43,14 @@ EQUIP_FROZEN = 28008
 EQUIP_INTERNAL_ERROR = 28010
 EQUIP_MATERIAL_NOT_ENOUGH = 28013
 EQUIP_LEVEL_CHANGED = 28022
+EQUIP_AFFIX_ALREADY_MAX_QUALITY = 28023
+EQUIP_AFFIX_POLISH_EXEMPT = 28024
+EQUIP_AFFIX_SLOT_EMPTY = 28025
+EQUIP_AFFIX_REFORGE_SAME = 28026
 EQUIP_BIND_CONFIRM_REQUIRED = 28027
+EQUIP_POLISH_PITY_CHANGED = 28028
+EQUIP_CRAFT_GOLD_NOT_ENOUGH = 28029
+EQUIP_PROXY_MASTER_UNAVAILABLE = 28030
 
 # 材料自选与游戏日/周契约（UTC+8 05:00 换日，UTC+8 周一 05:00 换周，与 C++ PlayerEquipmentMaterialRewardSystem 一致）。
 DAY_MS = 86_400_000
@@ -48,9 +67,21 @@ MATERIAL_REWARD_WEEKLY_LIMIT = 150
 CRAFTING_MATERIAL_ID = 3001
 ENHANCEMENT_STONE_ID = 3002
 LEGACY_ENHANCEMENT_STONE_ID = 2001
+POLISH_SAND_ID = 3403
+BOUND_ARTIFACT_VOUCHER_ID = 3404
+GUARANTEE_CHARM_ID = 3405
 UNSEAL_TALISMAN_ID = 3409
 INHERIT_TALISMAN_ID = 3410
 DEFAULT_FORGE_MATERIAL_COUNT = 10
+
+POLISH_GOLD_COST = 20
+REFORGE_GOLD_COST = 20
+UPGRADE_TIER_BASE_GOLD_PER_STEP = 100
+UPGRADE_TIER_ACCESSORY_GOLD_PER_STEP = 60
+MIN_QUALITY_TIER = 1
+MAX_QUALITY_TIER = 5
+POLISH_PITY_LIMIT = 8
+SPEED_AFFIX_EFFECT = 4
 
 _OUTCOME_UNKNOWN = 0
 _OUTCOME_REJECTED = 1
@@ -62,6 +93,7 @@ _OP_REFORGE_AFFIX = 3
 _OP_POLISH_AFFIX = 4
 _OP_UNSEAL_TO_TRADABLE = 5
 _OP_INHERIT_ENHANCE = 6
+_OP_UPGRADE_TIER = 7
 
 _MAX_SOURCE_BPS = {
     1: 3200, 2: 3200, 5: 3200, 6: 3200,
@@ -158,6 +190,75 @@ def _valid_artifact_row(row) -> bool:
     )
 
 
+def is_polish_exempt(effect: int) -> bool:
+    """速度词条（G02, effect=4）豁免品相随机，固定满值。"""
+    return effect == SPEED_AFFIX_EFFECT
+
+
+def effective_quality_tier(stored_tier: int, exempt: bool) -> int:
+    """兼容旧存档 quality_tier==0 与豁免词条均视作 5 档极品。"""
+    if exempt or stored_tier == 0:
+        return MAX_QUALITY_TIER
+    return max(MIN_QUALITY_TIER, min(MAX_QUALITY_TIER, stored_tier))
+
+
+def default_quality_ratio_pct(tier: int) -> int:
+    return {1: 80, 2: 85, 3: 90, 4: 95}.get(tier, 100)
+
+
+def default_quality_name(tier: int) -> str:
+    return {1: "凡品", 2: "良品", 3: "上品", 4: "珍品"}.get(tier, "极品")
+
+
+def scale_value_by_quality(max_value_bps: int, ratio_pct: int) -> int:
+    clamped = max(1, min(100, int(ratio_pct)))
+    return (int(max_value_bps) * clamped) // 100
+
+
+def roll_quality_tier(weights_bps: tuple[int, ...], roll_bps: int) -> int:
+    acc = 0
+    for idx, weight in enumerate(weights_bps):
+        acc += weight
+        if roll_bps < acc:
+            return idx + 1
+    return MAX_QUALITY_TIER
+
+
+def resolve_polish(current_tier: int, current_pity: int, rolled_tier: int, use_guarantee_charm: bool) -> tuple[int, int, bool]:
+    """只升不降 + 累计第 8 次必达极品（或定星保底符直接必达极品），返回 (new_tier, new_pity, guaranteed)。"""
+    base_tier = max(MIN_QUALITY_TIER, min(MAX_QUALITY_TIER, current_tier))
+    rolled = max(MIN_QUALITY_TIER, min(MAX_QUALITY_TIER, rolled_tier))
+    if use_guarantee_charm or current_pity + 1 >= POLISH_PITY_LIMIT:
+        return MAX_QUALITY_TIER, 0, True
+    next_tier = max(base_tier, rolled)
+    if next_tier >= MAX_QUALITY_TIER:
+        return MAX_QUALITY_TIER, 0, False
+    return next_tier, current_pity + 1, False
+
+
+def can_upgrade_tier(
+    source_profile: int, source_kind: int, source_level: int, source_class: int,
+    target_profile: int, target_kind: int, target_level: int, target_class: int,
+) -> bool:
+    """V1 装备原地无损升档合法性校验（仅 profile 1/2，同部位同职业，目标等级高于源等级）。"""
+    if source_profile not in (1, 2):
+        return False
+    if target_profile != source_profile or target_kind != source_kind or target_class != source_class:
+        return False
+    return target_level > source_level
+
+
+def upgrade_tier_gold_cost(equip_profile: int, source_level: int, target_level: int) -> int:
+    """V1 装备原地无损升档银两消耗：每跨 10 级一档，基础装 100 银/档，首饰 60 银/档。"""
+    if equip_profile not in (1, 2) or target_level <= source_level:
+        return 0
+    src_tier = source_level // 10
+    dst_tier = target_level // 10
+    steps = (dst_tier - src_tier) if dst_tier > src_tier else 1
+    per_step = UPGRADE_TIER_BASE_GOLD_PER_STEP if equip_profile == 1 else UPGRADE_TIER_ACCESSORY_GOLD_PER_STEP
+    return steps * per_step
+
+
 def _fill_affix_info(row, out) -> None:
     out.affix_id = row.id
     out.pool = row.pool
@@ -187,12 +288,13 @@ def _fill_artifact_info(row, out) -> None:
 class SceneEquipCraft:
     """Scene 装备 V1 打造、固定词条安装与每日材料自选领取伴生模块。"""
 
-    def __init__(self, scene, tables, assets=None, *, clock=now_ms) -> None:
+    def __init__(self, scene, tables, assets=None, *, clock=now_ms, roll_fn=None) -> None:
         self.scene = scene
         self.protocol = scene.protocol
         self.tables = tables
         self.assets = assets if assets is not None else getattr(scene, "assets", None)
         self.clock = clock
+        self._roll_fn = roll_fn
         self._explicit_profiles = any(
             getattr(row, "equip_profile", 0) > 0 for row in tables["Item"].rows()
         )
@@ -287,8 +389,67 @@ class SceneEquipCraft:
             ids.add(selected.affix_id)
         return True
 
+    def _quality_row(self, tier: int):
+        if "EquipAffixQuality" not in self.tables.tables:
+            return None
+        return self.tables["EquipAffixQuality"].get(tier)
+
+    def _quality_ratio_pct(self, tier: int) -> int:
+        row = self._quality_row(tier)
+        if row is not None and row.ratio_pct:
+            return int(row.ratio_pct)
+        return default_quality_ratio_pct(tier)
+
+    def _quality_name(self, tier: int) -> str:
+        row = self._quality_row(tier)
+        if row is not None and row.name:
+            return row.name
+        return default_quality_name(tier)
+
+    def _roll_quality_for_mastery(self, mastery_tier: int) -> int:
+        if self._roll_fn is not None:
+            return max(MIN_QUALITY_TIER, min(MAX_QUALITY_TIER, int(self._roll_fn(mastery_tier))))
+        weights = []
+        for tier in range(MIN_QUALITY_TIER, MAX_QUALITY_TIER + 1):
+            row = self._quality_row(tier)
+            if row is not None:
+                if mastery_tier >= MASTERY_MASTER:
+                    weights.append(int(row.master_weight))
+                elif mastery_tier >= MASTERY_ARTISAN:
+                    weights.append(int(row.artisan_weight))
+                else:
+                    weights.append(int(row.apprentice_weight))
+        if len(weights) == MAX_QUALITY_TIER and sum(weights) > 0:
+            total = sum(weights)
+            return roll_quality_tier(tuple(weights), random.randrange(total))
+        return MAX_QUALITY_TIER
+
+    def _fill_affix_instance(self, affix_row, selected, out) -> None:
+        _fill_affix_info(affix_row, out)
+        exempt = is_polish_exempt(affix_row.effect)
+        tier = effective_quality_tier(int(selected.quality_tier), exempt)
+        ratio = self._quality_ratio_pct(tier)
+        out.max_value_bps = int(affix_row.value_permyriad)
+        out.value_bps = scale_value_by_quality(affix_row.value_permyriad, ratio)
+        out.quality_tier = tier
+        out.quality_name = self._quality_name(tier)
+        out.quality_ratio_pct = ratio
+        out.polish_pity_count = 0 if (exempt or tier >= MAX_QUALITY_TIER) else int(selected.polish_pity_count)
+        out.polish_pity_limit = 0 if exempt else POLISH_PITY_LIMIT
+        out.polish_exempt = exempt
+
+    def _fill_forge_mastery(self, data, out) -> None:
+        out.Clear()
+        exp = int(data.craft_component.forge_mastery_exp) if data.HasField("craft_component") else 0
+        tier = mastery_tier_for_exp(exp)
+        out.tier = tier
+        out.tier_name = mastery_tier_name(tier)
+        out.exp = exp
+        out.next_tier_exp = mastery_next_exp(exp)
+        out.top_quality_rate_bps = forge_top_quality_rate_bps(tier)
+
     def fill_v1_display(self, item, info) -> None:
-        """为 BagItemInfo 补充 V1 固定词条槽位与法宝展示数据。"""
+        """为 BagItemInfo 补充 V1 固定词条槽位（含品相缩放与保底进度）与法宝展示数据。"""
         row = self.tables["Item"].get(item.config_id)
         if row is None:
             return
@@ -306,11 +467,128 @@ class SceneEquipCraft:
                     if selected.slot == slot:
                         affix = self.tables["EquipV1Affix"].get(selected.affix_id)
                         if affix is not None:
-                            _fill_affix_info(affix, shown.selected)
+                            self._fill_affix_instance(affix, selected, shown.selected)
         elif profile == 3 and "EquipArtifact" in self.tables.tables:
             artifact = self.tables["EquipArtifact"].get(getattr(row, "artifact_id", 0))
             if artifact is not None and _valid_artifact_row(artifact):
                 _fill_artifact_info(artifact, info.artifact)
+
+    def collect_effects(self, data, effects) -> None:
+        """汇总已穿戴 V1 装备固定词条（含品相缩放与同类上限）、法宝效果及当季赛季印轻属性。"""
+        effects.Clear()
+        if self.assets is None:
+            return
+        effects.support_sources_complete = True
+        values: dict[tuple[int, int], list[int]] = {}
+        artifacts: list[tuple[int, object]] = []
+        for _, item in self.assets.entries(data.bag_component, 2):
+            if item.size != 1:
+                continue
+            row = self.tables["Item"].get(item.config_id)
+            if row is None:
+                effects.support_sources_complete = False
+                continue
+            profile = self._item_profile(row)
+            if not 1 <= profile <= 3:
+                continue
+            if not item.HasField("equip") or not self._valid_selections(item, profile):
+                effects.support_sources_complete = False
+                continue
+            for selected in item.equip.fixed_affixes:
+                affix = self.tables["EquipV1Affix"].get(selected.affix_id)
+                if affix is None:
+                    effects.support_sources_complete = False
+                    continue
+                exempt = is_polish_exempt(affix.effect)
+                tier = effective_quality_tier(int(selected.quality_tier), exempt)
+                scaled_val = scale_value_by_quality(affix.value_permyriad, self._quality_ratio_pct(tier))
+                key = (int(affix.effect), int(affix.effect_param))
+                if key not in values:
+                    values[key] = [scaled_val, int(affix.source_cap)]
+                else:
+                    values[key][0] += scaled_val
+                    values[key][1] = min(values[key][1], int(affix.source_cap))
+                if affix.effect in (5, 6):
+                    src = effects.support_sources.add()
+                    src.kind = 1
+                    src.item_id = int(item.item_id)
+                    src.affix_id = int(affix.id)
+                    src.name = f"{row.name} · {affix.name}"
+                    src.effect_kind = 2 if affix.effect == 6 else 1
+                    src.raw_bonus_bps = scaled_val
+                    src.source_cap_bps = int(affix.source_cap)
+            if profile == 3:
+                artifacts.append((int(item.item_id), row))
+
+        for (eff, param), (total_val, cap_val) in values.items():
+            capped = min(total_val, cap_val)
+            if eff == 1:
+                effects.physical_attack_bps = capped
+            elif eff == 2:
+                effects.magic_attack_bps = capped
+            elif eff == 3:
+                effects.max_health_bps = capped
+            elif eff == 4:
+                effects.speed_bps = capped
+            elif eff == 5:
+                effects.outgoing_heal_bps = capped
+            elif eff == 6:
+                effects.shield_capacity_bps = capped
+            elif eff == 7:
+                effects.physical_crit_bps = capped
+            elif eff == 8:
+                effects.magic_crit_bps = capped
+            elif eff == 9:
+                effects.physical_resist_bps = capped
+            elif eff == 10:
+                effects.magic_resist_bps = capped
+            elif eff == 11:
+                effects.ailment_hit_bps[param] = capped
+            elif eff == 12:
+                effects.ailment_resist_bps[param] = capped
+            elif eff == 13:
+                effects.mana_reduction_bps[param] = capped
+
+        support_list = sorted(effects.support_sources, key=lambda s: (s.item_id, s.affix_id))
+        if support_list:
+            del effects.support_sources[:]
+            healing_left = int(effects.outgoing_heal_bps)
+            shield_left = int(effects.shield_capacity_bps)
+            for s in support_list:
+                out_s = effects.support_sources.add()
+                out_s.CopyFrom(s)
+                if out_s.effect_kind == 2:
+                    contrib = min(shield_left, int(out_s.raw_bonus_bps))
+                    shield_left -= contrib
+                else:
+                    contrib = min(healing_left, int(out_s.raw_bonus_bps))
+                    healing_left -= contrib
+                out_s.effective_bonus_bps = contrib
+                if contrib < out_s.raw_bonus_bps:
+                    out_s.reason = "装备同类来源上限已截取"
+
+        artifacts.sort(key=lambda pair: pair[0])
+        if "EquipArtifact" in self.tables.tables:
+            for item_id, row in artifacts:
+                art = self.tables["EquipArtifact"].get(getattr(row, "artifact_id", 0))
+                if art is None or not _valid_artifact_row(art):
+                    effects.support_sources_complete = False
+                    continue
+                effects.artifacts.add(
+                    item_id=item_id,
+                    effect_id=art.id,
+                    bonus_bps=art.bonus_bps,
+                    cap_bps=art.cap_bps,
+                    per_round_limit=art.per_round_limit,
+                    battle_limit=art.battle_limit,
+                    active_rounds=art.active_rounds,
+                    health_threshold_bps=art.health_threshold_bps,
+                    name=art.name,
+                )
+
+        season = getattr(self.scene, "season", None)
+        if season is not None and hasattr(season, "collect_effects"):
+            season.collect_effects(data, effects, now_ms_val=self.clock())
 
     def _fill_product(self, item, info) -> None:
         info.Clear()
@@ -835,30 +1113,79 @@ class SceneEquipCraft:
                     return item, bag_type
         return None, 0
 
+    def _find_online_player(self, player_id: int):
+        for location in getattr(self.scene, "locations", {}).values():
+            target = location.players.get(player_id)
+            if target is not None:
+                return target
+        return None
+
+    @staticmethod
+    def _display_name(data, player_id: int) -> str:
+        name = getattr(data.profile_component, "name", "") if data.HasField("profile_component") else ""
+        return name or f"宗师#{player_id}"
+
+    def _resolve_proxy_master(self, buyer_id: int, buyer_data, proxy_master_id: int, prepared: dict) -> int:
+        if not proxy_master_id:
+            exp = int(buyer_data.craft_component.forge_mastery_exp) if buyer_data.HasField("craft_component") else 0
+            prepared["effective_mastery_tier"] = mastery_tier_for_exp(exp)
+            return 0
+        if proxy_master_id == buyer_id:
+            return EQUIP_PROXY_MASTER_UNAVAILABLE
+        master = self._find_online_player(proxy_master_id)
+        if master is None or not self.scene.mutable(master):
+            return EQUIP_PROXY_MASTER_UNAVAILABLE
+        master_data = self.scene.rows.assemble(master.snapshot)
+        mc = master_data.craft_component
+        if (
+            not mc.proxy_stall_open
+            or mastery_tier_for_exp(int(mc.forge_mastery_exp)) < MASTERY_MASTER
+            or not valid_proxy_fee(int(mc.proxy_forge_fee_gold))
+        ):
+            return EQUIP_PROXY_MASTER_UNAVAILABLE
+        fee = int(mc.proxy_forge_fee_gold)
+        net_fee = proxy_net_gold(fee)
+        if net_fee > 0 and (
+            self.assets.currency_blocked(master_data, 0)
+            or self.assets.credit_overflows(master_data, 0, net_fee)
+        ):
+            return EQUIP_PROXY_MASTER_UNAVAILABLE
+        prepared["proxy_master_player_id"] = proxy_master_id
+        prepared["proxy_fee_gold"] = fee
+        prepared["proxy_master_name"] = self._display_name(master_data, proxy_master_id)
+        prepared["effective_mastery_tier"] = MASTERY_MASTER
+        return 0
+
     def _plan_bound_policy(self, data, choice, *, is_create_new: bool, prepared: dict) -> None:
-        """规划装备打造/装条的 T/B 隔离策略，与 C++ PlanBoundPolicy 保持一致。"""
-        mat_id = prepared["material_id"]
-        mat_count = prepared["material_count"]
-        tradable_avail = (
-            self.assets.removable_tradable_count(data, mat_id)
-            if hasattr(self.assets, "removable_tradable_count")
-            else self._available_material(data, mat_id)
-        )
-        total_owned = self._owned_material(data, mat_id)
-        tradable_owned = (
-            self.assets.total_tradable_count(data, mat_id)
-            if hasattr(self.assets, "total_tradable_count")
-            else total_owned
-        )
-        all_tradable_enough = tradable_avail >= mat_count
-        any_countable_bound = total_owned > tradable_owned
+        """规划装备打造/装条/重铸/打磨的 T/B 隔离策略，与 C++ PlanBoundPolicy 保持一致。"""
+        consumed = prepared.get("consumed") or {}
+        all_tradable_enough = True
+        any_countable_bound = False
+        for mat_id, mat_count in consumed.items():
+            if mat_count <= 0:
+                continue
+            tradable_avail = (
+                self.assets.removable_tradable_count(data, mat_id)
+                if hasattr(self.assets, "removable_tradable_count")
+                else self._available_material(data, mat_id)
+            )
+            if tradable_avail < mat_count:
+                all_tradable_enough = False
+            total_owned = self._owned_material(data, mat_id)
+            tradable_owned = (
+                self.assets.total_tradable_count(data, mat_id)
+                if hasattr(self.assets, "total_tradable_count")
+                else total_owned
+            )
+            if total_owned > tradable_owned:
+                any_countable_bound = True
 
         prepared["tradable_only"] = False
         prepared["will_bind_item"] = False
         prepared["bind_confirm_blocked"] = False
 
         if is_create_new:
-            if all_tradable_enough:
+            if not choice.allow_bound_materials and all_tradable_enough:
                 prepared["tradable_only"] = True
                 prepared["will_bind_item"] = False
                 return
@@ -883,12 +1210,15 @@ class SceneEquipCraft:
         prepared["tradable_only"] = False
         prepared["will_bind_item"] = any_countable_bound
 
-    def _prepare_choice(self, data, choice):
+    def _prepare_choice(self, buyer_id: int, data, choice):
         if carries_unknown(choice):
             return FEATURE_UNAVAILABLE, None
         op = choice.operation
         if op == _OP_CREATE_ITEM:
-            if choice.item_id or choice.affix_slot or choice.affix_id or choice.source_item_id:
+            if (
+                choice.item_id or choice.affix_slot or choice.affix_id or choice.source_item_id
+                or choice.use_guarantee_charm or choice.HasField("expected_polish_pity_count")
+            ):
                 return INVALID, None
             row = self.tables["Item"].get(choice.config_id)
             if row is None or not self._valid_template(row):
@@ -902,13 +1232,29 @@ class SceneEquipCraft:
                 "holder": 0,
                 "material_id": mat_id,
                 "material_count": mat_count,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {mat_id: mat_count},
+                "base_gold_cost": 0,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": -1,
+                "polish_exempt": False,
+                "reroll_quality_on_reforge": False,
                 "bind_on_consumed_bound": True,
             }
+            if err := self._resolve_proxy_master(buyer_id, data, int(choice.proxy_master_player_id), prepared):
+                return err, None
             self._plan_bound_policy(data, choice, is_create_new=True, prepared=prepared)
             return 0, prepared
 
         if op == _OP_INSTALL_AFFIX:
-            if choice.config_id or not choice.item_id or not choice.affix_id or choice.source_item_id:
+            if (
+                choice.config_id or not choice.item_id or not choice.affix_id or choice.source_item_id
+                or choice.use_guarantee_charm or choice.HasField("expected_polish_pity_count")
+            ):
                 return INVALID, None
             found_item, holder = self._locate_equipment(data, choice.item_id)
             if found_item is None:
@@ -939,8 +1285,158 @@ class SceneEquipCraft:
                 "holder": holder,
                 "material_id": affix.material_id,
                 "material_count": affix.material_count,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {affix.material_id: affix.material_count},
+                "base_gold_cost": 0,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": len(result.equip.fixed_affixes) - 1,
+                "polish_exempt": is_polish_exempt(affix.effect),
+                "reroll_quality_on_reforge": False,
                 "bind_on_consumed_bound": True,
             }
+            if err := self._resolve_proxy_master(buyer_id, data, int(choice.proxy_master_player_id), prepared):
+                return err, None
+            self._plan_bound_policy(data, choice, is_create_new=False, prepared=prepared)
+            return 0, prepared
+
+        if op == _OP_REFORGE_AFFIX:
+            if (
+                choice.config_id or not choice.item_id or not choice.affix_id or choice.source_item_id
+                or choice.use_guarantee_charm or choice.proxy_master_player_id
+                or choice.HasField("expected_polish_pity_count")
+            ):
+                return INVALID, None
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            item_row = self.tables["Item"].get(found_item.config_id)
+            new_affix = self.tables["EquipV1Affix"].get(choice.affix_id)
+            if item_row is None or new_affix is None or not valid_affix_row(new_affix):
+                return INVALID, None
+            profile = self._item_profile(item_row)
+            if (
+                pool_for(profile, choice.affix_slot) != new_affix.pool
+                or found_item.size != 1
+                or not self._valid_selections(found_item, profile)
+            ):
+                return INVALID, None
+            if carries_unknown(found_item) or carries_unknown(found_item.equip):
+                return FEATURE_UNAVAILABLE, None
+            found_idx = -1
+            for idx, selected in enumerate(found_item.equip.fixed_affixes):
+                if carries_unknown(selected):
+                    return FEATURE_UNAVAILABLE, None
+                if selected.slot == choice.affix_slot:
+                    if selected.affix_id == choice.affix_id:
+                        return EQUIP_AFFIX_REFORGE_SAME, None
+                    found_idx = idx
+                elif selected.affix_id == choice.affix_id:
+                    return INVALID, None
+            if found_idx < 0:
+                return EQUIP_AFFIX_SLOT_EMPTY, None
+            result = clone(found_item)
+            target = result.equip.fixed_affixes[found_idx]
+            old_affix = self.tables["EquipV1Affix"].get(target.affix_id)
+            old_exempt = old_affix is not None and is_polish_exempt(old_affix.effect)
+            new_exempt = is_polish_exempt(new_affix.effect)
+            target.affix_id = choice.affix_id
+            reroll_quality = False
+            if new_exempt:
+                target.quality_tier = MAX_QUALITY_TIER
+                target.polish_pity_count = 0
+            elif old_exempt:
+                reroll_quality = True
+            exp = int(data.craft_component.forge_mastery_exp) if data.HasField("craft_component") else 0
+            prepared = {
+                "result": result,
+                "original": found_item,
+                "holder": holder,
+                "material_id": POLISH_SAND_ID,
+                "material_count": 1,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {POLISH_SAND_ID: 1},
+                "base_gold_cost": REFORGE_GOLD_COST,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": mastery_tier_for_exp(exp),
+                "target_affix_index": found_idx,
+                "polish_exempt": new_exempt,
+                "reroll_quality_on_reforge": reroll_quality,
+                "bind_on_consumed_bound": True,
+            }
+            self._plan_bound_policy(data, choice, is_create_new=False, prepared=prepared)
+            return 0, prepared
+
+        if op == _OP_POLISH_AFFIX:
+            if choice.config_id or not choice.item_id or choice.affix_id or choice.source_item_id:
+                return INVALID, None
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            item_row = self.tables["Item"].get(found_item.config_id)
+            if item_row is None:
+                return INVALID, None
+            profile = self._item_profile(item_row)
+            if (
+                pool_for(profile, choice.affix_slot) == 0
+                or found_item.size != 1
+                or not self._valid_selections(found_item, profile)
+            ):
+                return INVALID, None
+            if carries_unknown(found_item) or carries_unknown(found_item.equip):
+                return FEATURE_UNAVAILABLE, None
+            found_idx = -1
+            for idx, selected in enumerate(found_item.equip.fixed_affixes):
+                if carries_unknown(selected):
+                    return FEATURE_UNAVAILABLE, None
+                if selected.slot == choice.affix_slot:
+                    found_idx = idx
+                    break
+            if found_idx < 0:
+                return EQUIP_AFFIX_SLOT_EMPTY, None
+            current = found_item.equip.fixed_affixes[found_idx]
+            affix = self.tables["EquipV1Affix"].get(current.affix_id)
+            if affix is None:
+                return INVALID, None
+            if is_polish_exempt(affix.effect):
+                return EQUIP_AFFIX_POLISH_EXEMPT, None
+            current_tier = effective_quality_tier(int(current.quality_tier), False)
+            if current_tier >= MAX_QUALITY_TIER:
+                return EQUIP_AFFIX_ALREADY_MAX_QUALITY, None
+            if choice.HasField("expected_polish_pity_count") and choice.expected_polish_pity_count != current.polish_pity_count:
+                return EQUIP_POLISH_PITY_CHANGED, None
+            consumed = {POLISH_SAND_ID: 1}
+            extra_id = GUARANTEE_CHARM_ID if choice.use_guarantee_charm else 0
+            extra_count = 1 if choice.use_guarantee_charm else 0
+            if extra_id:
+                consumed[extra_id] = consumed.get(extra_id, 0) + extra_count
+            prepared = {
+                "result": clone(found_item),
+                "original": found_item,
+                "holder": holder,
+                "material_id": POLISH_SAND_ID,
+                "material_count": 1,
+                "extra_material_id": extra_id,
+                "extra_material_count": extra_count,
+                "consumed": consumed,
+                "base_gold_cost": POLISH_GOLD_COST,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": found_idx,
+                "polish_exempt": False,
+                "reroll_quality_on_reforge": False,
+                "bind_on_consumed_bound": True,
+            }
+            if err := self._resolve_proxy_master(buyer_id, data, int(choice.proxy_master_player_id), prepared):
+                return err, None
             self._plan_bound_policy(data, choice, is_create_new=False, prepared=prepared)
             return 0, prepared
 
@@ -962,10 +1458,10 @@ class SceneEquipCraft:
             if carries_unknown(found_item) or carries_unknown(found_item.equip):
                 return FEATURE_UNAVAILABLE, None
             if not found_item.bound:
-                return INVALID, None  # 已是可交易装备无需解封剥离
+                return INVALID, None
             for gem in found_item.equip.gems:
                 if gem.gem_config_id != 0:
-                    return INVALID, None  # 要求先取下所有宝石，防止误销毁
+                    return INVALID, None
             result = clone(found_item)
             result.bound = False
             result.equip.enhance_level = 0
@@ -979,6 +1475,17 @@ class SceneEquipCraft:
                 "holder": holder,
                 "material_id": UNSEAL_TALISMAN_ID,
                 "material_count": 1,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {UNSEAL_TALISMAN_ID: 1},
+                "base_gold_cost": 0,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": -1,
+                "polish_exempt": False,
+                "reroll_quality_on_reforge": False,
                 "tradable_only": False,
                 "will_bind_item": False,
                 "bind_confirm_blocked": False,
@@ -1024,7 +1531,6 @@ class SceneEquipCraft:
             result = clone(found_item)
             result.equip.enhance_level = source_level
             result.equip.enhance_pity_count = int(source_item.equip.enhance_pity_count)
-            # 目标副套装备强制绑定仅自用，避免通过流派副套继承复制/洗白多件可交易高强成品。
             result.bound = True
             return 0, {
                 "result": result,
@@ -1032,15 +1538,88 @@ class SceneEquipCraft:
                 "holder": holder,
                 "material_id": INHERIT_TALISMAN_ID,
                 "material_count": 1,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {INHERIT_TALISMAN_ID: 1},
+                "base_gold_cost": 0,
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": -1,
+                "polish_exempt": False,
+                "reroll_quality_on_reforge": False,
                 "tradable_only": False,
                 "will_bind_item": not found_item.bound,
                 "bind_confirm_blocked": False,
                 "bind_on_consumed_bound": False,
             }
 
+        if op == _OP_UPGRADE_TIER:
+            if (
+                not choice.config_id or not choice.item_id or choice.source_item_id
+                or choice.affix_slot or choice.affix_id or choice.use_guarantee_charm
+                or choice.proxy_master_player_id or choice.HasField("expected_polish_pity_count")
+            ):
+                return INVALID, None
+            found_item, holder = self._locate_equipment(data, choice.item_id)
+            if found_item is None:
+                return EQUIP_ITEM_NOT_FOUND, None
+            source_row = self.tables["Item"].get(found_item.config_id)
+            target_row = self.tables["Item"].get(choice.config_id)
+            if (
+                source_row is None or target_row is None
+                or not self._valid_template(source_row) or not self._valid_template(target_row)
+                or not can_upgrade_tier(
+                    self._item_profile(source_row), source_row.equip_kind, source_row.equip_level,
+                    getattr(source_row, "equip_class", 0),
+                    self._item_profile(target_row), target_row.equip_kind, target_row.equip_level,
+                    getattr(target_row, "equip_class", 0),
+                )
+                or found_item.size != 1
+                or not self._valid_selections(found_item, self._item_profile(source_row))
+            ):
+                return INVALID, None
+            if carries_unknown(found_item) or carries_unknown(found_item.equip):
+                return FEATURE_UNAVAILABLE, None
+            result = clone(found_item)
+            result.config_id = target_row.id
+            return 0, {
+                "result": result,
+                "original": found_item,
+                "holder": holder,
+                "material_id": 0,
+                "material_count": 0,
+                "extra_material_id": 0,
+                "extra_material_count": 0,
+                "consumed": {},
+                "base_gold_cost": upgrade_tier_gold_cost(
+                    self._item_profile(source_row), source_row.equip_level, target_row.equip_level,
+                ),
+                "proxy_fee_gold": 0,
+                "proxy_master_player_id": 0,
+                "proxy_master_name": "",
+                "effective_mastery_tier": MASTERY_APPRENTICE,
+                "target_affix_index": -1,
+                "polish_exempt": False,
+                "reroll_quality_on_reforge": False,
+                "tradable_only": False,
+                "will_bind_item": False,
+                "bind_confirm_blocked": False,
+                "bind_on_consumed_bound": False,
+            }
+
         return INVALID, None
 
-    def _check_availability(self, player, data, prepared) -> int:
+    def _split_gold_costs(self, op: int, prepared: dict) -> tuple[int, int]:
+        allow_bind_for_base_fee = (op != _OP_UNSEAL_TO_TRADABLE) and bool(prepared["result"].bound)
+        base_gold = int(prepared.get("base_gold_cost", 0))
+        proxy_fee = int(prepared.get("proxy_fee_gold", 0))
+        strict_gold = proxy_fee + (0 if allow_bind_for_base_fee else base_gold)
+        prefer_bind_gold = base_gold if allow_bind_for_base_fee else 0
+        return strict_gold, prefer_bind_gold
+
+    def _check_availability(self, player, data, op: int, prepared) -> int:
         if writable_err := self._writable_error(player):
             return writable_err
         if self._get_forge_revision(player.player_id, data) == _MAX_UINT64:
@@ -1052,22 +1631,28 @@ class SceneEquipCraft:
             return UNAVAILABLE
         if effective_level(data) < row.equip_level:
             return EQUIP_LEVEL_NOT_ENOUGH
-        available = self._available_material(data, prepared["material_id"])
-        if available < prepared["material_count"]:
-            return EQUIP_MATERIAL_NOT_ENOUGH
+        for mat_id, mat_count in sorted((prepared.get("consumed") or {}).items()):
+            if mat_count > 0 and self._available_material(data, mat_id) < mat_count:
+                return EQUIP_MATERIAL_NOT_ENOUGH
         if prepared.get("bind_confirm_blocked"):
             return EQUIP_BIND_CONFIRM_REQUIRED
+        strict_gold, prefer_bind_gold = self._split_gold_costs(op, prepared)
+        if strict_gold > 0 or prefer_bind_gold > 0:
+            if not self.assets.can_afford_split_gold(data, strict_gold, prefer_bind_gold):
+                return EQUIP_CRAFT_GOLD_NOT_ENOUGH
         if prepared["original"] is None:
-            # 预检扣料后主背包是否至少有 1 个空位容纳新打造装备。
             staged = clone(data)
-            err, _ = self._consume_material_tb(
-                staged, prepared["material_id"], prepared["material_count"],
-                tradable_only=bool(prepared.get("tradable_only")),
-            )
-            if err == BAG_INSUFFICIENT:
-                return EQUIP_MATERIAL_NOT_ENOUGH
-            if err:
-                return err
+            for mat_id, mat_count in sorted((prepared.get("consumed") or {}).items()):
+                if mat_count <= 0:
+                    continue
+                err, _ = self._consume_material_tb(
+                    staged, mat_id, mat_count,
+                    tradable_only=bool(prepared.get("tradable_only")),
+                )
+                if err == BAG_INSUFFICIENT:
+                    return EQUIP_MATERIAL_NOT_ENOUGH
+                if err:
+                    return err
             entries = self.assets.entries(staged.bag_component, 0)
             if len(entries) >= bag_capacity(staged.bag_component, 0):
                 return BAG_FULL
@@ -1076,7 +1661,7 @@ class SceneEquipCraft:
     # ── 5 个客户端 RPC 处理入口 ──
 
     def get_rules(self, _world, player, _route, _request):
-        """查询权威打造配方、固定词条池、规则指纹与当前打造修订号。"""
+        """查询权威打造配方、固定词条池、品相权重、规则指纹与当前打造修订号。"""
         response = self.protocol.message("GetEquipmentCraftRulesResponse")
         if self.assets is None:
             response.error_message.id = UNAVAILABLE
@@ -1088,10 +1673,11 @@ class SceneEquipCraft:
         data = self.scene.rows.assemble(player.snapshot)
         response.CopyFrom(cached)
         response.forge_revision = self._get_forge_revision(player.player_id, data)
+        self._fill_forge_mastery(data, response.forge_mastery)
         return response
 
     def preview_craft(self, _world, player, _route, request):
-        """试算装备打造或词条安装结果与所需材料，不落盘不扣料。"""
+        """试算装备打造、装条、重铸、打磨、解封、继承或无损升档结果与所需材料，不落盘不扣料。"""
         response = self.protocol.message("PreviewEquipmentCraftResponse")
         if self.assets is None:
             response.error_message.id = UNAVAILABLE
@@ -1104,7 +1690,7 @@ class SceneEquipCraft:
             response.error_message.id = err
             return response
         data = self.scene.rows.assemble(player.snapshot)
-        err, prepared = self._prepare_choice(data, request.choice)
+        err, prepared = self._prepare_choice(player.player_id, data, request.choice)
         if err:
             response.error_message.id = err
             return response
@@ -1115,10 +1701,24 @@ class SceneEquipCraft:
         preview_item = clone(prepared["result"])
         if prepared.get("will_bind_item"):
             preview_item.bound = True
+        if request.choice.operation == _OP_POLISH_AFFIX and prepared["target_affix_index"] >= 0:
+            target = preview_item.equip.fixed_affixes[prepared["target_affix_index"]]
+            if request.choice.use_guarantee_charm or target.polish_pity_count + 1 >= POLISH_PITY_LIMIT:
+                target.quality_tier = MAX_QUALITY_TIER
+                target.polish_pity_count = 0
         preview.will_bind_item = bool(prepared.get("will_bind_item"))
         self._fill_product(preview_item, preview.result)
-        self._fill_material_display(data, prepared["material_id"], prepared["material_count"], preview.material)
-        unavailable = self._check_availability(player, data, prepared)
+        if prepared["material_id"] and prepared["material_count"]:
+            self._fill_material_display(data, prepared["material_id"], prepared["material_count"], preview.material)
+        if prepared["extra_material_id"] and prepared["extra_material_count"]:
+            self._fill_material_display(
+                data, prepared["extra_material_id"], prepared["extra_material_count"], preview.extra_material,
+            )
+        preview.gold_cost = int(prepared.get("base_gold_cost", 0))
+        preview.proxy_fee_gold = int(prepared.get("proxy_fee_gold", 0))
+        if prepared.get("proxy_master_name"):
+            preview.proxy_master_name = prepared["proxy_master_name"]
+        unavailable = self._check_availability(player, data, request.choice.operation, prepared)
         preview.available = unavailable == 0
         if unavailable:
             preview.unavailable_tip = unavailable
@@ -1130,13 +1730,20 @@ class SceneEquipCraft:
             del self._craft_receipts[oldest]
         self._craft_receipts[(player_id, request_id)] = (item_id, forge_revision)
 
-    def _fill_craft_applied(self, player, data, response, *, item_id: int, result_rev: int, replayed: bool):
+    def _fill_craft_applied(
+        self, player, data, response, *, item_id: int, result_rev: int, replayed: bool,
+        quality_tier: int = 0, polish_pity_count: int = 0, guaranteed_by_pity: bool = False,
+    ):
         response.outcome = _OUTCOME_APPLIED
         response.replayed = replayed
         response.durable = True
         response.item_id = item_id
         response.result_forge_revision = result_rev
         response.current_forge_revision = self._get_forge_revision(player.player_id, data)
+        response.result_quality_tier = quality_tier
+        response.result_polish_pity_count = polish_pity_count
+        response.guaranteed_by_pity = guaranteed_by_pity
+        self._fill_forge_mastery(data, response.forge_mastery)
         inv = _bag(self.scene, self.tables, player, 0)
         eq = _bag(self.scene, self.tables, player, 2)
         if inv.error_message.id or eq.error_message.id:
@@ -1149,7 +1756,7 @@ class SceneEquipCraft:
         return response
 
     async def commit_craft(self, _world, player, _route, request):
-        """原子提交装备打造或首次固定词条安装，带水位乐观锁与 client_request_id 幂等。"""
+        """原子提交装备打造/装条/重铸/打磨/解封/继承/无损升档，带水位乐观锁、拆分银两与 client_request_id 幂等。"""
         response = self.protocol.message(
             "CommitEquipmentCraftResponse", client_request_id=request.client_request_id,
         )
@@ -1183,6 +1790,9 @@ class SceneEquipCraft:
             )
             return self._fill_craft_applied(
                 player, data, response, item_id=item_id, result_rev=result_rev, replayed=True,
+                quality_tier=int(getattr(prior, "equipment_quality_tier", 0)),
+                polish_pity_count=int(getattr(prior, "equipment_polish_pity_count", 0)),
+                guaranteed_by_pity=bool(getattr(prior, "equipment_guaranteed_by_pity", False)),
             )
 
         if request.expected_forge_revision != current_rev:
@@ -1193,25 +1803,83 @@ class SceneEquipCraft:
         if request.rules_fingerprint != cached.rules_fingerprint:
             return reject(INVALID)
 
-        err, prepared = self._prepare_choice(data, request.choice)
+        op = request.choice.operation
+        err, prepared = self._prepare_choice(player.player_id, data, request.choice)
         if err:
             return reject(err)
-        err = self._check_availability(player, data, prepared)
+        err = self._check_availability(player, data, op, prepared)
         if err:
             return reject(err)
+
+        res_quality_tier = 0
+        res_polish_pity = 0
+        res_guaranteed = False
+        target_idx = prepared["target_affix_index"]
+        if (op == _OP_INSTALL_AFFIX or prepared["reroll_quality_on_reforge"]) and target_idx >= 0:
+            target = prepared["result"].equip.fixed_affixes[target_idx]
+            tier = MAX_QUALITY_TIER if prepared["polish_exempt"] else self._roll_quality_for_mastery(
+                prepared["effective_mastery_tier"],
+            )
+            target.quality_tier = tier
+            target.polish_pity_count = 0
+            res_quality_tier = tier
+            res_polish_pity = 0
+            res_guaranteed = False
+        elif op == _OP_REFORGE_AFFIX and target_idx >= 0:
+            target = prepared["result"].equip.fixed_affixes[target_idx]
+            res_quality_tier = effective_quality_tier(int(target.quality_tier), prepared["polish_exempt"])
+            res_polish_pity = int(target.polish_pity_count)
+        elif op == _OP_POLISH_AFFIX and target_idx >= 0:
+            target = prepared["result"].equip.fixed_affixes[target_idx]
+            cur_tier = effective_quality_tier(int(target.quality_tier), False)
+            rolled_tier = self._roll_quality_for_mastery(prepared["effective_mastery_tier"])
+            new_tier, new_pity, guaranteed = resolve_polish(
+                cur_tier, int(target.polish_pity_count), rolled_tier, bool(request.choice.use_guarantee_charm),
+            )
+            target.quality_tier = new_tier
+            target.polish_pity_count = new_pity
+            res_quality_tier = new_tier
+            res_polish_pity = new_pity
+            res_guaranteed = guaranteed
+
+        if (
+            op in (_OP_INSTALL_AFFIX, _OP_POLISH_AFFIX)
+            and not prepared["polish_exempt"]
+            and res_quality_tier == MAX_QUALITY_TIER
+            and prepared["effective_mastery_tier"] == MASTERY_MASTER
+        ):
+            signer_id = prepared["proxy_master_player_id"] or player.player_id
+            signer_name = (
+                prepared["proxy_master_name"]
+                if prepared["proxy_master_player_id"]
+                else self._display_name(data, signer_id)
+            )
+            prepared["result"].equip.crafter_player_id = signer_id
+            prepared["result"].equip.crafter_name = signer_name
 
         staged = clone(data)
-        consume_err, consumed_bound = self._consume_material_tb(
-            staged, prepared["material_id"], prepared["material_count"],
-            tradable_only=bool(prepared.get("tradable_only")),
-        )
-        if consume_err == BAG_INSUFFICIENT:
-            return reject(EQUIP_MATERIAL_NOT_ENOUGH)
-        if consume_err:
-            return reject(consume_err)
+        consumed_bound = False
+        for mat_id, mat_count in sorted((prepared.get("consumed") or {}).items()):
+            if mat_count <= 0:
+                continue
+            consume_err, used_bound = self._consume_material_tb(
+                staged, mat_id, mat_count,
+                tradable_only=bool(prepared.get("tradable_only")),
+            )
+            if consume_err == BAG_INSUFFICIENT:
+                return reject(EQUIP_MATERIAL_NOT_ENOUGH)
+            if consume_err:
+                return reject(consume_err)
+            if used_bound:
+                consumed_bound = True
+
+        strict_gold, prefer_bind_gold = self._split_gold_costs(op, prepared)
+        if strict_gold > 0 or prefer_bind_gold > 0:
+            if self.assets.deduct_split_gold(staged, strict_gold, prefer_bind_gold):
+                return reject(EQUIP_CRAFT_GOLD_NOT_ENOUGH)
 
         bind_on_consumed_bound = bool(prepared.get("bind_on_consumed_bound"))
-        if request.choice.operation == _OP_CREATE_ITEM:
+        if op == _OP_CREATE_ITEM:
             if self.assets.allocate_item_id is None:
                 return reject(UNAVAILABLE)
             try:
@@ -1245,8 +1913,8 @@ class SceneEquipCraft:
         next_rev = current_rev + 1
         if hasattr(staged.client_request_ledger, "forge_revision"):
             staged.client_request_ledger.forge_revision = next_rev
-        # 本人打造/装条自然涨 1 点铸器熟练度；解封/继承不涨熟练度。
-        if request.choice.operation in (_OP_CREATE_ITEM, _OP_INSTALL_AFFIX) and not request.choice.proxy_master_player_id:
+        # 本人打造/装条/打磨自然涨 1 点铸器熟练度；重铸/解封/继承/无损升档不涨熟练度。
+        if op in (_OP_CREATE_ITEM, _OP_INSTALL_AFFIX, _OP_POLISH_AFFIX) and not prepared["proxy_master_player_id"]:
             if staged.HasField("craft_component") and staged.craft_component.forge_mastery_exp < (1 << 32) - 1:
                 staged.craft_component.forge_mastery_exp += 1
         client_request.remember(
@@ -1256,26 +1924,44 @@ class SceneEquipCraft:
             fingerprint,
             equipment_item_id=target_item_id,
             forge_revision=next_rev,
+            equipment_quality_tier=res_quality_tier,
+            equipment_polish_pity_count=res_polish_pity,
+            equipment_guaranteed_by_pity=res_guaranteed,
         )
-        # 若修改的是已穿戴装备，commit 成功后通知属性重算。
         saved = await self.assets._save(
             player, staged, 27, correlation=request.client_request_id,
             item_extra={"operation": "equipment_craft", "item_id": target_item_id},
         )
         if not saved:
             return reject(UNAVAILABLE, known=False)
+
+        if prepared["proxy_master_player_id"]:
+            proxy_master = self._find_online_player(prepared["proxy_master_player_id"])
+            net_fee = proxy_net_gold(prepared["proxy_fee_gold"])
+            if proxy_master is not None and net_fee > 0:
+                master_staged = clone(self.scene.rows.assemble(proxy_master.snapshot))
+                if not self.assets.add_currency(master_staged, 0, net_fee):
+                    try:
+                        await self.scene.commit_player_data(proxy_master, master_staged)
+                    except (StoreRejected, StoreUnavailable, OSError):
+                        logger.warning(
+                            "Proxy master forge fee credit failed master_id=%s fee=%s",
+                            prepared["proxy_master_player_id"], net_fee,
+                        )
+
         self._set_forge_revision(player.player_id, staged, next_rev)
-        if request.choice.operation != _OP_CREATE_ITEM and prepared["holder"] == 2:
+        if op != _OP_CREATE_ITEM and prepared["holder"] == 2:
             attributes = getattr(self.scene, "attributes", None)
             if attributes is not None:
                 attributes.notify(player)
         self._remember_craft(player.player_id, request.client_request_id, target_item_id, next_rev)
         logger.info(
-            "Equipment craft committed player_id=%s op=%s item_id=%s revision=%s",
-            player.player_id, request.choice.operation, target_item_id, next_rev,
+            "Equipment craft committed player_id=%s op=%s item_id=%s revision=%s quality=%s",
+            player.player_id, op, target_item_id, next_rev, res_quality_tier,
         )
         return self._fill_craft_applied(
             player, staged, response, item_id=target_item_id, result_rev=next_rev, replayed=False,
+            quality_tier=res_quality_tier, polish_pity_count=res_polish_pity, guaranteed_by_pity=res_guaranteed,
         )
 
     def _light_card_active(self, data, stamp: int) -> bool:

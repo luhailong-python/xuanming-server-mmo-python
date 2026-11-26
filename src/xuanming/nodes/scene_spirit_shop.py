@@ -29,6 +29,7 @@ from ..data.asset_inventory import (
     clone,
 )
 from ..data.asset_ledger import INT64_MAX, UINT64_MAX
+from .scene_mission import effective_level
 from .scene_player import _bag
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ TX_SPIRIT_SHOP_BUY = 44
 RESET_LIFETIME = 0
 RESET_WEEKLY = 1
 
+GRANT_MODE_ALL = 0
+GRANT_MODE_CHOOSE_ONE = 1
+MAX_GOODS_ITEMS = 4
+
 MAX_UNIT_PRICE = 1_000_000_000
 MAX_BUY_COUNT_PER_REQUEST = 99
 MAX_LIMIT_GROUP_WEIGHT = 1_000_000
@@ -56,7 +61,7 @@ _MAX_UINT32 = 0xFFFFFFFF
 WEEK_MS = 7 * 24 * 3600 * 1000
 FIRST_MONDAY_05_UTC8_MS = 334_800_000
 
-# 对应 C++ spirit_shop_error_tip.pb.h 错误码（37000..37010）。
+# 对应 C++ spirit_shop_error_tip.pb.h 错误码（37000..37013）。
 SPIRIT_SHOP_UNAVAILABLE = 37000
 SPIRIT_SHOP_GOODS_OFF_SHELF = 37001
 SPIRIT_SHOP_PRICE_CHANGED = 37002
@@ -68,6 +73,9 @@ SPIRIT_SHOP_BAG_FULL = 37007
 SPIRIT_SHOP_FROZEN = 37008
 SPIRIT_SHOP_IN_BATTLE = 37009
 SPIRIT_SHOP_ITEM_BLOCKED = 37010
+SPIRIT_SHOP_NOT_IN_SALE_WINDOW = 37011
+SPIRIT_SHOP_LEVEL_NOT_MET = 37012
+SPIRIT_SHOP_INVALID_CHOICE = 37013
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +99,7 @@ class ResolvedLimitGroup:
 
 @dataclass(frozen=True, slots=True)
 class ResolvedGoods:
-    """百宝阁单行在售商品快照。"""
+    """百宝阁单行在售商品快照（支持 V2 定时上下架、等级阶段、多物品与多选一）。"""
 
     goods_id: int
     tab_id: int
@@ -108,11 +116,55 @@ class ResolvedGoods:
     limit_count: int
     limit_group_id: int
     limit_group_weight: int
+    start_time_ms: int = 0
+    end_time_ms: int = 0
+    grant_mode: int = GRANT_MODE_ALL
+    original_price: int = 0
+    min_level: int = 0
+    max_level: int = 0
 
 
 def is_valid_reset_kind(reset_kind: int) -> bool:
     """校验限购重置周期：0=终身，1=每周。"""
     return reset_kind in (RESET_LIFETIME, RESET_WEEKLY)
+
+
+def is_valid_grant_mode(grant_mode: int) -> bool:
+    """校验发放模式：0=ALL 全部发放，1=CHOOSE_ONE 多选一。"""
+    return grant_mode in (GRANT_MODE_ALL, GRANT_MODE_CHOOSE_ONE)
+
+
+def is_in_sale_window(start_time_ms: int, end_time_ms: int, now_ms: int) -> bool:
+    """定时上下架判定：左闭右开 [start_time_ms, end_time_ms)，任一端为 0 表示该侧不限。"""
+    if start_time_ms > 0 and now_ms < start_time_ms:
+        return False
+    if end_time_ms > 0 and now_ms >= end_time_ms:
+        return False
+    return True
+
+
+def is_level_eligible(eff_level: int, min_level: int, max_level: int) -> bool:
+    """角色有效等级阶段解锁判定：任一端为 0 表示该侧不限。"""
+    if min_level > 0 and eff_level < min_level:
+        return False
+    if max_level > 0 and eff_level > max_level:
+        return False
+    return True
+
+
+def resolve_selected_items(goods: ResolvedGoods, chosen_item_index: int) -> tuple[ResolvedItem, ...] | None:
+    """根据发放模式解析本次实际发入背包的物品列表。"""
+    if not goods.items:
+        return None
+    if goods.grant_mode == GRANT_MODE_ALL:
+        if chosen_item_index != 0:
+            return None
+        return goods.items
+    if goods.grant_mode == GRANT_MODE_CHOOSE_ONE:
+        if len(goods.items) < 2 or not 0 <= chosen_item_index < len(goods.items):
+            return None
+        return (goods.items[chosen_item_index],)
+    return None
 
 
 def resolve_week(now_ms: int) -> tuple[int, int] | None:
@@ -324,44 +376,76 @@ class SceneSpiritShop:
             return None, "goods id is 0"
         if int(row.enabled) == 0:
             return None, "goods disabled"
+        tab_id = int(row.tab_id)
+        if tab_id == 0:
+            return None, "tab_id is 0"
         currency_type = int(row.currency_type)
         if currency_type not in self.assets.currency_types:
             return None, "unknown currency_type"
         price = int(row.price)
         if not 1 <= price <= MAX_UNIT_PRICE:
             return None, "price not in 1..1000000000"
+        original_price = int(getattr(row, "original_price", 0))
+        if original_price > 0 and (original_price <= price or original_price > MAX_UNIT_PRICE):
+            return None, "original_price must be 0 or strictly greater than price and <= 1000000000"
+        start_time_ms = int(getattr(row, "start_time_ms", 0))
+        end_time_ms = int(getattr(row, "end_time_ms", 0))
+        if start_time_ms > 0 and end_time_ms > 0 and end_time_ms <= start_time_ms:
+            return None, "end_time_ms must be greater than start_time_ms"
+        min_level = int(getattr(row, "min_level", 0))
+        max_level = int(getattr(row, "max_level", 0))
+        if min_level > 0 and max_level > 0 and max_level < min_level:
+            return None, "max_level must be >= min_level"
+        grant_mode = int(getattr(row, "grant_mode", GRANT_MODE_ALL))
+        if not is_valid_grant_mode(grant_mode):
+            return None, "grant_mode must be 0 (ALL) or 1 (CHOOSE_ONE)"
         max_buy = int(row.max_buy_per_request)
         if not 1 <= max_buy <= MAX_BUY_COUNT_PER_REQUEST:
             return None, "max_buy_per_request not in 1..99"
         limit_reset_kind = int(row.limit_reset_kind)
         if not is_valid_reset_kind(limit_reset_kind):
             return None, "limit_reset_kind is invalid"
-        bound1 = int(row.item_bound_1)
-        bound2 = int(row.item_bound_2)
-        if bound1 not in (0, 1) or bound2 not in (0, 1):
-            return None, "item_bound must be 0 or 1"
 
         items_table = self._table("Item")
-        item1_id = int(row.item_id_1)
-        item1_count = int(row.item_count_1)
-        item1 = None if items_table is None else items_table.get(item1_id)
-        if item1 is None or item1_count == 0:
-            return None, "item_id_1 missing or item_count_1 is 0"
-        if int(item1.max_stack_size) == 0 or item1_count * max_buy > _MAX_UINT32:
-            return None, "item_1 stack size invalid or count overflows"
+        raw_slots = (
+            (int(row.item_id_1), int(row.item_count_1), int(row.item_bound_1)),
+            (int(row.item_id_2), int(row.item_count_2), int(row.item_bound_2)),
+            (int(getattr(row, "item_id_3", 0)), int(getattr(row, "item_count_3", 0)), int(getattr(row, "item_bound_3", 0))),
+            (int(getattr(row, "item_id_4", 0)), int(getattr(row, "item_count_4", 0)), int(getattr(row, "item_bound_4", 0))),
+        )
+        resolved_items: list[ResolvedItem] = []
+        first_item = None
+        seen_empty = False
+        for item_id, item_count, item_bound in raw_slots:
+            if item_bound not in (0, 1):
+                return None, "item_bound must be 0 or 1"
+            if item_id == 0:
+                if item_count != 0 or item_bound != 0:
+                    return None, "empty item slot has non-zero count or bound"
+                seen_empty = True
+                continue
+            if seen_empty:
+                return None, "item slots must not contain gaps"
+            item_row = None if items_table is None else items_table.get(item_id)
+            if item_row is None or item_count == 0:
+                return None, "item_id missing or item_count is 0"
+            if int(item_row.max_stack_size) == 0 or item_count * max_buy > _MAX_UINT32:
+                return None, "item stack size invalid or count overflows"
+            bound = bool(item_bound)
+            for existing in resolved_items:
+                if grant_mode == GRANT_MODE_ALL:
+                    if existing.item_config_id == item_id and existing.bound == bound:
+                        return None, "ALL bundle has duplicate (item_id, bound)"
+                elif existing.item_config_id == item_id and existing.item_count == item_count and existing.bound == bound:
+                    return None, "CHOOSE_ONE bundle has duplicate option"
+            if first_item is None:
+                first_item = item_row
+            resolved_items.append(ResolvedItem(item_id, item_count, bound))
 
-        resolved_items = [ResolvedItem(item1_id, item1_count, bool(bound1))]
-        item2_id = int(row.item_id_2)
-        if item2_id != 0:
-            item2_count = int(row.item_count_2)
-            item2 = None if items_table is None else items_table.get(item2_id)
-            if item2 is None or item2_count == 0:
-                return None, "item_id_2 missing or item_count_2 is 0"
-            if item2_id == item1_id and bool(bound2) == bool(bound1):
-                return None, "item_2 duplicates (item_id_1, item_bound_1)"
-            if int(item2.max_stack_size) == 0 or item2_count * max_buy > _MAX_UINT32:
-                return None, "item_2 stack size invalid or count overflows"
-            resolved_items.append(ResolvedItem(item2_id, item2_count, bool(bound2)))
+        if not resolved_items or first_item is None:
+            return None, "item_id_1 missing or item_count_1 is 0"
+        if grant_mode == GRANT_MODE_CHOOSE_ONE and len(resolved_items) < 2:
+            return None, "CHOOSE_ONE requires at least 2 item options"
 
         group_id = int(row.limit_group_id)
         group_weight = 0
@@ -375,11 +459,11 @@ class SceneSpiritShop:
 
         return ResolvedGoods(
             goods_id=gid,
-            tab_id=int(row.tab_id),
+            tab_id=tab_id,
             sort_order=int(row.sort_order),
-            name=str(row.name) or str(item1.name),
-            description=str(row.description) or str(item1.description),
-            icon_key=str(row.icon_key) or str(item1.icon_key),
+            name=str(row.name) or str(first_item.name),
+            description=str(row.description) or str(first_item.description),
+            icon_key=str(row.icon_key) or str(first_item.icon_key),
             badge_text=str(row.badge_text),
             currency_type=currency_type,
             unit_price=price,
@@ -389,6 +473,12 @@ class SceneSpiritShop:
             limit_count=int(row.limit_count),
             limit_group_id=group_id,
             limit_group_weight=group_weight,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            grant_mode=grant_mode,
+            original_price=original_price,
+            min_level=min_level,
+            max_level=max_level,
         ), ""
 
     def validate_tables(self) -> bool:
@@ -467,6 +557,7 @@ class SceneSpiritShop:
                 next_reset_ms=week_next_ms if (group.reset_kind == RESET_WEEKLY and week_ok) else 0,
             )
 
+        player_level = effective_level(data) if data.HasField("level_component") else 1
         goods_table = self._table("SpiritShopGoods")
         goods_list: list[ResolvedGoods] = []
         if goods_table is not None:
@@ -474,8 +565,13 @@ class SceneSpiritShop:
                 if int(row.enabled) == 0:
                     continue
                 resolved, _ = self._resolve_goods_row(row)
-                if resolved is not None:
-                    goods_list.append(resolved)
+                if resolved is None:
+                    continue
+                if not is_in_sale_window(resolved.start_time_ms, resolved.end_time_ms, now_val):
+                    continue
+                if not is_level_eligible(player_level, resolved.min_level, resolved.max_level):
+                    continue
+                goods_list.append(resolved)
         goods_list.sort(key=lambda g: (g.tab_id, g.sort_order, g.goods_id))
         for goods in goods_list:
             bought = (
@@ -504,6 +600,12 @@ class SceneSpiritShop:
                     if (goods.limit_count > 0 and goods.limit_reset_kind == RESET_WEEKLY and week_ok)
                     else 0
                 ),
+                start_time_ms=goods.start_time_ms,
+                end_time_ms=goods.end_time_ms,
+                grant_mode=goods.grant_mode,
+                original_price=goods.original_price,
+                min_level=goods.min_level,
+                max_level=goods.max_level,
             )
             for item in goods.items:
                 view.items.add(
@@ -679,9 +781,21 @@ class SceneSpiritShop:
             )
             return self._reject(route, SPIRIT_SHOP_UNAVAILABLE)
 
+        if not is_in_sale_window(goods.start_time_ms, goods.end_time_ms, now_val):
+            return self._reject(route, SPIRIT_SHOP_NOT_IN_SALE_WINDOW)
+        if goods.min_level > 0 or goods.max_level > 0:
+            if not data.HasField("level_component"):
+                return self._reject(route, SPIRIT_SHOP_UNAVAILABLE)
+            if not is_level_eligible(effective_level(data), goods.min_level, goods.max_level):
+                return self._reject(route, SPIRIT_SHOP_LEVEL_NOT_MET)
+
         count = int(request.count)
         if count == 0 or count > goods.max_buy_per_request:
             return self._reject(route, SPIRIT_SHOP_INVALID_COUNT)
+        chosen_idx = int(getattr(request, "chosen_item_index", 0))
+        selected_items = resolve_selected_items(goods, chosen_idx)
+        if selected_items is None:
+            return self._reject(route, SPIRIT_SHOP_INVALID_CHOICE)
         if (
             int(request.expected_currency_type) != goods.currency_type
             or int(request.expected_unit_price) != goods.unit_price
@@ -737,18 +851,20 @@ class SceneSpiritShop:
         cost = total_cost(goods.unit_price, count)
         if cost is None:
             return self._reject(route, SPIRIT_SHOP_INVALID_COUNT)
-        for item in goods.items:
+        for item in selected_items:
             if self.assets.item_gain_blocked(data, item.item_config_id):
                 return self._reject(route, SPIRIT_SHOP_ITEM_BLOCKED)
         if balance(data, goods.currency_type) < cost:
             return self._reject(route, SPIRIT_SHOP_CURRENCY_NOT_ENOUGH)
 
         items_to_grant: list[tuple[int, int, bool]] = []
-        for item in goods.items:
+        for item in selected_items:
             qty = item.item_count * count
             if not 0 < qty <= _MAX_UINT32:
                 return self._reject(route, SPIRIT_SHOP_INVALID_COUNT)
-            items_to_grant.append((item.item_config_id, qty, item.bound))
+            # 策划口径永久仅自用道具无论表内 item_bound 配置如何均强制 bound=True。
+            is_bound = item.bound or self.assets.is_always_bound_item(item.item_config_id)
+            items_to_grant.append((item.item_config_id, qty, is_bound))
 
         # 6. 候选副本原子装配：先完成全部分堆空间规划与发号，再复核闸口并扣款、记限购与幂等。
         staged = clone(data)
@@ -802,6 +918,17 @@ class SceneSpiritShop:
             fingerprint,
         )
 
+        audit_extra = {
+            "source": "spirit_shop",
+            "goods_id": goods.goods_id,
+            "count": count,
+            "unit_price": goods.unit_price,
+            "currency_type": goods.currency_type,
+        }
+        if goods.grant_mode != GRANT_MODE_ALL or chosen_idx != 0:
+            audit_extra["grant_mode"] = goods.grant_mode
+            audit_extra["chosen_item_index"] = chosen_idx
+
         # 7. WALLET（扣灵石 + 限购 + 幂等）与 BAG（绑定物品）同事务落盘并写 TX_SPIRIT_SHOP_BUY=44 流水。
         saved = await self.assets._save(
             player,
@@ -809,13 +936,7 @@ class SceneSpiritShop:
             self.buy_tx,
             correlation=client_request_id,
             gains=gains,
-            item_extra={
-                "source": "spirit_shop",
-                "goods_id": goods.goods_id,
-                "count": count,
-                "unit_price": goods.unit_price,
-                "currency_type": goods.currency_type,
-            },
+            item_extra=audit_extra,
         )
         if not saved:
             return self._reject(route, UNAVAILABLE)

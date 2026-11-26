@@ -4,6 +4,7 @@ from dataclasses import replace
 
 from xuanming.grpc_runtime import GrpcClient
 from xuanming.nodes.player_inbox import BATTLE
+from xuanming.nodes.scene_stats import player_stats
 from xuanming.runtime import Runtime, grpc_address
 from xuanming.settings import Settings
 from xuanming.smoke import connect
@@ -83,7 +84,8 @@ def test_client_mission_dungeon_and_durable_battle_inbox(tmp_path):
                     player = scene.locations[1].players[1]
                     saved = scene.rows.assemble(player.snapshot)
                     assert saved.currency.values[0] == 700
-                    assert saved.derived_attributes_component.health == ready.snapshot.max_health
+                    assert saved.level_component.level == 4
+                    assert saved.derived_attributes_component.health == player_stats(p, scene.tables, saved).max_health
                     assert 4 in saved.mission_component.scopes[0].completed_mission_ids
                     assert 4 not in saved.mission_component.scopes[0].claimable_mission_ids
                     assert saved.bag_component.items

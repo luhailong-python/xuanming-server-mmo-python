@@ -235,6 +235,7 @@ class GatherPipeline:
         battle_nodes: BattleNodeResolver,
         *,
         on_tournament_profiles: Callable[[list[tuple[int, str, int, int, str]]], None] | None = None,
+        on_tournament_captains: Callable[[int, int], set[int]] | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
@@ -243,6 +244,7 @@ class GatherPipeline:
         self.presence = presence
         self.battle_nodes = battle_nodes
         self.on_tournament_profiles = on_tournament_profiles
+        self.on_tournament_captains = on_tournament_captains
 
     async def _cancel_prepared(self, battle_id: int, prepared: list[tuple[int, str]]) -> None:
         """发房前失败补偿：逐人向原备战端点发 CancelBattlePrepare（幂等）。"""
@@ -287,6 +289,7 @@ class GatherPipeline:
         formation: Message,
         *,
         ai_defender_snapshots: tuple[Message, ...] = (),
+        boss_weekly_affix_id: int = 0,
     ) -> bool:
         """同步执行一局成局的 Prepare -> Preflight -> SaveIntent -> CreateBattle 管线。"""
         battle_id = int(formation.battle_id)
@@ -326,6 +329,15 @@ class GatherPipeline:
         except Exception:
             logger.error("match gather invalid frozen context battle_id=%d", battle_id, exc_info=True)
             return await fail_pre_persist("invalid_frozen_context", 0)
+
+        tournament_captains: set[int] = set()
+        if tournament_ctx is not None and self.on_tournament_captains is not None:
+            try:
+                tournament_captains = set(
+                    self.on_tournament_captains(int(tournament_ctx.squad_a_id), int(tournament_ctx.squad_b_id))
+                )
+            except Exception:
+                logger.warning("match gather tournament captain lookup failed battle_id=%d", battle_id, exc_info=True)
 
         # 1. 逐参与者 PrepareBattle 收快照
         for member in formation.members:
@@ -372,6 +384,8 @@ class GatherPipeline:
             snap = self.protocol.message("BattlePlayerSnapshot")
             snap.CopyFrom(resp.snapshot)
             snap.team_index = int(member.team_index)
+            if pid in tournament_captains:
+                snap.is_team_captain = True
             prepared_members.append((pid, endpoint, snap, resp.table_fingerprint or snap.table_fingerprint))
 
         # 锦标赛 V3 模块 F：建房阶段顺手回填参战成员真实角色外观快照（最佳努力，不阻塞建房）。
@@ -460,6 +474,9 @@ class GatherPipeline:
             create_req.tournament_context.CopyFrom(tournament_ctx)
         if custom_duel_rules is not None:
             create_req.custom_duel_rules.CopyFrom(custom_duel_rules)
+        effective_boss_affix = int(boss_weekly_affix_id) or int(getattr(formation, "boss_weekly_affix_id", 0))
+        if effective_boss_affix:
+            create_req.boss_weekly_affix_id = effective_boss_affix
         for _, _, snap, _ in prepared_members:
             create_req.players.add().CopyFrom(snap)
         for ai_snap in ai_defender_snapshots:

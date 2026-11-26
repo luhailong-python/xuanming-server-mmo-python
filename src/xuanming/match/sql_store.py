@@ -35,6 +35,8 @@ from .errors import (
     ActivityIntentConflictError,
     ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
+    ERR_INVALID_PARAMETER,
+    ERR_RATE_LIMIT_EXCEEDED,
     GuildWarMemberOccupiedError,
     ERR_MATCH_ALREADY_QUEUED,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
@@ -100,6 +102,7 @@ from .model import (
     OUTCOME_DECISION_ABORT,
     OUTCOME_DECISION_COMPLETE,
     OUTCOME_DECISION_UNKNOWN,
+    RECALL_COOLDOWN_MS,
     ROLE_BLOCKER_OCCUPANCY,
     ROLE_BLOCKER_SETTLEMENT,
     ROLE_BLOCKER_SPECTATOR,
@@ -124,6 +127,7 @@ from .model import (
     TICKET_STATE_FORMING,
     TICKET_STATE_QUEUED,
     TICKET_STATE_READY,
+    VALID_TEAM_FOLLOW_FORMATIONS,
     CallerIdentity,
     RoleFenceRow,
     build_battle_report_summary,
@@ -141,10 +145,13 @@ from .model import (
 )
 from .ranked import (
     RANKED_SEASON_ACTIVE,
+    RankedFeaturedBuildRow,
     RankedPlayerPrefsRow,
     RankedPlayerSeasonRow,
     RankedRewardRow,
+    RankedRivalryRow,
     RankedSeasonRow,
+    is_rivalry_revenge_target,
 )
 from .rating import (
     DEFAULT_RATING_CENTI,
@@ -1288,6 +1295,80 @@ class SqlMatchStore:
             return TeamMutationOutcome(
                 team_id=my_tid, version=version, record=rec, epochs=await self._epochs_tx(cur, mids),
                 reason=17, actor_id=caller.player_id, now_ms=now, kept=tuple(mids),
+            )
+
+        return await self._run_tx(work)
+
+    async def set_team_formation(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
+        formation: int,
+        request_id: str,
+    ) -> TeamMutationOutcome:
+        if formation not in VALID_TEAM_FOLLOW_FORMATIONS:
+            raise TeamBusinessError(ERR_INVALID_PARAMETER)
+
+        async def work(cur) -> TeamMutationOutcome:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            my_tid, _ = await self._get_membership_tx(cur, caller.player_id, for_update=True)
+            if my_tid == 0 or (expected_team_id and my_tid != expected_team_id):
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            loaded = await self._load_team_for_update(cur, my_tid)
+            if loaded is None or loaded[2] != TEAM_STATE_ACTIVE:
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            version, data, _ = loaded
+            rec = data.record
+            now = await self._db_now(cur)
+            if int(rec.leader_id) != caller.player_id:
+                raise TeamBusinessError(ERR_TEAM_NOT_LEADER)
+            if self._team_locked(rec, now):
+                raise TeamBusinessError(ERR_TEAM_IN_MATCH)
+            changed = int(rec.follow_formation) != formation
+            if changed:
+                rec.follow_formation = formation
+                version += 1
+                await self._save_team_tx(cur, my_tid, version, data, TEAM_STATE_ACTIVE, now + TEAM_IDLE_TTL_MS)
+            mids = [int(m.player_id) for m in rec.members]
+            return TeamMutationOutcome(
+                team_id=my_tid, version=version, record=rec, epochs=await self._epochs_tx(cur, mids),
+                reason=18 if changed else 0, actor_id=caller.player_id, now_ms=now,
+                kept=tuple(mids), formation_changed=changed,
+            )
+
+        return await self._run_tx(work)
+
+    async def recall_team_members(
+        self,
+        caller: CallerIdentity,
+        expected_team_id: int,
+        request_id: str,
+    ) -> TeamMutationOutcome:
+        async def work(cur) -> TeamMutationOutcome:
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            my_tid, _ = await self._get_membership_tx(cur, caller.player_id, for_update=True)
+            if my_tid == 0 or (expected_team_id and my_tid != expected_team_id):
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            loaded = await self._load_team_for_update(cur, my_tid)
+            if loaded is None or loaded[2] != TEAM_STATE_ACTIVE:
+                raise TeamBusinessError(ERR_TEAM_NO_TEAM)
+            version, data, _ = loaded
+            rec = data.record
+            now = await self._db_now(cur)
+            if int(rec.leader_id) != caller.player_id:
+                raise TeamBusinessError(ERR_TEAM_NOT_LEADER)
+            last_recall = int(rec.last_recall_at_ms)
+            if last_recall > 0 and now < last_recall + RECALL_COOLDOWN_MS:
+                raise TeamBusinessError(ERR_RATE_LIMIT_EXCEEDED)
+            rec.last_recall_at_ms = now
+            version += 1
+            await self._save_team_tx(cur, my_tid, version, data, TEAM_STATE_ACTIVE, now + TEAM_IDLE_TTL_MS)
+            mids = [int(m.player_id) for m in rec.members]
+            recipients = tuple(pid for pid in mids if pid != caller.player_id)
+            return TeamMutationOutcome(
+                team_id=my_tid, version=version, record=rec, epochs=await self._epochs_tx(cur, mids),
+                reason=0, actor_id=caller.player_id, now_ms=now,
+                kept=tuple(mids), recall_recipients=recipients,
             )
 
         return await self._run_tx(work)
@@ -3325,6 +3406,8 @@ class SqlMatchStore:
             honor_bits=int(r[12]),
             final_rank=int(r[13]),
             updated_ms=int(r[14]),
+            current_win_streak=int(r[15]) if len(r) > 15 else 0,
+            best_win_streak=int(r[16]) if len(r) > 16 else 0,
         )
 
     async def get_active_ranked_season(self) -> RankedSeasonRow | None:
@@ -3524,6 +3607,8 @@ class SqlMatchStore:
             milestone_bits = prev.milestone_bits if prev else 0
             honor_bits = prev.honor_bits if prev else 0
             final_rank = prev.final_rank if prev else 0
+            cur_streak = prev.current_win_streak if prev else 0
+            best_streak = prev.best_win_streak if prev else 0
 
             if participated:
                 valid_matches += 1
@@ -3532,10 +3617,15 @@ class SqlMatchStore:
                     qualified_at_ms = settled_at_ms
                 if outcome_kind == 1:
                     wins += 1
+                    cur_streak += 1
+                    if cur_streak > best_streak:
+                        best_streak = cur_streak
                 elif outcome_kind == 2:
                     losses += 1
+                    cur_streak = 0
                 elif outcome_kind == 3:
                     draws += 1
+                    cur_streak = 0
 
             if qualified:
                 if peak_rating == 0 or rating_centi > peak_rating:
@@ -3617,11 +3707,14 @@ class SqlMatchStore:
                 honor_bits=honor_bits,
                 final_rank=final_rank,
                 updated_ms=settled_at_ms,
+                current_win_streak=cur_streak,
+                best_win_streak=best_streak,
             )
 
             final_summary = type(summary_template)()
             final_summary.CopyFrom(summary_template)
             final_summary.season_valid_matches_after = valid_matches
+            final_summary.win_streak_after = cur_streak
             for rew in unlocked:
                 final_summary.newly_unlocked_rewards.add(
                     season_id=rew.season_id,
@@ -3656,3 +3749,229 @@ class SqlMatchStore:
                     )
                 row = await cur.fetchone()
                 return _to_bytes(row[0]) if row else None
+
+    @staticmethod
+    def _scan_ranked_rivalry(r) -> RankedRivalryRow:
+        return RankedRivalryRow(
+            season_id=int(r[0]),
+            player_id=int(r[1]),
+            opponent_id=int(r[2]),
+            opponent_name=_to_str(r[3]),
+            wins=int(r[4]),
+            losses=int(r[5]),
+            draws=int(r[6]),
+            last_outcome=int(r[7]),
+            last_battle_id=int(r[8]),
+            updated_ms=int(r[9]),
+        )
+
+    @staticmethod
+    def _scan_ranked_featured_build(r) -> RankedFeaturedBuildRow:
+        return RankedFeaturedBuildRow(
+            season_id=int(r[0]),
+            build_key=_to_str(r[1]),
+            season_seal_id=int(r[2]),
+            starter_pet_table_id=int(r[3]),
+            core_skill_ids=_to_str(r[4]),
+            appearances=int(r[5]),
+            wins=int(r[6]),
+            high_tier_wins=int(r[7]),
+            featured_battle_id=int(r[8]),
+            featured_player_id=int(r[9]),
+            featured_player_name=_to_str(r[10]),
+            featured_rating_centi=int(r[11]),
+            featured_team_size=int(r[12]),
+            featured_total_rounds=int(r[13]),
+            updated_ms=int(r[14]),
+        )
+
+    async def get_ranked_rivalry(
+        self, season_id: int, player_id: int, opponent_id: int,
+    ) -> RankedRivalryRow | None:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`player_id`,`opponent_id`,`opponent_name`,`wins`,`losses`,"
+                    "`draws`,`last_outcome`,`last_battle_id`,`updated_ms` "
+                    "FROM `match_ranked_rivalry` WHERE `season_id`=%s AND `player_id`=%s AND `opponent_id`=%s",
+                    (season_id, player_id, opponent_id),
+                )
+                r = await cur.fetchone()
+                return self._scan_ranked_rivalry(r) if r else None
+
+    async def upsert_ranked_rivalry(self, row: RankedRivalryRow) -> RankedRivalryRow:
+        async def work(cur) -> RankedRivalryRow:
+            await cur.execute(
+                "INSERT INTO `match_ranked_rivalry`(`season_id`,`player_id`,`opponent_id`,`opponent_name`,"
+                "`wins`,`losses`,`draws`,`last_outcome`,`last_battle_id`,`updated_ms`) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE `opponent_name`=IF(VALUES(`opponent_name`)<>'',VALUES(`opponent_name`),`opponent_name`),"
+                "`wins`=VALUES(`wins`),`losses`=VALUES(`losses`),`draws`=VALUES(`draws`),"
+                "`last_outcome`=VALUES(`last_outcome`),`last_battle_id`=VALUES(`last_battle_id`),"
+                "`updated_ms`=VALUES(`updated_ms`)",
+                (
+                    row.season_id, row.player_id, row.opponent_id, row.opponent_name,
+                    row.wins, row.losses, row.draws, row.last_outcome, row.last_battle_id, row.updated_ms,
+                ),
+            )
+            return row
+
+        return await self._run_tx(work)
+
+    async def list_ranked_top_rivals(
+        self, season_id: int, player_id: int, *, limit: int = 8,
+    ) -> list[RankedRivalryRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`player_id`,`opponent_id`,`opponent_name`,`wins`,`losses`,"
+                    "`draws`,`last_outcome`,`last_battle_id`,`updated_ms` "
+                    "FROM `match_ranked_rivalry` WHERE `season_id`=%s AND `player_id`=%s "
+                    "ORDER BY (`wins`+`losses`) DESC,`updated_ms` DESC LIMIT %s",
+                    (season_id, player_id, limit),
+                )
+                return [
+                    r for r in (self._scan_ranked_rivalry(row) for row in await cur.fetchall())
+                    if (r.wins + r.losses + r.draws) > 0
+                ]
+
+    async def load_rivalry_encounters(
+        self, season_id: int, members: list[tuple[int, int]],
+    ) -> list[Message]:
+        if season_id == 0 or len(members) < 2:
+            return []
+        out: list[Message] = []
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                for pid_a, team_a in members:
+                    for pid_b, team_b in members:
+                        if not pid_a or not pid_b or team_a == team_b:
+                            continue
+                        await cur.execute(
+                            "SELECT `season_id`,`player_id`,`opponent_id`,`opponent_name`,`wins`,`losses`,"
+                            "`draws`,`last_outcome`,`last_battle_id`,`updated_ms` "
+                            "FROM `match_ranked_rivalry` WHERE `season_id`=%s AND `player_id`=%s AND `opponent_id`=%s",
+                            (season_id, pid_a, pid_b),
+                        )
+                        r = await cur.fetchone()
+                        if not r:
+                            continue
+                        rec = self._scan_ranked_rivalry(r)
+                        if (rec.wins + rec.losses) == 0:
+                            continue
+                        out.append(
+                            self.protocol.message(
+                                "RankedRivalryEncounter",
+                                player_id=rec.player_id,
+                                opponent_id=rec.opponent_id,
+                                opponent_name=rec.opponent_name,
+                                wins=rec.wins,
+                                losses=rec.losses,
+                                revenge_target=is_rivalry_revenge_target(rec),
+                            )
+                        )
+        out.sort(key=lambda e: (int(e.player_id), int(e.opponent_id)))
+        return out
+
+    async def upsert_ranked_featured_build(
+        self,
+        *,
+        season_id: int,
+        build_key: str,
+        season_seal_id: int,
+        starter_pet_table_id: int,
+        core_skill_ids_csv: str,
+        tier_qingfeng_centi: int,
+        battle_id: int,
+        player_id: int,
+        player_name: str,
+        after_rating_centi: int,
+        team_size: int,
+        total_rounds: int,
+        player_won: bool,
+        settled_at_ms: int,
+    ) -> RankedFeaturedBuildRow:
+        async def work(cur) -> RankedFeaturedBuildRow:
+            await cur.execute(
+                "SELECT `season_id`,`build_key`,`season_seal_id`,`starter_pet_table_id`,`core_skill_ids`,"
+                "`appearances`,`wins`,`high_tier_wins`,`featured_battle_id`,`featured_player_id`,"
+                "`featured_player_name`,`featured_rating_centi`,`featured_team_size`,`featured_total_rounds`,`updated_ms` "
+                "FROM `match_ranked_featured_build` WHERE `season_id`=%s AND `build_key`=%s FOR UPDATE",
+                (season_id, build_key),
+            )
+            r = await cur.fetchone()
+            prev = self._scan_ranked_featured_build(r) if r else None
+            high_tier_min = tier_qingfeng_centi if tier_qingfeng_centi > 0 else 152_000
+            appearances = (prev.appearances if prev else 0) + 1
+            wins = (prev.wins if prev else 0) + (1 if player_won else 0)
+            high_tier_wins = (prev.high_tier_wins if prev else 0) + (
+                1 if (player_won and after_rating_centi >= high_tier_min) else 0
+            )
+            f_bid = prev.featured_battle_id if prev else 0
+            f_pid = prev.featured_player_id if prev else 0
+            f_pname = prev.featured_player_name if prev else ""
+            f_rating = prev.featured_rating_centi if prev else 0
+            f_tsize = prev.featured_team_size if prev else 0
+            f_rounds = prev.featured_total_rounds if prev else 0
+            if player_won and (f_bid == 0 or after_rating_centi >= f_rating):
+                f_bid = battle_id
+                f_pid = player_id
+                f_pname = player_name
+                f_rating = after_rating_centi
+                f_tsize = team_size
+                f_rounds = total_rounds
+            row = RankedFeaturedBuildRow(
+                season_id=season_id, build_key=build_key, season_seal_id=season_seal_id,
+                starter_pet_table_id=starter_pet_table_id, core_skill_ids=core_skill_ids_csv,
+                appearances=appearances, wins=wins, high_tier_wins=high_tier_wins,
+                featured_battle_id=f_bid, featured_player_id=f_pid, featured_player_name=f_pname,
+                featured_rating_centi=f_rating, featured_team_size=f_tsize,
+                featured_total_rounds=f_rounds, updated_ms=settled_at_ms,
+            )
+            await cur.execute(
+                "INSERT INTO `match_ranked_featured_build`(`season_id`,`build_key`,`season_seal_id`,"
+                "`starter_pet_table_id`,`core_skill_ids`,`appearances`,`wins`,`high_tier_wins`,"
+                "`featured_battle_id`,`featured_player_id`,`featured_player_name`,`featured_rating_centi`,"
+                "`featured_team_size`,`featured_total_rounds`,`updated_ms`) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE `appearances`=VALUES(`appearances`),`wins`=VALUES(`wins`),"
+                "`high_tier_wins`=VALUES(`high_tier_wins`),`featured_battle_id`=VALUES(`featured_battle_id`),"
+                "`featured_player_id`=VALUES(`featured_player_id`),`featured_player_name`=VALUES(`featured_player_name`),"
+                "`featured_rating_centi`=VALUES(`featured_rating_centi`),`featured_team_size`=VALUES(`featured_team_size`),"
+                "`featured_total_rounds`=VALUES(`featured_total_rounds`),`updated_ms`=VALUES(`updated_ms`)",
+                (
+                    row.season_id, row.build_key, row.season_seal_id, row.starter_pet_table_id,
+                    row.core_skill_ids, row.appearances, row.wins, row.high_tier_wins,
+                    row.featured_battle_id, row.featured_player_id, row.featured_player_name,
+                    row.featured_rating_centi, row.featured_team_size, row.featured_total_rounds, row.updated_ms,
+                ),
+            )
+            return row
+
+        return await self._run_tx(work)
+
+    async def list_ranked_featured_builds(
+        self, season_id: int, *, limit: int = 5,
+    ) -> list[RankedFeaturedBuildRow]:
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT `season_id`,`build_key`,`season_seal_id`,`starter_pet_table_id`,`core_skill_ids`,"
+                    "`appearances`,`wins`,`high_tier_wins`,`featured_battle_id`,`featured_player_id`,"
+                    "`featured_player_name`,`featured_rating_centi`,`featured_team_size`,`featured_total_rounds`,`updated_ms` "
+                    "FROM `match_ranked_featured_build` WHERE `season_id`=%s AND `wins`>0 "
+                    "ORDER BY `high_tier_wins` DESC,`wins` DESC,`featured_rating_centi` DESC,`updated_ms` DESC LIMIT %s",
+                    (season_id, limit),
+                )
+                return [self._scan_ranked_featured_build(r) for r in await cur.fetchall()]
+
+    async def is_featured_ranked_replay_allowed(self, battle_id: int) -> bool:
+        if battle_id <= 0:
+            return False
+        async with portal_sql.connection(self.pool) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM `match_ranked_featured_build` WHERE `featured_battle_id`=%s LIMIT 1",
+                    (battle_id,),
+                )
+                return await cur.fetchone() is not None

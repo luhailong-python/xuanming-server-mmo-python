@@ -16,8 +16,10 @@ from .node import open_service, run
 from .outbox import OutcomeOutboxWorker, OutboxRoundStats
 from .ranked import (
     OFFICIAL_RANKED_PRESETS,
+    RankedFeaturedBuildRow,
     RankedManager,
     RankedPresetSpec,
+    RankedRivalryRow,
     RankedRuleConfig,
     RankedSeasonRow,
     tier_for_rating,
@@ -72,8 +74,10 @@ __all__ = [
     "RANK_BOARD_TYPES",
     "RankOutboxPublisher",
     "RankPublishStats",
+    "RankedFeaturedBuildRow",
     "RankedManager",
     "RankedPresetSpec",
+    "RankedRivalryRow",
     "RankedRuleConfig",
     "RankedSeasonRow",
     "RatingApplyResult",

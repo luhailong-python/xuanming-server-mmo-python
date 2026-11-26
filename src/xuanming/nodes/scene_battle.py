@@ -40,6 +40,29 @@ _HOLD_CAP_MS = 15 * 60_000
 _LOCK_EXTRA_SECONDS = 60
 _REAPER_INTERVAL_MS = 30_000
 _UINT64_MAX = (1 << 64) - 1
+_TIDE_CANDIDATES = (2, 3, 5)
+_TIDE_INTERVAL_SEC = 3600
+_TIDE_DURATION_SEC = 2400
+_GUILD_WAR_MODES = frozenset({9, 10})
+
+
+def is_world_tide_active_on_scene(now_unix_sec: int, scene_config_id: int) -> bool:
+    """判定指定野外地图当前是否处于灵潮珍兽潮激活窗口（默认轮换 [2,3,5]/3600s/2400s）。"""
+    # shortcut: uses default tide schedule [2,3,5]/3600s/2400s, read WorldMapOverview snapshot if ops customizes tide schedule
+    if not scene_config_id or (now_unix_sec % _TIDE_INTERVAL_SEC) >= _TIDE_DURATION_SEC:
+        return False
+    round_index = now_unix_sec // _TIDE_INTERVAL_SEC
+    return _TIDE_CANDIDATES[round_index % len(_TIDE_CANDIDATES)] == scene_config_id
+
+
+def is_npc_isolated_encounter_kind(boss_trial_kind: int) -> bool:
+    """归元城原创 NPC 场景玩法（演武试招木桩=9、回合残局=10、人物奇谈=11）。"""
+    return 9 <= int(boss_trial_kind) <= 11
+
+
+def is_practice_dummy_kind(boss_trial_kind: int) -> bool:
+    """归元城演武试招木桩（boss_trial_kind=9，禁用免费预设）。"""
+    return int(boss_trial_kind) == 9
 
 _WRITE = """
 local current = redis.call('GET', KEYS[1])
@@ -430,6 +453,10 @@ class SceneBattle:
         boss_trial_kind = int(getattr(dungeon_row, "boss_trial_kind", 0)) if dungeon_row is not None else 0
         is_boss_trial = is_boss_trial_kind(boss_trial_kind)
         is_guard_rescue = boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+        is_npc_isolated_encounter = is_npc_isolated_encounter_kind(boss_trial_kind)
+        is_guild_war = bool(
+            request is not None and int(getattr(request, "match_mode", 0)) in _GUILD_WAR_MODES
+        )
         is_festival_beast = bool(
             request is not None
             and request.HasField("activity_context")
@@ -462,6 +489,40 @@ class SceneBattle:
                 use_free_preset = True
 
         now_stamp = self._clock()
+        world = self.scene.locations.get(player.player_id)
+        current_scene_config_id = int(getattr(world, "config_id", 0)) if world is not None else 0
+
+        # 野外灵宠栖息地场景与灵潮珍兽潮窗口权威校验。
+        if dungeon_row is not None and int(getattr(dungeon_row, "allow_pet_capture", 0)) == 1 and int(getattr(dungeon_row, "scene_id", 0)) > 1:
+            req_scene = int(dungeon_row.scene_id)
+            if current_scene_config_id != req_scene:
+                logger.warning(
+                    "PrepareBattle rejected: wild pet habitat scene mismatch player_id=%s battle_config_id=%s required=%s current=%s",
+                    player.player_id, request.battle_config_id, req_scene, current_scene_config_id,
+                )
+                return 1006
+            if 210 <= int(dungeon_row.id) <= 219 and not is_world_tide_active_on_scene(now_stamp // 1000, req_scene):
+                logger.warning(
+                    "PrepareBattle rejected: wild pet tide habitat inactive player_id=%s battle_config_id=%s required=%s",
+                    player.player_id, request.battle_config_id, req_scene,
+                )
+                return 1006
+
+        # 归元城 NPC 场景玩法（木桩/残局/奇谈）场景与预设准入校验。
+        if is_npc_isolated_encounter and dungeon_row is not None:
+            req_scene = int(getattr(dungeon_row, "scene_id", 0))
+            if req_scene != 0 and current_scene_config_id != req_scene:
+                logger.warning(
+                    "PrepareBattle rejected: npc encounter scene mismatch player_id=%s battle_config_id=%s required=%s current=%s",
+                    player.player_id, request.battle_config_id, req_scene, current_scene_config_id,
+                )
+                return 1006
+            if is_practice_dummy_kind(boss_trial_kind) and use_free_preset:
+                logger.warning(
+                    "PrepareBattle rejected: practice dummy forbids free preset player_id=%s battle_config_id=%s",
+                    player.player_id, request.battle_config_id,
+                )
+                return 1006
         tower_ctx_source = None
         if is_wuxing_tower:
             wk = wuxing_week_key(now_stamp)
@@ -509,6 +570,8 @@ class SceneBattle:
             or is_formal_ranked
             or is_boss_trial
             or is_guard_rescue
+            or is_npc_isolated_encounter
+            or is_guild_war
             or is_festival_beast
             or is_wuxing_tower
             or has_custom_duel

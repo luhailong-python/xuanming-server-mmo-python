@@ -126,10 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9`（短哈希 `0f9bc81d6`，另已提前同步 C++ 工作区最新草稿至消息号 `521` 与 74 表 version 72）
-  - 追平范围：涵盖 `2f0e62225..0f9bc81d6` 全部最新提交（战前备战 `504/505` 与首领试炼全破绽、战法配置构筑 `502/503`、灵宠词条预设与升阶 `500/501`、装备强化 T/B 隔离与解封/继承定稿、全天帮战 `485~495,499`、交易管理风控 `496/497`、账号 Stage1 可交易配额 `498`），以及 C++ 工作区最新增量（锦标赛 V3 `506~508,511~514`、灵玉商城与新手礼包 V1 `509~510`、五行阵法/五行塔/战备书签 `515~521` 与战斗 V4、`SpiritShopGoods`/`SpiritShopLimitGroup` 74 张最新配表）。
+  - Commit SHA：`1212e017ed1db628af1e3d2a335c0c884f5bf06a`（短哈希 `1212e017e`）
+  - 追平范围：涵盖 `0f9bc81d6..1212e017e` 全部 16 笔提交（战斗 V5 战前 3 禁技能/战术标记 `532~533`/赛季与首领周词缀/天梯战中召唤灵宠、Match V4 禁灵脉 `534`/精彩集锦 `535`/宿敌连胜、Team V4 队形 `524`/一键召回 `525`、装备预设方案 `536~539`、技能书封印与解封 `543~544`、成长被动技能 V2 与战斗成长升级、挂机月卡托管设置与战报 `522~523`、合规激励视频 `540~542` 与 `CURRENCY_TYPE_BIND_GOLD=3` 绑金禁交易红线、82 张最新配表 version 93 及 516 条路由）。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9..HEAD`。
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 1212e017ed1db628af1e3d2a335c0c884f5bf06a..HEAD`。
   2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

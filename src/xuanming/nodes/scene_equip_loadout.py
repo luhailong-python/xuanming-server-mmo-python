@@ -858,14 +858,12 @@ class SceneEquipLoadout:
             if stored_scheme.linked_attribute_scheme_id:
                 attributes = getattr(self.scene, "attributes", None)
                 if attributes is not None and hasattr(attributes, "try_switch_linked_scheme"):
-                    attr_err = attributes.try_switch_linked_scheme(staged, int(stored_scheme.linked_attribute_scheme_id))
-                    if attr_err == 25008:  # _SWITCH_COOLDOWN
-                        response.linked_notices.append("属性加点方案切换冷却中，本次仅完成装备切换")
-                    elif attr_err == 25006:  # _SCHEME_NOT_FOUND
-                        response.linked_notices.append("绑定的属性加点方案不存在，本次仅完成装备切换")
-                    elif attr_err not in (0, 25010):  # not OK / not ALREADY_ACTIVE
-                        response.linked_notices.append("属性加点方案暂不可切换，本次仅完成装备切换")
-                    elif attr_err == 0:
+                    attr_ok, attr_notice = attributes.try_switch_linked_scheme(
+                        staged, int(stored_scheme.linked_attribute_scheme_id),
+                    )
+                    if attr_notice:
+                        response.linked_notices.append(attr_notice)
+                    if attr_ok:
                         linked_changed = True
                 else:
                     response.linked_notices.append("属性加点方案暂不可切换，本次仅完成装备切换")

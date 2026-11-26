@@ -19,9 +19,10 @@ from ..data.asset_inventory import (
     clone, held_item_count,
 )
 from ..data.asset_ledger import (
-    CALLERS, INSTANCE_LIMIT, INT64_MAX, Outcome, authorized, classify,
+    CALLERS, INSTANCE_LIMIT, INT64_MAX, UINT64_MAX, Outcome, authorized, classify,
     find_receipt, find_stream, receipt_matches, record, valid,
 )
+from ..data.asset_anomaly import AssetGain
 from ..data import client_request
 from .scene_player import _bag, _scaled
 
@@ -58,6 +59,13 @@ _GEM_TYPE_MISMATCH = 28020
 _GEM_BAG_FULL = 28021
 _TEMPORARY_BUSY = 6017
 _TX_AUCTION_RETURN = 30
+CURRENCY_GOLD = 0
+CURRENCY_DIAMOND = 1
+CURRENCY_BIND_DIAMOND = 2
+CURRENCY_BIND_GOLD = 3
+# 策划口径永久仅自用绑定道具（商店 / 邮件 / 系统入包均强制 bound = True，禁止经任何发奖通道洗成可交易）。
+ALWAYS_BOUND_ITEM_IDS = frozenset({3404, 3405, 3408, 3409, 3410})
+SEALED_SKILL_BOOK_CONFIG_ID = 3414
 _RULES = {
     1: ("debit", (24,)),
     2: ("credit", (25, 26)),
@@ -491,7 +499,14 @@ class SceneAssets(AssetInventory):
             if any(existing.pet_id == pet.pet_id for existing in data.pet_component.pets):
                 return Outcome.REJECTED, _INVALID_BUNDLE, False
         counts = {item.config_id: item.count for item in bundle.items}
-        result = await self.add_items(data, counts, instances=items, gains=gains, counts_as_gain=counts_as_gain)
+        normal_counts = {cid: qty for cid, qty in counts.items() if cid not in ALWAYS_BOUND_ITEM_IDS}
+        bound_counts = {cid: qty for cid, qty in counts.items() if cid in ALWAYS_BOUND_ITEM_IDS}
+        for inst in items:
+            if inst.config_id in ALWAYS_BOUND_ITEM_IDS:
+                inst.bound = True
+        result = await self.add_items(data, normal_counts, instances=items, gains=gains, counts_as_gain=counts_as_gain)
+        if not result and bound_counts:
+            result = await self.add_bound_items(data, bound_counts, gains=gains, counts_as_gain=counts_as_gain)
         if result in (BLOCKED, INVALID):
             return Outcome.REJECTED, BLOCKED, False
         if result:
@@ -506,7 +521,7 @@ class SceneAssets(AssetInventory):
             return Outcome.REJECTED, _INVALID_BUNDLE, False
         if pet is not None:
             data.pet_component.pets.add().CopyFrom(pet)
-        mutated = bool(counts or items or pet is not None)
+        mutated = bool(normal_counts or bound_counts or items or pet is not None)
         for entry in bundle.currencies:
             result = self.add_currency(data, entry.currency_type, entry.amount, gains=gains,
                                        counts_as_gain=counts_as_gain, now_seconds=credit_at)
@@ -782,6 +797,126 @@ class SceneAssets(AssetInventory):
             response.success, response.enhance_level = success, level
         return response
 
+    # ── 双轨银两（流通银两 + 绑定银两）与强制绑定入包辅助 ──
+
+    @staticmethod
+    def is_always_bound_item(config_id: int) -> bool:
+        """判断配置 ID 是否属于策划口径永久仅自用绑定道具。"""
+        return config_id in ALWAYS_BOUND_ITEM_IDS
+
+    @staticmethod
+    def spendable_gold_with_bind(data) -> int:
+        """返回可共同用于仅自用消耗的银两总额（流通银两 + 绑定银两，饱和至 UINT64_MAX）。"""
+        gold = balance(data, CURRENCY_GOLD)
+        bind_gold = balance(data, CURRENCY_BIND_GOLD)
+        total = gold + bind_gold
+        return UINT64_MAX if total > UINT64_MAX else total
+
+    def can_afford_gold_with_bind(self, data, amount: int) -> bool:
+        """判断流通银两 + 绑定银两是否足够支付指定绑定自用银两开销。"""
+        if amount == 0:
+            return True
+        if amount > INT64_MAX:
+            return False
+        return self.spendable_gold_with_bind(data) >= amount
+
+    def can_afford_split_gold(self, data, strict_gold: int, prefer_bind_gold: int) -> bool:
+        """校验拆分银两支付：strict_gold 严格只认流通银两，prefer_bind_gold 优先扣绑定银两不足再补流通银两。"""
+        if strict_gold < 0 or prefer_bind_gold < 0:
+            return False
+        if strict_gold > INT64_MAX or prefer_bind_gold > INT64_MAX or strict_gold + prefer_bind_gold > INT64_MAX:
+            return False
+        gold = balance(data, CURRENCY_GOLD)
+        if gold < strict_gold:
+            return False
+        bind_gold = balance(data, CURRENCY_BIND_GOLD)
+        return (gold - strict_gold) + bind_gold >= prefer_bind_gold
+
+    def deduct_split_gold(self, data, strict_gold: int, prefer_bind_gold: int) -> int:
+        """原子执行拆分银两扣除：优先消耗绑定银两抵扣 prefer_bind_gold，余量及 strict_gold 扣流通银两。"""
+        if not self.can_afford_split_gold(data, strict_gold, prefer_bind_gold):
+            return INSUFFICIENT
+        bind_avail = balance(data, CURRENCY_BIND_GOLD)
+        bind_take = min(prefer_bind_gold, bind_avail)
+        gold_take = strict_gold + (prefer_bind_gold - bind_take)
+        if bind_take > 0:
+            err = self.deduct_currency(data, CURRENCY_BIND_GOLD, bind_take)
+            if err:
+                return err
+        if gold_take > 0:
+            err = self.deduct_currency(data, CURRENCY_GOLD, gold_take)
+            if err:
+                return err
+        return 0
+
+    def deduct_gold_prefer_bind(self, data, amount: int) -> int:
+        """仅自用银两消耗：优先扣绑定银两（CURRENCY_TYPE_BIND_GOLD=3），不足再补流通银两。"""
+        return self.deduct_split_gold(data, 0, amount)
+
+    async def add_bound_items(self, data, counts, *, gains=None, counts_as_gain: bool = True) -> int:
+        """向主背包发放强制 bound=True 物品，仅与同配置绑定堆叠合并，永不混入可交易堆。"""
+        if not counts:
+            return 0
+        bag = clone(data.bag_component)
+        entries = self.entries(bag, 0)
+        cap = bag_capacity(bag, 0)
+        if not self._usable(entries, cap):
+            return INVALID_DATA
+        occupied = {entry.pos for entry, _ in entries}
+        free_slots = (slot for slot in range(cap) if slot not in occupied)
+        plan: list[tuple[int, int, int]] = []
+        for config, amount in sorted(counts.items()):
+            if amount <= 0:
+                continue
+            row = self.tables["Item"].get(config)
+            if row is None or row.max_stack_size == 0:
+                return INVALID
+            if counts_as_gain and self.item_gain_blocked(data, config):
+                return BLOCKED
+            max_stack = row.max_stack_size
+            remaining = amount
+            if max_stack > 1:
+                for entry, item in sorted(entries, key=lambda pair: (pair[1].acquire_seq, pair[1].item_id)):
+                    if item.config_id == config and item.bound and self._mergeable(item, max_stack):
+                        added = min(remaining, max_stack - item.size)
+                        if added > 0:
+                            item.size += added
+                            remaining -= added
+                            self.write_entry(entry, item)
+                            if remaining == 0:
+                                break
+            while remaining > 0:
+                slot = next(free_slots, None)
+                if slot is None:
+                    return BAG_FULL
+                stack = min(remaining, max_stack)
+                plan.append((slot, config, stack))
+                remaining -= stack
+        if plan and self.allocate_item_id is None:
+            return UNAVAILABLE
+        ids = self.all_ids(bag)
+        watermark = max((item.acquire_seq for _, item in entries), default=0)
+        for slot, config, stack in plan:
+            try:
+                guid = await self.allocate_item_id()
+            except (OSError, RuntimeError, ValueError):
+                return UNAVAILABLE
+            if type(guid) is not int or not 1 <= guid <= UINT64_MAX or guid in ids:
+                return UNAVAILABLE
+            ids.add(guid)
+            watermark += 1
+            item = self.protocol.message(
+                "ItemComp", item_id=guid, config_id=config, size=stack, bound=True, acquire_seq=watermark,
+            )
+            self.write_entry(bag.items.add(pos=slot, bag_type=0), item)
+        self._order(bag.items)
+        data.bag_component.CopyFrom(bag)
+        if gains is not None and counts_as_gain:
+            for config, amount in sorted(counts.items()):
+                if amount > 0:
+                    gains.append(AssetGain(kind="item", id=config, amount=amount))
+        return 0
+
     # ── T/B 可交易隔离扣除与强化预览补齐 ──
 
     def removable_tradable_count(self, data, config: int, *, except_hold_id: int = 0) -> int:
@@ -941,6 +1076,26 @@ class SceneAssets(AssetInventory):
             if stored is None:
                 continue
             info.bound = bool(stored.bound)
+            if stored.HasField("sealed_skill_book") and stored.sealed_skill_book.skill_table_id:
+                sealed = stored.sealed_skill_book
+                out_sealed = info.sealed_skill_book
+                out_sealed.Clear()
+                out_sealed.skill_table_id = int(sealed.skill_table_id)
+                skill_row = self.tables["Skill"].get(sealed.skill_table_id)
+                if skill_row is not None:
+                    out_sealed.skill_name = skill_row.name
+                out_sealed.scroll_id = int(sealed.scroll_id)
+                if "SkillScrollCraft" in self.tables.tables and sealed.scroll_id:
+                    scroll_row = self.tables["SkillScrollCraft"].get(sealed.scroll_id)
+                    if scroll_row is not None:
+                        out_sealed.scroll_name = scroll_row.name
+                out_sealed.rarity_tier = int(sealed.rarity_tier)
+                if sealed.crafter_name:
+                    out_sealed.crafter_name = sealed.crafter_name
+                    info.crafter_name = sealed.crafter_name
+                if sealed.crafter_player_id:
+                    out_sealed.crafter_player_id = int(sealed.crafter_player_id)
+                    info.crafter_player_id = int(sealed.crafter_player_id)
             row = self.tables["Item"].get(stored.config_id)
             if row is not None and row.equip_kind and stored.HasField("equip"):
                 info.enhance_pity_count = int(stored.equip.enhance_pity_count)
@@ -1061,8 +1216,12 @@ class SceneAssets(AssetInventory):
                     return _EQUIP_BIND_CONFIRM_REQUIRED, False, 0
 
         cost_gold = int(rule.cost_gold)
-        if cost_gold > 0 and (cost_gold > INT64_MAX or balance(data, 0) < cost_gold):
-            return _ENHANCE_GOLD, False, 0
+        if cost_gold > 0:
+            if equip_currently_bound:
+                if not self.can_afford_gold_with_bind(data, cost_gold):
+                    return _ENHANCE_GOLD, False, 0
+            elif cost_gold > INT64_MAX or balance(data, CURRENCY_GOLD) < cost_gold:
+                return _ENHANCE_GOLD, False, 0
 
         pity_limit = int(getattr(rule, "pity_limit", 0))
         if pity_limit > 0 and current_pity + 1 >= pity_limit:
@@ -1071,8 +1230,14 @@ class SceneAssets(AssetInventory):
             success = randbelow(_PERMYRIAD_BASE) < rule.success_rate
             next_pity = 0 if success else (current_pity + 1 if pity_limit > 0 else 0)
 
-        if cost_gold > 0 and self.deduct_currency(data, 0, cost_gold):
-            return _ENHANCE_GOLD, False, 0
+        if cost_gold > 0:
+            deduct_err = (
+                self.deduct_gold_prefer_bind(data, cost_gold)
+                if equip_currently_bound
+                else self.deduct_currency(data, CURRENCY_GOLD, cost_gold)
+            )
+            if deduct_err:
+                return _ENHANCE_GOLD, False, 0
 
         consumed_bound = False
         if needs_material:

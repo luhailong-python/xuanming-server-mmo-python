@@ -9,8 +9,18 @@ from .battle_dropin_effects import (
     BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
     is_boss_trial_kind,
 )
+from .scene_afk_pass import SceneAfkPass
+from .scene_attributes import (
+    BattleProgressionDelta,
+    LevelExpRow,
+    ModeRewardRow,
+    WeeklySilverRule,
+    prepare_economy_ledger,
+    resolve_level_for_exp,
+)
+from .scene_equip_craft import resolve_game_week
 from .scene_festival_beast import SceneFestivalBeast
-from .scene_mission import now_ms
+from .scene_mission import LEVEL, now_ms
 from .scene_stats import pet_pool, pet_stats, player_stats
 
 logger = logging.getLogger(__name__)
@@ -99,6 +109,39 @@ class BattleSettlement:
                     if (amount := min(count, self.assets.removable_count(
                         data, item, except_hold_id=settlement.battle_id)))}
         gained = {key: count for key, count in gained.items() if not self.assets.item_gain_blocked(data, key)}
+        stamp = self.clock()
+        boss_trial_kind = int(getattr(settlement, "boss_trial_kind", 0))
+        is_npc_isolated_encounter = 9 <= boss_trial_kind <= 11
+        is_guild_war = int(settlement.match_mode) in (9, 10)
+        is_festival_beast = (
+            settlement.HasField("festival_beast") and settlement.festival_beast.activity_instance_id != 0
+        ) or boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST
+
+        # 计算全玩法战斗经验/银两与周银两软上限候选账本（与货币入账同一次提交）。
+        attributes = getattr(self.scene, "attributes", None)
+        reward_rows = (
+            attributes.load_battle_progression_rewards()
+            if attributes is not None and hasattr(attributes, "load_battle_progression_rewards")
+            else self._load_reward_rows()
+        )
+        silver_rule = (
+            attributes.load_weekly_silver_rule()
+            if attributes is not None and hasattr(attributes, "load_weekly_silver_rule")
+            else self._load_silver_rule()
+        )
+        week = resolve_game_week(stamp)
+        week_start_ms = week[0] if week is not None else 0
+        explicit_silver = currencies.get(0, 0)
+        explicit_exp = int(getattr(settlement, "exp_gain", 0))
+        existing_economy = data.client_request_ledger.battle_economy
+        candidate_economy, prog_delta = prepare_economy_ledger(
+            existing_economy, week_start_ms, settlement, explicit_exp, explicit_silver, reward_rows, silver_rule,
+        )
+        if prog_delta.silver_gain > 0:
+            currencies[0] = prog_delta.silver_gain
+        else:
+            currencies.pop(0, None)
+
         checkpoint = self._checkpoint(data, audits)
         gains = []
         for kind, amount in tuple(currencies.items()):
@@ -106,14 +149,24 @@ class BattleSettlement:
             # be interpreted by this version of the server.
             if self.assets.currency_blocked(data, kind):
                 del currencies[kind]
+                if kind == 0:
+                    candidate_economy.battle_silver_this_week = existing_economy.battle_silver_this_week
+                    prog_delta.silver_gain = 0
+                    prog_delta.weekly_silver_used_after = int(existing_economy.battle_silver_this_week)
                 continue
             if any(debt.currency_type == kind and carries_unknown(debt) for debt in data.currency.debts):
                 return False
             error = self.assets.add_currency(data, kind, amount, gains=gains)
             if error == ASSET_BLOCKED:
                 del currencies[kind]
+                if kind == 0:
+                    candidate_economy.battle_silver_this_week = existing_economy.battle_silver_this_week
+                    prog_delta.silver_gain = 0
+                    prog_delta.weekly_silver_used_after = int(existing_economy.battle_silver_this_week)
             elif error:
                 return False
+        if prog_delta.ledger_changed:
+            data.client_request_ledger.battle_economy.CopyFrom(candidate_economy)
         self._audit(player, checkpoint, data, 8, audits, correlation=settlement.battle_id, credit=True, gains=gains)
         checkpoint = self._checkpoint(data, audits)
         if consumed and self.assets.consume_items(data, consumed, except_hold_id=settlement.battle_id):
@@ -135,15 +188,14 @@ class BattleSettlement:
                         defer_reasons.append(BAG_SPACE_DEFERRED)
                     return False
         self._audit(player, checkpoint, data, 20, audits, correlation=settlement.battle_id, item_extra=details, gains=gains)
-        is_festival_beast = (
-            settlement.HasField("festival_beast") and settlement.festival_beast.activity_instance_id != 0
-        ) or int(getattr(settlement, "boss_trial_kind", 0)) == BOSS_TRIAL_KIND_FESTIVAL_BEAST
         isolate_temp_state = (
             is_festival_beast
+            or is_npc_isolated_encounter
+            or is_guild_war
             or bool(getattr(settlement, "use_free_preset", False))
             or bool(getattr(settlement, "competitive_ranked", False))
-            or is_boss_trial_kind(int(getattr(settlement, "boss_trial_kind", 0)))
-            or int(getattr(settlement, "boss_trial_kind", 0)) == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+            or is_boss_trial_kind(boss_trial_kind)
+            or boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
             or settlement.HasField("tower_settlement")
         )
         if not isolate_temp_state:
@@ -155,8 +207,29 @@ class BattleSettlement:
                 base.health, base.mana = stats.max_health, stats.max_mana
             if not self._pets(data, settlement.pets):
                 return False
-        stamp = self.clock()
-        if settlement.defeated_monsters and not is_festival_beast:
+
+        # 经验入账与等级平滑升级（同帧提交，不覆写超上限旧档）。
+        if data.HasField("level_component"):
+            if attributes is not None and hasattr(attributes, "apply_battle_exp_and_level_up"):
+                ok_lvl, lvl_res = attributes.apply_battle_exp_and_level_up(data, prog_delta.exp_gain)
+            else:
+                ok_lvl, lvl_res = self._apply_exp_fallback(data, prog_delta.exp_gain)
+            if not ok_lvl:
+                return False
+            prog_delta.level_before = lvl_res.level_before
+            prog_delta.level_after = lvl_res.level_after
+            prog_delta.total_exp_after = lvl_res.total_exp_after
+            prog_delta.next_level_total_exp = lvl_res.next_level_total_exp
+            prog_delta.leveled_up = lvl_res.leveled_up
+            if lvl_res.leveled_up and self.missions is not None:
+                checkpoint = self._checkpoint(data, audits)
+                lvl_gains = []
+                scope = self.missions.scopes(data)[0]
+                for reached in range(lvl_res.level_before + 1, lvl_res.level_after + 1):
+                    await self.missions._event(data, scope, LEVEL, reached, reached, stamp, gains=lvl_gains)
+                self._audit(player, checkpoint, data, 7, audits, gains=lvl_gains)
+
+        if settlement.defeated_monsters and not is_festival_beast and not is_npc_isolated_encounter:
             checkpoint = self._checkpoint(data, audits)
             gains = []
             await self.missions.battle_defeats(data, settlement.defeated_monsters, stamp, gains=gains)
@@ -165,13 +238,30 @@ class BattleSettlement:
         if fb_delta is None:
             return False
         travel_pass = getattr(self.scene, "travel_pass", None)
-        if travel_pass is not None and hasattr(travel_pass, "apply_battle_credit"):
+        if not is_npc_isolated_encounter and travel_pass is not None and hasattr(travel_pass, "apply_battle_credit"):
             travel_pass.apply_battle_credit(data, settlement, stamp)
-        self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
+        if not is_npc_isolated_encounter:
+            self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
         self._record(
             data.battle_results, settlement, currencies, gained, consumed, stamp,
-            items_mailed=items_mailed, fb_delta=fb_delta,
+            items_mailed=items_mailed, fb_delta=fb_delta, prog_delta=prog_delta,
         )
+        # 离线托管期间的真实战斗结算同帧记入收获简报（不额外发产出）。
+        hosting_active = bool(getattr(player, "hosting_active", False) or getattr(player, "disconnect_at", None) is not None)
+        if hosting_active:
+            won = (
+                (settlement.outcome == 1 and settlement.player_team_index == 0)
+                or (settlement.outcome == 2 and settlement.player_team_index == 1)
+            )
+            SceneAfkPass.record_hosted_battle_settlement(
+                data,
+                hosting_active=True,
+                won=won,
+                exp_gained=prog_delta.exp_gain,
+                silver_gained=currencies.get(0, 0),
+                item_count=sum(gained.values()),
+                now_unix_sec=stamp // 1000,
+            )
         return True
 
     def _apply_festival_beast_credit(self, data, settlement, stamp: int) -> dict | None:
@@ -388,8 +478,53 @@ class BattleSettlement:
                 pet.health, pet.mana = stats["max_health"], stats["max_mana"]
         return True
 
+    def _load_reward_rows(self) -> list[ModeRewardRow]:
+        if "BattleProgressionReward" not in self.tables.tables:
+            return []
+        return [
+            ModeRewardRow(
+                match_mode=int(row.match_mode),
+                difficulty=int(row.difficulty),
+                outcome_tier=int(row.outcome_tier),
+                exp_gain=int(row.exp_gain),
+                silver_gain=int(row.silver_gain),
+            )
+            for row in self.tables["BattleProgressionReward"].rows()
+        ]
+
+    def _load_silver_rule(self) -> WeeklySilverRule | None:
+        if "BattleProgressionRule" not in self.tables.tables:
+            return None
+        row = self.tables["BattleProgressionRule"].get(1)
+        if row is None:
+            return None
+        return WeeklySilverRule(
+            soft_cap=int(row.weekly_silver_soft_cap),
+            diminished_rate_permyriad=int(row.diminished_rate_permyriad),
+            hard_cap=int(row.weekly_silver_hard_cap),
+        )
+
+    def _apply_exp_fallback(self, data, exp_gain: int):
+        rows = []
+        if "PlayerLevelExp" in self.tables.tables:
+            rows = sorted(
+                (LevelExpRow(level=int(r.id), required_total_exp=int(r.required_total_exp))
+                 for r in self.tables["PlayerLevelExp"].rows()),
+                key=lambda r: r.level,
+            )
+        ok, res = resolve_level_for_exp(int(data.level_component.level), int(data.level_component.total_exp), exp_gain, rows)
+        if ok:
+            if exp_gain > 0:
+                data.level_component.total_exp = res.total_exp_after
+            if res.leveled_up:
+                data.level_component.level = res.stored_level_after
+        return ok, res
+
     @staticmethod
-    def _record(history, settlement, currencies, gained, consumed, stamp, *, items_mailed=False, fb_delta=None):
+    def _record(
+        history, settlement, currencies, gained, consumed, stamp, *,
+        items_mailed=False, fb_delta=None, prog_delta: BattleProgressionDelta | None = None,
+    ):
         seq = max(history.last_result_seq, max((entry.result_seq for entry in history.entries), default=0)) + 1
         history.last_result_seq = seq
         entry = history.entries.add(
@@ -399,6 +534,15 @@ class BattleSettlement:
             lines_truncated=len(gained) > MAX_LINES or len(consumed) > MAX_LINES,
             match_mode=settlement.match_mode, battle_config_id=settlement.battle_config_id, items_mailed=items_mailed,
         )
+        if prog_delta is not None:
+            entry.exp_gain = int(prog_delta.exp_gain)
+            entry.level_before = int(prog_delta.level_before)
+            entry.level_after = int(prog_delta.level_after)
+            entry.total_exp_after = int(prog_delta.total_exp_after)
+            entry.next_level_total_exp = int(prog_delta.next_level_total_exp)
+            entry.battle_silver_weekly_used = int(prog_delta.weekly_silver_used_after)
+            entry.battle_silver_weekly_soft_cap = int(prog_delta.weekly_silver_soft_cap)
+            entry.battle_silver_diminished = bool(prog_delta.silver_diminished)
         if fb_delta and fb_delta.get("active"):
             entry.festival_activity_instance_id = int(fb_delta.get("activity_instance_id", 0))
             entry.festival_reward_identity = str(fb_delta.get("reward_identity", ""))
@@ -418,26 +562,41 @@ class BattleSettlement:
     async def complete(self, player, settlement) -> None:
         if self.scene.battle and not await self.scene.battle.settled(player.player_id, settlement.battle_id):
             return
-        pets = getattr(self.scene, "pets", None)
-        if settlement.pets and pets is not None:
-            pets.notify(player)
         data = self.scene.rows.assemble(player.snapshot)
         result = next((entry for entry in data.battle_results.entries
                        if entry.battle_id == settlement.battle_id), None)
+        leveled_up = bool(result is not None and result.level_after > result.level_before)
+        pets = getattr(self.scene, "pets", None)
+        if (settlement.pets or leveled_up) and pets is not None:
+            pets.notify(player)
+        attributes = getattr(self.scene, "attributes", None)
+        if leveled_up and attributes is not None:
+            attributes.notify(player)
         end_msg = self.protocol.message(
             "BattleEndS2C", battle_id=settlement.battle_id, outcome=settlement.outcome, settlement=settlement,
             items_mailed=bool(result and result.items_mailed),
         )
-        if result is not None and result.festival_activity_instance_id:
-            fb_summary = end_msg.festival_beast_settlement
-            fb_summary.activity_instance_id = result.festival_activity_instance_id
-            fb_summary.reward_identity = result.festival_reward_identity
-            fb_summary.wins_before = result.festival_wins_before
-            fb_summary.wins_after = result.festival_wins_after
-            fb_summary.required_wins = result.festival_required_wins
-            fb_summary.newly_eligible = result.festival_newly_eligible
-            fb_summary.material_units_added = result.material_credit_units_added
-            fb_summary.material_tradable_units_added = result.material_tradable_units_added
-            fb_summary.material_available_units_after = result.material_available_units_after
-            fb_summary.material_earnable_remaining_after = result.material_earnable_remaining_after
+        if result is not None:
+            end_msg.level_before = int(result.level_before)
+            end_msg.level_after = int(result.level_after)
+            end_msg.exp_gain = int(result.exp_gain)
+            end_msg.total_exp_after = int(result.total_exp_after)
+            end_msg.next_level_total_exp = int(result.next_level_total_exp)
+            end_msg.battle_silver_diminished = bool(result.battle_silver_diminished)
+            for cur in result.currencies:
+                if cur.currency_type == 0:
+                    end_msg.silver_gain = int(cur.amount)
+                    break
+            if result.festival_activity_instance_id:
+                fb_summary = end_msg.festival_beast_settlement
+                fb_summary.activity_instance_id = result.festival_activity_instance_id
+                fb_summary.reward_identity = result.festival_reward_identity
+                fb_summary.wins_before = result.festival_wins_before
+                fb_summary.wins_after = result.festival_wins_after
+                fb_summary.required_wins = result.festival_required_wins
+                fb_summary.newly_eligible = result.festival_newly_eligible
+                fb_summary.material_units_added = result.material_credit_units_added
+                fb_summary.material_tradable_units_added = result.material_tradable_units_added
+                fb_summary.material_available_units_after = result.material_available_units_after
+                fb_summary.material_earnable_remaining_after = result.material_earnable_remaining_after
         self.scene._push(player, "BattleClientPlayerNotifyBattleEnd", end_msg)

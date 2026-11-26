@@ -1,6 +1,9 @@
-"""角色属性面板、加点方案及其存档入口。"""
+"""角色属性面板、加点方案、战斗平滑升级曲线及存档入口。"""
 
+from bisect import bisect_right
+from dataclasses import dataclass
 from inspect import isawaitable
+import logging
 import time
 
 from ..data import client_request
@@ -9,6 +12,8 @@ from ..data.attribute_allocation import AllocationError, distribute_points, eval
 from .scene_mission import LEVEL, effective_level
 from .scene_skills import _rescale
 from .scene_stats import STATS, UINT32_MAX, UINT64_MAX, _equipment, class_id, player_stats
+
+logger = logging.getLogger(__name__)
 
 _SERVICE = "SceneAttributeClientPlayer"
 _CREATE_SCHEME = 3
@@ -31,6 +36,298 @@ _ALLOCATION_TIPS = {
     AllocationError.CAP_EXCEEDED: 25005,
     AllocationError.NOTHING_TO_CHANGE: _NO_CHANGE,
 }
+
+# 角色等级上限与全玩法战斗成长/银两周软上限纯规则常量（与 C++ battle_progression_rules.h 严格对齐）。
+MAX_PLAYER_LEVEL = 85
+LIGHT_CARD_BONUS_SCHEMES = 3
+WUXING_TOWER_LOOKUP_MODE = 99
+OUTCOME_TIER_WIN = 1
+OUTCOME_TIER_QUALIFIED_NON_WIN = 2
+PVP_MIN_ROUNDS_FOR_LOSS = 3
+PVP_MIN_MANUAL_ROUNDS_FOR_LOSS = 2
+PERMYRIAD_BASE = 10_000
+_PVP_PROGRESSION_MODES = frozenset({1, 3, 7, 8, 9, 11})
+_GUILD_WAR_MODES = frozenset({9, 10})
+_MATCH_MODE_PVP_CHALLENGE = 6
+
+
+@dataclass(frozen=True, slots=True)
+class LevelExpRow:
+    level: int
+    required_total_exp: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModeRewardRow:
+    match_mode: int
+    difficulty: int
+    outcome_tier: int
+    exp_gain: int
+    silver_gain: int
+
+
+@dataclass(frozen=True, slots=True)
+class WeeklySilverRule:
+    soft_cap: int = 30_000
+    diminished_rate_permyriad: int = 2000
+    hard_cap: int = 45_000
+
+
+@dataclass(slots=True)
+class LevelExpDisplay:
+    total_exp: int = 0
+    current_level_exp: int = 0
+    next_level_exp: int = 0
+    next_level_total_exp: int = 0
+    is_max_level: bool = False
+
+
+@dataclass(slots=True)
+class LevelProgressResult:
+    stored_level_before: int = 1
+    stored_level_after: int = 1
+    level_before: int = 1
+    level_after: int = 1
+    total_exp_after: int = 0
+    next_level_total_exp: int = 0
+    leveled_up: bool = False
+
+
+@dataclass(slots=True)
+class WeeklySilverEval:
+    credited_silver: int = 0
+    used_after: int = 0
+    diminished: bool = False
+
+
+@dataclass(slots=True)
+class BattleProgressionDelta:
+    exp_gain: int = 0
+    silver_gain: int = 0
+    level_before: int = 0
+    level_after: int = 0
+    total_exp_after: int = 0
+    next_level_total_exp: int = 0
+    weekly_silver_used_after: int = 0
+    weekly_silver_soft_cap: int = 0
+    silver_diminished: bool = False
+    leveled_up: bool = False
+    ledger_changed: bool = False
+
+
+def capped_level(stored_level: int) -> int:
+    return min(MAX_PLAYER_LEVEL, max(1, int(stored_level)))
+
+
+def validate_level_exp_rows(rows: list[LevelExpRow]) -> bool:
+    """校验 1..85 经验表完整性：连续无空洞、1 级恒为 0、后续严格单调递增。"""
+    if len(rows) != MAX_PLAYER_LEVEL:
+        return False
+    prev_exp = 0
+    for expected in range(1, MAX_PLAYER_LEVEL + 1):
+        row = rows[expected - 1]
+        if row.level != expected:
+            return False
+        if expected == 1:
+            if row.required_total_exp != 0:
+                return False
+        elif row.required_total_exp <= prev_exp:
+            return False
+        prev_exp = row.required_total_exp
+    return True
+
+
+def validate_weekly_silver_rule(rule: WeeklySilverRule) -> bool:
+    return rule.diminished_rate_permyriad <= PERMYRIAD_BASE and rule.hard_cap >= rule.soft_cap
+
+
+def compute_level_exp_display(eff_level: int, total_exp: int, sorted_rows: list[LevelExpRow]) -> LevelExpDisplay:
+    """计算面板与战果展示用的本级经验进度（绝不下溢）。"""
+    out = LevelExpDisplay(total_exp=total_exp)
+    lvl = capped_level(eff_level)
+    if lvl >= MAX_PLAYER_LEVEL:
+        out.is_max_level = True
+        return out
+    if not validate_level_exp_rows(sorted_rows):
+        return out
+    cur_req = sorted_rows[lvl - 1].required_total_exp
+    next_req = sorted_rows[lvl].required_total_exp
+    out.next_level_total_exp = next_req
+    out.next_level_exp = next_req - cur_req if next_req > cur_req else 0
+    if total_exp >= cur_req and out.next_level_exp > 0:
+        out.current_level_exp = min(total_exp - cur_req, out.next_level_exp)
+    return out
+
+
+def resolve_level_for_exp(
+    stored_level: int, current_total_exp: int, exp_gain: int, sorted_rows: list[LevelExpRow],
+) -> tuple[bool, LevelProgressResult]:
+    """按累计总经验推进存储等级（绝不降级、不覆盖超上限旧档、溢出返回 False）。"""
+    out = LevelProgressResult()
+    if exp_gain > UINT64_MAX - current_total_exp:
+        return False, out
+    out.stored_level_before = stored_level
+    out.level_before = capped_level(stored_level)
+    out.total_exp_after = current_total_exp + exp_gain
+    if not sorted_rows or not validate_level_exp_rows(sorted_rows) or stored_level >= MAX_PLAYER_LEVEL:
+        out.stored_level_after = stored_level
+        out.level_after = capped_level(stored_level)
+    else:
+        thresholds = [r.required_total_exp for r in sorted_rows]
+        idx = bisect_right(thresholds, out.total_exp_after)
+        target_level = sorted_rows[idx - 1].level if idx > 0 else 1
+        target_level = min(target_level, MAX_PLAYER_LEVEL)
+        base_stored = 1 if stored_level == 0 else stored_level
+        out.stored_level_after = max(base_stored, target_level)
+        out.level_after = capped_level(out.stored_level_after)
+        out.leveled_up = out.stored_level_after > base_stored
+    display = compute_level_exp_display(out.level_after, out.total_exp_after, sorted_rows)
+    out.next_level_total_exp = display.next_level_total_exp
+    return True, out
+
+
+def is_pvp_progression_mode(match_mode: int) -> bool:
+    return match_mode in _PVP_PROGRESSION_MODES
+
+
+def is_guild_war_mode(match_mode: int) -> bool:
+    return match_mode in _GUILD_WAR_MODES
+
+
+def resolve_battle_lookup_key(settlement) -> tuple[bool, int, int, int]:
+    """判定单局是否具备基础经验/银两资格，返回 (ok, lookup_mode, difficulty, outcome_tier)。"""
+    if settlement.outcome in (0, 4) or settlement.total_rounds == 0 or settlement.fled:
+        return False, 0, 0, 0
+    boss_kind = int(getattr(settlement, "boss_trial_kind", 0))
+    if (
+        (settlement.HasField("festival_beast") and settlement.festival_beast.activity_instance_id != 0)
+        or (9 <= boss_kind <= 11)
+    ):
+        return False, 0, 0, 0
+    mode = int(settlement.match_mode)
+    if mode in (0, _MATCH_MODE_PVP_CHALLENGE):
+        return False, 0, 0, 0
+    won = (
+        (settlement.outcome == 1 and settlement.player_team_index == 0)
+        or (settlement.outcome == 2 and settlement.player_team_index == 1)
+    )
+    is_tower = settlement.HasField("tower_settlement") and settlement.tower_settlement.floor != 0
+    if is_tower:
+        if not won:
+            return False, 0, 0, 0
+        return True, WUXING_TOWER_LOOKUP_MODE, 0, OUTCOME_TIER_WIN
+    if is_pvp_progression_mode(mode):
+        if won:
+            return True, mode, 0, OUTCOME_TIER_WIN
+        if (
+            settlement.total_rounds >= PVP_MIN_ROUNDS_FOR_LOSS
+            and int(getattr(settlement, "manual_action_rounds", 0)) >= PVP_MIN_MANUAL_ROUNDS_FOR_LOSS
+            and bool(getattr(settlement, "effective_combat_contribution", False))
+        ):
+            return True, mode, 0, OUTCOME_TIER_QUALIFIED_NON_WIN
+        return False, 0, 0, 0
+    if not won:
+        return False, 0, 0, 0
+    return True, mode, int(getattr(settlement, "battle_difficulty", 0)), OUTCOME_TIER_WIN
+
+
+def find_mode_reward(rows: list[ModeRewardRow], lookup_mode: int, difficulty: int, outcome_tier: int) -> ModeRewardRow | None:
+    fallback = None
+    for row in rows:
+        if row.match_mode != lookup_mode or row.outcome_tier != outcome_tier:
+            continue
+        if row.difficulty == difficulty:
+            return row
+        if row.difficulty == 0 and fallback is None:
+            fallback = row
+    return fallback
+
+
+def evaluate_weekly_silver_cap(raw_silver: int, used_this_week: int, rule: WeeklySilverRule) -> WeeklySilverEval:
+    """对原始银两施加每周软上限 + 衰减比例 + 硬封顶（精确跨边界拆分）。"""
+    out = WeeklySilverEval(used_after=used_this_week)
+    if raw_silver == 0:
+        out.diminished = rule.soft_cap > 0 and used_this_week >= rule.soft_cap
+        return out
+    if rule.hard_cap > 0 and used_this_week >= rule.hard_cap:
+        out.diminished = True
+        return out
+    full_room = rule.soft_cap - used_this_week if rule.soft_cap > used_this_week else 0
+    full_part = min(raw_silver, full_room)
+    overflow_part = raw_silver - full_part
+    diminished_part = (
+        (overflow_part * rule.diminished_rate_permyriad) // PERMYRIAD_BASE
+        if overflow_part > 0 and rule.diminished_rate_permyriad > 0 else 0
+    )
+    total = full_part + diminished_part
+    if rule.hard_cap > 0:
+        hard_room = rule.hard_cap - used_this_week if rule.hard_cap > used_this_week else 0
+        total = min(total, hard_room)
+    out.credited_silver = total
+    out.used_after = used_this_week + total
+    out.diminished = overflow_part > 0 or (rule.hard_cap > 0 and out.used_after >= rule.hard_cap)
+    return out
+
+
+def prepare_economy_ledger(
+    current_ledger,
+    current_week_start_ms: int,
+    settlement,
+    explicit_exp: int,
+    explicit_silver: int,
+    reward_rows: list[ModeRewardRow],
+    rule: WeeklySilverRule | None,
+) -> tuple[object, BattleProgressionDelta]:
+    """统一在当前周账本上计算本局最终经验、实得银两与更新后的周账本候选。"""
+    candidate = clone(current_ledger)
+    delta = BattleProgressionDelta()
+
+    week_reset = False
+    if current_week_start_ms > candidate.week_starts_at_ms:
+        candidate.week_starts_at_ms = current_week_start_ms
+        candidate.battle_silver_this_week = 0
+        candidate.battle_exp_this_week = 0
+        week_reset = True
+
+    table_exp = 0
+    table_silver = 0
+    if reward_rows:
+        ok, lookup_mode, difficulty, outcome_tier = resolve_battle_lookup_key(settlement)
+        if ok:
+            row = find_mode_reward(reward_rows, lookup_mode, difficulty, outcome_tier)
+            if row is not None:
+                table_exp = row.exp_gain
+                table_silver = 0 if is_guild_war_mode(int(settlement.match_mode)) else row.silver_gain
+
+    final_exp = max(explicit_exp, table_exp)
+    raw_silver = explicit_silver if is_guild_war_mode(int(settlement.match_mode)) else max(explicit_silver, table_silver)
+
+    credited_silver = raw_silver
+    diminished = False
+    used_after = int(candidate.battle_silver_this_week)
+    soft_cap = 0
+
+    if rule is not None and validate_weekly_silver_rule(rule):
+        soft_cap = rule.soft_cap
+        if table_silver > 0:
+            ev = evaluate_weekly_silver_cap(raw_silver, int(candidate.battle_silver_this_week), rule)
+            credited_silver = ev.credited_silver
+            used_after = ev.used_after
+            diminished = ev.diminished
+            if credited_silver > 0:
+                candidate.battle_silver_this_week = used_after
+
+    if final_exp > 0:
+        cur_week_exp = int(candidate.battle_exp_this_week)
+        candidate.battle_exp_this_week = UINT64_MAX if final_exp > UINT64_MAX - cur_week_exp else cur_week_exp + final_exp
+
+    delta.exp_gain = final_exp
+    delta.silver_gain = credited_silver
+    delta.weekly_silver_used_after = used_after
+    delta.weekly_silver_soft_cap = soft_cap
+    delta.silver_diminished = diminished
+    delta.ledger_changed = week_reset or final_exp > 0 or (table_silver > 0 and credited_silver > 0)
+    return candidate, delta
 
 
 def _default_name(ordinal: int) -> str:
@@ -117,6 +414,155 @@ class SceneAttributes:
     def _max_schemes(self) -> int:
         return (self.rule.max_schemes or 1) if self.rule else 1
 
+    def _afk_pass_active(self, data) -> bool:
+        afk_pass = getattr(self.scene, "afk_pass", None)
+        if afk_pass is not None and hasattr(afk_pass, "is_active_data"):
+            return bool(afk_pass.is_active_data(data))
+        if data.HasField("uint64_pb_component"):
+            return int(getattr(data.uint64_pb_component, "afk_pass_expires_at", 0)) > int(self.now_s())
+        return False
+
+    def _max_schemes_for(self, data) -> int:
+        base = self._max_schemes()
+        return base + LIGHT_CARD_BONUS_SCHEMES if self._afk_pass_active(data) else base
+
+    def load_level_exp_rows(self) -> list[LevelExpRow]:
+        if "PlayerLevelExp" not in self.tables.tables:
+            return []
+        rows = [
+            LevelExpRow(level=int(row.id), required_total_exp=int(row.required_total_exp))
+            for row in self.tables["PlayerLevelExp"].rows()
+        ]
+        rows.sort(key=lambda r: r.level)
+        return rows
+
+    def load_battle_progression_rewards(self) -> list[ModeRewardRow]:
+        if "BattleProgressionReward" not in self.tables.tables:
+            return []
+        return [
+            ModeRewardRow(
+                match_mode=int(row.match_mode),
+                difficulty=int(row.difficulty),
+                outcome_tier=int(row.outcome_tier),
+                exp_gain=int(row.exp_gain),
+                silver_gain=int(row.silver_gain),
+            )
+            for row in self.tables["BattleProgressionReward"].rows()
+        ]
+
+    def load_weekly_silver_rule(self) -> WeeklySilverRule | None:
+        if "BattleProgressionRule" not in self.tables.tables:
+            return None
+        row = self.tables["BattleProgressionRule"].get(1)
+        if row is None:
+            return None
+        return WeeklySilverRule(
+            soft_cap=int(row.weekly_silver_soft_cap),
+            diminished_rate_permyriad=int(row.diminished_rate_permyriad),
+            hard_cap=int(row.weekly_silver_hard_cap),
+        )
+
+    def validate_progression_tables(self) -> bool:
+        exp_rows = self.load_level_exp_rows()
+        if not validate_level_exp_rows(exp_rows):
+            logger.error("PlayerLevelExp table validation failed: rows=%d", len(exp_rows))
+            return False
+        rewards = self.load_battle_progression_rewards()
+        if not rewards:
+            logger.error("BattleProgressionReward table is empty")
+            return False
+        for row in rewards:
+            if row.outcome_tier not in (OUTCOME_TIER_WIN, OUTCOME_TIER_QUALIFIED_NON_WIN):
+                logger.error("BattleProgressionReward invalid outcome_tier=%d", row.outcome_tier)
+                return False
+            if is_guild_war_mode(row.match_mode) and row.silver_gain != 0:
+                logger.error("BattleProgressionReward guild war mode must have silver_gain=0: mode=%d", row.match_mode)
+                return False
+        rule = self.load_weekly_silver_rule()
+        if rule is None or not validate_weekly_silver_rule(rule):
+            logger.error("BattleProgressionRule table (id=1) missing or invalid")
+            return False
+        return True
+
+    def apply_battle_exp_and_level_up(self, data, exp_gain: int) -> tuple[bool, LevelProgressResult]:
+        """推进战斗经验与升级，同步重算人物与宝宝二级属性（同步版；任务升级事件由调用方触发）。"""
+        if not data.HasField("level_component"):
+            return False, LevelProgressResult()
+        stored_level = int(data.level_component.level)
+        exp_rows = self.load_level_exp_rows()
+        ok, res = resolve_level_for_exp(stored_level, int(data.level_component.total_exp), exp_gain, exp_rows)
+        if not ok:
+            return False, res
+        if exp_gain > 0:
+            data.level_component.total_exp = res.total_exp_after
+        if res.leveled_up:
+            old = player_stats(self.protocol, self.tables, data)
+            data.level_component.level = res.stored_level_after
+            self._rescale(old, data, level_changed=True)
+            pets = getattr(self.scene, "pets", None)
+            if pets is not None:
+                pets.recalculate_all(data, level_changed=True)
+            logger.info(
+                "Player leveled up via battle exp level=%d->%d total_exp=%d",
+                res.level_before, res.level_after, res.total_exp_after,
+            )
+        return True, res
+
+    def try_switch_linked_scheme(self, data, scheme_id: int) -> tuple[bool, str]:
+        """供装备流派一键联动切换加点方案（原地修改 data，不破坏主装备切换）。"""
+        if not self._present(data):
+            return False, "属性数据尚未就绪"
+        comp = data.attribute_component
+        if self._scheme(comp, scheme_id) is None:
+            return False, f"加点方案 {scheme_id} 不存在"
+        if comp.active_scheme_id == scheme_id:
+            return True, ""
+        now = int(self.now_s())
+        if self.rule and self.rule.switch_cooldown_seconds:
+            if comp.last_switch_time + self.rule.switch_cooldown_seconds > now:
+                return False, "加点方案切换冷却中"
+        old = player_stats(self.protocol, self.tables, data)
+        comp.active_scheme_id = scheme_id
+        comp.last_switch_time = now
+        self._rescale(old, data)
+        return True, ""
+
+    def _fill_support_effects(self, effects, out) -> None:
+        out.Clear()
+        out.in_battle = False
+        out.round_index = 0
+        healing = out.healing
+        shield = out.shield
+        complete = bool(effects.support_sources_complete)
+        healing.complete = complete
+        shield.complete = complete
+        healing.total_bonus_bps = float(effects.outgoing_heal_bps)
+        shield.total_bonus_bps = float(effects.shield_capacity_bps)
+        for src in effects.support_sources:
+            target = shield if src.effect_kind == 2 else healing
+            if src.source_cap_bps and (not target.equipment_cap_bps or src.source_cap_bps < target.equipment_cap_bps):
+                target.equipment_cap_bps = int(src.source_cap_bps)
+            target.sources.add().CopyFrom(src)
+        for art in effects.artifacts:
+            if art.effect_id in (5, 7):
+                s = healing.sources.add()
+                s.kind = 4
+                s.name = art.name
+                s.item_id = art.item_id
+                s.raw_bonus_bps = float(art.bonus_bps)
+                s.effective_bonus_bps = 0.0
+                s.conditional = True
+                s.effect_kind = 1
+            elif art.effect_id in (6, 8):
+                s = shield.sources.add()
+                s.kind = 4
+                s.name = art.name
+                s.item_id = art.item_id
+                s.raw_bonus_bps = float(art.bonus_bps)
+                s.effective_bonus_bps = 0.0
+                s.conditional = True
+                s.effect_kind = 2
+
     def _valid_name(self, name) -> bool:
         limit = (self.rule.scheme_name_max_len or 12) if self.rule else 12
         if not 0 < len(name) <= limit or any(ord(char) < 0x20 or char == "\x7f" for char in name):
@@ -132,7 +578,12 @@ class SceneAttributes:
         level = effective_level(data)
         panel = response.panel
         panel.level, panel.active_scheme_id = level, comp.active_scheme_id
-        panel.max_schemes, panel.create_scheme_cost_gold = self._max_schemes(), self._scheme_cost(comp)
+        exp_display = compute_level_exp_display(level, int(data.level_component.total_exp), self.load_level_exp_rows())
+        panel.total_exp = exp_display.total_exp
+        panel.current_level_exp = exp_display.current_level_exp
+        panel.next_level_exp = exp_display.next_level_exp
+        panel.is_max_level = exp_display.is_max_level
+        panel.max_schemes, panel.create_scheme_cost_gold = self._max_schemes_for(data), self._scheme_cost(comp)
         if self.rule and self.rule.switch_cooldown_seconds:
             panel.switch_cooldown_until = min(UINT64_MAX, comp.last_switch_time + self.rule.switch_cooldown_seconds)
         for scheme in comp.schemes:
@@ -160,13 +611,26 @@ class SceneAttributes:
         for key in STATS:
             setattr(panel.derived, key, getattr(stats, key))
         panel.derived.health, panel.derived.mana = base.health, base.mana
+        equip_craft = getattr(self.scene, "equip_craft", None)
+        if equip_craft is not None and hasattr(equip_craft, "collect_effects"):
+            equip_craft.collect_effects(data, panel.equipment_effects)
+        else:
+            panel.equipment_effects.support_sources_complete = True
+        equip_fx = panel.equipment_effects
         for stat, row in sorted(self.combat_rows.items(), key=lambda item: (item[1].sort, item[0])):
             if not row.name:
                 continue
             field = stats.combat.DESCRIPTOR.fields_by_number[stat]
             intrinsic = base.critchance if stat in (1, 2) else base.resistance if stat in (14, 15) else 0
-            value = min(100 if row.percent else UINT64_MAX, intrinsic + getattr(stats.combat, field.name))
+            fixed_bps = (
+                equip_fx.physical_crit_bps if stat == 1 else
+                equip_fx.magic_crit_bps if stat == 2 else
+                equip_fx.magic_resist_bps if stat == 14 else
+                equip_fx.physical_resist_bps if stat == 15 else 0
+            )
+            value = min(100 if row.percent else UINT64_MAX, intrinsic + getattr(stats.combat, field.name) + fixed_bps // 100)
             panel.combat.add(combat_id=stat, name=row.name, value=value, percent=bool(row.percent), sort=row.sort)
+        self._fill_support_effects(equip_fx, panel.support_effects)
 
     def _rescale(self, old, data, *, level_changed=False):
         new = player_stats(self.protocol, self.tables, data)
@@ -204,7 +668,13 @@ class SceneAttributes:
         return pool, scheme, 0 if scheme is not None else _SCHEME_NOT_FOUND
 
     def _debit(self, data, cost):
-        error = self.assets.deduct_currency(data, self.gold, cost) if cost else 0
+        if not cost:
+            return 0
+        error = (
+            self.assets.deduct_gold_prefer_bind(data, cost)
+            if hasattr(self.assets, "deduct_gold_prefer_bind")
+            else self.assets.deduct_currency(data, self.gold, cost)
+        )
         return _INSUFFICIENT_GOLD if error == INSUFFICIENT else error
 
     async def _save(self, player, response, data, *, audit=None):
@@ -302,7 +772,7 @@ class SceneAttributes:
         if error := self._write_error(player, data):
             return self._reject(response, error)
         comp = data.attribute_component
-        if len(comp.schemes) >= self._max_schemes():
+        if len(comp.schemes) >= self._max_schemes_for(data):
             return self._reject(response, _SCHEME_LIMIT)
         name = request.name or _default_name(len(comp.schemes) + 1)
         if not self._valid_name(name):

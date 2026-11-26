@@ -114,6 +114,8 @@ class BattleSkills:
             return self.engine.configured.check_skill(actor, action, rule)
         if skill_id not in actor.skill_table_ids or rule.class_id and not actor.skill_ranks.get(skill_id):
             return 1005
+        if getattr(self.engine, "is_skill_banned", lambda _sid: False)(skill_id):
+            return 7028
         if not rule.castable:
             return 7004
         if getattr(self.engine, "ban_control_skills", False) and self.engine.is_control_skill(rule):
@@ -264,8 +266,13 @@ class BattleSkills:
                 if actor.team_index != target.team_index:
                     encounter.try_dispel_boss_stance(actor, target, turn, group)
                 else:
-                    encounter.clear_sunder_on_ally_dispel(actor, target)
-            self.engine.effects.dispel(target, rule.dispel_count, turn, group, hit)
+                    encounter.clear_sunder_on_ally_dispel(actor, target, turn, group)
+            removed = self.engine.effects.dispel(target, rule.dispel_count, turn, group, hit)
+            if removed:
+                if hasattr(self.engine, "record_dispel_landed"):
+                    self.engine.record_dispel_landed(actor.actor_id, removed)
+                if encounter is not None:
+                    encounter.on_boss_weekly_affix_dispel_triggered(actor.actor_id, turn, group)
 
     def _mana_event(self, turn: Message, group: int, hit: int, source: Message, target: Message,
                     skill_id: int, delta: int) -> None:
@@ -298,6 +305,8 @@ class BattleSkills:
         basic = self._basic_expectation(actor)
         best = None
         for skill_id in actor.skill_table_ids:
+            if getattr(engine, "is_skill_banned", lambda _sid: False)(skill_id):
+                continue
             rule = self.rules.get(skill_id)
             if rule is None or not rule.class_id:
                 continue

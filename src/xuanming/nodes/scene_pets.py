@@ -569,10 +569,19 @@ class ScenePets:
         self._recalculate_one(pet, row, effective_level(data), old)
         return 0
 
+    def _spendable_gold(self, data) -> int:
+        if self.assets is not None and hasattr(self.assets, "spendable_gold_with_bind"):
+            return self.assets.spendable_gold_with_bind(data)
+        return min(UINT64_MAX, balance(data, self.gold) + balance(data, 3))
+
     def _deduct(self, data, cost):
         if not cost:
             return 0
-        error = self.assets.deduct_currency(data, self.gold, cost)
+        error = (
+            self.assets.deduct_gold_prefer_bind(data, cost)
+            if hasattr(self.assets, "deduct_gold_prefer_bind")
+            else self.assets.deduct_currency(data, self.gold, cost)
+        )
         return _GOLD_LOW if error == INSUFFICIENT else error
 
     def _reset(self, data, request):
@@ -847,7 +856,7 @@ class ScenePets:
             return finish(_LEVEL_LOW)
         if not self.has_normal_pet_slot(comp):
             return finish(_FULL)
-        if balance(data, self.gold) < price:
+        if self._spendable_gold(data) < price:
             return finish(_GOLD_LOW)
 
         error, candidate = await self._prepare_new_pet(comp, row, owner_level)
@@ -855,9 +864,9 @@ class ScenePets:
             return finish(error)
         before = clone(data) if self.assets is not None and self.assets.audit_enabled else None
         if self.assets is not None:
-            deduct_err = self.assets.deduct_currency(data, self.gold, price)
+            deduct_err = self._deduct(data, price)
             if deduct_err:
-                return finish(_GOLD_LOW if deduct_err == INSUFFICIENT else deduct_err)
+                return finish(deduct_err)
         comp.pets.add().CopyFrom(candidate)
         comp.last_purchase_sequence = seq
         comp.last_purchase_pet_table_id = request.pet_table_id
@@ -920,7 +929,7 @@ class ScenePets:
             block_tip = PET_TIER_LEVEL_NOT_ENOUGH
         elif out.cost_item_id and owned_material < out.cost_item_count:
             block_tip = PET_TIER_MATERIAL_NOT_ENOUGH
-        elif out.cost_gold and (data is None or balance(data, self.gold) < out.cost_gold):
+        elif out.cost_gold and (data is None or self._spendable_gold(data) < out.cost_gold):
             block_tip = _GOLD_LOW
         out.can_ascend = block_tip == 0
         out.block_tip_id = block_tip
@@ -1296,7 +1305,7 @@ class ScenePets:
             return fail(PET_TIER_LEVEL_NOT_ENOUGH)
 
         cost_gold = int(getattr(current_row, "ascend_cost_gold", 0))
-        if cost_gold > 0 and (cost_gold > INT64_MAX or balance(data, self.gold) < cost_gold):
+        if cost_gold > 0 and (cost_gold > INT64_MAX or self._spendable_gold(data) < cost_gold):
             return fail(_GOLD_LOW)
 
         cost_item_id = int(getattr(current_row, "ascend_cost_item_id", 0))

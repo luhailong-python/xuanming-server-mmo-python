@@ -62,12 +62,14 @@ PVP_MIN_MANUAL_ROUNDS_FOR_LOSS = 2
 
 def is_eligible_battle(settlement) -> bool:
     """按 C++ PlayerSeasonSystem::IsEligibleBattle 判定本场结算是否可累计赛季印进度点。"""
+    boss_kind = int(getattr(settlement, "boss_trial_kind", 0))
     if (
         not settlement.battle_id
         or not settlement.player_id
         or settlement.fled
         or settlement.total_rounds <= 0
         or settlement.player_team_index > 1
+        or (9 <= boss_kind <= 11)
         or settlement.outcome not in (1, 2, 3)
     ):
         return False
@@ -265,6 +267,63 @@ def _copy_bookmark_to_view(src, dst) -> None:
     dst.saved_at_ms = src.saved_at_ms
 
 
+# 赛季全员对称周环境词缀常量（对齐 C++ season_rules.h）。
+WEEKLY_AFFIX_NONE = 0
+WEEKLY_AFFIX_SHIELD_OVERLOAD = 1
+WEEKLY_AFFIX_SPIRIT_RECOVERY = 2
+WEEKLY_AFFIX_OPENING_GUARD = 3
+WEEKLY_AFFIX_SHARP_TEMPO = 4
+WEEKLY_AFFIX_COUNT = 4
+_MS_PER_WEEK = 7 * 24 * 3600 * 1000
+_MONDAY_05_CST_OFFSET_MS = (3 * 24 - 3) * 3600 * 1000
+_WEEKLY_AFFIX_TEXT = {
+    WEEKLY_AFFIX_SHIELD_OVERLOAD: (
+        "护盾过载周",
+        "全员对称：本季常规对局中双方技能施加的护盾量额外 +15%。",
+        "推荐搭配破盾赛季印与破甲/护盾技能抢占节奏。",
+    ),
+    WEEKLY_AFFIX_SPIRIT_RECOVERY: (
+        "灵息充盈周",
+        "全员对称：本季常规对局中双方执行普通防御额外回复 3% 最大法力。",
+        "推荐搭配聚息援印或固阵守印打稳守蓄蓝反击。",
+    ),
+    WEEKLY_AFFIX_OPENING_GUARD: (
+        "先机守势周",
+        "全员对称：本季常规对局前 2 回合双方受到的直伤降低 8%。",
+        "前两回合爆发更克制，推荐蓄势增益或固阵守印后发制人。",
+    ),
+    WEEKLY_AFFIX_SHARP_TEMPO: (
+        "锋芒竞速周",
+        "全员对称：本季常规对局中攻击无护盾目标的直伤提升 5%。",
+        "先破盾再集火收益更高，推荐破阵锐印/玄印联动群攻技。",
+    ),
+}
+
+
+def compute_season_week_index(starts_at_ms: int, now_ms_val: int) -> int:
+    """计算当前权威赛季周次（1 起）。"""
+    if starts_at_ms > 0:
+        if now_ms_val <= starts_at_ms:
+            return 1
+        return ((now_ms_val - starts_at_ms) // _MS_PER_WEEK) + 1
+    return ((now_ms_val + _MONDAY_05_CST_OFFSET_MS) // _MS_PER_WEEK) + 1
+
+
+def weekly_affix_for_week(season_id: int, week_index: int) -> int:
+    """由赛季编号与周次确定性轮换全员对称周词缀（1..4）；任一为 0 返回 0。"""
+    if not season_id or not week_index:
+        return WEEKLY_AFFIX_NONE
+    return ((season_id - 1 + week_index - 1) % WEEKLY_AFFIX_COUNT) + 1
+
+
+def is_seal_effect_recommended_for_affix(affix_id: int, effect_id: int) -> bool:
+    if affix_id in (WEEKLY_AFFIX_SHIELD_OVERLOAD, WEEKLY_AFFIX_SHARP_TEMPO):
+        return effect_id in (1, 2)
+    if affix_id in (WEEKLY_AFFIX_SPIRIT_RECOVERY, WEEKLY_AFFIX_OPENING_GUARD):
+        return effect_id in (6, 7)
+    return False
+
+
 def _sync_tower_week(tower, week_key: int) -> bool:
     """跨周自动重置五行幻境周位图与在途轮次，保留单调 run_id 与 revision。"""
     if tower.week_key == week_key:
@@ -437,6 +496,48 @@ class SceneSeason:
         dst.health_threshold_bps = seal.health_threshold_bps
         dst.name = seal.name
 
+    def _fill_honors(self, comp, active_season_id: int, out) -> None:
+        """填充永久零数值赛季纪念印记与称谓（休赛期亦保留展示）。"""
+        if "SeasonRule" not in self.tables.tables:
+            return
+        season_ids = {int(rec.season_id) for rec in comp.records if rec.season_id}
+        if active_season_id:
+            season_ids.add(active_season_id)
+        for sid in sorted(season_ids):
+            rule = self.tables["SeasonRule"].get(sid)
+            if rule is None or not rule.seal_max_points:
+                continue
+            rec = _find_record(comp, sid)
+            progress = min(rec.progress_points, rule.seal_max_points) if rec is not None else 0
+            unlocked = progress >= rule.seal_max_points
+            if not unlocked and sid != active_season_id:
+                continue
+            out.honors.add(
+                season_id=sid,
+                season_name=rule.name,
+                honor_title_name=getattr(rule, "honor_title_name", ""),
+                honor_badge_icon_key=getattr(rule, "honor_badge_icon_key", ""),
+                progress_points=progress,
+                max_points=rule.seal_max_points,
+                unlocked=unlocked,
+                is_current_season=sid == active_season_id,
+            )
+
+    @staticmethod
+    def _fill_weekly_affix(rule, stamp: int, valid_seals: list, out) -> None:
+        out.Clear()
+        week_idx = compute_season_week_index(int(rule.starts_at_ms), stamp)
+        affix_id = weekly_affix_for_week(int(rule.id), week_idx)
+        text = _WEEKLY_AFFIX_TEXT.get(affix_id)
+        if text is None:
+            return
+        out.week_index = week_idx
+        out.affix_id = affix_id
+        out.name, out.description, out.strategy_tip = text
+        for seal in valid_seals:
+            if is_seal_effect_recommended_for_affix(affix_id, int(seal.effect_id)):
+                out.recommended_seal_ids.append(int(seal.id))
+
     def _fill_state(self, player, data, stamp: int, out) -> int:
         out.Clear()
         out.server_now_ms = stamp
@@ -450,6 +551,7 @@ class SceneSeason:
             _copy_bookmark_to_view(bookmark, out.saved_builds.add())
 
         rule = find_active_season_rule(self.tables, stamp)
+        self._fill_honors(comp, int(rule.id) if rule is not None else 0, out)
         if rule is None:
             out.available = False
             out.unavailable_reason = "当前暂无进行中的赛季"
@@ -502,6 +604,7 @@ class SceneSeason:
             if seal.season_id == rule.id and valid_seal_row(seal)
         ]
         seals.sort(key=lambda row: row.id)
+        self._fill_weekly_affix(rule, stamp, seals, out.weekly_affix)
         for seal in seals:
             out.seals.add(
                 seal_id=seal.id,

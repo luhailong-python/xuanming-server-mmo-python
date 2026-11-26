@@ -9,6 +9,7 @@ from google.protobuf.message import Message
 ERR_OK = 0
 ERR_UNAVAILABLE = 1003
 ERR_INVALID_PARAMETER = 1005
+ERR_RATE_LIMIT_EXCEEDED = 1008
 
 # -- 组队业务错误码（team_error 段，base = 4000）------------------------------------------------------
 

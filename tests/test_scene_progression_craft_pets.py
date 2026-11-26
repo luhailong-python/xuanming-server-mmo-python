@@ -354,6 +354,56 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
                 client_request_id=302, artifact_item_config_id=3302,
             )
             assert no_voucher.error_message.id == TRIAL_JOURNAL_VOUCHER_NOT_ENOUGH
+
+            # 验证专属外观里程碑（M105 -> 技能特效 #3 寒星流华，M302 -> 灵宠幻化 #3 月弦师）展示、校验与直授闭环。
+            snap_cos = (await rpc("SceneTrialJournalClientPlayer", "GetTrialJournal")).snapshot
+            m105_view = next(m for m in snap_cos.milestones if m.milestone_id == 105)
+            assert m105_view.grant_skill_vfx_id == 3 and m105_view.grant_skill_vfx_name == "寒星流华"
+            m302_view = next(m for m in snap_cos.milestones if m.milestone_id == 302)
+            assert m302_view.grant_pet_cosmetic_id == 3 and m302_view.grant_pet_cosmetic_name == "月弦师"
+            assert not journal._is_valid_exclusive_pet_cosmetic(1)
+            assert journal._is_valid_exclusive_pet_cosmetic(3)
+            assert not journal._is_valid_exclusive_skill_vfx(1)
+            assert journal._is_valid_exclusive_skill_vfx(3)
+
+            # 点亮卷一余下 9 印（103/104/105 -> 共 15 印）与卷三 S1 的 4 枚赛季印（301/302）。
+            data2 = scene.rows.assemble(player.snapshot)
+            journal.record_trial_progress(data2, 103, won=True, total_rounds=5)
+            journal.record_trial_progress(data2, 104, won=True, total_rounds=5, guard_stance_dispelled=True)
+            journal.record_trial_progress(data2, 105, won=True, total_rounds=6, guard_stance_dispelled=True)
+            journal.record_trial_progress(data2, 301, won=True, total_rounds=5, guard_survived=True)
+            journal.record_trial_progress(
+                data2, 302, won=True, total_rounds=7, initial_human_count=5,
+                team_dealt_physical_direct_damage=True, team_dealt_magic_direct_damage=True,
+            )
+            await scene.commit_player_data(player, data2)
+
+            m302_claim = await rpc(
+                "SceneTrialJournalClientPlayer", "ClaimTrialJournalMilestone",
+                client_request_id=401, milestone_id=302,
+            )
+            assert not m302_claim.error_message.id and m302_claim.granted_pet_cosmetic_id == 3
+            m302_replay = await rpc(
+                "SceneTrialJournalClientPlayer", "ClaimTrialJournalMilestone",
+                client_request_id=401, milestone_id=302,
+            )
+            assert not m302_replay.error_message.id and m302_replay.replayed and m302_replay.granted_pet_cosmetic_id == 3
+
+            m105_claim = await rpc(
+                "SceneTrialJournalClientPlayer", "ClaimTrialJournalMilestone",
+                client_request_id=402, milestone_id=105,
+            )
+            assert not m105_claim.error_message.id and m105_claim.granted_skill_vfx_id == 3
+            m105_replay = await rpc(
+                "SceneTrialJournalClientPlayer", "ClaimTrialJournalMilestone",
+                client_request_id=402, milestone_id=105,
+            )
+            assert not m105_replay.error_message.id and m105_replay.replayed and m105_replay.granted_skill_vfx_id == 3
+
+            final_data = scene.rows.assemble(player.snapshot)
+            assert has_packed_bit(final_data.profile_component.pet_cosmetic_owned_bits, journal.tables["PetCosmetic"].bit_index(3))
+            assert has_packed_bit(final_data.profile_component.skill_vfx_owned_bits, journal.tables["SkillVfxCosmetic"].bit_index(3))
+            assert not dict(final_data.profile_component.equipped_skill_vfx)
         finally:
             await scene.close()
 

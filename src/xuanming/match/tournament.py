@@ -106,6 +106,14 @@ PREDICTION_PENDING = 0
 PREDICTION_HIT = 1
 PREDICTION_MISS = 2
 
+# V4 模块 J：战队荣耀铭牌单调位图（与 Go internal/tournament/rules.go 逐位一致）
+HONOR_BIT_DEBUT = 1 << 0
+HONOR_BIT_STREAK = 1 << 1
+HONOR_BIT_UNBEATEN = 1 << 2
+HONOR_BIT_COMEBACK = 1 << 3
+HONOR_BIT_SWEEP = 1 << 4
+HONOR_BIT_CHAMPION = 1 << 5
+
 MIN_SQUAD_NAME_CHARS = 2
 MAX_SQUAD_NAME_CHARS = 12
 MILLIS_PER_DAY = 86_400_000
@@ -237,11 +245,30 @@ def _splitmix64(x: int) -> int:
     return (x ^ (x >> 31)) & _MASK64
 
 
-def draw_leylines(season_id: int, match_id: int, best_of: int) -> tuple[int, ...]:
-    """为一场 BO3 淘汰赛确定性无放回抽取五行灵脉顺序（与 Go/Java 逐字节同源）。"""
+def is_valid_leyline_element(element: int) -> bool:
+    """校验五行灵脉枚举是否为 1..5（金/木/水/火/土）。"""
+    return LEYLINE_METAL <= int(element) <= LEYLINE_EARTH
+
+
+def draw_leylines_with_bans(
+    season_id: int,
+    match_id: int,
+    best_of: int,
+    banned_a: int = 0,
+    banned_b: int = 0,
+) -> tuple[int, ...]:
+    """V4 模块 H：从五行灵脉池剔除双方队长禁选后再以 SplitMix64 确定性无放回抽取 best_of 条灵脉。"""
     if best_of <= 1:
         return ()
-    pool = [LEYLINE_METAL, LEYLINE_WOOD, LEYLINE_WATER, LEYLINE_FIRE, LEYLINE_EARTH]
+    all_elems = [LEYLINE_METAL, LEYLINE_WOOD, LEYLINE_WATER, LEYLINE_FIRE, LEYLINE_EARTH]
+    ba = int(banned_a)
+    bb = int(banned_b)
+    pool = [
+        e for e in all_elems
+        if not ((is_valid_leyline_element(ba) and e == ba) or (is_valid_leyline_element(bb) and e == bb))
+    ]
+    if not pool:
+        pool = list(all_elems)
     count = min(int(best_of), len(pool))
     state = (((int(season_id) & _MASK64) << 32) ^ (int(match_id) & _MASK64)) & _MASK64
     out: list[int] = []
@@ -252,6 +279,67 @@ def draw_leylines(season_id: int, match_id: int, best_of: int) -> tuple[int, ...
         pool[i], pool[pick] = pool[pick], pool[i]
         out.append(pool[i])
     return tuple(out)
+
+
+def draw_leylines(season_id: int, match_id: int, best_of: int) -> tuple[int, ...]:
+    """为一场 BO3 淘汰赛确定性无放回抽取五行灵脉顺序（与 Go/Java 逐字节同源）。"""
+    return draw_leylines_with_bans(season_id, match_id, best_of, 0, 0)
+
+
+def compute_qualifier_honor_bits(
+    existing: int,
+    played: int,
+    wins: int,
+    losses: int,
+    min_participation: int,
+) -> int:
+    """V4 模块 J：海选每场结束后单调累加战队荣耀铭牌（问道初成/连胜破竹/不败金身）。"""
+    bits = int(existing)
+    req = min_participation if min_participation > 0 else 2
+    if played >= req:
+        bits |= HONOR_BIT_DEBUT
+    if wins >= 3:
+        bits |= HONOR_BIT_STREAK
+    if played >= 3 and losses == 0:
+        bits |= HONOR_BIT_UNBEATEN
+    return bits
+
+
+def compute_knockout_series_honor_bits(
+    existing: int,
+    best_of: int,
+    winner_wins: int,
+    loser_wins: int,
+    is_champion: bool,
+) -> int:
+    """V4 模块 J：淘汰赛大场决胜后单调累加胜方战队荣耀铭牌（逆转乾坤/零封强敌/问鼎群仙）。"""
+    bits = int(existing)
+    if best_of >= 3:
+        if winner_wins + loser_wins >= 3:
+            bits |= HONOR_BIT_COMEBACK
+        if winner_wins >= 2 and loser_wins == 0:
+            bits |= HONOR_BIT_SWEEP
+    if is_champion:
+        bits |= HONOR_BIT_CHAMPION
+    return bits
+
+
+def classify_highlight_tag(
+    is_third_place: bool,
+    round_index: int,
+    max_round: int,
+    best_of: int,
+    wins_a: int,
+    wins_b: int,
+) -> tuple[int, str, int]:
+    """V4 模块 I：为已完赛的公开淘汰赛判定名局录标签与确定性排序优先级（0 最高）。"""
+    if not is_third_place and max_round > 0 and round_index >= max_round:
+        return 1, "总决赛巅峰局", 0
+    if best_of >= 3 and wins_a + wins_b >= 3:
+        return 2, "决胜三局激战", 1
+    if is_third_place:
+        return 3, "季军争夺战", 2
+    return 4, "高光问鼎局", 3
 
 
 def encode_leyline_sequence(seq: Iterable[int]) -> str:
@@ -588,6 +676,8 @@ class TournamentRuleSpec:
     prediction_enabled: bool = True
     prediction_reward_min_hits: int = 2
     third_place_match_enabled: bool = True
+    leyline_ban_enabled: bool = True
+    skill_ban_slots_per_team: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,6 +728,8 @@ class TournamentCatalog:
             raise ValueError(f"tournament: knockout_max_teams={rule.knockout_max_teams} invalid")
         if rule.knockout_round_timeout_seconds <= 0:
             raise ValueError("tournament: knockout_round_timeout_seconds must be > 0")
+        if not 0 <= rule.skill_ban_slots_per_team <= 3:
+            raise ValueError(f"tournament: skill_ban_slots_per_team={rule.skill_ban_slots_per_team} out of [0,3]")
         self.rule = rule
         seen: set[int] = set()
         ordered = sorted((r for r in rewards if r.id > 0), key=lambda r: r.id)
@@ -696,6 +788,8 @@ class TournamentCatalog:
             prediction_enabled=bool(getattr(row, "prediction_enabled", True)),
             prediction_reward_min_hits=int(getattr(row, "prediction_reward_min_hits", 2)) or 2,
             third_place_match_enabled=bool(getattr(row, "third_place_match_enabled", True)),
+            leyline_ban_enabled=bool(getattr(row, "leyline_ban_enabled", True)),
+            skill_ban_slots_per_team=int(getattr(row, "skill_ban_slots_per_team", 3)),
         )
         rewards: list[TournamentRewardSpec] = []
         for r in tables["TournamentReward"].rows():
@@ -798,6 +892,7 @@ class _SeasonRecord:
     final_mvp_player_id: int = 0
     final_mvp_player_name: str = ""
     final_mvp_score: int = 0
+    champion_honor_bits: int = 0
 
 
 @dataclass
@@ -835,6 +930,7 @@ class _SquadRecord:
     registered_ms: int = 0
     updated_ms: int = 0
     emblem_id: int = DEFAULT_EMBLEM_ID
+    honor_bits: int = 0
 
 
 @dataclass
@@ -887,6 +983,8 @@ class _MatchRecord:
     mvp_healing: int = 0
     mvp_controls: int = 0
     target_squad_id: int = 0
+    banned_leyline_a: int = LEYLINE_UNSPECIFIED
+    banned_leyline_b: int = LEYLINE_UNSPECIFIED
 
 
 @dataclass
@@ -1098,9 +1196,21 @@ class TournamentManager:
             squad_b_emblem_id=sq_b.emblem_id if sq_b is not None else DEFAULT_EMBLEM_ID,
             is_warmup=(match.phase == PHASE_WARMUP),
             is_third_place=match.is_third_place,
+            skill_ban_slots_per_team=(
+                0 if match.phase == PHASE_WARMUP else self.catalog.rule.skill_ban_slots_per_team
+            ),
         )
         self._battle_contexts[battle_id] = ctx
         return ctx
+
+    def load_squad_captains(self, squad_a_id: int, squad_b_id: int) -> set[int]:
+        """返回两支参战战队队长的 player_id 集合（供 Gather 标记 `is_team_captain`）。"""
+        captains: set[int] = set()
+        for sid in (int(squad_a_id), int(squad_b_id)):
+            sq = self._squads.get(sid)
+            if sq is not None and sq.captain_player_id > 0:
+                captains.add(int(sq.captain_player_id))
+        return captains
 
     def battle_context_for(self, battle_id: int) -> Message | None:
         """返回某场已开战锦标赛对局的冻结 TournamentBattleContext（无则返回 None）。"""
@@ -1199,6 +1309,7 @@ class TournamentManager:
             final_mvp_player_id=season.final_mvp_player_id,
             final_mvp_player_name=season.final_mvp_player_name,
             final_mvp_score=season.final_mvp_score,
+            champion_honor_bits=season.champion_honor_bits,
         )
         for cm in season.champion_members:
             self._fill_member_view(view.champion_members.add(), cm)
@@ -1224,6 +1335,7 @@ class TournamentManager:
             cheer_count=squad.cheer_count,
             registered_ms=squad.registered_ms,
             emblem_id=emblem,
+            honor_bits=squad.honor_bits,
         )
         for m in self._squad_members(squad.squad_id):
             self._fill_member_view(view.members.add(), m)
@@ -1304,6 +1416,8 @@ class TournamentManager:
             my_predicted_squad_id=my_pred_squad,
             predict_count_a=pred_a,
             predict_count_b=pred_b,
+            banned_leyline_a=m.banned_leyline_a,
+            banned_leyline_b=m.banned_leyline_b,
         )
         view.leyline_sequence.extend(m.leyline_sequence)
         view.game_battle_ids.extend(game_battle_ids)
@@ -2431,6 +2545,14 @@ class TournamentManager:
                 sq_a.qualifier_points += rule.qualifier_draw_points
                 sq_b.qualifier_draws += 1
                 sq_b.qualifier_points += rule.qualifier_draw_points
+            sq_a.honor_bits = compute_qualifier_honor_bits(
+                sq_a.honor_bits, sq_a.qualifier_played, sq_a.qualifier_wins, sq_a.qualifier_losses,
+                rule.participation_min_matches,
+            )
+            sq_b.honor_bits = compute_qualifier_honor_bits(
+                sq_b.honor_bits, sq_b.qualifier_played, sq_b.qualifier_wins, sq_b.qualifier_losses,
+                rule.participation_min_matches,
+            )
             sq_a.updated_ms = stamp
             sq_b.updated_ms = stamp
             if game is None:
@@ -2488,6 +2610,14 @@ class TournamentManager:
         if match.wins_a >= wins_needed or match.wins_b >= wins_needed:
             series_winner = sq_a.squad_id if match.wins_a >= wins_needed else sq_b.squad_id
             loser = sq_b if series_winner == sq_a.squad_id else sq_a
+            winner_sq = self._squads[series_winner]
+            win_games = match.wins_a if series_winner == sq_a.squad_id else match.wins_b
+            lose_games = match.wins_b if series_winner == sq_a.squad_id else match.wins_a
+            total_rounds = total_knockout_rounds(season.knockout_team_count)
+            is_final_champion = (not match.is_third_place) and match.round_index >= total_rounds
+            winner_sq.honor_bits = compute_knockout_series_honor_bits(
+                winner_sq.honor_bits, best_of, win_games, lose_games, is_final_champion,
+            )
             self._advance_knockout_winner(season, match, series_winner, loser, stamp)
             match.state = MATCH_FINISHED
             match.winner_squad_id = series_winner
@@ -2597,6 +2727,8 @@ class TournamentManager:
             season.champion_member_summary = " / ".join(names)
             season.champion_members = members
             season.champion_emblem_id = winner.emblem_id
+            winner.honor_bits |= HONOR_BIT_CHAMPION
+            season.champion_honor_bits = winner.honor_bits
             if match.mvp_player_id > 0:
                 season.final_mvp_player_id = match.mvp_player_id
                 season.final_mvp_player_name = match.mvp_player_name
@@ -2903,3 +3035,85 @@ class TournamentManager:
         season.settled_ms = stamp
         season.updated_ms = stamp
         logger.info("Tournament season settled season=%d champion=%d", season.season_id, season.champion_squad_id)
+
+    # -- V4 模块 H / I 客户端 RPC 实现 ----------------------------------------------------------------
+
+    def ban_tournament_leyline(self, caller: CallerIdentity, request: Message) -> Message:
+        """V4 模块 H（534）：BO3 淘汰赛首局开战前，参战两队队长各禁 1 条五行灵脉并立即重算灵脉序列。"""
+        resp = self.protocol.message("match.BanTournamentLeylineResponse")
+        if not self.catalog.rule.enabled:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_NOT_OPEN)
+        if not self.catalog.rule.leyline_ban_enabled:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_STAGE_CLOSED)
+        match_id = int(request.match_id)
+        leyline = int(request.leyline_element)
+        if caller.player_id <= 0 or match_id <= 0 or not is_valid_leyline_element(leyline):
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_MATCH_NOT_READY)
+        stamp = self._now_ms()
+        cur = self._ensure_season(stamp)
+        if cur.stage != STAGE_KNOCKOUT:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_STAGE_CLOSED)
+        m = self._matches.get(match_id)
+        if m is None or m.season_id != cur.season_id or m.phase != PHASE_KNOCKOUT:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_MATCH_NOT_READY)
+        if (
+            m.best_of < 3
+            or m.wins_a > 0
+            or m.wins_b > 0
+            or m.squad_a_id == 0
+            or m.squad_b_id == 0
+            or m.state not in (MATCH_WAITING_OPPONENT, MATCH_READY)
+        ):
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_MATCH_NOT_READY)
+        sq_a = self._squads.get(m.squad_a_id)
+        sq_b = self._squads.get(m.squad_b_id)
+        if sq_a is None or sq_b is None:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_SQUAD_NOT_FOUND)
+        if caller.player_id == sq_a.captain_player_id:
+            m.banned_leyline_a = leyline
+        elif caller.player_id == sq_b.captain_player_id:
+            m.banned_leyline_b = leyline
+        else:
+            return set_tip(resp, ERR_MATCH_TOURNAMENT_NOT_CAPTAIN)
+        seq = draw_leylines_with_bans(m.season_id, m.match_id, m.best_of, m.banned_leyline_a, m.banned_leyline_b)
+        m.leyline_sequence = seq
+        m.current_leyline_element = leyline_for_game(seq, 1)
+        m.updated_ms = stamp
+        resp.match.CopyFrom(self._match_view(m, viewer_player_id=caller.player_id))
+        return resp
+
+    def get_tournament_highlights(self, caller: CallerIdentity, request: Message) -> Message:
+        """V4 模块 I（535）：从指定赛季已完赛的公开淘汰赛中确定性策展 Top 10 本季名局录。"""
+        resp = self.protocol.message("match.GetTournamentHighlightsResponse")
+        stamp = self._now_ms()
+        season_id = int(request.season_id)
+        if season_id == 0:
+            season = self._ensure_season(stamp)
+        else:
+            season = self._seasons.get(season_id)
+            if season is None:
+                return set_tip(resp, ERR_MATCH_TOURNAMENT_SQUAD_NOT_FOUND)
+        resp.season_id = season.season_id
+        resp.server_time_ms = stamp
+        if not self.catalog.rule.public_knockout_replay:
+            return resp
+
+        finished = [
+            m for m in self._matches.values()
+            if m.season_id == season.season_id and m.phase == PHASE_KNOCKOUT and m.state == MATCH_FINISHED
+        ]
+        max_round = max((m.round_index for m in finished), default=0)
+        candidates: list[tuple[int, int, int, int, int, str, _MatchRecord]] = []
+        for m in finished:
+            game_ids = self._game_battle_ids(m.match_id)
+            if m.battle_id == 0 and not game_ids:
+                continue
+            tag, label, prio = classify_highlight_tag(
+                m.is_third_place, m.round_index, max_round, m.best_of, m.wins_a, m.wins_b,
+            )
+            candidates.append((prio, -m.mvp_score, -m.finished_ms, m.match_id, tag, label, m))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        for _, _, _, _, tag, label, m in candidates[:10]:
+            entry = resp.highlights.add(tag=tag, tag_label=label)
+            entry.match.CopyFrom(self._match_view(m, viewer_player_id=caller.player_id))
+        return resp

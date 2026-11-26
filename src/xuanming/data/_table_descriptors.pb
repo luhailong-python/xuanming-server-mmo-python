@@ -1579,8 +1579,8 @@ jumpTarget
 TrialJournalEntryTableData+
 data (2.TrialJournalEntryTableRdataBH
 com.game.tableB TrialJournalEntryTableOuterClassPZgenerated/pb/tablebproto3
-ä
-,table_wire/trialjournalmilestone_table.proto"∞
+Í
+,table_wire/trialjournalmilestone_table.proto"ê
 TrialJournalMilestoneTable
 id (Rid(
 scope_chapter_id (RscopeChapterId
@@ -1598,7 +1598,9 @@ badge_name (	R	badgeName%
 grant_appearance_id (	RgrantAppearanceId
 enabled (Renabled
 title (	Rtitle
-desc (	Rdesc"Q
+desc (	Rdesc1
+grant_pet_cosmetic_id (RgrantPetCosmeticId+
+grant_skill_vfx_id (RgrantSkillVfxId"Q
 TrialJournalMilestoneTableData/
 data (2.TrialJournalMilestoneTableRdataBL
 com.game.tableB$TrialJournalMilestoneTableOuterClassPZgenerated/pb/tablebproto3

@@ -175,6 +175,8 @@ class TeamGrpcService:
                 "NotifyTeamInvite": self.push_noop,
                 "NotifyTeamEvent": self.push_noop,
                 "ConfirmRankedPreset": self.confirm_ranked_preset,
+                "SetTeamFormation": self.set_team_formation,
+                "RecallTeamMembers": self.recall_team_members,
             },
             SERVICE_TEAM_AUTHORITY: {
                 "ReadMembership": self.read_membership,
@@ -223,6 +225,7 @@ class TeamGrpcService:
             zone_id=zone_id or pres.zone_id,
             join_seq=join_seq,
             appearance_id=pres.appearance_id,
+            is_hosted=bool(pres.hosted),
         )
         if rec_member is not None:
             view.ranked_character_preset_id = int(rec_member.ranked_character_preset_id)
@@ -258,6 +261,7 @@ class TeamGrpcService:
         view.application_count = len(record.applications)
         view.match_fill_supported = True
         view.pvp_match_supported = True
+        view.follow_formation = int(record.follow_formation)
         if record.match_lock_token:
             view.match_state = 1  # STARTING
         elif snap is not None and snap.launch_state == TEAM_LAUNCH_QUEUED:
@@ -367,8 +371,21 @@ class TeamGrpcService:
                         ),
                     )
 
+            for rec_pid in outcome.recall_recipients:
+                if rec_pid != caller_id:
+                    await self.notifier.push_to_player(
+                        rec_pid,
+                        MSG_NOTIFY_TEAM_EVENT,
+                        self.protocol.message(
+                            "teampb.TeamEventS2C",
+                            type=3,  # TEAM_EVENT_TYPE_LEADER_RECALL
+                            team_id=outcome.team_id,
+                            actor_id=outcome.actor_id,
+                        ),
+                    )
+
             refresh_ids = list(outcome.joined) + list(outcome.left)
-            if outcome.leader_changed:
+            if outcome.leader_changed or outcome.formation_changed:
                 refresh_ids.extend(outcome.kept)
             for pid in unique_ints(refresh_ids):
                 await self.notifier.refresh_scene(pid)
@@ -583,6 +600,33 @@ class TeamGrpcService:
                 char_preset,
                 pet_preset,
                 rule_ver,
+                request.request_id,
+            )
+            return await self._outcome_response(caller, outcome)
+        except TeamBusinessError as exc:
+            return await self._error_team_response(caller, exc.code, *exc.params)
+
+    async def set_team_formation(self, request: Message, context, path: str) -> Message:
+        """524：队长切换跑图跟随队形（0=长蛇 / 1=雁行 / 2=五行），变更时广播并刷新全员场景队形。"""
+        caller = await self._admit_client(context, path)
+        try:
+            outcome = await self.store.set_team_formation(
+                caller,
+                int(request.expected_team_id),
+                int(request.formation),
+                request.request_id,
+            )
+            return await self._outcome_response(caller, outcome)
+        except TeamBusinessError as exc:
+            return await self._error_team_response(caller, exc.code, *exc.params)
+
+    async def recall_team_members(self, request: Message, context, path: str) -> Message:
+        """525：队长一键召集队员归队（15 秒团队冷却，向非队长队员推送 LEADER_RECALL 事件）。"""
+        caller = await self._admit_client(context, path)
+        try:
+            outcome = await self.store.recall_team_members(
+                caller,
+                int(request.expected_team_id),
                 request.request_id,
             )
             return await self._outcome_response(caller, outcome)
