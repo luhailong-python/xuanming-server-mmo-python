@@ -30,7 +30,7 @@
   - **系统 / 模块间消息通信（Actor 隔离）**：跨系统、跨协程队列、跨进程交互一律通过**不可变消息**（Mailbox / 事件 / RPC / Kafka）通信，各模块独占状态、禁止传递可变对象引用或借全局单例绕过通道；仅限跨模块/跨边界使用，单个模块内部保持正常直接方法调用，严禁把内部普通函数过度拆成消息（详见 [docs/rules/engineering-principles.md](docs/rules/engineering-principles.md)）。
   - 某功能有成熟高 Star 开源库可用时（Star 门槛按语言与细分领域生态体量浮动，不机械死卡固定阈值），交由程序决定是否引入并说明原因。
   - 纯布尔完成/领取状态优先用 bit 位图存储，严格遵守删表 ID 红线（见 [docs/rules/bit-storage-and-table-ids.md](docs/rules/bit-storage-and-table-ids.md)）。
-- **分工约定**：只聚焦服务端代码与单测实现时，协议生成、全量编译与冒烟可交由 Codex 执行（交接时写明命令与验证范围，模型档位见 [docs/rules/ai-workflow.md](docs/rules/ai-workflow.md)）。
+- **分工约定**：只聚焦服务端代码与单测实现时，协议生成、全量编译与冒烟可交由 Gemini 执行；**Codex 仅负责作图（UI / 美术素材 / 视觉精修）**，不参与编码、分析、编译、协议生成、测试、压测与运维收尾（交接时写明命令与验证范围，模型档位见 [docs/rules/ai-workflow.md](docs/rules/ai-workflow.md)）。
 
 ## 2. 门禁命令
 

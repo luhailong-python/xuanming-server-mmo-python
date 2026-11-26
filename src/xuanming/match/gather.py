@@ -43,6 +43,7 @@ from .model import (
     MODE_PVE_SOLO,
     MODE_PVE_TEAM,
     MODE_PVP_TEAM,
+    MODE_SEASON_TOURNAMENT,
     BattleNodeEntry,
     PlayerPresence,
     preferred_region,
@@ -232,6 +233,8 @@ class GatherPipeline:
         rpc: EndpointCaller,
         presence: PresenceProvider,
         battle_nodes: BattleNodeResolver,
+        *,
+        on_tournament_profiles: Callable[[list[tuple[int, str, int, int, str]]], None] | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
@@ -239,6 +242,7 @@ class GatherPipeline:
         self.rpc = rpc
         self.presence = presence
         self.battle_nodes = battle_nodes
+        self.on_tournament_profiles = on_tournament_profiles
 
     async def _cancel_prepared(self, battle_id: int, prepared: list[tuple[int, str]]) -> None:
         """发房前失败补偿：逐人向原备战端点发 CancelBattlePrepare（幂等）。"""
@@ -304,6 +308,25 @@ class GatherPipeline:
             await self.store.abort_formation_pre_persist(battle_id, culprit)
             return False
 
+        # 解码成局时冻结的可选上下文（锦标赛 V2/V3、自定义切磋规则、排位上下文）。
+        raw_ranked = bytes(getattr(formation, "ranked_context", b""))
+        raw_tournament = bytes(getattr(formation, "tournament_context", b""))
+        raw_custom_duel = bytes(getattr(formation, "custom_duel_rules", b""))
+        is_wuxing_tower = bool(getattr(formation, "is_wuxing_tower", False))
+        ranked_ctx = None
+        tournament_ctx = None
+        custom_duel_rules = None
+        try:
+            if raw_ranked:
+                ranked_ctx = self.protocol.parse("RankedMatchContext", raw_ranked)
+            if raw_tournament:
+                tournament_ctx = self.protocol.parse("TournamentBattleContext", raw_tournament)
+            if raw_custom_duel:
+                custom_duel_rules = self.protocol.parse("CustomDuelRules", raw_custom_duel)
+        except Exception:
+            logger.error("match gather invalid frozen context battle_id=%d", battle_id, exc_info=True)
+            return await fail_pre_persist("invalid_frozen_context", 0)
+
         # 1. 逐参与者 PrepareBattle 收快照
         for member in formation.members:
             pid = int(member.player_id)
@@ -321,15 +344,16 @@ class GatherPipeline:
                 prepare_deadline_ms=prepare_deadline_ms,
                 battle_config_id=int(formation.config_id),
                 match_mode=int(formation.mode),
+                is_wuxing_tower=is_wuxing_tower,
             )
             if formation.activity_context:
                 req.activity_context.CopyFrom(
                     self.protocol.parse("BattleActivityContext", formation.activity_context)
                 )
-            if getattr(formation, "ranked_context", b""):
-                req.ranked_context.CopyFrom(
-                    self.protocol.parse("RankedMatchContext", formation.ranked_context)
-                )
+            if ranked_ctx is not None:
+                req.ranked_context.CopyFrom(ranked_ctx)
+            if custom_duel_rules is not None:
+                req.custom_duel_rules.CopyFrom(custom_duel_rules)
             try:
                 raw_resp = await self.rpc.call(
                     endpoint, PREPARE_BATTLE_PATH, req.SerializeToString(deterministic=True), timeout=3.0
@@ -349,6 +373,23 @@ class GatherPipeline:
             snap.CopyFrom(resp.snapshot)
             snap.team_index = int(member.team_index)
             prepared_members.append((pid, endpoint, snap, resp.table_fingerprint or snap.table_fingerprint))
+
+        # 锦标赛 V3 模块 F：建房阶段顺手回填参战成员真实角色外观快照（最佳努力，不阻塞建房）。
+        if int(formation.mode) == MODE_SEASON_TOURNAMENT and self.on_tournament_profiles is not None:
+            try:
+                profiles = [
+                    (
+                        pid,
+                        str(getattr(snap, "player_name", "")),
+                        int(getattr(snap, "class_id", 0)),
+                        int(getattr(snap, "gender", 0)),
+                        str(getattr(snap, "appearance_id", "")),
+                    )
+                    for pid, _, snap, _ in prepared_members
+                ]
+                self.on_tournament_profiles(profiles)
+            except Exception:
+                logger.warning("match gather tournament profile backfill failed battle_id=%d", battle_id, exc_info=True)
 
         # 2. 校验配表指纹一致性
         table_fp, offender, fp_ok = _check_table_fingerprints(self.config.table_fingerprint_mode, prepared_members)
@@ -387,6 +428,7 @@ class GatherPipeline:
         now_ms = await self.store.now_ms()
         created_at_ms = max(now_ms, int(formation.created_ms))
         has_activity = bool(formation.activity_context)
+        allow_public_spectate = bool(custom_duel_rules.allow_public_spectate) if custom_duel_rules is not None else False
         create_req = self.protocol.message(
             "CreateBattleRequest",
             battle_id=battle_id,
@@ -401,13 +443,23 @@ class GatherPipeline:
             target_instance_id=formation.target_instance_id,
             admit_before_ms=prepare_deadline_ms,
             outcome_protocol_version=1,
-            spectate_visibility=spectate_visibility_for(int(formation.mode), has_activity),
+            spectate_visibility=spectate_visibility_for(
+                int(formation.mode),
+                has_activity,
+                allow_public_spectate=allow_public_spectate,
+            ),
             record_replay=record_replay_for(int(formation.mode)),
         )
         if has_activity:
             create_req.activity_context.CopyFrom(
                 self.protocol.parse("BattleActivityContext", bytes(formation.activity_context))
             )
+        if ranked_ctx is not None:
+            create_req.ranked_context.CopyFrom(ranked_ctx)
+        if tournament_ctx is not None:
+            create_req.tournament_context.CopyFrom(tournament_ctx)
+        if custom_duel_rules is not None:
+            create_req.custom_duel_rules.CopyFrom(custom_duel_rules)
         for _, _, snap, _ in prepared_members:
             create_req.players.add().CopyFrom(snap)
         for ai_snap in ai_defender_snapshots:

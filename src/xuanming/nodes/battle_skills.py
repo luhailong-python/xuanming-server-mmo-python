@@ -116,6 +116,8 @@ class BattleSkills:
             return 1005
         if not rule.castable:
             return 7004
+        if getattr(self.engine, "ban_control_skills", False) and self.engine.is_control_skill(rule):
+            return 7004
         error = self._validate_target(actor, rule, action.target_id)
         if error:
             return error
@@ -241,6 +243,11 @@ class BattleSkills:
                        rule: BattleSkill, skill_id: int, rank: int) -> None:
         if rule.heal_multiplier > 0 or rule.heal_per_level > 0:
             raw_heal = self._heal_amount(actor, target, rule, rank)
+            if getattr(self.engine, "active_leyline", 0) == 2:  # TOURNAMENT_LEYLINE_WOOD
+                raw_heal *= 110.0 / 100.0
+            support_bonus_pct = getattr(self.engine, "wuxing_support_bonus_pct", lambda _a: 0)(actor)
+            if support_bonus_pct > 0:
+                raw_heal *= (100.0 + support_bonus_pct) / 100.0
             if getattr(self.engine, "escalation_stacks", 0) > 0:
                 raw_heal *= self.engine.escalation_support_pct / 100.0
             value = landed_heal(target, raw_heal)

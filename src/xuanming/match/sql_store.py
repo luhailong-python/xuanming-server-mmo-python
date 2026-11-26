@@ -1511,6 +1511,7 @@ class SqlMatchStore:
         network_profile: bytes,
         pool_region: int,
         queue_ttl_ms: int,
+        is_wuxing_tower: bool = False,
     ) -> Message:
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
         h, l = uuid_to_pair(req_uuid)
@@ -1662,7 +1663,13 @@ class SqlMatchStore:
                 return out
 
     async def create_challenge(
-        self, challenger: CallerIdentity, target_player_id: int, config_id: int, ttl_ms: int
+        self,
+        challenger: CallerIdentity,
+        target_player_id: int,
+        config_id: int,
+        ttl_ms: int,
+        *,
+        custom_rules_payload: bytes = b"",
     ) -> Message:
         if target_player_id == 0 or target_player_id == challenger.player_id:
             raise MatchBusinessError(ERR_MATCH_CHALLENGE_SELF)
@@ -1682,6 +1689,7 @@ class SqlMatchStore:
                 challenge_id=cid, challenger_player_id=challenger.player_id, target_player_id=target_player_id,
                 config_id=config_id, challenger_account=challenger.account, challenger_revision=challenger.owner_revision,
                 created_ms=now, expires_ms=now + ttl_ms, state=CHALLENGE_STATE_PENDING,
+                custom_rules_payload=custom_rules_payload,
             )
             await cur.execute(
                 "INSERT INTO `match_challenge_invitation`(`challenge_id`,`challenger_player_id`,`target_player_id`,"
@@ -1701,6 +1709,8 @@ class SqlMatchStore:
         *,
         battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
+        responder_character_preset_id: int = 0,
+        responder_pet_preset_id: int = 0,
     ) -> tuple[Message, Message | None]:
         battle_id_alloc = await self.next_id()
 
@@ -1780,6 +1790,11 @@ class SqlMatchStore:
         requeue_on_failure: bool,
         activity_context: bytes = b"",
         team_launch_keys: list[tuple[int, int, int]] | None = None,
+        tournament_context: bytes = b"",
+        custom_duel_rules: bytes = b"",
+        is_wuxing_tower: bool = False,
+        ranked_context: bytes = b"",
+        ranked_season_id: int = 0,
     ) -> Message:
         battle_id = await self.next_id()
 
@@ -1801,6 +1816,9 @@ class SqlMatchStore:
                 target_endpoint=target_endpoint, mode=mode, config_id=config_id,
                 created_ms=now, deadline_ms=now + battle_deadline_ms, retry_at_ms=now + 60_000,
                 activity_context=activity_context, requeue_on_failure=requeue_on_failure, release_track=release_track,
+                ranked_context=ranked_context, ranked_season_id=ranked_season_id,
+                tournament_context=tournament_context, custom_duel_rules=custom_duel_rules,
+                is_wuxing_tower=is_wuxing_tower,
             )
             for pid, tk_id, side, captain in members:
                 formation.members.add(player_id=pid, ticket=tk_id, team_index=side, captain=captain)
@@ -2545,15 +2563,16 @@ class SqlMatchStore:
                 )
                 return [self.protocol.parse("match.BattleReportSummary", _to_bytes(r[0])) for r in await cur.fetchall()]
 
-    async def get_battle_report(self, player_id: int, battle_id: int) -> Message:
+    async def get_battle_report(self, player_id: int, battle_id: int, *, allow_public: bool = False) -> Message:
         async with portal_sql.connection(self.pool) as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT 1 FROM `match_player_battle_report` WHERE `player_id`=%s AND `battle_id`=%s LIMIT 1",
-                    (player_id, battle_id),
-                )
-                if not await cur.fetchone():
-                    raise MatchBusinessError(ERR_MATCH_BATTLE_REPORT_NOT_FOUND)
+                if not allow_public:
+                    await cur.execute(
+                        "SELECT 1 FROM `match_player_battle_report` WHERE `player_id`=%s AND `battle_id`=%s LIMIT 1",
+                        (player_id, battle_id),
+                    )
+                    if not await cur.fetchone():
+                        raise MatchBusinessError(ERR_MATCH_BATTLE_REPORT_NOT_FOUND)
                 await cur.execute("SELECT `envelope` FROM `match_battle_report` WHERE `battle_id`=%s", (battle_id,))
                 row = await cur.fetchone()
                 if not row or not _to_bytes(row[0]):

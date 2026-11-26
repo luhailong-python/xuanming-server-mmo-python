@@ -71,12 +71,12 @@ def test_replay_stops_at_budget_and_bounds_decompression(monkeypatch):
 
 def test_record_replay_policy_matches_all_pvp_modes():
     from xuanming.match.model import (
-        MODE_1V1, MODE_3V3, MODE_5V5, MODE_POLARITY_5V5, MODE_PVE_SOLO,
-        MODE_PVE_TEAM, MODE_PVP_CHALLENGE, MODE_PVP_TEAM, MODE_SEASON_TOURNAMENT,
-        MODE_UNSPECIFIED, record_replay_for,
+        MODE_1V1, MODE_3V3, MODE_5V5, MODE_GUILD_WAR_PVP, MODE_GUILD_WAR_SIEGE,
+        MODE_POLARITY_5V5, MODE_PVE_SOLO, MODE_PVE_TEAM, MODE_PVP_CHALLENGE,
+        MODE_PVP_TEAM, MODE_SEASON_TOURNAMENT, MODE_UNSPECIFIED, record_replay_for,
     )
     for pvp in (MODE_1V1, MODE_3V3, MODE_5V5, MODE_PVP_CHALLENGE, MODE_PVP_TEAM,
-                MODE_POLARITY_5V5, MODE_SEASON_TOURNAMENT):
+                MODE_POLARITY_5V5, MODE_GUILD_WAR_PVP, MODE_SEASON_TOURNAMENT):
         assert record_replay_for(pvp) is True
-    for non_pvp in (MODE_UNSPECIFIED, MODE_PVE_SOLO, MODE_PVE_TEAM, 99):
+    for non_pvp in (MODE_UNSPECIFIED, MODE_PVE_SOLO, MODE_PVE_TEAM, MODE_GUILD_WAR_SIEGE, 99):
         assert record_replay_for(non_pvp) is False

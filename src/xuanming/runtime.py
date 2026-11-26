@@ -7,10 +7,10 @@ import uuid
 from contextlib import AsyncExitStack
 
 from .cluster import BATTLE, GATE, LOGIN, SCENE, EtcdDirectory, KafkaCommands, LocalDirectory
-from .data import ConfigTables, PlayerRowCodec, create_player_store
+from .data import ConfigTables, PlayerRowCodec, StoreRejected, StoreUnavailable, create_player_store
 from .data.id_segments import IdSegments
 from .data.navigation import load_navigation
-from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc
+from .grpc_runtime import GrpcClient, GrpcUnavailable, gate_signing_key, serve_grpc, sign_service_call
 from .kill_switch import EtcdKillSwitch, KillSwitch
 from .match_client import MatchClient
 from .node_link import GateLinks, SceneLinks
@@ -45,6 +45,7 @@ from .nodes.scene_rename import SceneRename
 from .nodes.scene_season import SceneSeason
 from .nodes.scene_skill_craft import SceneSkillCraft
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
+from .nodes.scene_spirit_shop import SceneSpiritShop
 from .nodes.scene_stats import initialize_base
 from .nodes.scene_team import SceneTeam
 from .nodes.scene_travel import create_scene_travel
@@ -56,6 +57,7 @@ from .transport.client_endpoint import ClientEndpointSettings
 logger = logging.getLogger(__name__)
 _ADMISSION_OPEN = 1
 _ADMISSION_CLOSED = 2
+_SYNC_STAGE1_TRADABLE_PATH = "/data_service.DataService/SyncAccountStage1Tradable"
 
 
 def grpc_address(host, port) -> str:
@@ -532,6 +534,89 @@ class Runtime:
         self.login_info = info
         await self._publish(info)
 
+    @staticmethod
+    def _bind_equip_craft_account_quota_sync(scene, data_service_call, account_secret, *, stack=None):
+        """集群模式下为 SceneEquipCraft 接入账号级阶段一可交易配额异步同步传输。"""
+        secret_bytes = account_secret.encode("utf-8") if isinstance(account_secret, str) else bytes(account_secret)
+        pending: dict[int, asyncio.Task] = {}
+
+        async def _sync_once(player_id: int, desired_char_total: int, now_ms: int) -> None:
+            stamp = int(now_ms) if now_ms else (time.time_ns() // 1_000_000)
+            req = scene.protocol.message(
+                "data_service.SyncAccountStage1TradableRequest",
+                player_id=int(player_id),
+                desired_char_total=int(desired_char_total),
+            )
+            sign_service_call(_SYNC_STAGE1_TRADABLE_PATH, req, "scene", stamp, secret_bytes)
+            try:
+                raw = await data_service_call(_SYNC_STAGE1_TRADABLE_PATH, req.SerializeToString())
+                reply = scene.protocol.parse("data_service.SyncAccountStage1TradableResponse", raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "EquipCraft account stage1 quota sync RPC failed player_id=%d desired=%d: %s",
+                    player_id,
+                    desired_char_total,
+                    exc,
+                )
+                return
+
+            async with scene._lock(player_id):
+                world = scene.locations.get(player_id)
+                player = None if world is None else world.players.get(player_id)
+                if player is None:
+                    return
+                data = scene.rows.assemble(player.snapshot)
+                changed = scene.equip_craft.apply_account_quota_sync_reply(
+                    player_id,
+                    data,
+                    desired_char_total=int(desired_char_total),
+                    found=bool(reply.found),
+                    account_used_total=int(reply.account_used_total),
+                    confirmed_char_total=int(reply.confirmed_char_total),
+                )
+                if changed and scene.mutable(player):
+                    try:
+                        await scene.commit_player_data(player, data)
+                    except (StoreRejected, StoreUnavailable, OSError):
+                        logger.warning(
+                            "EquipCraft account stage1 quota sync save failed player_id=%d",
+                            player_id,
+                            exc_info=True,
+                        )
+
+        def _dispatch(player_id: int, desired_char_total: int, now_ms: int):
+            existing = pending.get(player_id)
+            if existing is not None and not existing.done():
+                return existing
+            task = asyncio.create_task(
+                _sync_once(player_id, desired_char_total, now_ms),
+                name=f"equip-quota-sync-{player_id}",
+            )
+            pending[player_id] = task
+
+            def _cleanup(finished: asyncio.Task) -> None:
+                if pending.get(player_id) is finished:
+                    pending.pop(player_id, None)
+
+            task.add_done_callback(_cleanup)
+            return task
+
+        if stack is not None:
+            async def _close_pending() -> None:
+                tasks = list(pending.values())
+                pending.clear()
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            stack.push_async_callback(_close_pending)
+
+        scene.equip_craft.set_account_quota_sync_transport(_dispatch)
+        return _dispatch
+
     async def _scene(self) -> None:
         info = self._info("scene", SCENE)
         switch = self._configure_kill_switch(info)
@@ -650,10 +735,16 @@ class Runtime:
         scene.trial_journal.register()
         scene.equip_craft = SceneEquipCraft(scene, tables, scene.assets)
         scene.equip_craft.register()
+        if not self.local and data_service is not None:
+            self._bind_equip_craft_account_quota_sync(
+                scene, data_service.call, account_secret, stack=self._stack,
+            )
         scene.skill_craft = SceneSkillCraft(scene, tables, scene.assets)
         scene.skill_craft.register()
         scene.festival_beast = SceneFestivalBeast(scene, tables, scene.assets)
         scene.festival_beast.register()
+        scene.spirit_shop = SceneSpiritShop(scene, tables, scene.assets)
+        scene.spirit_shop.register()
         scene_cg_call = self.local_services.call_raw if (self.local and self.local_services is not None) else None
         if not self.local:
             cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()

@@ -83,6 +83,8 @@ from .model import (
     CHALLENGE_STATE_PENDING,
     COMPLETION_SOURCE_BATTLE_RPC,
     COMPLETION_SOURCE_MANUAL_ABORT,
+    DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID,
+    DEFAULT_CUSTOM_DUEL_PET_PRESET_ID,
     FORMATION_STATE_ABORTED,
     FORMATION_STATE_CREATED,
     FORMATION_STATE_PERSISTED,
@@ -358,6 +360,7 @@ class MatchStore(TypingProtocol):
         network_profile: bytes,
         pool_region: int,
         queue_ttl_ms: int,
+        is_wuxing_tower: bool = False,
     ) -> Message: ...
     async def cancel_queue(self, caller: CallerIdentity, queue_ticket: str, request_id: str) -> None: ...
     async def get_queue_status(self, caller: CallerIdentity, request_id: str = "") -> QueueStatusInfo: ...
@@ -370,6 +373,8 @@ class MatchStore(TypingProtocol):
         target_player_id: int,
         config_id: int,
         ttl_ms: int,
+        *,
+        custom_rules_payload: bytes = b"",
     ) -> Message: ...
     async def respond_challenge(
         self,
@@ -379,6 +384,8 @@ class MatchStore(TypingProtocol):
         *,
         battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
+        responder_character_preset_id: int = 0,
+        responder_pet_preset_id: int = 0,
     ) -> tuple[Message, Message | None]: ...
 
     async def claim_formation(
@@ -396,6 +403,11 @@ class MatchStore(TypingProtocol):
         requeue_on_failure: bool,
         activity_context: bytes = b"",
         team_launch_keys: list[tuple[int, int, int]] | None = None,
+        tournament_context: bytes = b"",
+        custom_duel_rules: bytes = b"",
+        is_wuxing_tower: bool = False,
+        ranked_context: bytes = b"",
+        ranked_season_id: int = 0,
     ) -> Message: ...
     async def mark_formation_prepared(self, battle_id: int, player_id: int, endpoint: str) -> None: ...
     async def save_formation_intent(
@@ -487,7 +499,7 @@ class MatchStore(TypingProtocol):
 
     # Battle Reports
     async def list_battle_reports(self, player_id: int) -> list[Message]: ...
-    async def get_battle_report(self, player_id: int, battle_id: int) -> Message: ...
+    async def get_battle_report(self, player_id: int, battle_id: int, *, allow_public: bool = False) -> Message: ...
 
     # Spectator
     async def get_spectator(self, player_id: int) -> Message | None: ...
@@ -743,6 +755,9 @@ class _MemState:
 
     # Guild War V2
     guild_war_intents: dict[int, int] = field(default_factory=dict)  # request_id -> battle_id
+
+    # Wuxing Tower V1 (记录单人排队票是否来自五行幻境爬塔)
+    tower_tickets: set[int] = field(default_factory=set)
 
 
 class MemoryMatchStore:
@@ -2007,6 +2022,7 @@ class MemoryMatchStore:
         network_profile: bytes,
         pool_region: int,
         queue_ttl_ms: int,
+        is_wuxing_tower: bool = False,
     ) -> Message:
         now = await self.now_ms()
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
@@ -2055,6 +2071,10 @@ class MemoryMatchStore:
                 pool_region=pool_region,
             )
             s.tickets[caller.player_id] = ticket
+            if is_wuxing_tower and mode == MODE_PVE_SOLO:
+                s.tower_tickets.add(caller.player_id)
+            else:
+                s.tower_tickets.discard(caller.player_id)
             s.join_intents[(caller.player_id, h, l)] = _MemJoinIntentRow(
                 player_id=caller.player_id,
                 request_high=h,
@@ -2155,6 +2175,8 @@ class MemoryMatchStore:
         target_player_id: int,
         config_id: int,
         ttl_ms: int,
+        *,
+        custom_rules_payload: bytes = b"",
     ) -> Message:
         if target_player_id == 0 or target_player_id == challenger.player_id:
             raise MatchBusinessError(ERR_MATCH_CHALLENGE_SELF)
@@ -2192,6 +2214,7 @@ class MemoryMatchStore:
                 created_ms=now,
                 expires_ms=now + ttl_ms,
                 state=CHALLENGE_STATE_PENDING,
+                custom_rules_payload=custom_rules_payload,
             )
             s.challenges[cid] = inv
             return self._clone_msg(inv)
@@ -2206,6 +2229,8 @@ class MemoryMatchStore:
         *,
         battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
+        responder_character_preset_id: int = 0,
+        responder_pet_preset_id: int = 0,
     ) -> tuple[Message, Message | None]:
         now = await self.now_ms()
 
@@ -2233,6 +2258,35 @@ class MemoryMatchStore:
             b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
             battle_id = self._alloc_id_locked()
             op_id = str(uuid.uuid4())
+            challenger_id = int(inv.challenger_player_id)
+            custom_payload = bytes(getattr(inv, "custom_rules_payload", b""))
+            ranked_ctx_bytes = b""
+            if custom_payload:
+                rules = self.protocol.parse("CustomDuelRules", custom_payload)
+                if bool(rules.use_free_preset):
+                    # 公平模板切磋：season_id=0 保证绝不计排位分、不进 Elo 榜。
+                    rctx = self.protocol.message(
+                        "RankedMatchContext",
+                        season_id=0,
+                        rule_version=0,
+                        use_free_preset=True,
+                    )
+                    m_challenger = rctx.members.add(player_id=challenger_id)
+                    m_challenger.presets.character_preset_id = (
+                        int(rules.challenger_character_preset_id) or DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID
+                    )
+                    m_challenger.presets.pet_preset_id = (
+                        int(rules.challenger_pet_preset_id) or DEFAULT_CUSTOM_DUEL_PET_PRESET_ID
+                    )
+                    m_responder = rctx.members.add(player_id=responder.player_id)
+                    m_responder.presets.character_preset_id = (
+                        int(responder_character_preset_id) or DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID
+                    )
+                    m_responder.presets.pet_preset_id = (
+                        int(responder_pet_preset_id) or DEFAULT_CUSTOM_DUEL_PET_PRESET_ID
+                    )
+                    ranked_ctx_bytes = rctx.SerializeToString(deterministic=True)
+
             formation = self.protocol.message(
                 "match.MatchFormationRecord",
                 battle_id=battle_id,
@@ -2249,8 +2303,10 @@ class MemoryMatchStore:
                 retry_at_ms=now + 60_000,
                 requeue_on_failure=False,
                 release_track=b_track,
+                ranked_context=ranked_ctx_bytes,
+                ranked_season_id=0,
+                custom_duel_rules=custom_payload,
             )
-            challenger_id = int(inv.challenger_player_id)
             for pid, side, acct, rev in (
                 (challenger_id, 0, inv.challenger_account, int(inv.challenger_revision)),
                 (responder.player_id, 1, responder.account, responder.owner_revision),
@@ -2295,14 +2351,22 @@ class MemoryMatchStore:
         requeue_on_failure: bool,
         activity_context: bytes = b"",
         team_launch_keys: list[tuple[int, int, int]] | None = None,
+        tournament_context: bytes = b"",
+        custom_duel_rules: bytes = b"",
+        is_wuxing_tower: bool = False,
+        ranked_context: bytes = b"",
+        ranked_season_id: int = 0,
     ) -> Message:
         now = await self.now_ms()
 
         def work(s: _MemState) -> Message:
+            tower_flag = bool(is_wuxing_tower)
             for pid, ticket_str, _, _ in members:
                 tk = s.tickets.get(pid)
                 if tk is None or tk.ticket != ticket_str or int(tk.state) != TICKET_STATE_QUEUED:
                     raise StoreUnavailableError(f"ticket not claimable player={pid}")
+                if mode == MODE_PVE_SOLO and pid in s.tower_tickets:
+                    tower_flag = True
             battle_id = self._alloc_id_locked()
             op_id = str(uuid.uuid4())
             formation = self.protocol.message(
@@ -2322,6 +2386,11 @@ class MemoryMatchStore:
                 activity_context=activity_context,
                 requeue_on_failure=requeue_on_failure,
                 release_track=release_track,
+                ranked_context=ranked_context,
+                ranked_season_id=ranked_season_id,
+                tournament_context=tournament_context,
+                custom_duel_rules=custom_duel_rules,
+                is_wuxing_tower=tower_flag,
             )
             for pid, ticket_str, side, captain in members:
                 formation.members.add(player_id=pid, ticket=ticket_str, team_index=side, captain=captain)
@@ -2329,6 +2398,7 @@ class MemoryMatchStore:
                 tk.state = TICKET_STATE_FORMING
                 tk.formation_id = battle_id
                 tk.selected_region = physical_region
+                s.tower_tickets.discard(pid)
             for key in team_launch_keys or ():
                 launch = s.team_launches.get(key)
                 if launch is not None:
@@ -3121,11 +3191,12 @@ class MemoryMatchStore:
             entries = self._state.player_reports.get(player_id, ())
             return [self.protocol.parse("match.BattleReportSummary", raw) for _, _, raw in entries[:MAX_BATTLE_REPORTS]]
 
-    async def get_battle_report(self, player_id: int, battle_id: int) -> Message:
+    async def get_battle_report(self, player_id: int, battle_id: int, *, allow_public: bool = False) -> Message:
         async with self._lock:
-            entries = self._state.player_reports.get(player_id, ())
-            if not any(bid == battle_id for _, bid, _ in entries):
-                raise MatchBusinessError(ERR_MATCH_BATTLE_REPORT_NOT_FOUND)
+            if not allow_public:
+                entries = self._state.player_reports.get(player_id, ())
+                if not any(bid == battle_id for _, bid, _ in entries):
+                    raise MatchBusinessError(ERR_MATCH_BATTLE_REPORT_NOT_FOUND)
             rep = self._state.reports.get(battle_id)
             if rep is None or not rep.envelope:
                 raise MatchBusinessError(ERR_MATCH_BATTLE_REPORT_NOT_FOUND)

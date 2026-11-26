@@ -70,6 +70,12 @@ message BattleStateS2C {
   uint32 surrender_unlock_round = 24;           // PVP 投降解锁回合号（0=不可投降，PVP 为 5）
   BattleSurrenderVoteState surrender_vote = 25; // 本队当前投降投票或冷却状态（对手与观众视角由节点清空）
   BattlePrepState prep_state = 26;              // 论剑 V3 战前 15 秒明牌变阵状态（非变阵期留空；对手与观众按视角脱敏）
+  TournamentBattleContext tournament_context = 27; // 全服赛季战队锦标赛 V2：BO3 局分与五行灵脉阵眼上下文（供参战与观众展示）
+  uint32 team_a_formation_id = 28;                 // A 方生效五行阵法（0=无，1..5）
+  uint32 team_b_formation_id = 29;                 // B 方生效五行阵法（0=无，1..5）
+  WuxingTowerBattleContext tower_context = 30;     // 五行幻境周常爬塔上下文（层数/灵脉/本轮已选符印）
+  CustomDuelRules custom_duel_rules = 31;          // 道友切磋坊生效自定义规则（供参战与观众展示）
+  bool wuxing_synergy_active_this_round = 32;      // 本回合是否激活人宠五行相生合击（每 3 回合）
 }
 
 message BattleStartS2C {
@@ -359,6 +365,7 @@ message BattleReplay {
   repeated TurnResultS2C rounds = 11;  // 按回合序;每帧带结算后的全量状态,可以从任一回合开始播
   BattleStateS2C final_state = 12;     // 只在 DEADLINE_DRAW 时填:强制结束那一刻的状态
   bool truncated = 13;                 // 超过录制上限,rounds 只录到截断前
+  repeated BattleActorBuildSummary actor_builds = 14; // 开局冻结的参战者脱敏公开配装摘要（供战报一键看配装）
 }
 
 // 回放的外壳:battle → match 提交、match 存库、match → 客户端下发都用它。

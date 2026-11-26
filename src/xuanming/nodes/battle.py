@@ -42,8 +42,19 @@ from .battle_dropin_effects import (
     PVP_SURRENDER_REJECT_COOLDOWN_ROUNDS,
     PVP_SURRENDER_UNLOCK_ROUND,
     RANKED_DEFAULT_MAX_ROUNDS,
+    EVENT_WUXING_SYNERGY,
     TACTICAL_PREP_DURATION_SECONDS,
     TACTICAL_PREP_TIMEOUT_MS,
+    TOURNAMENT_LEYLINE_EARTH,
+    TOURNAMENT_LEYLINE_FIRE,
+    TOURNAMENT_LEYLINE_METAL,
+    TOURNAMENT_LEYLINE_UNSPECIFIED,
+    TOURNAMENT_LEYLINE_WATER,
+    TOURNAMENT_LEYLINE_WOOD,
+    WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
+    WUXING_SYNERGY_BONUS_PCT,
+    WUXING_TOWER_MAX_FLOORS,
+    BattleEffectOp,
     BattleModifier,
     BattleStateKind,
     BattleTrigger,
@@ -56,10 +67,23 @@ from .battle_dropin_effects import (
     SeasonBattleRules,
     TrialContext,
     TrialFactTracker,
+    WuxingTowerSigilBonuses,
+    aggregate_tower_sigils,
+    are_elements_mutually_generating,
     choose_monster_action,
+    element_of_class,
+    element_of_pet,
+    formation_counter_bonus_pct,
+    formation_of,
     is_boss_trial_kind,
+    is_synergy_round,
+    is_valid_custom_duel_round_limit,
+    is_valid_formation_id,
+    is_valid_tower_sigil_id,
+    tower_monster_attack_pct,
+    tower_monster_health_pct,
 )
-from .battle_effects import FREEZE, STUN, U64_MAX, BattleEffects, landed_damage, landed_heal, rank_factor, scaled
+from .battle_effects import CONTROL_TYPES, FREEZE, SILENCE, STUN, U64_MAX, BattleEffects, landed_damage, landed_heal, rank_factor, scaled
 from .battle_replay import BattleReplayRecorder
 from .battle_script import BattleScriptRuntime
 from .battle_skills import BattleSkills, active as _active, base_stat, mana_cost
@@ -177,11 +201,42 @@ class TurnEngine:
             self.ranked_context = request.ranked_context
         else:
             self.ranked_context = None
+        if "tournament_context" in request.DESCRIPTOR.fields_by_name and request.HasField("tournament_context"):
+            self.tournament_context: Message | None = request.tournament_context
+        else:
+            self.tournament_context = None
+        if "custom_duel_rules" in request.DESCRIPTOR.fields_by_name and request.HasField("custom_duel_rules"):
+            self.custom_duel_rules: Message | None = request.custom_duel_rules
+        else:
+            self.custom_duel_rules = None
+        if self.custom_duel_rules is not None:
+            if not is_valid_custom_duel_round_limit(self.custom_duel_rules.round_limit_override):
+                raise BattleError("invalid custom duel round_limit_override")
+            if self.custom_duel_rules.round_limit_override > 0:
+                max_rounds = self.custom_duel_rules.round_limit_override
         self.battle_id = request.battle_id
         self.match_mode = request.match_mode
         self.pve = request.match_mode in _PVE_MODES
         self.rng = _Mt19937_64(request.seed)
         self.item_rules = items
+
+        # 提取并校验五行幻境周常爬塔上下文（仅单人 PVE 携带且符印/层数合法）。
+        self.tower_context: Message | None = None
+        self.tower_sigil_bonuses: WuxingTowerSigilBonuses = WuxingTowerSigilBonuses()
+        for snap in request.players:
+            if "tower_context" in snap.DESCRIPTOR.fields_by_name and snap.HasField("tower_context"):
+                tc = snap.tower_context
+                if tc.run_id != 0 or tc.floor != 0 or tc.active_sigil_ids:
+                    if (
+                        not self.pve
+                        or len(request.players) != 1
+                        or not (1 <= tc.floor <= WUXING_TOWER_MAX_FLOORS)
+                        or any(not is_valid_tower_sigil_id(sid) for sid in tc.active_sigil_ids)
+                    ):
+                        raise BattleError("invalid wuxing tower battle context")
+                    self.tower_context = tc
+                    self.tower_sigil_bonuses = aggregate_tower_sigils(tc.active_sigil_ids)
+                    break
 
         # 排位默认回合上限收敛到 20，物法易势 5V5 默认 16，瑞兽迎春硬性校验并取冻结 round_limit。
         if self.is_ranked_battle and not has_explicit_round_limit:
@@ -258,9 +313,16 @@ class TurnEngine:
         self.prep_active: bool = False
         self._next_pet_actor_index: int = 0
         self.prep_options_by_player: dict[int, _PrepPlayerOptions] = {}
+        self.team_formation_ids: list[int] = [0, 0]
+        self.opening_shield_by_actor: dict[int, int] = {}
+        self.synergy_active_actor_ids: set[int] = set()
+        self.total_damage_dealt_by_player: dict[int, int] = {}
+        self.total_healing_done_by_player: dict[int, int] = {}
+        self.total_controls_landed_by_player: dict[int, int] = {}
         self._group = 0
         self._team_slots = [0, 0]
         slots = self._team_slots
+        team_formation_min_slot: list[int | None] = [None, None]
         for player in request.players:
             actor_id = player.player_id
             if not 0 < actor_id < _ENGINE_ACTOR_FLAG or actor_id in self.actors or player.team_index > 1:
@@ -268,6 +330,10 @@ class TurnEngine:
             if slots[player.team_index] >= 5:
                 raise BattleError("too many players on one side")
             actor = self._actor(player, actor_id, _PLAYER, player.team_index, slots, player.player_name)
+            fid = int(getattr(player, "formation_id", 0))
+            if team_formation_min_slot[player.team_index] is None or actor.formation_slot < team_formation_min_slot[player.team_index]:
+                team_formation_min_slot[player.team_index] = actor.formation_slot
+                self.team_formation_ids[player.team_index] = fid if is_valid_formation_id(fid) else 0
             actor.appearance_id = player.appearance_id
             actor.class_id = player.class_id
             actor.gender = player.gender
@@ -335,6 +401,15 @@ class TurnEngine:
                 actor.ClearField("skill_table_ids")
                 actor.ClearField("runtime_skills")
                 actor.capture_pet_table_id = 0
+            if self.tower_context is not None and not self.encounter.is_festival_beast:
+                hp_pct = tower_monster_health_pct(self.tower_context.floor)
+                atk_pct = tower_monster_attack_pct(self.tower_context.floor)
+                actor.max_health = max(1, (actor.max_health * hp_pct) // 100)
+                actor.attributes.health = actor.max_health
+                if actor.physical_attack > 0:
+                    actor.physical_attack = max(1, (actor.physical_attack * atk_pct) // 100)
+                if actor.magic_attack > 0:
+                    actor.magic_attack = max(1, (actor.magic_attack * atk_pct) // 100)
             self.actors[actor.actor_id] = actor
         if {actor.team_index for actor in self.actors.values()} != {0, 1}:
             raise BattleError("both sides need a unit")
@@ -346,6 +421,7 @@ class TurnEngine:
             self.configured.initialize_abilities()
         self.trial_tracker.initialize(request)
         self.encounter.init_special_encounter_state()
+        self._init_opening_shields()
 
     @property
     def is_in_prep_phase(self) -> bool:
@@ -566,6 +642,7 @@ class TurnEngine:
 
         self.prep_active = False
         self.configured.initialize_abilities()
+        self._init_opening_shields()
         return True
 
     def build_prep_state_for_viewer(self, viewer_player_id: int, deadline_ms: int = 0) -> Message:
@@ -625,7 +702,191 @@ class TurnEngine:
 
     @property
     def uses_free_preset(self) -> bool:
-        return self.ranked_context is not None and bool(self.ranked_context.use_free_preset)
+        return (
+            (self.ranked_context is not None and bool(self.ranked_context.use_free_preset))
+            or (self.custom_duel_rules is not None and bool(self.custom_duel_rules.use_free_preset))
+        )
+
+    @property
+    def active_leyline(self) -> int:
+        """返回本场生效的五行灵脉（锦标赛 BO3 灵脉优先，其次五行幻境层灵脉）。"""
+        if self.tournament_context is not None and self.tournament_context.leyline_element:
+            return int(self.tournament_context.leyline_element)
+        if self.tower_context is not None and self.tower_context.leyline_element:
+            return int(self.tower_context.leyline_element)
+        return TOURNAMENT_LEYLINE_UNSPECIFIED
+
+    @property
+    def ban_control_skills(self) -> bool:
+        return self.custom_duel_rules is not None and bool(self.custom_duel_rules.ban_control_skills)
+
+    @property
+    def custom_duel_polarity_enabled(self) -> bool:
+        return self.custom_duel_rules is not None and bool(self.custom_duel_rules.enable_polarity_rotation)
+
+    def tournament_earth_shield_of(self, actor_id: int) -> int:
+        """返回指定单位当前剩余开场护盾余额（土厚灵脉 / 地载阵 / 幻境厚土符印）。"""
+        return self.opening_shield_by_actor.get(actor_id, 0)
+
+    def _init_opening_shields(self) -> None:
+        self.opening_shield_by_actor.clear()
+        earth_leyline = self.active_leyline == TOURNAMENT_LEYLINE_EARTH
+        for actor in self.actors.values():
+            if not _active(actor) or actor.max_health <= 0:
+                continue
+            pct = 8 if earth_leyline else 0
+            if actor.team_index in (0, 1):
+                pct += formation_of(self.team_formation_ids[actor.team_index]).opening_shield_pct
+            if actor.team_index == 0 and self.tower_context is not None:
+                pct += self.tower_sigil_bonuses.opening_shield_pct
+            if pct > 0:
+                self.opening_shield_by_actor[actor.actor_id] = max(1, (actor.max_health * pct) // 100)
+
+    def _absorb_opening_shield(self, actor_id: int, remaining: int) -> tuple[int, int]:
+        if remaining <= 0 or not self.opening_shield_by_actor:
+            return remaining, 0
+        avail = self.opening_shield_by_actor.get(actor_id, 0)
+        if avail <= 0:
+            return remaining, 0
+        absorbed = min(remaining, avail)
+        left = avail - absorbed
+        if left > 0:
+            self.opening_shield_by_actor[actor_id] = left
+        else:
+            self.opening_shield_by_actor.pop(actor_id, None)
+        return remaining - absorbed, absorbed
+
+    def is_control_skill(self, rule: BattleSkill) -> bool:
+        """判定技能是否包含任意硬控/封印效果（供自定义切磋禁控规则校验）。"""
+        buff_rules = self.effects.rules
+        for buff_id in rule.effects:
+            b = buff_rules.get(buff_id)
+            if b is None:
+                continue
+            if b.buff_type in CONTROL_TYPES:
+                return True
+            if b.battle_op == BattleEffectOp.CONTROL and 1 <= b.state_kind <= 6:
+                return True
+        return False
+
+    def wuxing_speed_bonus_pct(self, actor: Message) -> int:
+        if actor.team_index in (0, 1):
+            return formation_of(self.team_formation_ids[actor.team_index]).speed_bonus_pct
+        return 0
+
+    def wuxing_support_bonus_pct(self, actor: Message) -> int:
+        pct = 0
+        if actor.team_index in (0, 1):
+            pct += formation_of(self.team_formation_ids[actor.team_index]).heal_shield_bonus_pct
+        if actor.actor_id in self.synergy_active_actor_ids:
+            pct += WUXING_SYNERGY_BONUS_PCT
+        if actor.team_index == 0 and self.tower_context is not None:
+            pct += self.tower_sigil_bonuses.heal_shield_pct
+        return pct
+
+    def wuxing_control_resist_pct(self, actor: Message) -> int:
+        pct = 0
+        if actor.team_index in (0, 1):
+            pct += formation_of(self.team_formation_ids[actor.team_index]).control_resist_pct
+        if actor.team_index == 0 and self.tower_context is not None:
+            pct += self.tower_sigil_bonuses.control_resist_pct
+        return pct
+
+    def _synergy_pairs_this_round(self) -> list[tuple[Message, Message]]:
+        if not is_synergy_round(self.round_index):
+            return []
+        pairs: list[tuple[Message, Message]] = []
+        players = sorted(
+            (a for a in self.actors.values() if a.actor_type == _PLAYER and _active(a)),
+            key=lambda a: a.actor_id,
+        )
+        for player in players:
+            p_elem = element_of_class(player.class_id)
+            if not p_elem:
+                continue
+            for pet in sorted(
+                (a for a in self.actors.values() if a.actor_type == _PET and a.owner_player_id == player.actor_id and _active(a)),
+                key=lambda a: a.actor_id,
+            ):
+                pet_elem = element_of_pet(pet.pet_table_id)
+                if pet_elem and are_elements_mutually_generating(p_elem, pet_elem):
+                    pairs.append((player, pet))
+        return pairs
+
+    def has_any_active_synergy_this_round(self) -> bool:
+        return bool(self._synergy_pairs_this_round())
+
+    def _is_hard_control_buff(self, buff_table_id: int) -> bool:
+        if not buff_table_id:
+            return False
+        row = self.effects.rules.get(buff_table_id)
+        if row is None:
+            return False
+        if row.buff_type in (STUN, SILENCE, FREEZE):
+            return True
+        if row.battle_op == BattleEffectOp.CONTROL:
+            return BattleStateKind.SEAL_ACTIVE <= row.state_kind <= BattleStateKind.FREEZE
+        return False
+
+    def _accumulate_round_mvp_metrics(self, turn: Message) -> None:
+        for ev in turn.events:
+            source = self.actors.get(ev.source_id)
+            if source is None:
+                continue
+            if source.actor_type == _PLAYER:
+                owner_id = source.actor_id
+            elif source.actor_type == _PET:
+                owner_id = source.owner_player_id
+            else:
+                continue
+            if not owner_id:
+                continue
+            target = self.actors.get(ev.target_id)
+            et = ev.event_type
+            if et == 3:  # BATTLE_EVENT_DAMAGE
+                if target is None or target.team_index != source.team_index:
+                    dealt = min(U64_MAX, ev.value + ev.absorbed)
+                    if dealt > 0:
+                        self.total_damage_dealt_by_player[owner_id] = min(
+                            U64_MAX, self.total_damage_dealt_by_player.get(owner_id, 0) + dealt,
+                        )
+            elif et in (4, 20):  # BATTLE_EVENT_HEAL, BATTLE_EVENT_SHIELD
+                if ev.value > 0 and (target is None or target.team_index == source.team_index):
+                    self.total_healing_done_by_player[owner_id] = min(
+                        U64_MAX, self.total_healing_done_by_player.get(owner_id, 0) + ev.value,
+                    )
+            elif et == 7:  # BATTLE_EVENT_BUFF_TICK
+                if ev.value > 0 and target is not None:
+                    if target.team_index != source.team_index:
+                        self.total_damage_dealt_by_player[owner_id] = min(
+                            U64_MAX, self.total_damage_dealt_by_player.get(owner_id, 0) + ev.value,
+                        )
+                    else:
+                        self.total_healing_done_by_player[owner_id] = min(
+                            U64_MAX, self.total_healing_done_by_player.get(owner_id, 0) + ev.value,
+                        )
+            elif et == 5:  # BATTLE_EVENT_BUFF_ADD
+                if (
+                    ev.buff_table_id != 0
+                    and target is not None
+                    and target.team_index != source.team_index
+                    and self._is_hard_control_buff(ev.buff_table_id)
+                ):
+                    self.total_controls_landed_by_player[owner_id] = (
+                        self.total_controls_landed_by_player.get(owner_id, 0) + 1
+                    )
+
+    def build_tower_settlement_echo(self) -> Message | None:
+        """构建五行幻境单层结算回传载荷（非幻境局返回 None）。"""
+        if self.tower_context is None:
+            return None
+        return self.protocol.message(
+            "WuxingTowerSettlementEcho",
+            week_key=self.tower_context.week_key,
+            run_id=self.tower_context.run_id,
+            floor=self.tower_context.floor,
+            total_rounds=self.completed_rounds(),
+        )
 
     @property
     def is_competitive_pvp_battle(self) -> bool:
@@ -813,6 +1074,18 @@ class TurnEngine:
         surrender_unlock = self.surrender_unlock_round
         if surrender_unlock > 0:
             state.surrender_unlock_round = surrender_unlock
+        if self.tournament_context is not None and self.tournament_context.match_id != 0:
+            state.tournament_context.CopyFrom(self.tournament_context)
+        if self.team_formation_ids[0]:
+            state.team_a_formation_id = self.team_formation_ids[0]
+        if self.team_formation_ids[1]:
+            state.team_b_formation_id = self.team_formation_ids[1]
+        if self.tower_context is not None:
+            state.tower_context.CopyFrom(self.tower_context)
+        if self.custom_duel_rules is not None:
+            state.custom_duel_rules.CopyFrom(self.custom_duel_rules)
+        if self.has_any_active_synergy_this_round():
+            state.wuxing_synergy_active_this_round = True
         if unredacted:
             if self.prep_active:
                 state.prep_state.active = True
@@ -941,6 +1214,36 @@ class TurnEngine:
             return turn
         if self.prep_active:
             self.finalize_prep_phase()
+        # 回合初：五行相生合击判定与广播 + 水润灵脉 / 云垂阵 / 幻境符印回合初气血法力回复。
+        self.synergy_active_actor_ids.clear()
+        for player_actor, pet_actor in self._synergy_pairs_this_round():
+            self.synergy_active_actor_ids.add(player_actor.actor_id)
+            self.synergy_active_actor_ids.add(pet_actor.actor_id)
+            self._event(
+                turn, 0, EVENT_WUXING_SYNERGY, player_actor, pet_actor,
+                value=WUXING_SYNERGY_BONUS_PCT,
+            )
+        water_leyline = self.active_leyline == TOURNAMENT_LEYLINE_WATER
+        for actor in self.actors.values():
+            if not _active(actor):
+                continue
+            mana_pct = 5 if water_leyline else 0
+            if actor.team_index in (0, 1):
+                mana_pct += formation_of(self.team_formation_ids[actor.team_index]).round_mana_regen_pct
+            if actor.team_index == 0 and self.tower_context is not None:
+                mana_pct += self.tower_sigil_bonuses.round_mana_regen_pct
+            if mana_pct > 0 and actor.max_mana > 0 and actor.attributes.mana < actor.max_mana:
+                regen = max(1, (actor.max_mana * mana_pct) // 100)
+                actor.attributes.mana = min(actor.max_mana, actor.attributes.mana + regen)
+            if (
+                actor.team_index == 0
+                and self.tower_context is not None
+                and self.tower_sigil_bonuses.round_hp_regen_pct > 0
+                and actor.max_health > 0
+                and actor.attributes.health < actor.max_health
+            ):
+                hp_regen = max(1, (actor.max_health * self.tower_sigil_bonuses.round_hp_regen_pct) // 100)
+                actor.attributes.health = min(actor.max_health, actor.attributes.health + hp_regen)
         self._fill_default_actions()
         order = sorted((actor for actor in self.actors.values() if _active(actor)), key=self._sort_key)
         self.round_start_speeds = {actor.actor_id: self.configured.effective_speed(actor) for actor in order}
@@ -970,6 +1273,7 @@ class TurnEngine:
             self._group += 1
             self.encounter.process_boss_trial_round_end(turn, self._group)
             self._update_outcome()
+        self._accumulate_round_mvp_metrics(turn)
         self.trial_tracker.on_round_complete(self.round_index)
         for actor in self.actors.values():
             if actor.actor_type != _PLAYER:
@@ -1192,6 +1496,11 @@ class TurnEngine:
         target = self.actors.get(target_id, actor)
         old_health, old_mana = target.attributes.health, target.attributes.mana
         raw_heal = float(rule.heal_health)
+        if self.active_leyline == TOURNAMENT_LEYLINE_WOOD:
+            raw_heal *= 110.0 / 100.0
+        support_bonus_pct = self.wuxing_support_bonus_pct(actor)
+        if support_bonus_pct > 0:
+            raw_heal *= (100.0 + support_bonus_pct) / 100.0
         if self.escalation_stacks > 0:
             raw_heal *= self.escalation_support_pct / 100.0
         target.attributes.health = old_health + landed_heal(target, raw_heal)
@@ -1265,12 +1574,25 @@ class TurnEngine:
             damage = self.equipment_effects.apply_equipment_resist(
                 target, damage, damage_kind, eff_def,
             )
-        return damage * (1.0 if self.pve else 0.3)
+        damage = damage * (1.0 if self.pve else 0.3)
+        leyline = self.active_leyline
+        if leyline == TOURNAMENT_LEYLINE_METAL:
+            damage *= 104.0 / 100.0
+        elif leyline == TOURNAMENT_LEYLINE_FIRE:
+            damage *= 106.0 / 100.0
+        elif leyline == TOURNAMENT_LEYLINE_EARTH:
+            damage *= 95.0 / 100.0
+        return damage
 
-    @staticmethod
-    def _critical_chance(actor: Message, rule: BattleSkill) -> float:
+    def _critical_chance(self, actor: Message, rule: BattleSkill) -> float:
         kind = rule.damage_kind
         bonus = actor.combat.physical_crit_rate if kind == 1 else actor.combat.magic_crit_rate if kind == 0 else 0
+        if self.active_leyline == TOURNAMENT_LEYLINE_METAL:
+            bonus += 5
+        if actor.team_index in (0, 1):
+            bonus += formation_of(self.team_formation_ids[actor.team_index]).crit_bonus_pct
+        if actor.team_index == 0 and self.tower_context is not None:
+            bonus += self.tower_sigil_bonuses.crit_pct
         base = min(100, actor.attributes.critchance + bonus) / 100
         if not actor.HasField("equipment_effects"):
             return base
@@ -1295,7 +1617,10 @@ class TurnEngine:
         critical_rate = self._critical_chance(actor, rule)
         critical = critical_rate > 0 and self.rng.unit() < critical_rate
         if critical:
-            damage *= 2
+            crit_mult = 2.0
+            if actor.team_index == 0 and self.tower_context is not None and self.tower_sigil_bonuses.crit_damage_pct > 0:
+                crit_mult += self.tower_sigil_bonuses.crit_damage_pct / 100.0
+            damage *= crit_mult
         damage *= rank_factor(rank)
         if hit_kind == 1:
             damage *= 0.5
@@ -1316,6 +1641,41 @@ class TurnEngine:
             in_bonus = self.configured.modifier(target, BattleModifier.INCOMING_DAMAGE) + self.configured.hit_vulnerability_bonus(target)
             if in_bonus != 0.0:
                 damage *= max(0.0, 1.0 + in_bonus)
+            # 五行阵法 / 阵法克制环 / 人宠五行相生 / 五行幻境符印直伤与受击减伤修正。
+            wuxing_out_pct = 0
+            if actor.team_index in (0, 1):
+                atk_fid = self.team_formation_ids[actor.team_index]
+                atk_form = formation_of(atk_fid)
+                wuxing_out_pct += atk_form.damage_bonus_pct
+                if actor.actor_type == _PET:
+                    wuxing_out_pct += atk_form.pet_damage_bonus_pct
+                if target.team_index in (0, 1) and target.team_index != actor.team_index:
+                    wuxing_out_pct += formation_counter_bonus_pct(atk_fid, self.team_formation_ids[target.team_index])
+            if actor.actor_id in self.synergy_active_actor_ids:
+                wuxing_out_pct += WUXING_SYNERGY_BONUS_PCT
+            if actor.team_index == 0 and self.tower_context is not None:
+                sb = self.tower_sigil_bonuses
+                wuxing_out_pct += sb.damage_pct
+                if actor.actor_type == _PET:
+                    wuxing_out_pct += sb.pet_damage_pct
+                if self.round_index <= 3:
+                    wuxing_out_pct += sb.first3_rounds_damage_pct
+                if not is_multi_target:
+                    wuxing_out_pct += sb.single_target_damage_pct
+                if sb.shield_break_bonus_pct > 0 and (
+                    any(e.remaining_capacity > 0 for e in target.buffs)
+                    or self.opening_shield_by_actor.get(target.actor_id, 0) > 0
+                ):
+                    wuxing_out_pct += sb.shield_break_bonus_pct
+            if wuxing_out_pct > 0:
+                damage *= (100.0 + wuxing_out_pct) / 100.0
+            wuxing_reduce_pct = 0
+            if target.team_index in (0, 1) and target.team_index != actor.team_index:
+                wuxing_reduce_pct += formation_of(self.team_formation_ids[target.team_index]).damage_taken_reduce_pct
+                if target.team_index == 0 and self.tower_context is not None:
+                    wuxing_reduce_pct += self.tower_sigil_bonuses.damage_taken_reduce_pct
+            if wuxing_reduce_pct > 0:
+                damage *= max(0.1, (100.0 - wuxing_reduce_pct) / 100.0)
         if actor.actor_type == _PET and actor.HasField("pet_cultivation"):
             damage = self.pet_support.apply_pet_damage_bonus(
                 actor, damage, rule.damage_kind, is_direct=(hit_kind != 3), hit_kind=hit_kind,
@@ -1346,18 +1706,22 @@ class TurnEngine:
                 direct_or_pursuit_or_mirror=(hit_kind != 3),
             )
         original_shields = [entry.buff_id for entry in target.buffs if entry.remaining_capacity > 0]
-        absorbed = 0
+        buff_absorbed = 0
         if dealt > 0 and original_shields:
-            dealt, absorbed = self.equipment_effects.absorb_shields(actor, target, dealt, turn, group)
+            dealt, buff_absorbed = self.equipment_effects.absorb_shields(actor, target, dealt, turn, group)
             if actor.HasField("equipment_effects") and hit_kind == 0 and hit_index == 0:
                 self.equipment_effects.break_shields(
-                    actor, target, dealt + absorbed, rule.damage_kind,
+                    actor, target, dealt + buff_absorbed, rule.damage_kind,
                     self.round_index, turn, group, original_shields,
                 )
-        if dealt > 0 or not absorbed:
+        opening_absorbed = 0
+        if dealt > 0 and self.opening_shield_by_actor:
+            dealt, opening_absorbed = self._absorb_opening_shield(target.actor_id, dealt)
+        absorbed = buff_absorbed + opening_absorbed
+        if dealt > 0 or opening_absorbed > 0 or not absorbed:
             self._apply_damage(
                 turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
-                hit_kind=hit_kind, hit_index=hit_index,
+                hit_kind=hit_kind, hit_index=hit_index, absorbed=opening_absorbed,
                 is_splash_reduced=splash_reduced, is_primary_focus=is_primary_focus,
             )
         if not skill_id:
@@ -1369,17 +1733,37 @@ class TurnEngine:
             self.configured.increment_hit_vulnerability(target, self.round_index, group)
         if dealt > 0:
             self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
+        if hit_kind != 3 and dealt > 0 and self.tower_context is not None:
+            sb = self.tower_sigil_bonuses
+            # 403 祝融烈焰：暴击附加目标最大气血 3% 灼伤（单段封顶 1500）。
+            if critical and actor.team_index == 0 and sb.crit_burn_max_hp_pct > 0 and _active(target) and target.max_health > 0:
+                burn = min(
+                    target.attributes.health,
+                    WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
+                    max(1, (target.max_health * sb.crit_burn_max_hp_pct) // 100),
+                )
+                if burn > 0:
+                    self._apply_damage(turn, group, actor, target, burn, hit_kind=hit_kind, hit_index=hit_index)
+            # 302 玄冰护心：受直接伤害回复 4% 最大法力。
+            if target.team_index == 0 and sb.on_hit_mana_regen_pct > 0 and _active(target) and target.max_mana > 0:
+                gain = max(1, (target.max_mana * sb.on_hit_mana_regen_pct) // 100)
+                target.attributes.mana = min(target.max_mana, target.attributes.mana + gain)
+            # 502 坤元反震 / 503 昆仑镇岳：受直接攻击反震实际伤害百分比。
+            if target.team_index == 0 and sb.reflect_pct > 0 and _active(actor) and _active(target):
+                tower_reflected = min(actor.attributes.health, max(1, (dealt * sb.reflect_pct) // 100))
+                if tower_reflected > 0:
+                    self._apply_damage(turn, group, target, actor, tower_reflected, hit_kind=3, hit_index=hit_index)
         if not skill_id and hit_kind != 2 and dealt and _active(actor) and _active(target) and self.rng.percent(target.combat.reflect_rate):
             reflected = min(actor.attributes.health, (dealt + 1) // 2)
             self._apply_damage(turn, group, target, actor, reflected, hit_kind=3, hit_index=hit_index)
 
     def _apply_damage(self, turn: Message, group: int, source: Message, target: Message, value: int,
                       *, critical: bool = False, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
-                      is_splash_reduced: bool = False, is_primary_focus: bool = False) -> None:
+                      absorbed: int = 0, is_splash_reduced: bool = False, is_primary_focus: bool = False) -> None:
         target.attributes.health -= value
-        ev = self._event(turn, group, 3, source, target, value=value, is_critical=critical, skill_table_id=skill_id,
-                         hit_kind=hit_kind, hit_index=hit_index, target_health_after=target.attributes.health,
-                         target_mana_after=target.attributes.mana)
+        ev = self._event(turn, group, 3, source, target, value=value, absorbed=absorbed, is_critical=critical,
+                         skill_table_id=skill_id, hit_kind=hit_kind, hit_index=hit_index,
+                         target_health_after=target.attributes.health, target_mana_after=target.attributes.mana)
         if is_splash_reduced:
             ev.is_splash_reduced = True
         if is_primary_focus:
@@ -1587,6 +1971,7 @@ class BattleNode:
         if request.record_replay and not in_prep_phase:
             fingerprint = self.tables.fingerprint if self.tables else ""
             room.replay = BattleReplayRecorder(self.protocol, original, fingerprint, engine.snapshot(0))
+            self._populate_replay_actor_builds(room.replay, original, engine)
         assignments = {player: self._assignment(room, player, _PARTICIPANT) for player in routing}
         # Preparing the engine, replay and every ticket can exhaust the
         # placement window; do not commit a room after it has expired.
@@ -2074,6 +2459,7 @@ class BattleNode:
         if room.original.record_replay and room.replay is None:
             fingerprint = self.tables.fingerprint if self.tables else ""
             room.replay = BattleReplayRecorder(self.protocol, room.original, fingerprint, room.engine.snapshot(0))
+            self._populate_replay_actor_builds(room.replay, room.original, room.engine)
         for player, route in room.routing.items():
             start = self.protocol.message(
                 "BattleStartS2C",
@@ -2091,6 +2477,45 @@ class BattleNode:
             room.engine.battle_id,
             room.action_deadline_ms,
         )
+
+    @staticmethod
+    def _populate_replay_actor_builds(replay: BattleReplayRecorder, original: Message, engine: TurnEngine) -> None:
+        """为战报录制器冻结参战者脱敏公开构筑摘要（严禁含私密概率、冷却或背包）。"""
+        pb_replay = getattr(replay, "_replay", None)
+        if pb_replay is None or "actor_builds" not in pb_replay.DESCRIPTOR.fields_by_name:
+            return
+        for snap in original.players:
+            actor = engine.actors.get(snap.player_id)
+            pet = next(
+                (a for a in engine.actors.values() if a.actor_type == _PET and a.owner_player_id == snap.player_id),
+                None,
+            )
+            seal_id = 0
+            if actor is not None and actor.HasField("equipment_effects") and actor.equipment_effects.HasField("season_seal"):
+                seal_id = int(actor.equipment_effects.season_seal.seal_id)
+            elif snap.HasField("equipment_effects") and snap.equipment_effects.HasField("season_seal"):
+                seal_id = int(snap.equipment_effects.season_seal.seal_id)
+            fid = int(getattr(snap, "formation_id", 0))
+            if not is_valid_formation_id(fid):
+                fid = 0
+            summary = pb_replay.actor_builds.add(
+                player_id=snap.player_id,
+                name=snap.player_name,
+                team_index=snap.team_index,
+                class_id=snap.class_id,
+                level=snap.level,
+                formation_id=fid,
+                wuxing_element=element_of_class(snap.class_id),
+                season_seal_id=seal_id,
+                active_pet_table_id=pet.pet_table_id if pet is not None else 0,
+                active_pet_name=pet.name if pet is not None else "",
+                active_pet_element=element_of_pet(pet.pet_table_id) if pet is not None else 0,
+                used_free_preset=engine.uses_free_preset,
+            )
+            skills_src = actor.skill_table_ids if actor is not None else snap.skill_table_ids
+            summary.skill_table_ids.extend(list(skills_src)[:12])
+            if engine.tower_context is not None and snap.team_index == 0:
+                summary.wuxing_sigil_ids.extend(engine.tower_context.active_sigil_ids)
 
     @staticmethod
     def _snapshot(room: _Room, viewer: int) -> Message:
@@ -2185,7 +2610,12 @@ class BattleNode:
                 battle_difficulty=engine.encounter.battle_difficulty,
                 manual_action_rounds=len(engine.trial_tracker.manual_action_rounds.get(player, ())),
                 effective_combat_contribution=(player in engine.trial_tracker.effective_contribution_players),
+                total_damage_dealt=engine.total_damage_dealt_by_player.get(player, 0),
+                total_healing_done=engine.total_healing_done_by_player.get(player, 0),
+                total_controls_landed=engine.total_controls_landed_by_player.get(player, 0),
             )
+            if (tower_echo := engine.build_tower_settlement_echo()) is not None:
+                settlement.tower_settlement.CopyFrom(tower_echo)
             if engine.is_festival_beast_battle:
                 settlement.festival_beast.CopyFrom(request.activity_context.festival_beast)
             if engine.is_ranked_battle and engine.ranked_context is not None:

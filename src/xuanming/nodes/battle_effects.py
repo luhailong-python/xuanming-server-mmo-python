@@ -104,6 +104,12 @@ class BattleEffects:
         if specific is None or caster is None or actor.team_index == caster.team_index:
             return False
         total = min(U64_MAX, getattr(actor.combat, specific) + actor.combat.resist_all_ailment)
+        if rule.buff_type in CONTROL_TYPES:
+            if getattr(self.engine, "active_leyline", 0) == 3:  # TOURNAMENT_LEYLINE_WATER
+                total = min(U64_MAX, total + 8)
+            wuxing_resist = getattr(self.engine, "wuxing_control_resist_pct", lambda _a: 0)(actor)
+            if wuxing_resist > 0:
+                total = min(U64_MAX, total + wuxing_resist)
         return self.engine.rng.percent(max(0, total - caster.combat.ignore_ailment_resist))
 
     def next_buff_id(self) -> int:
@@ -139,6 +145,15 @@ class BattleEffects:
             *, percent: float = 0.0, depth: int = 0) -> None:
         rule = self.rules.get(table_id)
         if rule is None or depth > 8 or target.is_dead or self.immune(target, rule):
+            return
+        if (
+            getattr(self.engine, "ban_control_skills", False)
+            and rule.buff_type in CONTROL_TYPES
+            and (caster_actor := self.engine.actors.get(caster_id)) is not None
+            and caster_actor.team_index != target.team_index
+        ):
+            turn.events.add(event_type=15, source_id=caster_id, target_id=target.actor_id,
+                            buff_table_id=table_id, group_id=group, hit_index=hit)
             return
         if self._resisted(target, rule, caster_id):
             turn.events.add(event_type=15, source_id=caster_id, target_id=target.actor_id,

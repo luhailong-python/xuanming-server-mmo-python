@@ -144,6 +144,7 @@ class BattleSettlement:
             or bool(getattr(settlement, "competitive_ranked", False))
             or is_boss_trial_kind(int(getattr(settlement, "boss_trial_kind", 0)))
             or int(getattr(settlement, "boss_trial_kind", 0)) == BOSS_TRIAL_KIND_GUARDIAN_RESCUE
+            or settlement.HasField("tower_settlement")
         )
         if not isolate_temp_state:
             stats = player_stats(self.protocol, self.tables, data)
@@ -222,6 +223,19 @@ class BattleSettlement:
                         "Battle settlement season progress hook failed player_id=%s battle_id=%s",
                         player.player_id, settlement.battle_id, exc_info=True,
                     )
+                if settlement.HasField("tower_settlement"):
+                    try:
+                        season.settle_wuxing_tower_battle(
+                            data,
+                            settlement,
+                            now_ms_val=stamp,
+                            player_name=data.profile_component.name,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Battle settlement wuxing tower hook failed player_id=%s battle_id=%s",
+                            player.player_id, settlement.battle_id, exc_info=True,
+                        )
 
             trial_journal = getattr(self.scene, "trial_journal", None)
             if trial_journal is not None:

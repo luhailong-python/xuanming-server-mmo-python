@@ -98,6 +98,10 @@ message BattlePlayerSnapshot {
   repeated BattlePetSnapshot standby_pets = 26;
   // 论剑 V3 当季可用全部赛季印快照（全员免费临场切换机制槽，不重算人物基础气血/防御万分比）。
   repeated SeasonSealEffect available_season_seals = 27;
+  // 五行阵法 ID（0=无阵，1天覆/2地载/3风扬/4云垂/5虎翼；免费切换，组队按阵位最小者生效）。
+  uint32 formation_id = 28;
+  // 五行幻境·轻肉鸽周常爬塔权威上下文（由 Scene 从 PlayerSeasonComp 注入，客户端不可伪造）。
+  WuxingTowerBattleContext tower_context = 29;
 }
 
 // ---- 宝宝战斗快照:与主人同队、独立行动的战斗单位(设计文档 player-pet.md §5)----
@@ -240,6 +244,7 @@ enum eBattleEventType {
   BATTLE_EVENT_SHIELD = 20;
   BATTLE_EVENT_ARTIFACT = 21; // 法宝产生实际收益或消耗概率判定次数。
   BATTLE_EVENT_BOSS_MECHANIC = 22; // 首领试炼 V2 破招/阶段/联防/蓄势演出事件（mechanic_kind 标明子类型）。
+  BATTLE_EVENT_WUXING_SYNERGY = 23; // 人宠五行相生每 3 回合触发的合击共鸣事件。
 }
 
 // 一段伤害 / 出手是怎么来的(equipment-attributes.md §4.5)。0 = 普通,老客户端不读也不影响演出。
@@ -437,6 +442,12 @@ message BattleSettlementData {
   FestivalBeastBattleContext festival_beast = 31;
   // true = 本方通过第 5 回合起的 PVP 延迟投降结束本局（与 fled 逃跑区分：体面认输，满足有效对抗门槛照常计场次与绑定材料）。
   bool surrendered = 32;
+  // 群仙问道赛 V3 MVP 评定权威只读累计统计（本人及本人出战宝宝整场累计，由引擎在 BuildSettlement 冻结）。
+  uint64 total_damage_dealt = 33;
+  uint64 total_healing_done = 34;
+  uint32 total_controls_landed = 35;
+  // 五行幻境周常爬塔单层结算回传（供 Scene 幂等推进层数与生成三选一符印）。
+  WuxingTowerSettlementEcho tower_settlement = 36;
 }
 
 // ---- 出战宝宝的结算数据(随主人的 BattleSettlementData 一起回 scene)----
@@ -600,4 +611,77 @@ message BattleTrialJournalFacts {
   uint32 stance_break_count = 23;              // 首领试炼 V2：触发驱散/控断护势「崩势」次数
   bool all_self_cleaves_parried = 24;          // 首领试炼 V2：本人及本人宝宝被重劈点名>=1次且100%合法化解(不含倒地/退出取消)
   bool self_parried_cleave_at_least_once = 25; // 首领试炼 V2：本人或本人宝宝至少合法化解过 1 次重劈
+}
+
+// ---- 全服赛季战队锦标赛《群仙问道赛》V2：BO3 与五行灵脉阵眼开局冻结上下文(docs/design/season-team-tournament-v2.md) ----
+enum TournamentLeylineElement {
+  TOURNAMENT_LEYLINE_UNSPECIFIED = 0; // 无灵脉(BO1 / 非锦标赛)
+  TOURNAMENT_LEYLINE_METAL       = 1; // 金锐灵脉：暴击率 +5%，破防直伤 +4%
+  TOURNAMENT_LEYLINE_WOOD        = 2; // 木生灵脉：治疗与护盾效果 +10%
+  TOURNAMENT_LEYLINE_WATER       = 3; // 水润灵脉：回合初恢复 5% 法力，控制抗性 +8%
+  TOURNAMENT_LEYLINE_FIRE        = 4; // 火炽灵脉：全体伤害 +6%
+  TOURNAMENT_LEYLINE_EARTH       = 5; // 土厚灵脉：受到伤害 -5%，首回合护盾 +8% 气血上限
+}
+
+message TournamentBattleContext {
+  uint32 season_id = 1;
+  uint64 match_id = 2;
+  uint32 best_of = 3;                              // 1=BO1, 3=BO3
+  uint32 game_index = 4;                           // 当前第几小局(1..best_of)
+  uint32 wins_a = 5;                               // 本小局开打前 A 队已胜局数
+  uint32 wins_b = 6;                               // 本小局开打前 B 队已胜局数
+  TournamentLeylineElement leyline_element = 7;    // 本小局生效五行灵脉阵眼
+  uint64 squad_a_id = 8;
+  string squad_a_name = 9;
+  uint64 squad_b_id = 10;
+  string squad_b_name = 11;
+  uint32 squad_a_emblem_id = 12;                   // V3: A 队官方预设道家队徽(1..8)
+  uint32 squad_b_emblem_id = 13;                   // V3: B 队官方预设道家队徽(1..8)
+  bool is_warmup = 14;                             // V3: true=赛前零积分热身约战
+  bool is_third_place = 15;                        // V3: true=四强季军争夺战(铜牌战)
+}
+
+// ---- 五行幻境·轻肉鸽周常爬塔上下文与结算回传(docs/design/wuxing-gameplay-expansions-v1.md) ----
+message WuxingTowerBattleContext {
+  uint32 week_key = 1;                             // 开战冻结周键
+  uint64 run_id = 2;                               // 开战冻结轮次 ID
+  uint32 floor = 3;                                // 当前挑战层数（1..10）
+  TournamentLeylineElement leyline_element = 4;    // 本层环境五行灵脉（1..5）
+  repeated uint32 active_sigil_ids = 5;            // 本轮已选局内五行符印（仅本场生效）
+}
+
+message WuxingTowerSettlementEcho {
+  uint32 week_key = 1;
+  uint64 run_id = 2;
+  uint32 floor = 3;
+  uint32 total_rounds = 4;
+}
+
+// ---- 道友切磋坊·自定义规则切磋(docs/design/wuxing-gameplay-expansions-v1.md) ----
+message CustomDuelRules {
+  bool use_free_preset = 1;                        // true=公平 3x3 免费人宠模板；false=双方真养成
+  bool enable_polarity_rotation = 2;               // true=开启每 2 回合物势/法势交替
+  uint32 round_limit_override = 3;                 // 0=默认；白名单允许 8/12/20 回合
+  bool ban_control_skills = 4;                     // true=禁控纯拼直伤与续航
+  bool allow_public_spectate = 5;                  // true=允许全服公开观战
+  uint32 challenger_character_preset_id = 6;       // 公平模板切磋时发起者所选人物预设（0=默认 101）
+  uint32 challenger_pet_preset_id = 7;             // 公平模板切磋时发起者所选灵宠预设（0=默认 203）
+}
+
+// ---- 战报一键看配装·脱敏公开构筑摘要(严禁含私密概率/背包/冷却) ----
+message BattleActorBuildSummary {
+  uint64 player_id = 1;
+  string name = 2;
+  uint32 team_index = 3;
+  uint32 class_id = 4;
+  uint32 level = 5;
+  uint32 formation_id = 6;
+  uint32 wuxing_element = 7;                       // 1金/2木/3水/4火/5土
+  uint32 season_seal_id = 8;
+  uint32 active_pet_table_id = 9;
+  string active_pet_name = 10;
+  uint32 active_pet_element = 11;                  // 1金/2木/3水/4火/5土
+  repeated uint32 skill_table_ids = 12;
+  repeated uint32 wuxing_sigil_ids = 13;
+  bool used_free_preset = 14;
 }

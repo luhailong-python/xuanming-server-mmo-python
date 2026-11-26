@@ -15,7 +15,14 @@ from .battle_control import service_digest, sign_service_call, verify_service_ca
 from .battle_dropin_effects import (
     BOSS_TRIAL_KIND_FESTIVAL_BEAST,
     BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
+    MATCH_MODE_PVP_CHALLENGE,
+    WUXING_TOWER_MAX_FLOORS,
     is_boss_trial_kind,
+    is_valid_custom_duel_round_limit,
+    is_valid_formation_id,
+    tower_floor_dungeon_id,
+    tower_floor_leyline_element,
+    wuxing_week_key,
 )
 from .battle_tables import battle_table_fingerprint
 from .scene_festival_beast import FESTIVAL_BEAST_PET_CHANGED, FESTIVAL_BEAST_PET_DEAD, SceneFestivalBeast
@@ -439,6 +446,39 @@ class SceneBattle:
             and request.HasField("ranked_context")
             and request.ranked_context.use_free_preset
         )
+        is_wuxing_tower = bool(request is not None and getattr(request, "is_wuxing_tower", False))
+        has_custom_duel = bool(
+            request is not None
+            and "custom_duel_rules" in request.DESCRIPTOR.fields_by_name
+            and request.HasField("custom_duel_rules")
+        )
+        is_pvp_challenge = bool(
+            request is not None and int(getattr(request, "match_mode", 0)) == MATCH_MODE_PVP_CHALLENGE
+        )
+        if has_custom_duel:
+            if not is_valid_custom_duel_round_limit(request.custom_duel_rules.round_limit_override):
+                return 1005
+            if request.custom_duel_rules.use_free_preset:
+                use_free_preset = True
+
+        now_stamp = self._clock()
+        tower_ctx_source = None
+        if is_wuxing_tower:
+            wk = wuxing_week_key(now_stamp)
+            if not data.HasField("season_component") or not data.season_component.HasField("wuxing_tower"):
+                return 1006
+            tower = data.season_component.wuxing_tower
+            if (
+                tower.week_key != wk
+                or not tower.run_active
+                or not (1 <= tower.current_floor <= WUXING_TOWER_MAX_FLOORS)
+                or tower.pending_offer_sigil_ids
+            ):
+                return 1006
+            expected_dungeon = tower_floor_dungeon_id(tower.current_floor)
+            if request is not None and request.battle_config_id and request.battle_config_id != expected_dungeon:
+                return 1006
+            tower_ctx_source = tower
 
         # 瑞兽迎春准入硬隔离：boss_trial_kind=7 必须且仅能携带合法 FESTIVAL_BEAST 上下文。
         if (boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST) != is_festival_beast:
@@ -464,7 +504,16 @@ class SceneBattle:
             if pet_err:
                 return pet_err
 
-        isolate_temp_state = use_free_preset or is_formal_ranked or is_boss_trial or is_guard_rescue or is_festival_beast
+        isolate_temp_state = (
+            use_free_preset
+            or is_formal_ranked
+            or is_boss_trial
+            or is_guard_rescue
+            or is_festival_beast
+            or is_wuxing_tower
+            or has_custom_duel
+            or is_pvp_challenge
+        )
         base = data.derived_attributes_component
         if not isolate_temp_state and not base.health:
             return 1006
@@ -482,11 +531,22 @@ class SceneBattle:
             setattr(snapshot, key, getattr(stats, key))
         snapshot.combat.CopyFrom(stats.combat)
         snapshot.table_fingerprint = battle_table_fingerprint(self.tables)
+        # 注入玩家当前已装配五行阵法与权威五行幻境上下文（客户端不可伪造）。
+        if data.HasField("season_component"):
+            fid = int(data.season_component.equipped_formation_id)
+            if is_valid_formation_id(fid):
+                snapshot.formation_id = fid
+        if tower_ctx_source is not None:
+            tc = snapshot.tower_context
+            tc.week_key = tower_ctx_source.week_key
+            tc.run_id = tower_ctx_source.run_id
+            tc.floor = tower_ctx_source.current_floor
+            tc.leyline_element = tower_floor_leyline_element(tower_ctx_source.week_key, tower_ctx_source.current_floor)
+            tc.active_sigil_ids.extend(tower_ctx_source.active_sigil_ids)
         routing = snapshot.routing
         routing.session_id, routing.gate_node_id, routing.gate_instance_id = player.session_id, player.session_id >> 17, player.gate_uuid
         routing.scene_node_id, routing.scene_instance_id = self.scene.info.node_id, self.scene.info.node_uuid
         routing.zone_id = self.scene.info.zone_id
-        now_stamp = self._clock()
         active_season_rule = find_active_season_rule(self.tables, now_stamp)
         active_season_id = active_season_rule.id if active_season_rule is not None else 0
         battle_skills(self.tables, data, snapshot, active_season_id=active_season_id)

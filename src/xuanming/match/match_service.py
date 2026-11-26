@@ -23,6 +23,7 @@ from .errors import (
     ActivityIntentConflictError,
     ActivityOutsideWindowError,
     BattleOutcomeOriginalError,
+    ERR_INVALID_PARAMETER,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
     ERR_MATCH_CHALLENGE_SELF,
     ERR_MATCH_CHALLENGE_TARGET_OFFLINE,
@@ -32,6 +33,7 @@ from .errors import (
     ERR_MATCH_NOT_IN_SCENE,
     ERR_MATCH_NO_REGION_WITHIN_LATENCY,
     ERR_MATCH_PROBE_REQUIRED,
+    ERR_MATCH_RANKED_PRESET_INVALID,
     ERR_MATCH_TEAM_SIZE_NOT_CONFIGURED,
     GuildWarMemberOccupiedError,
     InvalidRoleFenceStateError,
@@ -44,6 +46,8 @@ from .gather import BattleNodeResolver, GatherPipeline, Matchmaker, PresenceProv
 from .model import (
     BATTLE_ACTIVITY_KIND_GUILD_WAR,
     COMPLETION_SOURCE_MANUAL_ABORT,
+    DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID,
+    DEFAULT_CUSTOM_DUEL_PET_PRESET_ID,
     MAX_OPERATOR_BYTES,
     MAX_PROBE_REGIONS,
     MAX_REASON_BYTES,
@@ -70,6 +74,7 @@ from .model import (
     TICKET_STATE_READY,
     CallerIdentity,
     authenticate_gate_caller,
+    has_custom_duel_rules,
     has_session_metadata,
     preferred_region,
     probe_latencies,
@@ -77,6 +82,7 @@ from .model import (
     sign_internal_reply,
     sign_probe_message,
     valid_operator_text,
+    validate_custom_duel_rules,
     verify_internal_hmac,
     verify_probe_message,
 )
@@ -129,6 +135,8 @@ class MatchGrpcService:
         self.battle_scripts = battle_scripts if battle_scripts is not None else BattleScriptManager(protocol, store)
         self.ranked = ranked if ranked is not None else RankedManager(protocol, store, clock_ms=self._clock_ms)
         self.tournament = tournament if tournament is not None else TournamentManager(protocol, clock_ms=self._clock_ms)
+        if self.gather.on_tournament_profiles is None:
+            self.gather.on_tournament_profiles = self.tournament.sync_member_profiles
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -167,6 +175,13 @@ class MatchGrpcService:
                 "StartTournamentMatch": self.start_tournament_match,
                 "CheerTournamentSquad": self.cheer_tournament_squad,
                 "ClaimTournamentReward": self.claim_tournament_reward,
+                "SaluteTournamentChampion": self.salute_tournament_champion,
+                "SendTournamentSpectateCheer": self.send_tournament_spectate_cheer,
+                "GetTournamentSpectateCheer": self.get_tournament_spectate_cheer,
+                "UpdateTournamentSquadEmblem": self.update_tournament_squad_emblem,
+                "StartTournamentWarmup": self.start_tournament_warmup,
+                "PredictTournamentMatch": self.predict_tournament_match,
+                "GetTournamentPredictionBoard": self.get_tournament_prediction_board,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -408,6 +423,7 @@ class MatchGrpcService:
                 network_profile=profile_bytes,
                 pool_region=pool_reg,
                 queue_ttl_ms=self.config.queue_ttl_sec * 1000,
+                is_wuxing_tower=bool(getattr(request, "is_wuxing_tower", False)),
             )
         except MatchBusinessError as exc:
             return fail(exc.code)
@@ -462,12 +478,27 @@ class MatchGrpcService:
         target_id = int(request.target_player_id)
         if target_id == 0 or target_id == caller.player_id:
             return set_tip(resp, ERR_MATCH_CHALLENGE_SELF)
+        custom_rules = request.custom_rules if request.HasField("custom_rules") else None
+        if not validate_custom_duel_rules(custom_rules):
+            return set_tip(resp, ERR_INVALID_PARAMETER)
+        if custom_rules is not None and bool(custom_rules.use_free_preset):
+            char_pid = int(custom_rules.challenger_character_preset_id) or DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID
+            pet_pid = int(custom_rules.challenger_pet_preset_id) or DEFAULT_CUSTOM_DUEL_PET_PRESET_ID
+            if not self.ranked.is_valid_preset_pair(char_pid, pet_pid):
+                return set_tip(resp, ERR_MATCH_RANKED_PRESET_INVALID)
+        custom_payload = (
+            custom_rules.SerializeToString(deterministic=True) if has_custom_duel_rules(custom_rules) else b""
+        )
         target_pres = await self.presence.get_presence(target_id)
         if not target_pres.online:
             return set_tip(resp, ERR_MATCH_CHALLENGE_TARGET_OFFLINE)
         try:
             inv = await self.store.create_challenge(
-                caller, target_id, int(request.battle_config_id) or 1, self.config.challenge_ttl_sec * 1000
+                caller,
+                target_id,
+                int(request.battle_config_id) or 1,
+                self.config.challenge_ttl_sec * 1000,
+                custom_rules_payload=custom_payload,
             )
             resp.challenge_id = int(inv.challenge_id)
             return resp
@@ -477,6 +508,13 @@ class MatchGrpcService:
     async def respond_challenge(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         resp = self.protocol.message("match.RespondChallengeResponse")
+        resp_char_pid = int(getattr(request, "responder_character_preset_id", 0))
+        resp_pet_pid = int(getattr(request, "responder_pet_preset_id", 0))
+        if request.accept and (resp_char_pid or resp_pet_pid):
+            c_id = resp_char_pid or DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID
+            p_id = resp_pet_pid or DEFAULT_CUSTOM_DUEL_PET_PRESET_ID
+            if not self.ranked.is_valid_preset_pair(c_id, p_id):
+                return set_tip(resp, ERR_MATCH_RANKED_PRESET_INVALID)
         battle_node = None
         if request.accept:
             nodes = await self.battle_nodes.list_nodes(release_track=caller.release_track)
@@ -491,6 +529,8 @@ class MatchGrpcService:
                 bool(request.accept),
                 battle_node=battle_node,
                 battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+                responder_character_preset_id=resp_char_pid,
+                responder_pet_preset_id=resp_pet_pid,
             )
         except MatchBusinessError as exc:
             return set_tip(resp, exc.code, *exc.params)
@@ -523,8 +563,13 @@ class MatchGrpcService:
     async def get_battle_report(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         resp = self.protocol.message("match.GetBattleReportResponse")
+        battle_id = int(request.battle_id)
         try:
-            env = await self.store.get_battle_report(caller.player_id, int(request.battle_id))
+            env = await self.store.get_battle_report(
+                caller.player_id,
+                battle_id,
+                allow_public=self.tournament.is_public_knockout_replay_allowed(battle_id),
+            )
             resp.replay.CopyFrom(env)
             return resp
         except MatchBusinessError as exc:
@@ -611,6 +656,36 @@ class MatchGrpcService:
     async def claim_tournament_reward(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         return await self.tournament.claim_tournament_reward(caller, request)
+
+    # -- Season Squad Tournament V2 / V3 客户端 RPCs（506..508, 511..514）---------------------------
+
+    async def salute_tournament_champion(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.salute_tournament_champion(caller, request)
+
+    async def send_tournament_spectate_cheer(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.send_tournament_spectate_cheer(caller, request)
+
+    async def get_tournament_spectate_cheer(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.get_tournament_spectate_cheer(caller, request)
+
+    async def update_tournament_squad_emblem(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.update_tournament_squad_emblem(caller, request)
+
+    async def start_tournament_warmup(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.start_tournament_warmup(caller, request)
+
+    async def predict_tournament_match(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.predict_tournament_match(caller, request)
+
+    async def get_tournament_prediction_board(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tournament.get_tournament_prediction_board(caller, request)
 
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 

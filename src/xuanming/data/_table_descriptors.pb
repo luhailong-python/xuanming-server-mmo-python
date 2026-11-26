@@ -1206,6 +1206,53 @@ rarityTier(
 SkillScrollCraftTableData*
 data (2.SkillScrollCraftTableRdataBG
 com.game.tableBSkillScrollCraftTableOuterClassPZgenerated/pb/tablebproto3
+ñ
+&table_wire/spiritshopgoods_table.proto"¯
+SpiritShopGoodsTable
+id (Rid
+tab_id (RtabId
+
+sort_order (R	sortOrder
+enabled (Renabled
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey#
+currency_type (RcurrencyType
+price	 (Rprice-
+max_buy_per_request
+ (RmaxBuyPerRequest
+	item_id_1 (RitemId1 
+item_count_1 (R
+itemCount1 
+item_bound_1 (R
+itemBound1
+	item_id_2 (RitemId2 
+item_count_2 (R
+itemCount2 
+item_bound_2 (R
+itemBound2(
+limit_reset_kind (RlimitResetKind
+limit_count (R
+limitCount$
+limit_group_id (RlimitGroupId,
+limit_group_weight (RlimitGroupWeight
+
+badge_text (	R	badgeText"E
+SpiritShopGoodsTableData)
+data (2.SpiritShopGoodsTableRdataBF
+com.game.tableBSpiritShopGoodsTableOuterClassPZgenerated/pb/tablebproto3
+Ò
++table_wire/spiritshoplimitgroup_table.proto"}
+SpiritShopLimitGroupTable
+id (Rid
+name (	Rname
+
+reset_kind (R	resetKind
+
+max_weight (R	maxWeight"O
+SpiritShopLimitGroupTableData.
+data (2.SpiritShopLimitGroupTableRdataBK
+com.game.tableB#SpiritShopLimitGroupTableOuterClassPZgenerated/pb/tablebproto3
 ³
 table_wire/test_table.proto"S
 Testtestobj
@@ -1289,8 +1336,9 @@ mail_title
 TournamentRewardTableData*
 data (2.TournamentRewardTableRdataBG
 com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
-¡
-%table_wire/tournamentrule_table.proto"ã
+´
+
+%table_wire/tournamentrule_table.proto"ö
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -1312,7 +1360,13 @@ mail_title
 qualifier_draw_points (RqualifierDrawPoints2
 qualifier_loss_points (RqualifierLossPoints,
 invite_ttl_seconds (RinviteTtlSeconds
-desc (	Rdesc"C
+desc (	Rdesc(
+bo3_top4_enabled (Rbo3Top4Enabled1
+intermission_seconds (RintermissionSeconds4
+public_knockout_replay (RpublicKnockoutReplay,
+salute_gold_amount (RsaluteGoldAmount$
+salute_item_id (RsaluteItemId*
+salute_item_count (RsaluteItemCount"C
 TournamentRuleTableData(
 data (2.TournamentRuleTableRdataBE
 com.game.tableBTournamentRuleTableOuterClassPZgenerated/pb/tablebproto3
@@ -2860,6 +2914,47 @@ rarityTier2
 rare_ink_count (RrareInkCount$
 rare_gold_cost (RrareGoldCost
 enabled (Renabled:7Š¦SkillScrollCraft’¦SkillScrollCraft.xlsxš¦id°¦bproto3
+¿
+spiritshopgoods_table.protommorpg.cfgtable.v1cfg_options.proto"ð
+SpiritShopGoodsTable
+id (Rid
+tab_id (RtabId
+
+sort_order (R	sortOrder
+enabled (Renabled
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey#
+currency_type (RcurrencyType
+price	 (Rprice-
+max_buy_per_request
+ (RmaxBuyPerRequest$
+	item_id_1 (Bò¬ItemRitemId1 
+item_count_1 (R
+itemCount1 
+item_bound_1 (R
+itemBound1
+	item_id_2 (RitemId2 
+item_count_2 (R
+itemCount2 
+item_bound_2 (R
+itemBound2(
+limit_reset_kind (RlimitResetKind
+limit_count (R
+limitCount$
+limit_group_id (RlimitGroupId,
+limit_group_weight (RlimitGroupWeight
+
+badge_text (	R	badgeText:5Š¦SpiritShopGoods’¦SpiritShopGoods.xlsxš¦id°¦bproto3
+’
+ spiritshoplimitgroup_table.protommorpg.cfgtable.v1cfg_options.proto"¾
+SpiritShopLimitGroupTable
+id (Rid
+name (	Rname
+
+reset_kind (R	resetKind
+
+max_weight (R	maxWeight:?Š¦SpiritShopLimitGroup’¦SpiritShopLimitGroup.xlsxš¦id°¦bproto3
 Ï
 test_table.protommorpg.cfgtable.v1cfg_options.proto"S
 Testtestobj
@@ -2933,8 +3028,8 @@ mail_title
  (	R	mailTitle
 	mail_body (	RmailBody
 desc (	Rdesc:3Š¦TournamentReward’¦TournamentReward.xlsxš¦idbproto3
-ï
-tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"¡
+ã
+tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"•
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -2956,7 +3051,17 @@ mail_title
 qualifier_draw_points (RqualifierDrawPoints2
 qualifier_loss_points (RqualifierLossPoints,
 invite_ttl_seconds (RinviteTtlSeconds
-desc (	Rdesc:/Š¦TournamentRule’¦TournamentRule.xlsxš¦idbproto3
+desc (	Rdesc(
+bo3_top4_enabled (Rbo3Top4Enabled1
+intermission_seconds (RintermissionSeconds4
+public_knockout_replay (RpublicKnockoutReplay,
+salute_gold_amount (RsaluteGoldAmount.
+salute_item_id (Bò¬ItemRsaluteItemId*
+salute_item_count (RsaluteItemCount.
+warmup_spar_enabled (RwarmupSparEnabled-
+prediction_enabled (RpredictionEnabled;
+prediction_reward_min_hits (RpredictionRewardMinHits9
+third_place_match_enabled (RthirdPlaceMatchEnabled:/Š¦TournamentRule’¦TournamentRule.xlsxš¦idbproto3
 ›
 trialjournalentry_table.protommorpg.cfgtable.v1cfg_options.proto"Ê
 TrialJournalEntryTable

@@ -491,10 +491,45 @@ def pending_settlement_delay_ms(issued_ms: int, now_ms: int) -> int:
 # -- 终局原件与成局核对纯函数 ------------------------------------------------------------------------
 
 
-def spectate_visibility_for(mode: int, has_activity_context: bool) -> int:
-    """判定开局的观战可见性：帮会全天帮战永远公开；其余帮会活动与 PVE 单人私密，PVP 与公开组队公开。"""
-    if mode in GUILD_WAR_MODES:
+# 道友切磋坊自定义规则白名单（与 docs/design/wuxing-gameplay-expansions-v1.md 对齐）
+VALID_CUSTOM_DUEL_ROUND_LIMITS = frozenset((0, 8, 12, 20))
+DEFAULT_CUSTOM_DUEL_CHARACTER_PRESET_ID = 101
+DEFAULT_CUSTOM_DUEL_PET_PRESET_ID = 203
+
+
+def has_custom_duel_rules(rules: Message | None) -> bool:
+    """判定 CustomDuelRules 是否勾选了任意非默认自定义规则。"""
+    if rules is None:
+        return False
+    return bool(
+        getattr(rules, "use_free_preset", False)
+        or getattr(rules, "enable_polarity_rotation", False)
+        or int(getattr(rules, "round_limit_override", 0))
+        or getattr(rules, "ban_control_skills", False)
+        or getattr(rules, "allow_public_spectate", False)
+        or int(getattr(rules, "challenger_character_preset_id", 0))
+        or int(getattr(rules, "challenger_pet_preset_id", 0))
+    )
+
+
+def validate_custom_duel_rules(rules: Message | None) -> bool:
+    """校验道友切磋坊自定义规则白名单（回合上限仅允许 0/8/12/20）。"""
+    if rules is None:
+        return True
+    return int(getattr(rules, "round_limit_override", 0)) in VALID_CUSTOM_DUEL_ROUND_LIMITS
+
+
+def spectate_visibility_for(
+    mode: int,
+    has_activity_context: bool,
+    *,
+    allow_public_spectate: bool = False,
+) -> int:
+    """判定开局的观战可见性：帮战与锦标赛公开；自定义切磋按 allow_public_spectate 冻结；活动与单人 PVE 私密。"""
+    if mode in GUILD_WAR_MODES or mode == MODE_SEASON_TOURNAMENT:
         return SPECTATE_VISIBILITY_PUBLIC
+    if mode == MODE_PVP_CHALLENGE:
+        return SPECTATE_VISIBILITY_PUBLIC if allow_public_spectate else SPECTATE_VISIBILITY_PRIVATE
     if has_activity_context or mode == MODE_PVE_SOLO:
         return SPECTATE_VISIBILITY_PRIVATE
     return SPECTATE_VISIBILITY_PUBLIC

@@ -47,6 +47,7 @@ _EVENT_RESIST = 15
 _EVENT_SHIELD = 20
 _EVENT_ARTIFACT = 21
 EVENT_BOSS_MECHANIC = 22
+EVENT_WUXING_SYNERGY = 23
 
 _HIT_COUNTER = 2
 _HIT_REFLECT = 3
@@ -65,8 +66,17 @@ ACTION_TAG_PHYSICAL = 1
 ACTION_TAG_MAGIC = 2
 MATCH_MODE_PVE_SOLO = 4
 MATCH_MODE_PVE_TEAM = 5
+MATCH_MODE_PVP_CHALLENGE = 6
 MATCH_MODE_POLARITY_5V5 = 8
 MATCH_MODE_SEASON_TOURNAMENT = 11
+
+# 锦标赛 V2 & 五行幻境共享五行灵脉枚举（与 TournamentLeylineElement 逐项一致）
+TOURNAMENT_LEYLINE_UNSPECIFIED = 0
+TOURNAMENT_LEYLINE_METAL = 1
+TOURNAMENT_LEYLINE_WOOD = 2
+TOURNAMENT_LEYLINE_WATER = 3
+TOURNAMENT_LEYLINE_FIRE = 4
+TOURNAMENT_LEYLINE_EARTH = 5
 
 PVP_PRIMARY_FOCUS_NUM = 120
 PVP_PRIMARY_FOCUS_DEN = 100
@@ -1305,6 +1315,11 @@ class EquipmentBattleEffects:
                         contributions.append(idx)
                     bonus += bps / 10_000.0
             capacity_float = PetAndSupportEffects.apply_bonus(base_capacity, bonus)
+        if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WOOD:
+            capacity_float *= 110.0 / 100.0
+        support_bonus_pct = getattr(self.engine, "wuxing_support_bonus_pct", lambda _a: 0)(caster)
+        if support_bonus_pct > 0:
+            capacity_float *= (100.0 + support_bonus_pct) / 100.0
         if getattr(self.engine, "escalation_stacks", 0) > 0:
             capacity_float *= self.engine.escalation_support_pct / 100.0
         capacity = PetAndSupportEffects.whole(capacity_float)
@@ -1586,6 +1601,13 @@ class EquipmentBattleEffects:
             resist += 100.0 * combat.resist_confusion
         else:
             resist += 100.0 * combat.resist_forget
+        if ailment_kind in (4, 5):
+            resist += 10_000.0 * self.engine.configured.modifier(target, BattleModifier.CONTROL_RESIST)
+        if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WATER:
+            resist += 800.0
+        wuxing_ctrl_resist = getattr(self.engine, "wuxing_control_resist_pct", lambda _a: 0)(target)
+        if wuxing_ctrl_resist > 0:
+            resist += 100.0 * wuxing_ctrl_resist
 
         consumed_echo = False
         if is_primary and caster.HasField("equipment_effects"):
@@ -2485,11 +2507,15 @@ class EncounterV2Controller:
 
     def init_special_encounter_state(self) -> None:
         """开局初始化物法易势极性、护卫救援目标或首领试炼/瑞兽首轮预告。"""
-        if self.boss_trial_kind == BOSS_TRIAL_KIND_NONE:
-            return
-        if self.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5 or self.request.match_mode == MATCH_MODE_POLARITY_5V5:
+        if (
+            self.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5
+            or self.request.match_mode == MATCH_MODE_POLARITY_5V5
+            or getattr(self.engine, "custom_duel_polarity_enabled", False)
+        ):
             self.initial_polarity = _DAMAGE_PHYSICAL if self._rand_index(2) == 0 else _DAMAGE_MAGIC
             self.update_polarity_for_round()
+            return
+        if self.boss_trial_kind == BOSS_TRIAL_KIND_NONE:
             return
         if self.boss_trial_kind == BOSS_TRIAL_KIND_GUARDIAN_RESCUE:
             for actor in self.engine.actors.values():
@@ -2499,7 +2525,11 @@ class EncounterV2Controller:
         self.refresh_encounter_telegraphs()
 
     def update_polarity_for_round(self) -> None:
-        if self.boss_trial_kind != BOSS_TRIAL_KIND_POLARITY_5V5 and self.request.match_mode != MATCH_MODE_POLARITY_5V5:
+        if (
+            self.boss_trial_kind != BOSS_TRIAL_KIND_POLARITY_5V5
+            and self.request.match_mode != MATCH_MODE_POLARITY_5V5
+            and not getattr(self.engine, "custom_duel_polarity_enabled", False)
+        ):
             self.active_polarity = 0
             return
         if self.initial_polarity == 0:
@@ -3573,6 +3603,9 @@ class ConfiguredAbilitiesController:
     def effective_speed(self, actor: Message) -> int:
         base = self.engine._effective_stat(actor, 13)
         mult = max(0.1, 1.0 + self.modifier(actor, BattleModifier.SPEED))
+        speed_bonus_pct = getattr(self.engine, "wuxing_speed_bonus_pct", lambda _a: 0)(actor)
+        if speed_bonus_pct > 0:
+            mult *= (100.0 + speed_bonus_pct) / 100.0
         return PetAndSupportEffects.whole(float(base) * mult)
 
     def effective_mitigation_score(self, actor: Message, *, is_magic: bool) -> float:
@@ -3722,6 +3755,8 @@ class ConfiguredAbilitiesController:
     def check_skill(self, actor: Message, action: Message, rule: BattleSkill) -> int:
         """校验配置化战法的封印/专修禁攻、蓄力防重、冷却、次数、耗蓝与目标合法性。"""
         if not self.subject_allowed(actor, rule) or not rule.castable:
+            return 7004
+        if getattr(self.engine, "ban_control_skills", False) and self.engine.is_control_skill(rule):
             return 7004
         if (
             self.has_state(actor, BattleStateKind.SEAL_ACTIVE)
@@ -3911,6 +3946,11 @@ class ConfiguredAbilitiesController:
             else:
                 basis = float(caster.magic_attack) if row.value_basis == 2 else float(receiver.max_health) if row.value_basis == 4 else float(caster.physical_attack)
                 raw = PetAndSupportEffects.support_base_value(row.flat_value, row.per_level, caster.level, basis, row.ratio, rank)
+            if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WOOD:
+                raw *= 110.0 / 100.0
+            support_bonus_pct = getattr(self.engine, "wuxing_support_bonus_pct", lambda _a: 0)(caster)
+            if support_bonus_pct > 0:
+                raw *= (100.0 + support_bonus_pct) / 100.0
             if getattr(self.engine, "escalation_stacks", 0) > 0:
                 raw *= self.engine.escalation_support_pct / 100.0
             value = landed_heal(receiver, raw)
@@ -3945,6 +3985,16 @@ class ConfiguredAbilitiesController:
 
         # 持久化 Buff / 控制 / 蓄力 / 易伤 / 免控分支
         if hostile and op == BattleEffectOp.CONTROL and 1 <= row.state_kind <= 6:
+            if getattr(self.engine, "ban_control_skills", False):
+                turn.events.add(
+                    event_type=_EVENT_RESIST,
+                    source_id=caster.actor_id,
+                    target_id=receiver.actor_id,
+                    buff_table_id=buff_id,
+                    group_id=group,
+                    hit_index=hit,
+                )
+                return
             if self.try_consume_control_immunity(caster, receiver, buff_id, turn, group, hit):
                 return
             base_chance = row.application_chance if row.application_chance > 0.0 else 1.0
@@ -4197,3 +4247,324 @@ class ConfiguredAbilitiesController:
                     self.remove_buff(owner, bid, turn, group)
                 else:
                     owner.buffs[cur_idx].remaining_hits -= 1
+
+
+# ---------------------------------------------------------------------------
+# 9. 五行玩法扩展纯规则（对照 wuxing_expansion_rules.h）
+# ---------------------------------------------------------------------------
+
+WUXING_ELEMENT_NONE = 0
+WUXING_ELEMENT_METAL = 1
+WUXING_ELEMENT_WOOD = 2
+WUXING_ELEMENT_WATER = 3
+WUXING_ELEMENT_FIRE = 4
+WUXING_ELEMENT_EARTH = 5
+
+MAX_WUXING_FORMATION_ID = 5
+WUXING_TOWER_MAX_FLOORS = 10
+WUXING_TOWER_OFFER_COUNT = 3
+MAX_SAVED_BUILD_BOOKMARKS = 12
+WUXING_SYNERGY_INTERVAL_ROUNDS = 3
+WUXING_SYNERGY_BONUS_PCT = 10
+WUXING_FORMATION_COUNTER_BONUS_PCT = 5
+WUXING_FIRE_CRIT_BURN_CAP_PER_HIT = 1500
+
+_WUXING_DAY_MS = 86_400_000
+_WUXING_WEEK_MS = 7 * _WUXING_DAY_MS
+_WUXING_FIRST_MONDAY_05_UTC8_MS = 3 * _WUXING_DAY_MS + 21 * 3_600_000
+
+_TOWER_FLOOR_DUNGEONS: dict[int, int] = {
+    1: 101,
+    2: 103,
+    3: 105,
+    4: 107,
+    5: 103,
+    6: 101,
+    7: 105,
+    8: 107,
+    9: 103,
+    10: 107,
+}
+
+
+def wuxing_week_key(now_ms_val: int) -> int:
+    """按 UTC+8 周一 05:00 计算五行幻境周键（正整数单调递增）。"""
+    if now_ms_val < _WUXING_FIRST_MONDAY_05_UTC8_MS:
+        return 1
+    return int((now_ms_val - _WUXING_FIRST_MONDAY_05_UTC8_MS) // _WUXING_WEEK_MS) + 1
+
+
+def element_of_class(class_id: int) -> int:
+    """角色门派/职业映射到五行属性（1..5，0=无）。"""
+    return WUXING_ELEMENT_NONE if class_id == 0 else ((class_id - 1) % 5) + 1
+
+
+def element_of_pet(pet_table_id: int) -> int:
+    """灵宠表 ID 映射到五行属性（1..5，0=无）。"""
+    return WUXING_ELEMENT_NONE if pet_table_id == 0 else ((pet_table_id - 1) % 5) + 1
+
+
+def element_generates(producer: int, receiver: int) -> bool:
+    """五行相生链：金(1)→水(3)→木(2)→火(4)→土(5)→金(1)。"""
+    return (producer, receiver) in (
+        (WUXING_ELEMENT_METAL, WUXING_ELEMENT_WATER),
+        (WUXING_ELEMENT_WATER, WUXING_ELEMENT_WOOD),
+        (WUXING_ELEMENT_WOOD, WUXING_ELEMENT_FIRE),
+        (WUXING_ELEMENT_FIRE, WUXING_ELEMENT_EARTH),
+        (WUXING_ELEMENT_EARTH, WUXING_ELEMENT_METAL),
+    )
+
+
+def are_elements_mutually_generating(first: int, second: int) -> bool:
+    """判定两五行是否互为相生（人生宠或宠生人皆触发）。"""
+    return element_generates(first, second) or element_generates(second, first)
+
+
+def is_synergy_round(round_index: int) -> bool:
+    """判定指定回合是否触发人宠五行相生合击（第 3/6/9... 回合）。"""
+    return round_index > 0 and (round_index % WUXING_SYNERGY_INTERVAL_ROUNDS) == 0
+
+
+@dataclass(frozen=True, slots=True)
+class WuxingFormationDef:
+    """五套免费道家阵法定义（与 C++ `WuxingFormationDef` 逐项一致）。"""
+
+    id: int = 0
+    element: int = WUXING_ELEMENT_NONE
+    counters_id: int = 0
+    damage_bonus_pct: int = 0
+    damage_taken_reduce_pct: int = 0
+    speed_bonus_pct: int = 0
+    heal_shield_bonus_pct: int = 0
+    control_resist_pct: int = 0
+    round_mana_regen_pct: int = 0
+    crit_bonus_pct: int = 0
+    pet_damage_bonus_pct: int = 0
+    opening_shield_pct: int = 0
+
+
+_EMPTY_FORMATION = WuxingFormationDef()
+
+WUXING_FORMATIONS: tuple[WuxingFormationDef, ...] = (
+    # 1 天覆阵（金）：直伤 +5%、速度 +2%，克地载阵(2)
+    WuxingFormationDef(1, WUXING_ELEMENT_METAL, 2, damage_bonus_pct=5, speed_bonus_pct=2),
+    # 2 地载阵（土）：受击减伤 +6%、开局 4% 护盾，克风扬阵(3)
+    WuxingFormationDef(2, WUXING_ELEMENT_EARTH, 3, damage_taken_reduce_pct=6, opening_shield_pct=4),
+    # 3 风扬阵（木）：速度 +6%、治疗与护盾 +4%，克云垂阵(4)
+    WuxingFormationDef(3, WUXING_ELEMENT_WOOD, 4, speed_bonus_pct=6, heal_shield_bonus_pct=4),
+    # 4 云垂阵（水）：控制抗性 +8%、回合初回复 3% 法力，克虎翼阵(5)
+    WuxingFormationDef(4, WUXING_ELEMENT_WATER, 5, control_resist_pct=8, round_mana_regen_pct=3),
+    # 5 虎翼阵（火）：暴击率 +4%、出战灵宠伤害 +8%，克天覆阵(1)
+    WuxingFormationDef(5, WUXING_ELEMENT_FIRE, 1, crit_bonus_pct=4, pet_damage_bonus_pct=8),
+)
+
+
+def is_valid_formation_id(formation_id: int) -> bool:
+    """校验五行阵法 ID 是否合法（0..5）。"""
+    return 0 <= formation_id <= MAX_WUXING_FORMATION_ID
+
+
+def formation_of(formation_id: int) -> WuxingFormationDef:
+    """按阵法 ID 返回定义，0 或越界返回空阵法。"""
+    if 1 <= formation_id <= MAX_WUXING_FORMATION_ID:
+        return WUXING_FORMATIONS[formation_id - 1]
+    return _EMPTY_FORMATION
+
+
+def formation_counter_bonus_pct(attacker_formation_id: int, defender_formation_id: int) -> int:
+    """判定阵法克制环（1>2>3>4>5>1），克制方获得 +5% 直伤。"""
+    if not (1 <= attacker_formation_id <= MAX_WUXING_FORMATION_ID and 1 <= defender_formation_id <= MAX_WUXING_FORMATION_ID):
+        return 0
+    return (
+        WUXING_FORMATION_COUNTER_BONUS_PCT
+        if WUXING_FORMATIONS[attacker_formation_id - 1].counters_id == defender_formation_id
+        else 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WuxingTowerSigilDef:
+    """五行幻境 15 枚局内五行符印定义（与 C++ `WuxingTowerSigilDef` 逐项一致）。"""
+
+    id: int = 0
+    element: int = WUXING_ELEMENT_NONE
+    rarity: int = 1
+    damage_pct: int = 0
+    crit_pct: int = 0
+    crit_damage_pct: int = 0
+    shield_break_bonus_pct: int = 0
+    heal_shield_pct: int = 0
+    pet_damage_pct: int = 0
+    round_hp_regen_pct: int = 0
+    round_mana_regen_pct: int = 0
+    control_resist_pct: int = 0
+    on_hit_mana_regen_pct: int = 0
+    damage_taken_reduce_pct: int = 0
+    first3_rounds_damage_pct: int = 0
+    single_target_damage_pct: int = 0
+    crit_burn_max_hp_pct: int = 0
+    opening_shield_pct: int = 0
+    reflect_pct: int = 0
+
+
+WUXING_TOWER_SIGILS: tuple[WuxingTowerSigilDef, ...] = (
+    # 金系（101..103）
+    WuxingTowerSigilDef(101, WUXING_ELEMENT_METAL, 1, damage_pct=8),
+    WuxingTowerSigilDef(102, WUXING_ELEMENT_METAL, 2, crit_pct=12, shield_break_bonus_pct=25),
+    WuxingTowerSigilDef(103, WUXING_ELEMENT_METAL, 3, damage_pct=14, crit_damage_pct=20),
+    # 木系（201..203）
+    WuxingTowerSigilDef(201, WUXING_ELEMENT_WOOD, 1, heal_shield_pct=12),
+    WuxingTowerSigilDef(202, WUXING_ELEMENT_WOOD, 2, pet_damage_pct=18),
+    WuxingTowerSigilDef(203, WUXING_ELEMENT_WOOD, 3, pet_damage_pct=22, round_hp_regen_pct=5),
+    # 水系（301..303）
+    WuxingTowerSigilDef(301, WUXING_ELEMENT_WATER, 1, round_mana_regen_pct=8),
+    WuxingTowerSigilDef(302, WUXING_ELEMENT_WATER, 2, control_resist_pct=15, on_hit_mana_regen_pct=4),
+    WuxingTowerSigilDef(303, WUXING_ELEMENT_WATER, 3, round_mana_regen_pct=10, control_resist_pct=20, damage_taken_reduce_pct=8),
+    # 火系（401..403）
+    WuxingTowerSigilDef(401, WUXING_ELEMENT_FIRE, 1, first3_rounds_damage_pct=14),
+    WuxingTowerSigilDef(402, WUXING_ELEMENT_FIRE, 2, single_target_damage_pct=12),
+    WuxingTowerSigilDef(403, WUXING_ELEMENT_FIRE, 3, damage_pct=16, crit_burn_max_hp_pct=3),
+    # 土系（501..503）
+    WuxingTowerSigilDef(501, WUXING_ELEMENT_EARTH, 1, opening_shield_pct=12),
+    WuxingTowerSigilDef(502, WUXING_ELEMENT_EARTH, 2, reflect_pct=12),
+    WuxingTowerSigilDef(503, WUXING_ELEMENT_EARTH, 3, damage_taken_reduce_pct=12, opening_shield_pct=20, reflect_pct=15),
+)
+
+_TOWER_SIGIL_BY_ID: dict[int, WuxingTowerSigilDef] = {d.id: d for d in WUXING_TOWER_SIGILS}
+
+
+def find_tower_sigil(sigil_id: int) -> WuxingTowerSigilDef | None:
+    """按符印 ID 查找定义，不存在返回 None。"""
+    return _TOWER_SIGIL_BY_ID.get(sigil_id)
+
+
+def is_valid_tower_sigil_id(sigil_id: int) -> bool:
+    """校验符印 ID 是否属于 15 枚合法五行幻境符印。"""
+    return sigil_id in _TOWER_SIGIL_BY_ID
+
+
+@dataclass(slots=True)
+class WuxingTowerSigilBonuses:
+    """聚合本轮五行幻境全部已选符印的局内确定性加成。"""
+
+    damage_pct: int = 0
+    crit_pct: int = 0
+    crit_damage_pct: int = 0
+    shield_break_bonus_pct: int = 0
+    heal_shield_pct: int = 0
+    pet_damage_pct: int = 0
+    round_hp_regen_pct: int = 0
+    round_mana_regen_pct: int = 0
+    control_resist_pct: int = 0
+    on_hit_mana_regen_pct: int = 0
+    damage_taken_reduce_pct: int = 0
+    first3_rounds_damage_pct: int = 0
+    single_target_damage_pct: int = 0
+    crit_burn_max_hp_pct: int = 0
+    opening_shield_pct: int = 0
+    reflect_pct: int = 0
+
+
+def aggregate_tower_sigils(sigil_ids: Iterable[int]) -> WuxingTowerSigilBonuses:
+    """去重聚合已选幻境符印的数值加成（忽略重复 ID）。"""
+    total = WuxingTowerSigilBonuses()
+    seen: set[int] = set()
+    for sid in sigil_ids:
+        if sid in seen:
+            continue
+        defn = _TOWER_SIGIL_BY_ID.get(sid)
+        if defn is None:
+            continue
+        seen.add(sid)
+        total.damage_pct += defn.damage_pct
+        total.crit_pct += defn.crit_pct
+        total.crit_damage_pct += defn.crit_damage_pct
+        total.shield_break_bonus_pct += defn.shield_break_bonus_pct
+        total.heal_shield_pct += defn.heal_shield_pct
+        total.pet_damage_pct += defn.pet_damage_pct
+        total.round_hp_regen_pct += defn.round_hp_regen_pct
+        total.round_mana_regen_pct += defn.round_mana_regen_pct
+        total.control_resist_pct += defn.control_resist_pct
+        total.on_hit_mana_regen_pct += defn.on_hit_mana_regen_pct
+        total.damage_taken_reduce_pct += defn.damage_taken_reduce_pct
+        total.first3_rounds_damage_pct += defn.first3_rounds_damage_pct
+        total.single_target_damage_pct += defn.single_target_damage_pct
+        total.crit_burn_max_hp_pct += defn.crit_burn_max_hp_pct
+        total.opening_shield_pct += defn.opening_shield_pct
+        total.reflect_pct += defn.reflect_pct
+    return total
+
+
+def tower_floor_dungeon_id(floor: int) -> int:
+    """幻境层数映射到既有稳定首领试炼普通副本 ID。"""
+    return _TOWER_FLOOR_DUNGEONS.get(floor, 101)
+
+
+def tower_floor_leyline_element(week_key: int, floor: int) -> int:
+    """按周键与层数确定性计算本层环境五行灵脉（1..5）。"""
+    clamped = floor if 1 <= floor <= WUXING_TOWER_MAX_FLOORS else 1
+    return ((week_key + clamped - 1) % 5) + 1
+
+
+def tower_monster_health_pct(floor: int) -> int:
+    """计算五行幻境指定层数的怪物气血倍率百分比。"""
+    f = floor if 1 <= floor <= WUXING_TOWER_MAX_FLOORS else 1
+    pct = 85 + (f - 1) * 8
+    if f == 5:
+        pct += 10
+    if f == 10:
+        pct += 20
+    return pct
+
+
+def tower_monster_attack_pct(floor: int) -> int:
+    """计算五行幻境指定层数的怪物攻击倍率百分比。"""
+    f = floor if 1 <= floor <= WUXING_TOWER_MAX_FLOORS else 1
+    pct = 85 + (f - 1) * 5
+    if f == 5:
+        pct += 6
+    if f == 10:
+        pct += 12
+    return pct
+
+
+def mix_seed_u64(x: int) -> int:
+    """64 位无符号 SplitMix64 混淆（与 C++ `wuxing::MixSeed` 逐位一致）。"""
+    x = (x + 0x9E3779B97F4A7C15) & U64_MAX
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & U64_MAX
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & U64_MAX
+    return (x ^ (x >> 31)) & U64_MAX
+
+
+def roll_tower_sigil_offer(
+    week_key: int,
+    run_id: int,
+    cleared_floor: int,
+    owned_sigils: Sequence[int],
+) -> list[int]:
+    """确定性抽取 3 枚不重复且未持有的幻境符印（与 C++ `RollTowerSigilOffer` 逐项一致）。"""
+    owned = set(owned_sigils)
+    pool = [
+        defn.id
+        for defn in WUXING_TOWER_SIGILS
+        if defn.id not in owned and not (cleared_floor <= 3 and defn.rarity >= 3)
+    ]
+    if len(pool) < WUXING_TOWER_OFFER_COUNT:
+        pool = [defn.id for defn in WUXING_TOWER_SIGILS if defn.id not in owned]
+    offers: list[int] = []
+    seed_in = (
+        ((week_key & 0xFFFFFFFF) << 32)
+        ^ mix_seed_u64(run_id & U64_MAX)
+        ^ ((cleared_floor * 0x517CC1B727220A95) & U64_MAX)
+    ) & U64_MAX
+    state = mix_seed_u64(seed_in)
+    while pool and len(offers) < WUXING_TOWER_OFFER_COUNT:
+        state = mix_seed_u64(state)
+        idx = state % len(pool)
+        offers.append(pool.pop(idx))
+    return offers
+
+
+def is_valid_custom_duel_round_limit(round_limit_override: int) -> bool:
+    """自定义切磋回合上限白名单：0=默认；仅允许 8/12/20 回合。"""
+    return round_limit_override in (0, 8, 12, 20)

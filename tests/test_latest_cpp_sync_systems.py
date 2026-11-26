@@ -100,8 +100,8 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 72
-    assert len(pb_tables.tables) == 72
+    assert len(json_tables.tables) == 74
+    assert len(pb_tables.tables) == 74
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {
@@ -322,6 +322,12 @@ def test_tournament_all_eleven_rpcs_full_season_lifecycle():
             assert len(ov_live.featured_matches) == 1 and ov_live.featured_matches[0].battle_id == ko2.battle_id
 
             assert tm.apply_battle_result(ko2.battle_id, OUTCOME_SIDE_A_WIN)
+            # 现行配表启用 4 强 BO3（2 胜决出冠军）：局间 60s 冷却后自动推进至第 2 局并完成夺冠。
+            if tm.advance_season() != STAGE_SETTLED:
+                clock[0] += 61_000
+                launched = tm.take_due_intermission_launches()
+                assert len(launched) == 1
+                assert tm.apply_battle_result(launched[0][1], OUTCOME_SIDE_A_WIN)
             assert tm.advance_season() == STAGE_SETTLED
 
             # 11. ClaimTournamentReward：冠军队员 1 领冠军奖、观众 99 领助威命中奖、重复领取报错，冠军殿堂可见。

@@ -7,6 +7,16 @@ import time
 
 from ..data import StoreRejected, StoreUnavailable, client_request
 from ..data.asset_inventory import INVALID, UNAVAILABLE, balance, clone
+from .battle_dropin_effects import (
+    MAX_SAVED_BUILD_BOOKMARKS,
+    WUXING_TOWER_MAX_FLOORS,
+    is_valid_formation_id,
+    is_valid_tower_sigil_id,
+    roll_tower_sigil_offer,
+    tower_floor_dungeon_id,
+    tower_floor_leyline_element,
+    wuxing_week_key,
+)
 from .scene_mission import effective_level, now_ms
 from .scene_stats import rank_limit
 
@@ -16,6 +26,10 @@ _SERVICE = "SceneSeasonClientPlayer"
 _CLIENT_REQUEST_KIND_CATCHUP = 9
 _MAX_UINT64 = (1 << 64) - 1
 _MAX_CACHED_RECEIPTS = 256
+_MAX_BOOKMARK_TITLE_BYTES = 48
+_MAX_BOOKMARK_SKILLS = 12
+_MAX_TOWER_ACTIVE_SIGILS = 9
+_TOWER_LEADERBOARD_TOP_N = 20
 
 # 赛季规则硬安全边界（与 C++ season_rules.h 保持一致）。
 HARD_STAT_CAP_BPS = 500
@@ -225,8 +239,52 @@ def find_active_season_rule(tables, now_ms_val: int):
     return active
 
 
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """按 UTF-8 字节上限安全截断字符串，避免截断多字节字符。"""
+    cleaned = text.strip()
+    raw = cleaned.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return cleaned
+    return raw[:max_bytes].decode("utf-8", errors="ignore").strip()
+
+
+def _copy_bookmark_to_view(src, dst) -> None:
+    """将持久化配装收藏条目投影至客户端视图消息。"""
+    dst.bookmark_id = src.bookmark_id
+    dst.title = src.title
+    dst.source_battle_id = src.source_battle_id
+    dst.source_player_id = src.source_player_id
+    dst.source_player_name = src.source_player_name
+    dst.class_id = src.class_id
+    dst.formation_id = src.formation_id
+    dst.season_seal_id = src.season_seal_id
+    dst.active_pet_table_id = src.active_pet_table_id
+    dst.active_pet_name = src.active_pet_name
+    dst.skill_table_ids.extend(src.skill_table_ids)
+    dst.wuxing_sigil_ids.extend(src.wuxing_sigil_ids)
+    dst.saved_at_ms = src.saved_at_ms
+
+
+def _sync_tower_week(tower, week_key: int) -> bool:
+    """跨周自动重置五行幻境周位图与在途轮次，保留单调 run_id 与 revision。"""
+    if tower.week_key == week_key:
+        if tower.current_floor == 0:
+            tower.current_floor = 1
+        return False
+    tower.week_key = week_key
+    tower.run_active = False
+    tower.current_floor = 1
+    tower.run_total_rounds = 0
+    tower.ClearField("active_sigil_ids")
+    tower.ClearField("pending_offer_sigil_ids")
+    tower.weekly_cleared_mask = 0
+    tower.weekly_best_floor = 0
+    tower.weekly_best_rounds = 0
+    return True
+
+
 class SceneSeason:
-    """Scene 赛季技能与单槽赛季印服务，管理状态快照、切换与快捷追赶。"""
+    """Scene 赛季技能与单槽赛季印服务，管理状态快照、切换、快捷追赶、五行阵法/幻境爬塔与配装收藏。"""
 
     def __init__(self, scene, tables, assets=None, *, clock=now_ms) -> None:
         self.scene = scene
@@ -237,12 +295,21 @@ class SceneSeason:
         tx_types = self.protocol.pool.FindEnumTypeByName("TransactionType")
         self._debit_tx = tx_types.values_by_name["TX_CURRENCY_DEDUCT"].number
         self._catchup_receipts: dict[tuple[int, int], tuple[int, int]] = {}
+        # 五行幻境周最速榜内存快照：week_key -> {player_id: (best_floor, best_rounds, player_name, formation_id, sigil_ids)}
+        self._tower_leaderboards: dict[int, dict[int, tuple[int, int, str, int, tuple[int, ...]]]] = {}
 
     def register(self) -> None:
-        """向 SceneNode 注册赛季客户端 RPC。"""
+        """向 SceneNode 注册赛季及五行玩法扩展客户端 RPC（含 515..521）。"""
         self.scene.register(_SERVICE, "GetSeasonState", self.get_state)
         self.scene.register(_SERVICE, "EquipSeasonSeal", self.equip_seal, mutating=True)
         self.scene.register(_SERVICE, "CatchupSeasonSeal", self.catchup, mutating=True)
+        self.scene.register(_SERVICE, "EquipWuxingFormation", self.equip_wuxing_formation, mutating=True)
+        self.scene.register(_SERVICE, "GetWuxingTowerState", self.get_wuxing_tower_state)
+        self.scene.register(_SERVICE, "StartWuxingTowerRun", self.start_wuxing_tower_run, mutating=True)
+        self.scene.register(_SERVICE, "PickWuxingTowerSigil", self.pick_wuxing_tower_sigil, mutating=True)
+        self.scene.register(_SERVICE, "AbandonWuxingTowerRun", self.abandon_wuxing_tower_run, mutating=True)
+        self.scene.register(_SERVICE, "SaveBattleBuildBookmark", self.save_battle_build_bookmark, mutating=True)
+        self.scene.register(_SERVICE, "DeleteBattleBuildBookmark", self.delete_battle_build_bookmark, mutating=True)
 
     def validate_tables(self) -> bool:
         """启动前校验 SeasonRule 与 SeasonSeal 配表一致性。"""
@@ -375,6 +442,13 @@ class SceneSeason:
         out.server_now_ms = stamp
         if not data.HasField("level_component"):
             return SEASON_UNAVAILABLE
+        # 无论当前是否存在进行中的赛季，始终回填玩家已装配五行阵法与公开配装收藏夹。
+        comp = data.season_component
+        fid = int(comp.equipped_formation_id)
+        out.equipped_formation_id = fid if is_valid_formation_id(fid) else 0
+        for bookmark in comp.saved_builds:
+            _copy_bookmark_to_view(bookmark, out.saved_builds.add())
+
         rule = find_active_season_rule(self.tables, stamp)
         if rule is None:
             out.available = False
@@ -643,3 +717,362 @@ class SceneSeason:
         response.added_points = points_to_buy
         response.spent_currency = total_price
         return self._finish(response, player, data, stamp)
+
+    # ── 五行阵法 / 五行幻境周常爬塔 / 战报配装收藏夹（515..521） ──
+
+    async def equip_wuxing_formation(self, _world, player, _route, request):
+        """515 战外免费切换五行阵法（0..5，零数值付费）。"""
+        response = self.protocol.message("EquipWuxingFormationResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            return self._finish(response, player, data, stamp, SEASON_UNAVAILABLE)
+        fid = int(request.formation_id)
+        if not is_valid_formation_id(fid):
+            response.equipped_formation_id = int(data.season_component.equipped_formation_id)
+            return self._finish(response, player, data, stamp, INVALID)
+        if writable_err := self._writable_error(player):
+            response.equipped_formation_id = int(data.season_component.equipped_formation_id)
+            return self._finish(response, player, data, stamp, writable_err)
+
+        data.season_component.equipped_formation_id = fid
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            latest = self.scene.rows.assemble(player.snapshot)
+            response.equipped_formation_id = int(latest.season_component.equipped_formation_id)
+            return self._finish(response, player, latest, stamp, UNAVAILABLE)
+        response.equipped_formation_id = fid
+        logger.info("Equipped wuxing formation player_id=%s formation_id=%s", player.player_id, fid)
+        return self._finish(response, player, data, stamp)
+
+    def _fill_tower_state(self, data, stamp: int, out) -> None:
+        out.Clear()
+        wk = wuxing_week_key(stamp)
+        view_tower = self.protocol.message("WuxingTowerCompState")
+        if data.HasField("season_component") and data.season_component.HasField("wuxing_tower"):
+            view_tower.CopyFrom(data.season_component.wuxing_tower)
+        _sync_tower_week(view_tower, wk)
+        floor = view_tower.current_floor if 1 <= view_tower.current_floor <= WUXING_TOWER_MAX_FLOORS else 1
+        out.week_key = wk
+        out.run_active = bool(view_tower.run_active)
+        out.run_id = view_tower.run_id
+        out.current_floor = floor
+        out.max_floors = WUXING_TOWER_MAX_FLOORS
+        out.current_floor_dungeon_id = tower_floor_dungeon_id(floor)
+        out.current_floor_leyline_element = tower_floor_leyline_element(wk, floor)
+        out.run_total_rounds = view_tower.run_total_rounds
+        out.active_sigil_ids.extend(view_tower.active_sigil_ids)
+        out.pending_offer_sigil_ids.extend(view_tower.pending_offer_sigil_ids)
+        out.weekly_cleared_mask = view_tower.weekly_cleared_mask
+        out.weekly_best_floor = view_tower.weekly_best_floor
+        out.weekly_best_rounds = view_tower.weekly_best_rounds
+        out.revision = view_tower.revision
+
+        board = self._tower_leaderboards.get(wk, {})
+        ranked = sorted(
+            board.items(),
+            key=lambda kv: (-kv[1][0], kv[1][1] if kv[1][1] > 0 else (1 << 30), kv[0]),
+        )[:_TOWER_LEADERBOARD_TOP_N]
+        for rank_idx, (pid, (best_floor, best_rounds, pname, fid, sigils)) in enumerate(ranked, start=1):
+            entry = out.weekly_leaderboard.add(
+                rank=rank_idx,
+                player_id=pid,
+                player_name=pname,
+                best_floor=best_floor,
+                best_rounds=best_rounds,
+                formation_id=fid,
+            )
+            entry.sigil_ids.extend(sigils)
+
+    def _finish_tower(self, response, data, stamp: int, error: int = 0):
+        if error:
+            response.error_message.id = error
+        self._fill_tower_state(data, stamp, response.state)
+        return response
+
+    def get_wuxing_tower_state(self, _world, player, _route, _request):
+        """516 查询五行幻境周常爬塔状态与本周最速流派榜（只读）。"""
+        response = self.protocol.message("GetWuxingTowerStateResponse")
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        return self._finish_tower(response, data, self.clock())
+
+    async def start_wuxing_tower_run(self, _world, player, _route, _request):
+        """517 开启新一轮五行幻境周常爬塔（从第 1 层起，清空旧局内符印）。"""
+        response = self.protocol.message("StartWuxingTowerRunResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        if writable_err := self._writable_error(player):
+            return self._finish_tower(response, data, stamp, writable_err)
+
+        wk = wuxing_week_key(stamp)
+        tower = data.season_component.wuxing_tower
+        _sync_tower_week(tower, wk)
+        if tower.run_active:
+            return self._finish_tower(response, data, stamp, INVALID)
+
+        tower.run_active = True
+        if tower.run_id < _MAX_UINT64:
+            tower.run_id += 1
+        tower.current_floor = 1
+        tower.run_total_rounds = 0
+        tower.ClearField("active_sigil_ids")
+        tower.ClearField("pending_offer_sigil_ids")
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info("Started wuxing tower run player_id=%s week_key=%s run_id=%s", player.player_id, wk, tower.run_id)
+        return self._finish_tower(response, data, stamp)
+
+    async def pick_wuxing_tower_sigil(self, _world, player, _route, request):
+        """518 通关一层后从三选一候选中确定选择一枚局内五行符印。"""
+        response = self.protocol.message("PickWuxingTowerSigilResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        if writable_err := self._writable_error(player):
+            return self._finish_tower(response, data, stamp, writable_err)
+
+        wk = wuxing_week_key(stamp)
+        tower = data.season_component.wuxing_tower
+        _sync_tower_week(tower, wk)
+        sigil_id = int(request.sigil_id)
+        if (
+            not tower.run_active
+            or request.expected_run_id != tower.run_id
+            or not tower.pending_offer_sigil_ids
+            or sigil_id not in tower.pending_offer_sigil_ids
+            or not is_valid_tower_sigil_id(sigil_id)
+            or sigil_id in tower.active_sigil_ids
+            or len(tower.active_sigil_ids) >= _MAX_TOWER_ACTIVE_SIGILS
+        ):
+            return self._finish_tower(response, data, stamp, INVALID)
+
+        tower.active_sigil_ids.append(sigil_id)
+        tower.ClearField("pending_offer_sigil_ids")
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info(
+            "Picked wuxing tower sigil player_id=%s run_id=%s sigil_id=%s active_count=%s",
+            player.player_id, tower.run_id, sigil_id, len(tower.active_sigil_ids),
+        )
+        return self._finish_tower(response, data, stamp)
+
+    async def abandon_wuxing_tower_run(self, _world, player, _route, request):
+        """519 放弃当前在途五行幻境爬塔轮次并立即清空局内符印。"""
+        response = self.protocol.message("AbandonWuxingTowerRunResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        if writable_err := self._writable_error(player):
+            return self._finish_tower(response, data, stamp, writable_err)
+
+        wk = wuxing_week_key(stamp)
+        tower = data.season_component.wuxing_tower
+        _sync_tower_week(tower, wk)
+        if not tower.run_active or (request.expected_run_id and request.expected_run_id != tower.run_id):
+            return self._finish_tower(response, data, stamp, INVALID)
+
+        abandoned_run = tower.run_id
+        tower.run_active = False
+        tower.current_floor = 1
+        tower.run_total_rounds = 0
+        tower.ClearField("active_sigil_ids")
+        tower.ClearField("pending_offer_sigil_ids")
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info("Abandoned wuxing tower run player_id=%s run_id=%s", player.player_id, abandoned_run)
+        return self._finish_tower(response, data, stamp)
+
+    def settle_wuxing_tower_battle(
+        self,
+        data,
+        settlement,
+        *,
+        now_ms_val: int | None = None,
+        player_name: str = "",
+    ) -> bool:
+        """幂等推进五行幻境单层结算：校验 (week_key, run_id, floor) 与待选符印为空，通关 1..9 层生成三选一，第 10 层入榜。"""
+        if not settlement.HasField("tower_settlement"):
+            return False
+        player_won = (
+            (settlement.outcome == 1 and settlement.player_team_index == 0)
+            or (settlement.outcome == 2 and settlement.player_team_index == 1)
+        )
+        if not player_won or settlement.fled:
+            return False
+        echo = settlement.tower_settlement
+        stamp = self.clock() if now_ms_val is None else now_ms_val
+        wk = wuxing_week_key(stamp)
+        if echo.week_key != wk or not (1 <= echo.floor <= WUXING_TOWER_MAX_FLOORS):
+            return False
+        tower = data.season_component.wuxing_tower
+        _sync_tower_week(tower, wk)
+        if (
+            not tower.run_active
+            or tower.run_id != echo.run_id
+            or tower.current_floor != echo.floor
+            or tower.pending_offer_sigil_ids
+        ):
+            return False
+
+        floor = int(echo.floor)
+        tower.weekly_cleared_mask |= 1 << (floor - 1)
+        tower.run_total_rounds += max(1, int(echo.total_rounds or settlement.total_rounds or 1))
+        if floor > tower.weekly_best_floor:
+            tower.weekly_best_floor = floor
+
+        if floor < WUXING_TOWER_MAX_FLOORS:
+            tower.current_floor = floor + 1
+            offers = roll_tower_sigil_offer(wk, tower.run_id, floor, list(tower.active_sigil_ids))
+            tower.pending_offer_sigil_ids.extend(offers)
+        else:
+            if tower.weekly_best_rounds == 0 or tower.run_total_rounds < tower.weekly_best_rounds:
+                tower.weekly_best_rounds = tower.run_total_rounds
+            pname = player_name or (data.profile_component.name if data.HasField("profile_component") else "")
+            fid = int(data.season_component.equipped_formation_id)
+            sigil_tuple = tuple(tower.active_sigil_ids)
+            board = self._tower_leaderboards.setdefault(wk, {})
+            prev = board.get(data.player_id)
+            if prev is None or floor > prev[0] or (floor == prev[0] and tower.weekly_best_rounds < prev[1]):
+                board[data.player_id] = (floor, tower.weekly_best_rounds, pname, fid, sigil_tuple)
+            tower.run_active = False
+            tower.current_floor = 1
+            tower.ClearField("active_sigil_ids")
+            tower.ClearField("pending_offer_sigil_ids")
+
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+        return True
+
+    async def save_battle_build_bookmark(self, _world, player, _route, request):
+        """520 保存或更新战报公开脱敏配装收藏（单角色硬上限 12 条，按 bookmark_id 幂等覆盖）。"""
+        response = self.protocol.message("SaveBattleBuildBookmarkResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        comp = data.season_component
+
+        def _finish_bm(error: int = 0, saved_entry=None):
+            if error:
+                response.error_message.id = error
+            if saved_entry is not None:
+                _copy_bookmark_to_view(saved_entry, response.saved)
+            for item in comp.saved_builds:
+                _copy_bookmark_to_view(item, response.all_bookmarks.add())
+            return response
+
+        if not data.HasField("level_component"):
+            return _finish_bm(SEASON_UNAVAILABLE)
+        if writable_err := self._writable_error(player):
+            return _finish_bm(writable_err)
+        if not request.HasField("bookmark"):
+            return _finish_bm(INVALID)
+
+        incoming = request.bookmark
+        existing = (
+            next((b for b in comp.saved_builds if b.bookmark_id == incoming.bookmark_id), None)
+            if incoming.bookmark_id
+            else None
+        )
+        if existing is None and len(comp.saved_builds) >= MAX_SAVED_BUILD_BOOKMARKS:
+            return _finish_bm(INVALID)
+
+        if existing is not None:
+            target = existing
+            bookmark_id = existing.bookmark_id
+        else:
+            bookmark_id = incoming.bookmark_id or (max((b.bookmark_id for b in comp.saved_builds), default=0) + 1)
+            target = comp.saved_builds.add()
+
+        target.Clear()
+        target.bookmark_id = bookmark_id
+        target.title = _truncate_utf8(incoming.title, _MAX_BOOKMARK_TITLE_BYTES) or "配装方案"
+        target.source_battle_id = incoming.source_battle_id
+        target.source_player_id = incoming.source_player_id
+        target.source_player_name = _truncate_utf8(incoming.source_player_name, _MAX_BOOKMARK_TITLE_BYTES)
+        target.class_id = incoming.class_id
+        target.formation_id = incoming.formation_id if is_valid_formation_id(incoming.formation_id) else 0
+        target.season_seal_id = incoming.season_seal_id
+        target.active_pet_table_id = incoming.active_pet_table_id
+        target.active_pet_name = _truncate_utf8(incoming.active_pet_name, _MAX_BOOKMARK_TITLE_BYTES)
+        seen_skills: set[int] = set()
+        for sid in incoming.skill_table_ids:
+            if sid and sid not in seen_skills:
+                seen_skills.add(sid)
+                target.skill_table_ids.append(sid)
+                if len(target.skill_table_ids) >= _MAX_BOOKMARK_SKILLS:
+                    break
+        seen_sigils: set[int] = set()
+        for sg in incoming.wuxing_sigil_ids:
+            if is_valid_tower_sigil_id(sg) and sg not in seen_sigils:
+                seen_sigils.add(sg)
+                target.wuxing_sigil_ids.append(sg)
+                if len(target.wuxing_sigil_ids) >= _MAX_TOWER_ACTIVE_SIGILS:
+                    break
+        target.saved_at_ms = stamp
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            latest = self.scene.rows.assemble(player.snapshot)
+            comp = latest.season_component
+            return _finish_bm(UNAVAILABLE)
+        logger.info("Saved battle build bookmark player_id=%s bookmark_id=%s", player.player_id, bookmark_id)
+        return _finish_bm(0, target)
+
+    async def delete_battle_build_bookmark(self, _world, player, _route, request):
+        """521 删除指定战报配装收藏条目。"""
+        response = self.protocol.message("DeleteBattleBuildBookmarkResponse")
+        data = self.scene.rows.assemble(player.snapshot)
+        comp = data.season_component
+
+        def _finish_del(error: int = 0):
+            if error:
+                response.error_message.id = error
+            for item in comp.saved_builds:
+                _copy_bookmark_to_view(item, response.all_bookmarks.add())
+            return response
+
+        if not data.HasField("level_component"):
+            return _finish_del(SEASON_UNAVAILABLE)
+        if writable_err := self._writable_error(player):
+            return _finish_del(writable_err)
+        if not request.bookmark_id:
+            return _finish_del(INVALID)
+        idx = next((i for i, b in enumerate(comp.saved_builds) if b.bookmark_id == request.bookmark_id), -1)
+        if idx < 0:
+            return _finish_del(INVALID)
+
+        del comp.saved_builds[idx]
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            latest = self.scene.rows.assemble(player.snapshot)
+            comp = latest.season_component
+            return _finish_del(UNAVAILABLE)
+        logger.info("Deleted battle build bookmark player_id=%s bookmark_id=%s", player.player_id, request.bookmark_id)
+        return _finish_del(0)
