@@ -20,6 +20,7 @@ from .scene_skill_craft import (
     MASTERY_ARTISAN,
     MASTERY_MASTER,
     forge_top_quality_rate_bps,
+    get_proxy_stall_directory,
     mastery_next_exp,
     mastery_tier_for_exp,
     mastery_tier_name,
@@ -143,8 +144,49 @@ def resolve_game_week(now_ms_val: int) -> tuple[int, int] | None:
 
 
 def maximum_source_bps(effect: int) -> int:
-    """返回装备同类固定词条全身上限（万分比）。"""
+    """返回装备同类固定词条全身上限（未强化表上限，万分比）。"""
     return _MAX_SOURCE_BPS.get(effect, 0)
+
+
+# 控辅 V1 基础装固定词条强化克制份额（与 C++ equip_attribute_rules.h / Java EquipmentRules 逐比特一致）。
+V1_SUPPORT_ENHANCE_SHARE_PERMYRIAD = 5000  # 50%：施放治疗(5)、护盾容量(6)
+V1_CONTROL_ENHANCE_SHARE_PERMYRIAD = 2500  # 25%：控场命中(11)
+V1_TOP_ENHANCE_BONUS_PERMYRIAD = 2400      # +11 顶级强化增幅 24%
+
+
+def v1_fixed_affix_enhance_share_permyriad(equip_profile: int, effect: int) -> int:
+    if equip_profile != 1:
+        return 0
+    if effect in (5, 6):
+        return V1_SUPPORT_ENHANCE_SHARE_PERMYRIAD
+    if effect == 11:
+        return V1_CONTROL_ENHANCE_SHARE_PERMYRIAD
+    return 0
+
+
+def v1_fixed_affix_enhance_bonus_permyriad(
+    equip_profile: int, effect: int, item_enhance_bonus_permyriad: int,
+) -> int:
+    share = v1_fixed_affix_enhance_share_permyriad(equip_profile, effect)
+    if not share or item_enhance_bonus_permyriad <= 0:
+        return 0
+    return (int(item_enhance_bonus_permyriad) * share) // 10_000
+
+
+def scale_v1_fixed_affix_by_enhance(
+    equip_profile: int, effect: int, value_bps: int, item_enhance_bonus_permyriad: int,
+) -> int:
+    affix_bonus = v1_fixed_affix_enhance_bonus_permyriad(
+        equip_profile, effect, item_enhance_bonus_permyriad,
+    )
+    if affix_bonus <= 0 or value_bps <= 0:
+        return int(value_bps)
+    val = int(value_bps)
+    return val + (val * affix_bonus) // 10_000
+
+
+def max_v1_fixed_affix_effective_cap(effect: int, base_cap_bps: int) -> int:
+    return scale_v1_fixed_affix_by_enhance(1, effect, base_cap_bps, V1_TOP_ENHANCE_BONUS_PERMYRIAD)
 
 
 def pool_for(profile: int, slot: int) -> int:
@@ -424,13 +466,40 @@ class SceneEquipCraft:
             return roll_quality_tier(tuple(weights), random.randrange(total))
         return MAX_QUALITY_TIER
 
-    def _fill_affix_instance(self, affix_row, selected, out) -> None:
+    def _v1_item_enhance_bonus(self, item, row) -> int:
+        if (
+            self._item_profile(row) != 1
+            or not item.HasField("equip")
+            or not item.equip.enhance_level
+        ):
+            return 0
+        from .scene_player import _enhance_row_for_profile, _max_enhance_level_for_profile
+        max_lvl = _max_enhance_level_for_profile(self.tables, 1)
+        if not max_lvl:
+            return 0
+        lvl = min(int(item.equip.enhance_level), max_lvl)
+        cur = _enhance_row_for_profile(self.tables, 1, lvl)
+        if cur is None or cur.bonus_permyriad > V1_TOP_ENHANCE_BONUS_PERMYRIAD:
+            return 0
+        return int(cur.bonus_permyriad)
+
+    def _fill_affix_instance(
+        self, affix_row, selected, out, *, equip_profile: int = 0, enhance_bonus: int = 0,
+    ) -> None:
         _fill_affix_info(affix_row, out)
         exempt = is_polish_exempt(affix_row.effect)
         tier = effective_quality_tier(int(selected.quality_tier), exempt)
         ratio = self._quality_ratio_pct(tier)
+        quality_scaled = scale_value_by_quality(affix_row.value_permyriad, ratio)
+        effective_val = scale_v1_fixed_affix_by_enhance(
+            equip_profile, affix_row.effect, quality_scaled, enhance_bonus,
+        )
         out.max_value_bps = int(affix_row.value_permyriad)
-        out.value_bps = scale_value_by_quality(affix_row.value_permyriad, ratio)
+        out.value_bps = effective_val
+        if enhance_bonus > 0 and v1_fixed_affix_enhance_share_permyriad(equip_profile, affix_row.effect) > 0:
+            out.source_cap_bps = scale_v1_fixed_affix_by_enhance(
+                equip_profile, affix_row.effect, int(affix_row.source_cap), enhance_bonus,
+            )
         out.quality_tier = tier
         out.quality_name = self._quality_name(tier)
         out.quality_ratio_pct = ratio
@@ -449,7 +518,7 @@ class SceneEquipCraft:
         out.top_quality_rate_bps = forge_top_quality_rate_bps(tier)
 
     def fill_v1_display(self, item, info) -> None:
-        """为 BagItemInfo 补充 V1 固定词条槽位（含品相缩放与保底进度）与法宝展示数据。"""
+        """为 BagItemInfo 补充 V1 固定词条槽位（含品相与控辅强化缩放、保底进度）与法宝展示数据。"""
         row = self.tables["Item"].get(item.config_id)
         if row is None:
             return
@@ -459,6 +528,7 @@ class SceneEquipCraft:
         info.ClearField("artifact")
         if profile in (1, 2):
             valid = self._valid_selections(item, profile)
+            enhance_bonus = self._v1_item_enhance_bonus(item, row) if (valid and profile == 1) else 0
             for slot in (1, 2):
                 shown = info.fixed_affix_slots.add(slot=slot, pool=pool_for(profile, slot))
                 if not valid:
@@ -467,14 +537,17 @@ class SceneEquipCraft:
                     if selected.slot == slot:
                         affix = self.tables["EquipV1Affix"].get(selected.affix_id)
                         if affix is not None:
-                            self._fill_affix_instance(affix, selected, shown.selected)
+                            self._fill_affix_instance(
+                                affix, selected, shown.selected,
+                                equip_profile=profile, enhance_bonus=enhance_bonus,
+                            )
         elif profile == 3 and "EquipArtifact" in self.tables.tables:
             artifact = self.tables["EquipArtifact"].get(getattr(row, "artifact_id", 0))
             if artifact is not None and _valid_artifact_row(artifact):
                 _fill_artifact_info(artifact, info.artifact)
 
     def collect_effects(self, data, effects) -> None:
-        """汇总已穿戴 V1 装备固定词条（含品相缩放与同类上限）、法宝效果及当季赛季印轻属性。"""
+        """汇总已穿戴 V1 装备固定词条（含品相与控辅强化克制缩放、动态上限）、法宝效果及当季赛季印轻属性。"""
         effects.Clear()
         if self.assets is None:
             return
@@ -494,6 +567,7 @@ class SceneEquipCraft:
             if not item.HasField("equip") or not self._valid_selections(item, profile):
                 effects.support_sources_complete = False
                 continue
+            item_enhance_bonus = self._v1_item_enhance_bonus(item, row) if profile == 1 else 0
             for selected in item.equip.fixed_affixes:
                 affix = self.tables["EquipV1Affix"].get(selected.affix_id)
                 if affix is None:
@@ -501,13 +575,22 @@ class SceneEquipCraft:
                     continue
                 exempt = is_polish_exempt(affix.effect)
                 tier = effective_quality_tier(int(selected.quality_tier), exempt)
-                scaled_val = scale_value_by_quality(affix.value_permyriad, self._quality_ratio_pct(tier))
+                quality_scaled = scale_value_by_quality(affix.value_permyriad, self._quality_ratio_pct(tier))
+                scaled_val = scale_v1_fixed_affix_by_enhance(
+                    profile, affix.effect, quality_scaled, item_enhance_bonus,
+                )
+                chan_enhance = (
+                    item_enhance_bonus
+                    if v1_fixed_affix_enhance_share_permyriad(profile, affix.effect) > 0
+                    else 0
+                )
                 key = (int(affix.effect), int(affix.effect_param))
                 if key not in values:
-                    values[key] = [scaled_val, int(affix.source_cap)]
+                    values[key] = [scaled_val, int(affix.source_cap), chan_enhance]
                 else:
                     values[key][0] += scaled_val
                     values[key][1] = min(values[key][1], int(affix.source_cap))
+                    values[key][2] = max(values[key][2], chan_enhance)
                 if affix.effect in (5, 6):
                     src = effects.support_sources.add()
                     src.kind = 1
@@ -520,8 +603,13 @@ class SceneEquipCraft:
             if profile == 3:
                 artifacts.append((int(item.item_id), row))
 
-        for (eff, param), (total_val, cap_val) in values.items():
-            capped = min(total_val, cap_val)
+        support_effective_caps = {1: 3200, 2: 3200}
+        for (eff, param), (total_val, cap_val, max_enh) in values.items():
+            effective_cap = (
+                scale_v1_fixed_affix_by_enhance(1, eff, cap_val, max_enh)
+                if max_enh > 0 else cap_val
+            )
+            capped = min(total_val, effective_cap)
             if eff == 1:
                 effects.physical_attack_bps = capped
             elif eff == 2:
@@ -532,8 +620,10 @@ class SceneEquipCraft:
                 effects.speed_bps = capped
             elif eff == 5:
                 effects.outgoing_heal_bps = capped
+                support_effective_caps[1] = effective_cap
             elif eff == 6:
                 effects.shield_capacity_bps = capped
+                support_effective_caps[2] = effective_cap
             elif eff == 7:
                 effects.physical_crit_bps = capped
             elif eff == 8:
@@ -557,6 +647,7 @@ class SceneEquipCraft:
             for s in support_list:
                 out_s = effects.support_sources.add()
                 out_s.CopyFrom(s)
+                out_s.source_cap_bps = support_effective_caps[2 if out_s.effect_kind == 2 else 1]
                 if out_s.effect_kind == 2:
                     contrib = min(shield_left, int(out_s.raw_bonus_bps))
                     shield_left -= contrib
@@ -1132,27 +1223,25 @@ class SceneEquipCraft:
             return 0
         if proxy_master_id == buyer_id:
             return EQUIP_PROXY_MASTER_UNAVAILABLE
-        master = self._find_online_player(proxy_master_id)
-        if master is None or not self.scene.mutable(master):
-            return EQUIP_PROXY_MASTER_UNAVAILABLE
-        master_data = self.scene.rows.assemble(master.snapshot)
-        mc = master_data.craft_component
+        stall = get_proxy_stall_directory(self.scene).find(proxy_master_id)
         if (
-            not mc.proxy_stall_open
-            or mastery_tier_for_exp(int(mc.forge_mastery_exp)) < MASTERY_MASTER
-            or not valid_proxy_fee(int(mc.proxy_forge_fee_gold))
+            stall is None
+            or stall.forge_mastery_tier < MASTERY_MASTER
+            or not valid_proxy_fee(int(stall.proxy_forge_fee_gold))
         ):
             return EQUIP_PROXY_MASTER_UNAVAILABLE
-        fee = int(mc.proxy_forge_fee_gold)
+        fee = int(stall.proxy_forge_fee_gold)
         net_fee = proxy_net_gold(fee)
+        outbox = getattr(self.scene, "mail_outbox", None)
         if net_fee > 0 and (
-            self.assets.currency_blocked(master_data, 0)
-            or self.assets.credit_overflows(master_data, 0, net_fee)
+            outbox is None
+            or not outbox.can_accept(buyer_data)
+            or (hasattr(self.assets, "currency_globally_blocked") and self.assets.currency_globally_blocked(0))
         ):
             return EQUIP_PROXY_MASTER_UNAVAILABLE
         prepared["proxy_master_player_id"] = proxy_master_id
         prepared["proxy_fee_gold"] = fee
-        prepared["proxy_master_name"] = self._display_name(master_data, proxy_master_id)
+        prepared["proxy_master_name"] = stall.master_name or f"宗师#{proxy_master_id}"
         prepared["effective_mastery_tier"] = MASTERY_MASTER
         return 0
 
@@ -1917,6 +2006,19 @@ class SceneEquipCraft:
         if op in (_OP_CREATE_ITEM, _OP_INSTALL_AFFIX, _OP_POLISH_AFFIX) and not prepared["proxy_master_player_id"]:
             if staged.HasField("craft_component") and staged.craft_component.forge_mastery_exp < (1 << 32) - 1:
                 staged.craft_component.forge_mastery_exp += 1
+        if prepared["proxy_master_player_id"]:
+            net_fee = proxy_net_gold(prepared["proxy_fee_gold"])
+            if net_fee > 0:
+                outbox = getattr(self.scene, "mail_outbox", None)
+                if outbox is None or not await outbox.prepare_proxy_fee(
+                    staged,
+                    recipient_player_id=prepared["proxy_master_player_id"],
+                    net_gold=net_fee,
+                    source_id=request.client_request_id,
+                    buyer_name=self._display_name(staged, player.player_id),
+                ):
+                    return reject(EQUIP_PROXY_MASTER_UNAVAILABLE)
+
         client_request.remember(
             staged.client_request_ledger,
             request.client_request_id,
@@ -1934,20 +2036,6 @@ class SceneEquipCraft:
         )
         if not saved:
             return reject(UNAVAILABLE, known=False)
-
-        if prepared["proxy_master_player_id"]:
-            proxy_master = self._find_online_player(prepared["proxy_master_player_id"])
-            net_fee = proxy_net_gold(prepared["proxy_fee_gold"])
-            if proxy_master is not None and net_fee > 0:
-                master_staged = clone(self.scene.rows.assemble(proxy_master.snapshot))
-                if not self.assets.add_currency(master_staged, 0, net_fee):
-                    try:
-                        await self.scene.commit_player_data(proxy_master, master_staged)
-                    except (StoreRejected, StoreUnavailable, OSError):
-                        logger.warning(
-                            "Proxy master forge fee credit failed master_id=%s fee=%s",
-                            prepared["proxy_master_player_id"], net_fee,
-                        )
 
         self._set_forge_revision(player.player_id, staged, next_rev)
         if op != _OP_CREATE_ITEM and prepared["holder"] == 2:

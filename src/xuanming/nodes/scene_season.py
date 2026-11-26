@@ -10,6 +10,7 @@ from ..data.asset_inventory import INVALID, UNAVAILABLE, balance, clone
 from .battle_dropin_effects import (
     MAX_SAVED_BUILD_BOOKMARKS,
     WUXING_TOWER_MAX_FLOORS,
+    SeasonBattleRules,
     is_valid_formation_id,
     is_valid_tower_sigil_id,
     roll_tower_sigil_offer,
@@ -35,7 +36,10 @@ _TOWER_LEADERBOARD_TOP_N = 20
 HARD_STAT_CAP_BPS = 500
 HARD_MAX_PROGRESS_POINTS = 1000
 HARD_MAX_CATCHUP_PRICE_PER_POINT = 1_000_000_000
-MAX_VALID_CURRENCY_TYPE = 2
+MAX_VALID_CURRENCY_TYPE = 3
+MIN_CYCLE_DURATION_DAYS = 7
+MAX_CYCLE_DURATION_DAYS = 180
+_MS_PER_DAY = 24 * 3600 * 1000
 
 # 赛季错误码（与 C++ season_error_tip.pb.h 严格对齐）。
 SEASON_NOT_OPEN = 34000
@@ -50,6 +54,8 @@ SEASON_FROZEN = 34008
 SEASON_IN_BATTLE = 34009
 SEASON_SKILL_NO_UPGRADE = 34010
 SEASON_UNAVAILABLE = 34011
+SEASON_HONOR_ALREADY_UNLOCKED = 34012
+SEASON_HONOR_TARGET_INVALID = 34013
 
 # MatchMode 枚举数值（保留既有 scene_season 映射以兼容旧单测；is_eligible_battle 严格按 proto MatchMode 判定）。
 _PVE_MODES = frozenset({1, 2})
@@ -158,22 +164,203 @@ def validate_rule(row) -> str | None:
         return "catchup_price_per_point exceeds limit"
     if not row.default_seal_id:
         return "default_seal_id must be non-zero"
+    cycle_days = int(getattr(row, "cycle_duration_days", 0))
+    if cycle_days != 0 and not (MIN_CYCLE_DURATION_DAYS <= cycle_days <= MAX_CYCLE_DURATION_DAYS):
+        return "cycle_duration_days must be 0 or in [7, 180]"
     return None
 
 
 def valid_seal_row(seal) -> bool:
-    """校验单条 SeasonSeal 配置行是否合法。"""
-    if not seal.season_id or not seal.id:
-        return False
-    return valid_artifact_definition(
-        seal.effect_id,
-        seal.bonus_bps,
-        seal.cap_bps,
-        seal.per_round_limit,
-        seal.battle_limit,
-        seal.active_rounds,
-        seal.health_threshold_bps,
+    """校验单条 SeasonSeal 配置行是否合法（含禁控印与表驱动共鸣硬上限）。"""
+    return SeasonBattleRules.valid_seal_definition(
+        int(seal.season_id),
+        int(seal.id),
+        int(seal.effect_id),
+        int(seal.bonus_bps),
+        int(seal.cap_bps),
+        int(seal.per_round_limit),
+        int(seal.battle_limit),
+        int(seal.active_rounds),
+        int(seal.health_threshold_bps),
+        int(getattr(seal, "resonance_skill_id", 0)),
+        int(getattr(seal, "resonance_kind", 0)),
+        int(getattr(seal, "resonance_param", 0)),
     )
+
+
+def validate_schedule(rules) -> str | None:
+    """校验整张 SeasonRule 排期（固定单季窗 vs 无限期号自动循环）。"""
+    any_cycle = False
+    for r in rules:
+        err = validate_rule(r)
+        if err is not None:
+            return err
+        if int(getattr(r, "cycle_duration_days", 0)) != 0:
+            any_cycle = True
+    if not any_cycle:
+        enabled = [r for r in rules if r.enabled]
+        for i, first in enumerate(enabled):
+            for second in enabled[i + 1:]:
+                if windows_overlap(first.starts_at_ms, first.ends_at_ms, second.starts_at_ms, second.ends_at_ms):
+                    return "overlapping enabled seasons in fixed-window mode"
+        return None
+    pool = []
+    shared_duration = 0
+    for r in rules:
+        order = int(getattr(r, "cycle_order", 0))
+        days = int(getattr(r, "cycle_duration_days", 0))
+        if order == 0:
+            if r.enabled or days != 0:
+                return "non-pool rule cannot be enabled or set cycle_duration_days in cycle mode"
+            continue
+        if not r.enabled:
+            return "cycle pool rule must be enabled"
+        if not (MIN_CYCLE_DURATION_DAYS <= days <= MAX_CYCLE_DURATION_DAYS):
+            return "cycle pool rule cycle_duration_days out of range [7, 180]"
+        if shared_duration == 0:
+            shared_duration = days
+        elif shared_duration != days:
+            return "cycle pool rules must share identical cycle_duration_days"
+        pool.append(r)
+    if not pool:
+        return "cycle mode requires at least one rule with cycle_order > 0"
+    pool.sort(key=lambda r: int(getattr(r, "cycle_order", 0)))
+    for i, r in enumerate(pool):
+        if int(getattr(r, "cycle_order", 0)) != i + 1:
+            return "cycle_order must form contiguous 1..N sequence without duplicates"
+    if not int(pool[0].starts_at_ms):
+        return "cycle mode requires pool[0].starts_at_ms > 0 as anchor timestamp"
+    return None
+
+
+def resolve_active_season(tables, now_ms_val: int):
+    """解析当前时刻活跃赛季：(rule, season_term, cycle_index, cycle_pool_size, term_start_ms, term_end_ms) 或 None。"""
+    if "SeasonRule" not in tables.tables:
+        return None
+    rules = list(tables["SeasonRule"].rows())
+    if not rules or validate_schedule(rules) is not None:
+        return None
+    any_cycle = any(int(getattr(r, "cycle_duration_days", 0)) != 0 for r in rules)
+    if not any_cycle:
+        for r in rules:
+            if is_window_active(r.starts_at_ms, r.ends_at_ms, bool(r.enabled), now_ms_val):
+                if find_valid_seal(tables, r.id, r.default_seal_id) is None:
+                    return None
+                return (r, 1, 1, 0, int(r.starts_at_ms), int(r.ends_at_ms))
+        return None
+    pool = sorted(
+        (r for r in rules if int(getattr(r, "cycle_order", 0)) != 0),
+        key=lambda r: int(getattr(r, "cycle_order", 0)),
+    )
+    anchor_ms = int(pool[0].starts_at_ms)
+    if now_ms_val < anchor_ms:
+        return None
+    period_ms = int(getattr(pool[0], "cycle_duration_days", 0)) * _MS_PER_DAY
+    elapsed_idx = (now_ms_val - anchor_ms) // period_ms
+    pool_size = len(pool)
+    picked = pool[elapsed_idx % pool_size]
+    if find_valid_seal(tables, picked.id, picked.default_seal_id) is None:
+        return None
+    term = min(0xFFFF_FFFF, elapsed_idx + 1)
+    cycle_idx = min(0xFFFF_FFFF, (elapsed_idx // pool_size) + 1)
+    term_start = anchor_ms + elapsed_idx * period_ms
+    term_end = term_start + period_ms
+    return (picked, int(term), int(cycle_idx), pool_size, int(term_start), int(term_end))
+
+
+def is_honor_bit_set(words, season_id: int) -> bool:
+    if season_id <= 0:
+        return False
+    word_idx, bit = divmod(season_id - 1, 64)
+    if word_idx >= len(words):
+        return False
+    return bool(int(words[word_idx]) & (1 << bit))
+
+
+def set_honor_bit(words, season_id: int) -> bool:
+    if season_id <= 0:
+        return False
+    word_idx, bit = divmod(season_id - 1, 64)
+    while len(words) <= word_idx:
+        words.append(0)
+    mask = 1 << bit
+    prev = int(words[word_idx])
+    newly = (prev & mask) == 0
+    words[word_idx] = prev | mask
+    return newly
+
+
+def is_season_honor_unlocked(tables, comp, season_id: int) -> bool:
+    if season_id <= 0:
+        return False
+    if is_honor_bit_set(comp.unlocked_honor_words, season_id):
+        return True
+    if "SeasonRule" not in tables.tables:
+        return False
+    rule = tables["SeasonRule"].get(season_id)
+    if rule is None or not rule.seal_max_points:
+        return False
+    rec = _find_record(comp, season_id)
+    return rec is not None and int(rec.progress_points) >= int(rule.seal_max_points)
+
+
+def sync_legacy_honors_to_bitmap(tables, comp) -> None:
+    if "SeasonRule" not in tables.tables:
+        return
+    for rec in comp.records:
+        sid = int(rec.season_id)
+        if not sid:
+            continue
+        rule = tables["SeasonRule"].get(sid)
+        if rule is not None and rule.seal_max_points and int(rec.progress_points) >= int(rule.seal_max_points):
+            set_honor_bit(comp.unlocked_honor_words, sid)
+            comp.retro_honor_progress.pop(sid, None)
+            if int(comp.retro_honor_target_season_id) == sid:
+                comp.retro_honor_target_season_id = 0
+
+
+def read_effective_term_progress(rec, current_term: int, max_points: int) -> tuple[int, int, int]:
+    if rec is None or max_points <= 0:
+        return 0, 0, 0
+    last_term = int(getattr(rec, "last_term", 0))
+    if not (last_term == current_term or (last_term == 0 and current_term == 1)):
+        return 0, 0, 0
+    progress = min(int(rec.progress_points), max_points)
+    battle_pts = min(int(rec.battle_points), progress)
+    catchup_pts = min(int(rec.catchup_points), progress)
+    return progress, battle_pts, catchup_pts
+
+
+def sync_record_for_term(tables, comp, rule, current_term: int):
+    sync_legacy_honors_to_bitmap(tables, comp)
+    record = _find_or_add_record(comp, rule.id)
+    last_term = int(getattr(record, "last_term", 0))
+    if last_term == 0 and current_term == 1:
+        record.last_term = 1
+    elif last_term != current_term:
+        record.progress_points = 0
+        record.battle_points = 0
+        record.catchup_points = 0
+        record.last_term = current_term
+    return record
+
+
+def all_configured_season_ids_asc(tables) -> list[int]:
+    if "SeasonRule" not in tables.tables:
+        return []
+    return sorted({int(r.id) for r in tables["SeasonRule"].rows() if r.id and r.seal_max_points})
+
+
+def resolve_retro_honor_target(tables, comp, active_season_id: int) -> tuple[int, bool]:
+    explicit_id = int(getattr(comp, "retro_honor_target_season_id", 0))
+    if explicit_id and explicit_id != active_season_id and "SeasonRule" in tables.tables:
+        rule = tables["SeasonRule"].get(explicit_id)
+        if rule is not None and rule.seal_max_points and not is_season_honor_unlocked(tables, comp, explicit_id):
+            return explicit_id, True
+    for sid in all_configured_season_ids_asc(tables):
+        if sid != active_season_id and not is_season_honor_unlocked(tables, comp, sid):
+            return sid, False
+    return 0, False
 
 
 def scaled_bonus_bps(progress_points: int, max_points: int, cap_bps: int) -> int:
@@ -227,18 +414,8 @@ def find_valid_seal(tables, season_id: int, seal_id: int):
 
 def find_active_season_rule(tables, now_ms_val: int):
     """查找当前时刻唯一活跃且合法的 SeasonRule；重叠或配置非法时 fail-closed 返回 None。"""
-    if "SeasonRule" not in tables.tables:
-        return None
-    active = None
-    for row in tables["SeasonRule"].rows():
-        if not is_window_active(row.starts_at_ms, row.ends_at_ms, bool(row.enabled), now_ms_val):
-            continue
-        if validate_rule(row) is not None or find_valid_seal(tables, row.id, row.default_seal_id) is None:
-            return None
-        if active is not None:
-            return None
-        active = row
-    return active
+    active = resolve_active_season(tables, now_ms_val)
+    return active[0] if active is not None else None
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
@@ -317,10 +494,14 @@ def weekly_affix_for_week(season_id: int, week_index: int) -> int:
 
 
 def is_seal_effect_recommended_for_affix(affix_id: int, effect_id: int) -> bool:
-    if affix_id in (WEEKLY_AFFIX_SHIELD_OVERLOAD, WEEKLY_AFFIX_SHARP_TEMPO):
-        return effect_id in (1, 2)
-    if affix_id in (WEEKLY_AFFIX_SPIRIT_RECOVERY, WEEKLY_AFFIX_OPENING_GUARD):
-        return effect_id in (6, 7)
+    if affix_id == WEEKLY_AFFIX_SHIELD_OVERLOAD:
+        return effect_id in (1, 2, 5)
+    if affix_id == WEEKLY_AFFIX_SPIRIT_RECOVERY:
+        return effect_id in (7, 6, 4)
+    if affix_id == WEEKLY_AFFIX_OPENING_GUARD:
+        return effect_id in (6, 7, 5)
+    if affix_id == WEEKLY_AFFIX_SHARP_TEMPO:
+        return effect_id in (1, 2, 4)
     return False
 
 
@@ -369,28 +550,30 @@ class SceneSeason:
         self.scene.register(_SERVICE, "AbandonWuxingTowerRun", self.abandon_wuxing_tower_run, mutating=True)
         self.scene.register(_SERVICE, "SaveBattleBuildBookmark", self.save_battle_build_bookmark, mutating=True)
         self.scene.register(_SERVICE, "DeleteBattleBuildBookmark", self.delete_battle_build_bookmark, mutating=True)
+        self.scene.register(_SERVICE, "SetRetroHonorTarget", self.set_retro_honor_target, mutating=True)
 
     def validate_tables(self) -> bool:
-        """启动前校验 SeasonRule 与 SeasonSeal 配表一致性。"""
-        rules = self.tables["SeasonRule"].rows() if "SeasonRule" in self.tables.tables else ()
-        seals = self.tables["SeasonSeal"].rows() if "SeasonSeal" in self.tables.tables else ()
+        """启动前校验 SeasonRule 与 SeasonSeal 配表一致性（含无限循环与共鸣校验）。"""
+        rules = list(self.tables["SeasonRule"].rows()) if "SeasonRule" in self.tables.tables else []
+        seals = list(self.tables["SeasonSeal"].rows()) if "SeasonSeal" in self.tables.tables else []
         if not rules:
             return not seals
-        enabled_rules = []
-        rule_ids = set()
+        if validate_schedule(rules) is not None:
+            return False
+        rule_ids = {int(r.id) for r in rules}
         for rule in rules:
-            if validate_rule(rule) is not None:
-                return False
             if find_valid_seal(self.tables, rule.id, rule.default_seal_id) is None:
                 return False
-            rule_ids.add(rule.id)
-            if rule.enabled:
-                enabled_rules.append(rule)
-        for index, first in enumerate(enabled_rules):
-            for second in enabled_rules[index + 1:]:
-                if windows_overlap(first.starts_at_ms, first.ends_at_ms, second.starts_at_ms, second.ends_at_ms):
+        skill_table = self.tables["Skill"] if "Skill" in self.tables.tables else None
+        for seal in seals:
+            if int(seal.season_id) not in rule_ids or not valid_seal_row(seal):
+                return False
+            res_kind = int(getattr(seal, "resonance_kind", 0))
+            if res_kind != SeasonBattleRules.RESONANCE_NONE and skill_table is not None:
+                linked = skill_table.get(int(getattr(seal, "resonance_skill_id", 0)))
+                if linked is None or int(getattr(linked, "season_id", 0)) != int(seal.season_id):
                     return False
-        return all(seal.season_id in rule_ids and valid_seal_row(seal) for seal in seals)
+        return True
 
     def initialize_on_load(self, data) -> None:
         """角色载入时确保 season_component 存在，不删除历史赛季归档。"""
@@ -416,6 +599,119 @@ class SceneSeason:
             return SEASON_IN_BATTLE
         return 0
 
+    def record_battle_progress_delta(
+        self,
+        data,
+        *,
+        match_mode: int,
+        player_won: bool,
+        fled: bool = False,
+        total_rounds: int = 1,
+        now_ms_val: int | None = None,
+        competitive_ranked: bool = False,
+        participated: bool = True,
+        manual_action_rounds: int = 0,
+        effective_combat_contribution: bool = False,
+    ) -> dict:
+        """按权威战斗结果累计当季赛季印进度点与满级后免费往季徽章追忆，返回增量摘要。"""
+        empty = {
+            "season_id": 0,
+            "points_added": 0,
+            "progress_after": 0,
+            "max_points": 0,
+            "honor_newly_unlocked": False,
+            "retro_honor_season_id": 0,
+            "retro_honor_points_added": 0,
+            "retro_honor_progress_after": 0,
+            "retro_honor_max_points": 0,
+            "retro_honor_newly_unlocked": False,
+        }
+        if fled or total_rounds <= 0:
+            return empty
+        if competitive_ranked:
+            if not participated:
+                return empty
+            if not player_won and (
+                total_rounds < PVP_MIN_ROUNDS_FOR_LOSS
+                or manual_action_rounds < PVP_MIN_MANUAL_ROUNDS_FOR_LOSS
+                or not effective_combat_contribution
+            ):
+                return empty
+        stamp = self.clock() if now_ms_val is None else now_ms_val
+        active = resolve_active_season(self.tables, stamp)
+        if active is None:
+            return empty
+        rule, season_term, _cycle_idx, _pool_size, _term_start, _term_end = active
+        if match_mode in _PVE_MODES or match_mode in (4, 5):
+            gain = rule.pve_win_points if player_won else 0
+        elif match_mode in _PVP_MODES or match_mode in (1, 3, 7):
+            gain = rule.pvp_win_points if player_won else rule.pvp_other_points
+        else:
+            gain = 0
+        if gain <= 0:
+            return empty
+
+        comp = data.season_component
+        record = sync_record_for_term(self.tables, comp, rule, season_term)
+        if not record.equipped_seal_id:
+            record.equipped_seal_id = rule.default_seal_id
+        max_points = int(rule.seal_max_points)
+        before = min(int(record.progress_points), max_points)
+        was_already_unlocked = is_season_honor_unlocked(self.tables, comp, rule.id)
+        used = min(gain, max_points - before) if before < max_points else 0
+        after = before + used
+        current_newly_unlocked = False
+        if used > 0:
+            record.progress_points = after
+            record.battle_points += used
+            if after >= max_points:
+                newly_set = set_honor_bit(comp.unlocked_honor_words, rule.id)
+                current_newly_unlocked = newly_set and not was_already_unlocked
+                comp.retro_honor_progress.pop(rule.id, None)
+                if int(comp.retro_honor_target_season_id) == rule.id:
+                    comp.retro_honor_target_season_id = 0
+
+        retro_sid = 0
+        retro_added = 0
+        retro_after = 0
+        retro_max = 0
+        retro_unlocked = False
+        overflow = gain - used
+        if overflow > 0:
+            target_sid, _ = resolve_retro_honor_target(self.tables, comp, rule.id)
+            if target_sid:
+                target_rule = self.tables["SeasonRule"].get(target_sid)
+                if target_rule is not None and target_rule.seal_max_points:
+                    target_max = int(target_rule.seal_max_points)
+                    prev_retro = min(int(comp.retro_honor_progress.get(target_sid, 0)), target_max)
+                    add = min(overflow, target_max - prev_retro) if prev_retro < target_max else 0
+                    after_retro = prev_retro + add
+                    if add > 0:
+                        retro_sid = target_sid
+                        retro_added = add
+                        retro_after = after_retro
+                        retro_max = target_max
+                        if after_retro >= target_max:
+                            retro_unlocked = set_honor_bit(comp.unlocked_honor_words, target_sid)
+                            comp.retro_honor_progress.pop(target_sid, None)
+                            if int(comp.retro_honor_target_season_id) == target_sid:
+                                comp.retro_honor_target_season_id = 0
+                        else:
+                            comp.retro_honor_progress[target_sid] = after_retro
+
+        return {
+            "season_id": int(rule.id),
+            "points_added": used,
+            "progress_after": after,
+            "max_points": max_points,
+            "honor_newly_unlocked": current_newly_unlocked,
+            "retro_honor_season_id": retro_sid,
+            "retro_honor_points_added": retro_added,
+            "retro_honor_progress_after": retro_after,
+            "retro_honor_max_points": retro_max,
+            "retro_honor_newly_unlocked": retro_unlocked,
+        }
+
     def record_battle_progress(
         self,
         data,
@@ -430,40 +726,20 @@ class SceneSeason:
         manual_action_rounds: int = 0,
         effective_combat_contribution: bool = False,
     ) -> int:
-        """按权威战斗结果累计当季赛季印进度点，返回实际新增点数。"""
-        if fled or total_rounds <= 0:
-            return 0
-        if competitive_ranked:
-            if not participated:
-                return 0
-            if not player_won and (
-                total_rounds < PVP_MIN_ROUNDS_FOR_LOSS
-                or manual_action_rounds < PVP_MIN_MANUAL_ROUNDS_FOR_LOSS
-                or not effective_combat_contribution
-            ):
-                return 0
-        stamp = self.clock() if now_ms_val is None else now_ms_val
-        rule = find_active_season_rule(self.tables, stamp)
-        if rule is None:
-            return 0
-        if match_mode in _PVE_MODES:
-            gain = rule.pve_win_points if player_won else 0
-        elif match_mode in _PVP_MODES:
-            gain = rule.pvp_win_points if player_won else rule.pvp_other_points
-        else:
-            gain = 0
-        if gain <= 0:
-            return 0
-        record = _find_or_add_record(data.season_component, rule.id)
-        if not record.equipped_seal_id:
-            record.equipped_seal_id = rule.default_seal_id
-        before = min(record.progress_points, rule.seal_max_points)
-        if before >= rule.seal_max_points:
-            return 0
-        added = min(gain, rule.seal_max_points - before)
-        record.progress_points = before + added
-        record.battle_points += added
-        return added
+        """按权威战斗结果累计当季赛季印进度点，返回实际新增本季点数。"""
+        delta = self.record_battle_progress_delta(
+            data,
+            match_mode=match_mode,
+            player_won=player_won,
+            fled=fled,
+            total_rounds=total_rounds,
+            now_ms_val=now_ms_val,
+            competitive_ranked=competitive_ranked,
+            participated=participated,
+            manual_action_rounds=manual_action_rounds,
+            effective_combat_contribution=effective_combat_contribution,
+        )
+        return int(delta["points_added"])
 
     def collect_effects(self, data, effects, *, now_ms_val: int | None = None) -> None:
         """汇总当前活跃赛季印的轻属性与战斗机制至 EquipmentEffects。"""
@@ -473,15 +749,16 @@ class SceneSeason:
         if not data.HasField("season_component"):
             return
         stamp = self.clock() if now_ms_val is None else now_ms_val
-        rule = find_active_season_rule(self.tables, stamp)
-        if rule is None:
+        active = resolve_active_season(self.tables, stamp)
+        if active is None:
             return
+        rule, season_term, *_ = active
         record = _find_record(data.season_component, rule.id)
         seal_id = self._effective_seal_id(rule, record)
         seal = find_valid_seal(self.tables, rule.id, seal_id)
         if seal is None:
             return
-        progress = min(record.progress_points, rule.seal_max_points) if record is not None else 0
+        progress, _, _ = read_effective_term_progress(record, season_term, int(rule.seal_max_points))
         effects.season_max_health_bps = scaled_bonus_bps(progress, rule.seal_max_points, rule.max_health_bps_cap)
         effects.season_defense_bps = scaled_bonus_bps(progress, rule.seal_max_points, rule.defense_bps_cap)
         dst = effects.season_seal
@@ -495,39 +772,53 @@ class SceneSeason:
         dst.active_rounds = seal.active_rounds
         dst.health_threshold_bps = seal.health_threshold_bps
         dst.name = seal.name
+        dst.resonance_skill_id = int(getattr(seal, "resonance_skill_id", 0))
+        dst.resonance_kind = int(getattr(seal, "resonance_kind", 0))
+        dst.resonance_param = int(getattr(seal, "resonance_param", 0))
 
-    def _fill_honors(self, comp, active_season_id: int, out) -> None:
-        """填充永久零数值赛季纪念印记与称谓（休赛期亦保留展示）。"""
-        if "SeasonRule" not in self.tables.tables:
-            return
-        season_ids = {int(rec.season_id) for rec in comp.records if rec.season_id}
-        if active_season_id:
-            season_ids.add(active_season_id)
-        for sid in sorted(season_ids):
+    def _fill_honors(
+        self,
+        comp,
+        active_season_id: int,
+        active_term: int,
+        retro_target_season_id: int,
+        out,
+    ) -> None:
+        """填充全量已配置赛季的永久零数值纪念徽章与往季追忆状态。"""
+        for sid in all_configured_season_ids_asc(self.tables):
             rule = self.tables["SeasonRule"].get(sid)
             if rule is None or not rule.seal_max_points:
                 continue
-            rec = _find_record(comp, sid)
-            progress = min(rec.progress_points, rule.seal_max_points) if rec is not None else 0
-            unlocked = progress >= rule.seal_max_points
-            if not unlocked and sid != active_season_id:
-                continue
+            max_pts = int(rule.seal_max_points)
+            unlocked = is_season_honor_unlocked(self.tables, comp, sid)
+            is_current = sid == active_season_id
+            retro_pts = 0 if unlocked else min(int(comp.retro_honor_progress.get(sid, 0)), max_pts)
+            if unlocked:
+                progress = max_pts
+            elif is_current:
+                progress, _, _ = read_effective_term_progress(_find_record(comp, sid), active_term, max_pts)
+            else:
+                progress = retro_pts
             out.honors.add(
                 season_id=sid,
                 season_name=rule.name,
                 honor_title_name=getattr(rule, "honor_title_name", ""),
                 honor_badge_icon_key=getattr(rule, "honor_badge_icon_key", ""),
                 progress_points=progress,
-                max_points=rule.seal_max_points,
+                max_points=max_pts,
                 unlocked=unlocked,
-                is_current_season=sid == active_season_id,
+                is_current_season=is_current,
+                is_retro_target=(not unlocked and sid == retro_target_season_id),
+                retro_progress_points=retro_pts,
             )
 
     @staticmethod
-    def _fill_weekly_affix(rule, stamp: int, valid_seals: list, out) -> None:
+    def _fill_weekly_affix(active, stamp: int, valid_seals: list, out) -> None:
         out.Clear()
-        week_idx = compute_season_week_index(int(rule.starts_at_ms), stamp)
-        affix_id = weekly_affix_for_week(int(rule.id), week_idx)
+        rule, season_term, _cycle_idx, pool_size, term_start_ms, _term_end_ms = active
+        affix_seed = season_term if pool_size > 0 else int(rule.id)
+        week_idx = compute_season_week_index(int(term_start_ms), stamp)
+        affix_id = weekly_affix_for_week(affix_seed, week_idx)
         text = _WEEKLY_AFFIX_TEXT.get(affix_id)
         if text is None:
             return
@@ -550,26 +841,32 @@ class SceneSeason:
         for bookmark in comp.saved_builds:
             _copy_bookmark_to_view(bookmark, out.saved_builds.add())
 
-        rule = find_active_season_rule(self.tables, stamp)
-        self._fill_honors(comp, int(rule.id) if rule is not None else 0, out)
-        if rule is None:
+        active = resolve_active_season(self.tables, stamp)
+        active_sid = int(active[0].id) if active is not None else 0
+        retro_target_id, retro_explicit = resolve_retro_honor_target(self.tables, comp, active_sid)
+        out.retro_honor_target_season_id = retro_target_id
+        out.retro_honor_target_explicit = retro_explicit
+        if active is None:
+            self._fill_honors(comp, 0, 0, retro_target_id, out)
             out.available = False
             out.unavailable_reason = "当前暂无进行中的赛季"
             return 0
 
+        rule, season_term, cycle_index, cycle_pool_size, term_start_ms, term_end_ms = active
+        self._fill_honors(comp, rule.id, season_term, retro_target_id, out)
         record = _find_record(data.season_component, rule.id)
         equipped_id = self._effective_seal_id(rule, record)
-        raw_progress = record.progress_points if record is not None else 0
-        progress = min(raw_progress, rule.seal_max_points)
-        battle_pts = min(record.battle_points, progress) if record is not None else 0
-        catchup_pts = min(record.catchup_points, progress) if record is not None else 0
+        progress, battle_pts, catchup_pts = read_effective_term_progress(record, season_term, int(rule.seal_max_points))
 
         out.available = True
         out.season_id = rule.id
         out.season_name = rule.name
         out.season_desc = rule.desc
-        out.starts_at_ms = rule.starts_at_ms
-        out.ends_at_ms = rule.ends_at_ms
+        out.starts_at_ms = term_start_ms
+        out.ends_at_ms = term_end_ms
+        out.season_term = season_term
+        out.cycle_index = cycle_index
+        out.cycle_pool_size = cycle_pool_size
 
         out.equipped_seal_id = equipped_id
         out.progress_points = progress
@@ -604,7 +901,7 @@ class SceneSeason:
             if seal.season_id == rule.id and valid_seal_row(seal)
         ]
         seals.sort(key=lambda row: row.id)
-        self._fill_weekly_affix(rule, stamp, seals, out.weekly_affix)
+        self._fill_weekly_affix(active, stamp, seals, out.weekly_affix)
         for seal in seals:
             out.seals.add(
                 seal_id=seal.id,
@@ -619,6 +916,10 @@ class SceneSeason:
                 active_rounds=seal.active_rounds,
                 health_threshold_bps=seal.health_threshold_bps,
                 equipped=seal.id == equipped_id,
+                resonance_skill_id=int(getattr(seal, "resonance_skill_id", 0)),
+                resonance_kind=int(getattr(seal, "resonance_kind", 0)),
+                resonance_param=int(getattr(seal, "resonance_param", 0)),
+                resonance_desc=str(getattr(seal, "resonance_desc", "")),
             )
 
         level = effective_level(data)
@@ -673,9 +974,10 @@ class SceneSeason:
         if not data.HasField("level_component"):
             return self._finish(response, player, data, stamp, SEASON_UNAVAILABLE)
 
-        rule = find_active_season_rule(self.tables, stamp)
-        if rule is None:
+        active = resolve_active_season(self.tables, stamp)
+        if active is None:
             return self._finish(response, player, data, stamp, SEASON_NOT_OPEN)
+        rule, season_term, *_ = active
         if not request.season_id or request.season_id != rule.id:
             return self._finish(response, player, data, stamp, SEASON_MISMATCH)
         if find_valid_seal(self.tables, rule.id, request.seal_id) is None:
@@ -687,7 +989,7 @@ class SceneSeason:
         if current_seal_id == request.seal_id:
             return self._finish(response, player, data, stamp, SEASON_SEAL_ALREADY_EQUIPPED)
 
-        record = _find_or_add_record(data.season_component, rule.id)
+        record = sync_record_for_term(self.tables, data.season_component, rule, season_term)
         record.equipped_seal_id = request.seal_id
         if record.revision < _MAX_UINT64:
             record.revision += 1
@@ -747,9 +1049,10 @@ class SceneSeason:
         if not data.HasField("level_component") or self.assets is None:
             return self._finish(response, player, data, stamp, SEASON_UNAVAILABLE)
 
-        rule = find_active_season_rule(self.tables, stamp)
-        if rule is None:
+        active = resolve_active_season(self.tables, stamp)
+        if active is None:
             return self._finish(response, player, data, stamp, SEASON_NOT_OPEN)
+        rule, season_term, *_ = active
         if not request.season_id or request.season_id != rule.id:
             return self._finish(response, player, data, stamp, SEASON_MISMATCH)
         if not rule.catchup_price_per_point:
@@ -758,7 +1061,7 @@ class SceneSeason:
             return self._finish(response, player, data, stamp, writable_err)
 
         existing = _find_record(data.season_component, rule.id)
-        current_points = min(existing.progress_points, rule.seal_max_points) if existing is not None else 0
+        current_points, _, _ = read_effective_term_progress(existing, season_term, int(rule.seal_max_points))
         if current_points >= rule.seal_max_points:
             return self._finish(response, player, data, stamp, SEASON_SEAL_ALREADY_MAX)
 
@@ -783,11 +1086,17 @@ class SceneSeason:
         if deduct_err:
             return self._finish(response, player, self.scene.rows.assemble(player.snapshot), stamp, deduct_err)
 
-        record = _find_or_add_record(data.season_component, rule.id)
+        record = sync_record_for_term(self.tables, data.season_component, rule, season_term)
         if not record.equipped_seal_id:
             record.equipped_seal_id = rule.default_seal_id
-        record.progress_points = current_points + points_to_buy
+        after_points = current_points + points_to_buy
+        record.progress_points = after_points
         record.catchup_points += points_to_buy
+        if after_points >= rule.seal_max_points:
+            set_honor_bit(data.season_component.unlocked_honor_words, rule.id)
+            data.season_component.retro_honor_progress.pop(rule.id, None)
+            if int(data.season_component.retro_honor_target_season_id) == rule.id:
+                data.season_component.retro_honor_target_season_id = 0
         if record.revision < _MAX_UINT64:
             record.revision += 1
 
@@ -819,6 +1128,38 @@ class SceneSeason:
         )
         response.added_points = points_to_buy
         response.spent_currency = total_price
+        return self._finish(response, player, data, stamp)
+
+    async def set_retro_honor_target(self, _world, player, _route, request):
+        """569 设定/清除「往季徽章追忆」指定目标（0=自动顺延首个未解锁往季；纯免费零收费）。"""
+        response = self.protocol.message("SetRetroHonorTargetResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            return self._finish(response, player, data, stamp, SEASON_UNAVAILABLE)
+        if writable_err := self._writable_error(player):
+            return self._finish(response, player, data, stamp, writable_err)
+
+        comp = data.season_component
+        sync_legacy_honors_to_bitmap(self.tables, comp)
+        target_sid = int(request.season_id)
+        if target_sid != 0:
+            target_rule = self.tables["SeasonRule"].get(target_sid) if "SeasonRule" in self.tables.tables else None
+            active_rule = find_active_season_rule(self.tables, stamp)
+            if (
+                target_rule is None
+                or not target_rule.seal_max_points
+                or (active_rule is not None and int(active_rule.id) == target_sid)
+            ):
+                return self._finish(response, player, data, stamp, SEASON_HONOR_TARGET_INVALID)
+            if is_season_honor_unlocked(self.tables, comp, target_sid):
+                return self._finish(response, player, data, stamp, SEASON_HONOR_ALREADY_UNLOCKED)
+        comp.retro_honor_target_season_id = target_sid
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, player, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info("Retro honor target updated player_id=%s target_season_id=%s", player.player_id, target_sid)
         return self._finish(response, player, data, stamp)
 
     # ── 五行阵法 / 五行幻境周常爬塔 / 战报配装收藏夹（515..521） ──

@@ -658,7 +658,7 @@ class TurnEngine:
                         seen_seal_ids.add(equipped_seal.seal_id)
                         opt.available_seals.append(equipped_seal)
                 for seal in getattr(snapshot, "available_season_seals", ()):
-                    if not SeasonBattleRules.valid_seal_effect(
+                    if not SeasonBattleRules.valid_seal_definition(
                         seal.season_id,
                         seal.seal_id,
                         seal.effect_id,
@@ -668,6 +668,9 @@ class TurnEngine:
                         seal.battle_limit,
                         seal.active_rounds,
                         seal.health_threshold_bps,
+                        int(getattr(seal, "resonance_skill_id", 0)),
+                        int(getattr(seal, "resonance_kind", 0)),
+                        int(getattr(seal, "resonance_param", 0)),
                     ):
                         raise BattleError("invalid available_season_seal snapshot")
                     if snapshot.active_season_id != 0 and seal.season_id != snapshot.active_season_id:

@@ -774,6 +774,31 @@ artifactId+
 data (2
 .ItemTableRdataB;
 com.game.tableBItemTableOuterClassPZgenerated/pb/tablebproto3
+ü
+"table_wire/jianghurule_table.proto"Ê
+JianghuRuleTable
+id (Rid
+enabled (Renabled(
+silver_writ_cost (RsilverWritCost)
+gold_writ_item_id (RgoldWritItemId$
+invite_ttl_sec (RinviteTtlSec(
+team_confirm_sec (RteamConfirmSec7
+same_target_cooldown_sec (RsameTargetCooldownSec?
+daily_unmatched_invite_limit (RdailyUnmatchedInviteLimit(
+duel_round_limit	 (RduelRoundLimit(
+duel_timeout_sec
+ (RduelTimeoutSec7
+defeat_mark_duration_sec (RdefeatMarkDurationSec*
+silver_clear_cost (RsilverClearCost"
+clear_item_id (RclearItemId7
+clear_badge_duration_sec (RclearBadgeDurationSec*
+grudge_max_rivals (RgrudgeMaxRivals8
+grudge_max_logs_per_rival (RgrudgeMaxLogsPerRival3
+guild_wall_max_records (RguildWallMaxRecords<
+streak_highlight_threshold (RstreakHighlightThreshold"=
+JianghuRuleTableData%
+data (2.JianghuRuleTableRdataBB
+com.game.tableBJianghuRuleTableOuterClassPZgenerated/pb/tablebproto3
 È
 %table_wire/messagelimiter_table.proto"Š
 MessageLimiterTable
@@ -1117,8 +1142,8 @@ requireSsv#
 RoleNameRuleTableData&
 data (2.RoleNameRuleTableRdataBC
 com.game.tableBRoleNameRuleTableOuterClassPZgenerated/pb/tablebproto3
-²
-!table_wire/seasonrule_table.proto"„
+ƒ
+!table_wire/seasonrule_table.proto"Õ
 SeasonRuleTable
 id (Rid
 name (	Rname 
@@ -1139,12 +1164,15 @@ ends_at_ms (RendsAtMs
 default_seal_id (RdefaultSealId
 desc (	Rdesc(
 honor_title_name (	RhonorTitleName/
-honor_badge_icon_key (	RhonorBadgeIconKey";
+honor_badge_icon_key (	RhonorBadgeIconKey
+cycle_order (R
+cycleOrder.
+cycle_duration_days (RcycleDurationDays";
 SeasonRuleTableData$
 data (2.SeasonRuleTableRdataBA
 com.game.tableBSeasonRuleTableOuterClassPZgenerated/pb/tablebproto3
-²
-!table_wire/seasonseal_table.proto"„
+×
+!table_wire/seasonseal_table.proto"©
 SeasonSealTable
 id (Rid
 	season_id (RseasonId
@@ -1158,7 +1186,11 @@ ends_at_ms (RendsAtMs
 battle_limit
  (RbattleLimit#
 active_rounds (RactiveRounds0
-health_threshold_bps (RhealthThresholdBps";
+health_threshold_bps (RhealthThresholdBps,
+resonance_skill_id (RresonanceSkillId%
+resonance_kind (RresonanceKind'
+resonance_param (RresonanceParam%
+resonance_desc (	RresonanceDesc";
 SeasonSealTableData$
 data (2.SeasonSealTableRdataBA
 com.game.tableBSeasonSealTableOuterClassPZgenerated/pb/tablebproto3
@@ -1461,8 +1493,9 @@ mail_title
 TournamentRewardTableData*
 data (2.TournamentRewardTableRdataBG
 com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
-ó
-%table_wire/tournamentrule_table.proto"µ
+ó
+%table_wire/tournamentrule_table.proto"µ
+
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -1487,10 +1520,7 @@ mail_title
 desc (	Rdesc(
 bo3_top4_enabled (Rbo3Top4Enabled1
 intermission_seconds (RintermissionSeconds4
-public_knockout_replay (RpublicKnockoutReplay,
-salute_gold_amount (RsaluteGoldAmount$
-salute_item_id (RsaluteItemId*
-salute_item_count (RsaluteItemCount.
+public_knockout_replay (RpublicKnockoutReplay.
 warmup_spar_enabled (RwarmupSparEnabled-
 prediction_enabled (RpredictionEnabled;
 prediction_reward_min_hits (RpredictionRewardMinHits9
@@ -2722,6 +2752,28 @@ affix_rule (Bò¬EquipAffixRuleR	affixRuleD
 forge_material_count (RforgeMaterialCount2
 artifact_id (Bò¬EquipArtifactR
 artifactId:Š¦Item’¦	Item.xlsxš¦id¨¦bproto3
+Ø
+jianghurule_table.protommorpg.cfgtable.v1cfg_options.proto"
+JianghuRuleTable
+id (Rid
+enabled (Renabled(
+silver_writ_cost (RsilverWritCost3
+gold_writ_item_id (Bò¬ItemRgoldWritItemId$
+invite_ttl_sec (RinviteTtlSec(
+team_confirm_sec (RteamConfirmSec7
+same_target_cooldown_sec (RsameTargetCooldownSec?
+daily_unmatched_invite_limit (RdailyUnmatchedInviteLimit(
+duel_round_limit	 (RduelRoundLimit(
+duel_timeout_sec
+ (RduelTimeoutSec7
+defeat_mark_duration_sec (RdefeatMarkDurationSec*
+silver_clear_cost (RsilverClearCost,
+clear_item_id (Bò¬ItemRclearItemId7
+clear_badge_duration_sec (RclearBadgeDurationSec*
+grudge_max_rivals (RgrudgeMaxRivals8
+grudge_max_logs_per_rival (RgrudgeMaxLogsPerRival3
+guild_wall_max_records (RguildWallMaxRecords<
+streak_highlight_threshold (RstreakHighlightThreshold:-Š¦JianghuRule’¦JianghuRule.xlsxš¦id°¦bproto3
 “
 messagelimiter_table.protommorpg.cfgtable.v1cfg_options.proto"Å
 MessageLimiterTable
@@ -3022,8 +3074,8 @@ requireSsv/
 rename_item_id
  (RrenameItemId*
 rename_item_count (RrenameItemCount:+Š¦RoleNameRule’¦RoleNameRule.xlsxš¦idbproto3
-û
-seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"±
+Ì
+seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"‚
 SeasonRuleTable
 id (Rid
 name (	Rname 
@@ -3044,10 +3096,13 @@ ends_at_ms (RendsAtMs
 default_seal_id (RdefaultSealId
 desc (	Rdesc(
 honor_title_name (	RhonorTitleName/
-honor_badge_icon_key (	RhonorBadgeIconKey:+Š¦
+honor_badge_icon_key (	RhonorBadgeIconKey
+cycle_order (R
+cycleOrder.
+cycle_duration_days (RcycleDurationDays:+Š¦
 SeasonRule’¦SeasonRule.xlsxš¦id°¦bproto3
-
-seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"Å
+´
+seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"ê
 SeasonSealTable
 id (Rid/
 	season_id (BØ¬ò¬
@@ -3062,7 +3117,11 @@ SeasonRuleRseasonId
 battle_limit
  (RbattleLimit#
 active_rounds (RactiveRounds0
-health_threshold_bps (RhealthThresholdBps:+Š¦
+health_threshold_bps (RhealthThresholdBps,
+resonance_skill_id (RresonanceSkillId%
+resonance_kind (RresonanceKind'
+resonance_param (RresonanceParam%
+resonance_desc (	RresonanceDesc:+Š¦
 SeasonSeal’¦SeasonSeal.xlsxš¦id°¦bproto3
 Î
 skill_table.protommorpg.cfgtable.v1cfg_options.proto"l
@@ -3336,8 +3395,8 @@ mail_title
  (	R	mailTitle
 	mail_body (	RmailBody
 desc (	Rdesc:3Š¦TournamentReward’¦TournamentReward.xlsxš¦idbproto3
-Ë
-tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"ý
+Š
+tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"¼
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -3362,16 +3421,13 @@ mail_title
 desc (	Rdesc(
 bo3_top4_enabled (Rbo3Top4Enabled1
 intermission_seconds (RintermissionSeconds4
-public_knockout_replay (RpublicKnockoutReplay,
-salute_gold_amount (RsaluteGoldAmount.
-salute_item_id (Bò¬ItemRsaluteItemId*
-salute_item_count (RsaluteItemCount.
+public_knockout_replay (RpublicKnockoutReplay.
 warmup_spar_enabled (RwarmupSparEnabled-
 prediction_enabled (RpredictionEnabled;
 prediction_reward_min_hits (RpredictionRewardMinHits9
 third_place_match_enabled (RthirdPlaceMatchEnabled.
 leyline_ban_enabled (RleylineBanEnabled6
-skill_ban_slots_per_team  (RskillBanSlotsPerTeam:/Š¦TournamentRule’¦TournamentRule.xlsxš¦idbproto3
+skill_ban_slots_per_team  (RskillBanSlotsPerTeam:/Š¦TournamentRule’¦TournamentRule.xlsxš¦idJJJRsalute_gold_amountRsalute_item_idRsalute_item_countbproto3
 ½
 travelpassseason_table.protommorpg.cfgtable.v1cfg_options.proto"í
 TravelPassSeasonTable

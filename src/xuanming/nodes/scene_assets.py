@@ -1133,16 +1133,24 @@ class SceneAssets(AssetInventory):
                         preview.pity_limit = pity_limit
                         preview.current_pity_count = cur_pity
                         preview.pity_guaranteed_next = bool(pity_limit and cur_pity + 1 >= pity_limit)
-                        for idx, base in enumerate(row.base_attr):
-                            if idx < len(info.base_attrs):
-                                val = _scaled(base.base_attr_value, bonus)
-                                info.base_attrs[idx].value = val
-                                info.base_attrs[idx].enhance_bonus = val - base.base_attr_value
-                                info.base_attrs[idx].enhance_next_value = _scaled(
-                                    base.base_attr_value, next_row.bonus_permyriad,
-                                )
                     else:
                         info.ClearField("enhance_next")
+                    from .scene_player import _accepted_attribute, _enhances_base_attribute
+                    base_idx = 0
+                    for base in row.base_attr:
+                        attr = _accepted_attribute(self.tables, base.base_attr_id)
+                        if attr is None or base_idx >= len(info.base_attrs):
+                            continue
+                        enhances = _enhances_base_attribute(profile, attr)
+                        val = _scaled(base.base_attr_value, bonus) if enhances else base.base_attr_value
+                        info.base_attrs[base_idx].value = val
+                        info.base_attrs[base_idx].enhance_bonus = val - base.base_attr_value
+                        if next_row is not None:
+                            info.base_attrs[base_idx].enhance_next_value = (
+                                _scaled(base.base_attr_value, next_row.bonus_permyriad)
+                                if enhances else base.base_attr_value
+                            )
+                        base_idx += 1
                 elif info.HasField("enhance_next"):
                     next_row = self._enhance_row(0, info.enhance_next.next_level)
                     pity_limit = int(getattr(next_row, "pity_limit", 0)) if next_row is not None else 0

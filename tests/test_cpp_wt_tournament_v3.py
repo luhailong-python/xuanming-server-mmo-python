@@ -31,9 +31,7 @@ from xuanming.match.errors import (
     ERR_INVALID_PARAMETER,
     ERR_MATCH_BATTLE_REPORT_NOT_FOUND,
     ERR_MATCH_RANKED_PRESET_INVALID,
-    ERR_MATCH_TOURNAMENT_ALREADY_SALUTED_TODAY,
     ERR_MATCH_TOURNAMENT_EMBLEM_INVALID,
-    ERR_MATCH_TOURNAMENT_NO_CHAMPION_TO_SALUTE,
     ERR_MATCH_TOURNAMENT_NOT_CAPTAIN,
     ERR_MATCH_TOURNAMENT_PREDICTION_CLOSED,
     ERR_MATCH_TOURNAMENT_PREDICTION_TARGET_INVALID,
@@ -75,7 +73,6 @@ from xuanming.match.tournament import (
     leyline_for_game,
     normalize_emblem_id,
     prediction_weight_for_round,
-    utc8_day_key,
 )
 from xuanming.protocol import Protocol
 from xuanming.runtime import Runtime
@@ -102,10 +99,6 @@ def test_tournament_v2_v3_pure_rules_and_cheer_hub():
     assert leyline_for_game(seq1, 1) == seq1[0]
     assert leyline_for_game(seq1, 3) == seq1[2]
     assert leyline_for_game(seq1, 4) == 0
-
-    # UTC+8 自然日键跨日检验（2026-11-25 15:59:59 UTC == 23:59:59 UTC+8）
-    assert utc8_day_key(1_795_622_399_000) == 20261125
-    assert utc8_day_key(1_795_622_401_000) == 20261126
 
     # 队徽白名单 1..8，0 归一化为 1
     assert normalize_emblem_id(0) == (1, True)
@@ -171,7 +164,7 @@ def test_tournament_v2_v3_pure_rules_and_cheer_hub():
     assert delta.cooldown_until_ms == 0 and len(delta.recent_cheers) == 1 and delta.recent_cheers[0].seq == 2
 
 
-# ── 2. 四战队完整 V2/V3 锦标赛全链路（队徽/热身/BO3/局间自动开局/季军战/MVP/竞猜/观道/观战喝彩/公开回放）──
+# ── 2. 四战队完整 V2/V3 锦标赛全链路（队徽/热身/BO3/局间自动开局/季军战/MVP/竞猜/观战喝彩/公开回放）──
 
 
 @asynccontextmanager
@@ -236,11 +229,7 @@ def test_tournament_v3_full_four_squad_lifecycle_grpc():
         base_ms = 1_795_622_399_000  # 2026-11-25 23:59:59 UTC+8
         clock = [base_ms]
         async with _v3_tournament_harness(clock) as (protocol, store, tm, call):
-            # 1. 尚无冠军时观道致敬被拒
-            salute0 = await call(901, "SaluteTournamentChampion")
-            assert salute0.error_message.id == ERR_MATCH_TOURNAMENT_NO_CHAMPION_TO_SALUTE
-
-            # 2. 建 4 支 3 人战队 + 校验队徽白名单与更换（511）
+            # 1. 建 4 支 3 人战队 + 校验队徽白名单与更换（511）
             bad_emblem = await call(101, "CreateTournamentSquad", squad_name="越界队徽", emblem_id=9)
             assert bad_emblem.error_message.id == ERR_MATCH_TOURNAMENT_EMBLEM_INVALID
 
@@ -457,17 +446,6 @@ def test_tournament_v3_full_four_squad_lifecycle_grpc():
             assert c_third.claimed_rewards[0].tier_kind == REWARD_TIER_THIRD_PLACE and c_third.claimed_rewards[0].gold_amount == 65000
             c_fourth = await call(cap_of[third_v.squad_a_id], "ClaimTournamentReward")
             assert c_fourth.claimed_rewards[0].tier_kind == REWARD_TIER_TOP4 and c_fourth.claimed_rewards[0].gold_amount == 50000
-
-            # 11. 模块 B：每日免费观道致敬（506）+ 同日防刷 + UTC+8 跨日刷新
-            sal1 = await call(901, "SaluteTournamentChampion")
-            assert not sal1.error_message.id and sal1.champion_salute_count == 1 and sal1.saluted_today and sal1.gold_amount == 5000
-            assert len(sal1.items) == 1 and sal1.items[0].item_id == 20 and sal1.items[0].count == 3
-            sal_dup = await call(901, "SaluteTournamentChampion")
-            assert sal_dup.error_message.id == ERR_MATCH_TOURNAMENT_ALREADY_SALUTED_TODAY
-
-            clock[0] += MILLIS_PER_DAY  # 次日 UTC+8 解冻
-            sal2 = await call(901, "SaluteTournamentChampion")
-            assert not sal2.error_message.id and sal2.champion_salute_count == 2
 
     asyncio.run(exercise())
 
@@ -711,10 +689,6 @@ def test_real_gate_tcp_routes_all_new_tournament_v3_rpcs(tmp_path):
                     # 514: GetTournamentPredictionBoard
                     board = await _gate_call(client_b, 105, "MatchServiceGetTournamentPredictionBoard", season_id=0)
                     assert not board.error_message.id and board.season_id == 1 and board.min_hits_for_reward == 2
-
-                    # 506: SaluteTournamentChampion（首季尚未产生冠军 -> 16057）
-                    sal = await _gate_call(client_b, 106, "MatchServiceSaluteTournamentChampion", season_id=0)
-                    assert sal.error_message.id == ERR_MATCH_TOURNAMENT_NO_CHAMPION_TO_SALUTE
 
                     # 507 & 508: SendTournamentSpectateCheer / GetTournamentSpectateCheer
                     send_bad = await _gate_call(

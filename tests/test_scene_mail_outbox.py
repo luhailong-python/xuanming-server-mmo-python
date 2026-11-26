@@ -213,3 +213,122 @@ def test_mail_sender_closes_retired_clients_on_endpoint_change(monkeypatch):
         assert closed == ["127.0.0.1:10001", "127.0.0.1:10002"]
 
     asyncio.run(exercise())
+
+
+def test_mail_sender_currency_and_recipient_and_deleted_recipient_drop(monkeypatch, tmp_path):
+    async def exercise():
+        protocol = Protocol()
+        key = b"battle-secret-01234567890123456789"
+        monkeypatch.setenv("MAIL_PRODUCER_SECRET_BATTLE", key.decode())
+        node = protocol.message("NodeInfo", node_type=8, protocol_type=1, node_uuid="mail-b",
+                                grpc_endpoint={"ip": "127.0.0.1", "port": 10003})
+
+        class Directory:
+            async def candidates(self, node_type, zone):
+                return [node]
+
+        captured = []
+
+        class Client:
+            async def call(self, path, data):
+                request = protocol.parse("mailpb.SendMailRequest", data)
+                captured.append((
+                    path,
+                    request.sender_kind,
+                    request.request_id,
+                    request.recipient_player_id,
+                    [(c.currency_type, c.amount) for c in request.attachments.currencies],
+                ))
+                assert verify_service_call(path, request, "battle", request.auth.timestamp_ms, key)
+                return protocol.message("mailpb.SendMailResponse", mail_id=77).SerializeToString()
+
+            async def close(self):
+                pass
+
+        sender = MailSender(protocol, Directory())
+        sender.clients["127.0.0.1:10003"] = Client()
+        entry = protocol.message(
+            "MailOutboxEntry",
+            request_id=88,
+            source=2,
+            source_id=9001,
+            title="名匠代打收益到账",
+            body="分成",
+            recipient_player_id=42,
+            currencies=[{"currency_type": 0, "amount": 76}],
+        )
+        try:
+            assert (await sender(7, entry)).mail_id == 77
+            assert captured == [("/mailpb.MailAdmin/SendPersonalMail", 5, 88, 42, [(0, 76)])]
+        finally:
+            await sender.close()
+
+        # 收件人已注销（ERR_MAIL_RECIPIENT_DELETED = 17011）应静默丢弃队头条目，不阻塞后续出箱。
+        scene = SceneNode(
+            protocol,
+            protocol.message("NodeInfo", node_id=6, zone_id=1, node_uuid="test-del"),
+            SqlitePlayerStore(tmp_path / "mail_del.sqlite"),
+            PlayerRowCodec(protocol),
+            lambda *args: None,
+        )
+        scene.create(protocol.message("CreateSceneRequest", scene_id=1, config_id=1))
+        await scene.enter(
+            protocol.message(
+                "PlayerEnterGameNodeRequest",
+                scene_id=1, session_id=1, player_id=1, owner_revision=1, login_generation=1,
+            ),
+            "gate",
+        )
+        player = scene.worlds[1].players[1]
+        seq = [200]
+        sent_to = []
+
+        async def allocate():
+            seq[0] += 1
+            return seq[0]
+
+        class DeletedFirstSender:
+            def secret(self):
+                return b"x" * 32
+
+            async def __call__(self, player_id, out_entry):
+                sent_to.append((player_id, out_entry.recipient_player_id, [(c.currency_type, c.amount) for c in out_entry.currencies]))
+                if out_entry.recipient_player_id == 999:
+                    return SimpleNamespace(error_message=SimpleNamespace(id=17011), mail_id=0)
+                return SimpleNamespace(error_message=SimpleNamespace(id=0), mail_id=501)
+
+            async def close(self):
+                pass
+
+        now = [10.0]
+        outbox = SceneMailOutbox(scene, allocate, DeletedFirstSender(), clock=lambda: now[0])
+        try:
+            data = scene.rows.assemble(player.snapshot)
+            assert await outbox.prepare_proxy_fee(
+                data, recipient_player_id=999, net_gold=95, source_id=1, buyer_name="墨竹",
+            )
+            assert await outbox.prepare_proxy_fee(
+                data, recipient_player_id=42, net_gold=76, source_id=2, buyer_name="墨竹",
+            )
+            await scene.commit_player_data(player, data)
+
+            now[0] += 1
+            outbox.tick()
+            await asyncio.gather(*tuple(outbox._jobs.values()))
+            # 第一条因收件人已注销被清理，仅剩第二条。
+            rem = scene.rows.assemble(player.snapshot).mail_outbox.entries
+            assert len(rem) == 1 and rem[0].recipient_player_id == 42
+
+            now[0] += 1
+            outbox.tick()
+            await asyncio.gather(*tuple(outbox._jobs.values()))
+            assert not scene.rows.assemble(player.snapshot).mail_outbox.entries
+            assert sent_to == [
+                (1, 999, [(0, 95)]),
+                (1, 42, [(0, 76)]),
+            ]
+        finally:
+            await outbox.close()
+            await scene.close()
+
+    asyncio.run(exercise())

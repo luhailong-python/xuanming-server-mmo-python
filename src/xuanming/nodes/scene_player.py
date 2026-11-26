@@ -112,6 +112,48 @@ def _bag(scene, tables: ConfigTables, player, bag_type: int):
     return response
 
 
+def _enhances_base_attribute(profile: int, attr) -> bool:
+    """判断基础属性是否随强化放大（与 C++ equiprules::EnhancesBaseAttribute 一致）：
+    V1 基础装放大基础气血(1)、物攻(3)、法攻(4)、双攻(effect=4)、防御(6)；速度(5)永不随强化放大。
+    """
+    if attr is None:
+        return False
+    if profile == 0:
+        return True
+    if profile != 1:
+        return False
+    if attr.effect == 4:
+        return True
+    return attr.effect == 3 and attr.effect_param in (1, 3, 4, 6)
+
+
+def _enhance_row_for_profile(tables: ConfigTables, profile: int, level: int):
+    table = tables["EquipEnhance"]
+    if profile == 0:
+        row = table.get(level)
+        if row is not None and int(getattr(row, "profile_id", 0)) == 0 and getattr(row, "level", 0) in (0, level):
+            return row
+        return None
+    found = None
+    for row in table.rows():
+        if int(getattr(row, "profile_id", 0)) != profile:
+            continue
+        row_level = int(getattr(row, "level", 0) or row.id)
+        if row_level != level:
+            continue
+        if found is not None:
+            return None
+        found = row
+    return found
+
+
+def _max_enhance_level_for_profile(tables: ConfigTables, profile: int) -> int:
+    level = 0
+    while _enhance_row_for_profile(tables, profile, level + 1) is not None:
+        level += 1
+    return level
+
+
 def _fill_item(tables: ConfigTables, info, equip) -> None:
     row = tables["Item"].get(info.config_id)
     if row is None:
@@ -126,17 +168,15 @@ def _fill_item(tables: ConfigTables, info, equip) -> None:
         return
 
     info.equip_level, info.equip_class = row.equip_level, row.equip_class
-    enhancement = tables["EquipEnhance"]
-    levels = 0
-    while levels < len(enhancement) and enhancement.get(levels + 1) is not None:
-        levels += 1
+    profile = int(getattr(row, "equip_profile", 0))
+    levels = _max_enhance_level_for_profile(tables, profile)
     level = min(equip.enhance_level, levels) if equip is not None else 0
-    current = enhancement.get(level) if level else None
+    current = _enhance_row_for_profile(tables, profile, level) if level else None
     bonus = current.bonus_permyriad if current is not None else 0
     info.enhance_level = level
     info.enhance_max_level = levels
     info.enhance_bonus_permyriad = bonus
-    preview = enhancement.get(level + 1) if equip is not None and level < levels else None
+    preview = _enhance_row_for_profile(tables, profile, level + 1) if equip is not None and level < levels else None
     if preview is not None and not preview.success_rate:
         preview = None
     if preview is not None:
@@ -146,13 +186,16 @@ def _fill_item(tables: ConfigTables, info, equip) -> None:
         attr = _accepted_attribute(tables, base.base_attr_id)
         if attr is None:
             continue
-        value = _scaled(base.base_attr_value, bonus)
+        enhances = _enhances_base_attribute(profile, attr)
+        value = _scaled(base.base_attr_value, bonus) if enhances else base.base_attr_value
         line = info.base_attrs.add(
             seq=len(info.base_attrs), enhance_bonus=value - base.base_attr_value,
         )
         _fill_line(line, attr, value)
         if preview is not None:
-            line.enhance_next_value = _scaled(base.base_attr_value, preview.bonus_permyriad)
+            line.enhance_next_value = (
+                _scaled(base.base_attr_value, preview.bonus_permyriad) if enhances else base.base_attr_value
+            )
     if equip is None:
         return
     for affix in sorted(equip.affixes, key=lambda line: (line.tier, line.seq)):
@@ -171,7 +214,7 @@ def _fill_item(tables: ConfigTables, info, equip) -> None:
 
 
 def _fill_enhance_preview(tables: ConfigTables, target, row) -> None:
-    target.next_level = row.id
+    target.next_level = int(getattr(row, "level", 0) or row.id)
     target.success_rate = row.success_rate
     target.cost_gold = row.cost_gold
     target.bonus_permyriad = row.bonus_permyriad

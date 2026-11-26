@@ -177,7 +177,6 @@ class MatchGrpcService:
                 "StartTournamentMatch": self.start_tournament_match,
                 "CheerTournamentSquad": self.cheer_tournament_squad,
                 "ClaimTournamentReward": self.claim_tournament_reward,
-                "SaluteTournamentChampion": self.salute_tournament_champion,
                 "SendTournamentSpectateCheer": self.send_tournament_spectate_cheer,
                 "GetTournamentSpectateCheer": self.get_tournament_spectate_cheer,
                 "UpdateTournamentSquadEmblem": self.update_tournament_squad_emblem,
@@ -664,11 +663,7 @@ class MatchGrpcService:
         caller = await self._admit_client(context, path)
         return await self.tournament.claim_tournament_reward(caller, request)
 
-    # -- Season Squad Tournament V2 / V3 客户端 RPCs（506..508, 511..514）---------------------------
-
-    async def salute_tournament_champion(self, request: Message, context, path: str) -> Message:
-        caller = await self._admit_client(context, path)
-        return await self.tournament.salute_tournament_champion(caller, request)
+    # -- Season Squad Tournament V2 / V3 客户端 RPCs（507..508, 511..514；506 已停用）----------------
 
     async def send_tournament_spectate_cheer(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)

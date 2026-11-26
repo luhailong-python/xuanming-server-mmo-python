@@ -134,6 +134,39 @@ message PrepareBattleRequest
   bool is_wuxing_tower = 10;
   // 道友切磋坊自定义规则（仅切磋局透传，供 scene 决定满血蓝隔离等准备策略）。
   CustomDuelRules custom_duel_rules = 11;
+  // 天墉生死状发起方队长备战资费冻结单（仅对 MATCH_MODE_JIANGHU_DUEL 的发起方队长填写，其余成员留空）。
+  JianghuDuelPrepareFee jianghu_duel_fee = 12;
+}
+
+message JianghuDuelPrepareFee
+{
+  uint64 duel_invite_id = 1; // 发号器永久 ID（兼作幂等预扣键）
+  uint32 writ_tier = 2;      // 1 = 普通 500 银两战书, 2 = 金帖生死状(Item 3415)
+  uint32 item_config_id = 3; // writ_tier == 2 时为 3415
+  uint64 silver_cost = 4;    // writ_tier == 1 时为 500
+}
+
+message CheckJianghuDuelEligibilityRequest
+{
+  repeated uint64 player_ids = 1;       // 待检查闭关免战开关的成员（最多 10 人）
+  uint64 payer_player_id = 2;           // 发起方队长（0 = 不做资费预检）
+  uint32 writ_tier = 3;                 // 1 = 普通银两, 2 = 金帖道具
+  uint32 item_config_id = 4;            // writ_tier == 2 时为 3415
+  uint64 silver_cost = 5;               // writ_tier == 1 时为 500
+}
+
+message JianghuPlayerEligibilityEntry
+{
+  uint64 player_id = 1;
+  bool online_on_node = 2;
+  bool duel_refuse_strangers = 3;
+}
+
+message CheckJianghuDuelEligibilityResponse
+{
+  TipInfoMessage error_message = 1;
+  repeated JianghuPlayerEligibilityEntry players = 2;
+  bool payer_has_sufficient_fee = 3;
 }
 
 message PrepareBattleResponse
@@ -141,12 +174,15 @@ message PrepareBattleResponse
   TipInfoMessage error_message = 1;   // 玩家不在/已在战斗等拒绝原因
   BattlePlayerSnapshot snapshot = 2;  // 冻结成功时返回战斗快照
   string table_fingerprint = 3;      // scene 侧战斗配表指纹(六张战斗表解析后确定性序列化的 sha256 前 16 字节 hex);match 比对全员一致
+  bool jianghu_silver_fee_charged = 4; // true = 本次备战已为天墉生死状普通战书扣除了发起方队长银两
 }
 
 message CancelBattlePrepareRequest
 {
   uint64 player_id = 1;
   uint64 battle_id = 2;  // 不匹配 InBattleComp.battle_id 时忽略(防迟到取消)
+  // true = 调用方（match）已接管该 battle_id 的普通战书银两邮件退还，scene 取消备战时不得重复退银两。
+  bool skip_jianghu_silver_refund = 3;
 }
 
 // 只封原节点实例已登记的≤through_generation；响应仅表示已采纳，不是排空或持久化证据。
@@ -164,4 +200,5 @@ service Scene {
   rpc PrepareBattle (PrepareBattleRequest) returns (PrepareBattleResponse);
   rpc CancelBattlePrepare (CancelBattlePrepareRequest) returns (Empty);
   rpc NodeHandshake(NodeHandshakeRequest) returns (NodeHandshakeResponse);
+  rpc CheckJianghuDuelEligibility (CheckJianghuDuelEligibilityRequest) returns (CheckJianghuDuelEligibilityResponse);
 }

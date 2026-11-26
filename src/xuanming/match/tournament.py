@@ -1,4 +1,4 @@
-"""全服赛季战队锦标赛《群仙问道赛》V1–V3：规则目录、四阶段推进、BO3 五行灵脉、观道致敬、观战喝彩、队徽、热身约战、神机竞猜、季军战与 MVP。"""
+"""全服赛季战队锦标赛《群仙问道赛》V1–V4：规则目录、四阶段推进、BO3 五行灵脉、观战喝彩、队徽、热身约战、神机竞猜、季军战与 MVP。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 
 from google.protobuf.message import Message
 
@@ -16,13 +15,11 @@ from .errors import (
     ERR_MATCH_INTERNAL,
     ERR_MATCH_TOURNAMENT_ALREADY_CHEERED,
     ERR_MATCH_TOURNAMENT_ALREADY_IN_SQUAD,
-    ERR_MATCH_TOURNAMENT_ALREADY_SALUTED_TODAY,
     ERR_MATCH_TOURNAMENT_EMBLEM_INVALID,
     ERR_MATCH_TOURNAMENT_INVITE_NOT_FOUND,
     ERR_MATCH_TOURNAMENT_LINEUP_INVALID,
     ERR_MATCH_TOURNAMENT_MATCH_NOT_READY,
     ERR_MATCH_TOURNAMENT_MEMBER_NOT_ENOUGH,
-    ERR_MATCH_TOURNAMENT_NO_CHAMPION_TO_SALUTE,
     ERR_MATCH_TOURNAMENT_NOT_CAPTAIN,
     ERR_MATCH_TOURNAMENT_NOT_OPEN,
     ERR_MATCH_TOURNAMENT_PREDICTION_CLOSED,
@@ -131,7 +128,6 @@ MAX_SQUAD_EMBLEM_ID = 8
 DEFAULT_EMBLEM_ID = 1
 
 _MASK64 = (1 << 64) - 1
-_UTC8 = timezone(timedelta(hours=8))
 
 
 # -- 纯规则辅助（与 Go internal/tournament/rules.go 一致）---------------------------------------------
@@ -371,12 +367,6 @@ def leyline_for_game(seq: tuple[int, ...] | list[int], game_index: int) -> int:
     if game_index <= 0 or game_index > len(seq):
         return LEYLINE_UNSPECIFIED
     return int(seq[game_index - 1])
-
-
-def utc8_day_key(unix_ms: int) -> int:
-    """将 Unix 毫秒转换为 UTC+8 自然日键 YYYYMMDD（每日免费观道致敬重置口径）。"""
-    dt = datetime.fromtimestamp(int(unix_ms) / 1000.0, tz=_UTC8)
-    return dt.year * 10000 + dt.month * 100 + dt.day
 
 
 def is_valid_spectate_cheer_phrase(phrase_id: int) -> bool:
@@ -669,9 +659,6 @@ class TournamentRuleSpec:
     bo3_top4_enabled: bool = True
     intermission_seconds: int = 60
     public_knockout_replay: bool = True
-    salute_gold_amount: int = 5000
-    salute_item_id: int = 20
-    salute_item_count: int = 3
     warmup_spar_enabled: bool = True
     prediction_enabled: bool = True
     prediction_reward_min_hits: int = 2
@@ -781,9 +768,6 @@ class TournamentCatalog:
             bo3_top4_enabled=bool(getattr(row, "bo3_top4_enabled", True)),
             intermission_seconds=int(getattr(row, "intermission_seconds", DEFAULT_INTERMISSION_SEC)) or DEFAULT_INTERMISSION_SEC,
             public_knockout_replay=bool(getattr(row, "public_knockout_replay", True)),
-            salute_gold_amount=int(getattr(row, "salute_gold_amount", 5000)),
-            salute_item_id=int(getattr(row, "salute_item_id", 20)),
-            salute_item_count=int(getattr(row, "salute_item_count", 3)),
             warmup_spar_enabled=bool(getattr(row, "warmup_spar_enabled", True)),
             prediction_enabled=bool(getattr(row, "prediction_enabled", True)),
             prediction_reward_min_hits=int(getattr(row, "prediction_reward_min_hits", 2)) or 2,
@@ -884,7 +868,6 @@ class _SeasonRecord:
     settled_ms: int = 0
     updated_ms: int = 0
     champion_members: tuple[_MemberRecord, ...] = ()
-    champion_salute_count: int = 0
     champion_emblem_id: int = 0
     third_place_squad_id: int = 0
     third_place_squad_name: str = ""
@@ -1010,16 +993,6 @@ class _CheerRecord:
 
 
 @dataclass
-class _SaluteRecord:
-    player_id: int
-    salute_day: int
-    season_id: int
-    reward_id: int
-    mail_id: int = 0
-    created_ms: int = 0
-
-
-@dataclass
 class _PredictionRecord:
     season_id: int
     player_id: int
@@ -1085,7 +1058,6 @@ class TournamentManager:
         self._games_by_battle: dict[int, _MatchGameRecord] = {}  # battle_id -> game record
         self._battle_contexts: dict[int, Message] = {}  # battle_id -> TournamentBattleContext
         self._cheers: dict[tuple[int, int], _CheerRecord] = {}  # (season_id, player_id)
-        self._salutes: dict[tuple[int, int], _SaluteRecord] = {}  # (player_id, salute_day)
         self._predictions: dict[tuple[int, int, int], _PredictionRecord] = {}  # (season_id, player_id, match_id)
         self._rewards: dict[tuple[int, int, int], _RewardRecord] = {}  # (season_id, player_id, tier_kind)
 
@@ -1141,11 +1113,6 @@ class TournamentManager:
             1 for sq in self._squads.values()
             if sq.season_id == season_id and sq.state in (SQUAD_REGISTERED, SQUAD_ELIMINATED, SQUAD_CHAMPION)
         )
-
-    def _saluted_today(self, player_id: int, stamp: int) -> bool:
-        if player_id <= 0:
-            return False
-        return (player_id, utc8_day_key(stamp)) in self._salutes
 
     def _game_battle_ids(self, match_id: int) -> list[int]:
         games = [g for g in self._match_games.values() if g.match_id == match_id and g.battle_id > 0]
@@ -1274,7 +1241,7 @@ class TournamentManager:
         dst.gender = m.gender
         dst.appearance_id = m.appearance_id
 
-    def _season_view(self, season: _SeasonRecord, registered_count: int, *, saluted_today: bool = False) -> Message:
+    def _season_view(self, season: _SeasonRecord, registered_count: int) -> Message:
         rule = self.catalog.rule
         view = self.protocol.message(
             "match.TournamentSeasonView",
@@ -1300,8 +1267,6 @@ class TournamentManager:
             champion_squad_id=season.champion_squad_id,
             champion_squad_name=season.champion_squad_name,
             champion_member_summary=season.champion_member_summary,
-            champion_salute_count=season.champion_salute_count,
-            saluted_today=saluted_today,
             champion_emblem_id=season.champion_emblem_id,
             third_place_squad_id=season.third_place_squad_id,
             third_place_squad_name=season.third_place_squad_name,
@@ -1482,8 +1447,7 @@ class TournamentManager:
         stamp = self._now_ms()
         cur = self._ensure_season(stamp)
         reg_count = self._registered_squad_count(cur.season_id)
-        saluted_today = self._saluted_today(caller.player_id, stamp)
-        resp.current_season.CopyFrom(self._season_view(cur, reg_count, saluted_today=saluted_today))
+        resp.current_season.CopyFrom(self._season_view(cur, reg_count))
         resp.server_time_ms = stamp
         self._fill_reward_tiers(resp.reward_tiers)
 
@@ -1550,7 +1514,7 @@ class TournamentManager:
             ]
             hof.sort(key=lambda s: s.season_id, reverse=True)
             for hs in hof[:20]:
-                resp.hall_of_fame.add().CopyFrom(self._season_view(hs, 0, saluted_today=saluted_today))
+                resp.hall_of_fame.add().CopyFrom(self._season_view(hs, 0))
         return resp
 
     async def create_tournament_squad(self, caller: CallerIdentity, request: Message) -> Message:
@@ -1846,9 +1810,7 @@ class TournamentManager:
         ]
         all_squads.sort(key=self._standings_sort_key)
 
-        resp.season.CopyFrom(
-            self._season_view(season, len(all_squads), saluted_today=self._saluted_today(caller.player_id, stamp))
-        )
+        resp.season.CopyFrom(self._season_view(season, len(all_squads)))
         resp.total_squads = len(all_squads)
         resp.server_time_ms = stamp
         start = (page - 1) * page_size
@@ -2084,50 +2046,7 @@ class TournamentManager:
             resp.claimed_rewards.add().CopyFrom(self._reward_view(r))
         return resp
 
-    # -- V2 客户端 RPC（506..508）：每日观道致敬 + 观战预设喝彩 ----------------------------------------
-
-    async def salute_tournament_champion(self, caller: CallerIdentity, request: Message) -> Message:
-        resp = self.protocol.message("match.SaluteTournamentChampionResponse")
-        if not self.catalog.rule.enabled:
-            return set_tip(resp, ERR_MATCH_TOURNAMENT_NOT_OPEN)
-        stamp = self._now_ms()
-        req_season = int(request.season_id)
-        season: _SeasonRecord | None = None
-        if req_season != 0:
-            cand = self._seasons.get(req_season)
-            if cand is not None and cand.champion_squad_id > 0:
-                season = cand
-        else:
-            settled = [s for s in self._seasons.values() if s.champion_squad_id > 0]
-            if settled:
-                settled.sort(key=lambda s: s.season_id, reverse=True)
-                season = settled[0]
-        if season is None:
-            return set_tip(resp, ERR_MATCH_TOURNAMENT_NO_CHAMPION_TO_SALUTE)
-
-        salute_day = utc8_day_key(stamp)
-        key = (caller.player_id, salute_day)
-        if key in self._salutes:
-            return set_tip(resp, ERR_MATCH_TOURNAMENT_ALREADY_SALUTED_TODAY)
-
-        reward_id = self._alloc_id()
-        self._salutes[key] = _SaluteRecord(
-            player_id=caller.player_id,
-            salute_day=salute_day,
-            season_id=season.season_id,
-            reward_id=reward_id,
-            created_ms=stamp,
-        )
-        season.champion_salute_count += 1
-        season.updated_ms = stamp
-        rule = self.catalog.rule
-        resp.season_id = season.season_id
-        resp.champion_salute_count = season.champion_salute_count
-        resp.saluted_today = True
-        resp.gold_amount = rule.salute_gold_amount
-        if rule.salute_item_id > 0 and rule.salute_item_count > 0:
-            resp.items.add(item_id=rule.salute_item_id, count=rule.salute_item_count)
-        return resp
+    # -- V2 客户端 RPC（507..508，506 已停用）：观战预设喝彩 -------------------------------------------
 
     def _fill_cheer_snapshot(self, resp: Message, snap: SpectateCheerSnapshot) -> None:
         resp.battle_id = snap.battle_id

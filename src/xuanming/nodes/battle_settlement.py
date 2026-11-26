@@ -240,11 +240,12 @@ class BattleSettlement:
         travel_pass = getattr(self.scene, "travel_pass", None)
         if not is_npc_isolated_encounter and travel_pass is not None and hasattr(travel_pass, "apply_battle_credit"):
             travel_pass.apply_battle_credit(data, settlement, stamp)
+        season_delta = None
         if not is_npc_isolated_encounter:
-            self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
+            season_delta = self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
         self._record(
             data.battle_results, settlement, currencies, gained, consumed, stamp,
-            items_mailed=items_mailed, fb_delta=fb_delta, prog_delta=prog_delta,
+            items_mailed=items_mailed, fb_delta=fb_delta, prog_delta=prog_delta, season_delta=season_delta,
         )
         # 离线托管期间的真实战斗结算同帧记入收获简报（不额外发产出）。
         hosting_active = bool(getattr(player, "hosting_active", False) or getattr(player, "disconnect_at", None) is not None)
@@ -279,7 +280,7 @@ class BattleSettlement:
 
     def _apply_progression_hooks(
         self, player, data, settlement, stamp: int, *, is_festival_beast: bool = False,
-    ) -> None:
+    ) -> dict | None:
         """在战斗终局落盘前，安全推进赛季印、试炼志与装备每日材料自选额度。"""
         if (
             settlement.fled
@@ -287,17 +288,18 @@ class BattleSettlement:
             or settlement.player_team_index > 1
             or settlement.outcome not in (1, 2, 3)
         ):
-            return
+            return None
         player_won = (
             (settlement.outcome == 1 and settlement.player_team_index == 0)
             or (settlement.outcome == 2 and settlement.player_team_index == 1)
         )
+        season_delta = None
 
         if not is_festival_beast:
             season = getattr(self.scene, "season", None)
             if season is not None:
                 try:
-                    season.record_battle_progress(
+                    season_delta = season.record_battle_progress_delta(
                         data,
                         match_mode=settlement.match_mode,
                         player_won=player_won,
@@ -371,6 +373,7 @@ class BattleSettlement:
                     "Battle settlement material reward hook failed player_id=%s battle_id=%s",
                     player.player_id, settlement.battle_id, exc_info=True,
                 )
+        return season_delta
 
     def _checkpoint(self, data, audits):
         if audits is not None and self.assets.audit_enabled:
@@ -524,6 +527,7 @@ class BattleSettlement:
     def _record(
         history, settlement, currencies, gained, consumed, stamp, *,
         items_mailed=False, fb_delta=None, prog_delta: BattleProgressionDelta | None = None,
+        season_delta: dict | None = None,
     ):
         seq = max(history.last_result_seq, max((entry.result_seq for entry in history.entries), default=0)) + 1
         history.last_result_seq = seq
@@ -534,6 +538,18 @@ class BattleSettlement:
             lines_truncated=len(gained) > MAX_LINES or len(consumed) > MAX_LINES,
             match_mode=settlement.match_mode, battle_config_id=settlement.battle_config_id, items_mailed=items_mailed,
         )
+        if season_delta:
+            if season_delta.get("season_id"):
+                entry.season_id = int(season_delta["season_id"])
+            entry.season_seal_points_added = int(season_delta.get("points_added", 0))
+            entry.season_seal_progress_after = int(season_delta.get("progress_after", 0))
+            entry.season_seal_max_points = int(season_delta.get("max_points", 0))
+            entry.season_honor_newly_unlocked = bool(season_delta.get("honor_newly_unlocked", False))
+            entry.retro_honor_season_id = int(season_delta.get("retro_honor_season_id", 0))
+            entry.retro_honor_points_added = int(season_delta.get("retro_honor_points_added", 0))
+            entry.retro_honor_progress_after = int(season_delta.get("retro_honor_progress_after", 0))
+            entry.retro_honor_max_points = int(season_delta.get("retro_honor_max_points", 0))
+            entry.retro_honor_newly_unlocked = bool(season_delta.get("retro_honor_newly_unlocked", False))
         if prog_delta is not None:
             entry.exp_gain = int(prog_delta.exp_gain)
             entry.level_before = int(prog_delta.level_before)
@@ -583,6 +599,15 @@ class BattleSettlement:
             end_msg.total_exp_after = int(result.total_exp_after)
             end_msg.next_level_total_exp = int(result.next_level_total_exp)
             end_msg.battle_silver_diminished = bool(result.battle_silver_diminished)
+            end_msg.season_seal_points_added = int(result.season_seal_points_added)
+            end_msg.season_seal_progress_after = int(result.season_seal_progress_after)
+            end_msg.season_seal_max_points = int(result.season_seal_max_points)
+            end_msg.season_honor_newly_unlocked = bool(result.season_honor_newly_unlocked)
+            end_msg.retro_honor_season_id = int(result.retro_honor_season_id)
+            end_msg.retro_honor_points_added = int(result.retro_honor_points_added)
+            end_msg.retro_honor_progress_after = int(result.retro_honor_progress_after)
+            end_msg.retro_honor_max_points = int(result.retro_honor_max_points)
+            end_msg.retro_honor_newly_unlocked = bool(result.retro_honor_newly_unlocked)
             for cur in result.currencies:
                 if cur.currency_type == 0:
                     end_msg.silver_gain = int(cur.amount)

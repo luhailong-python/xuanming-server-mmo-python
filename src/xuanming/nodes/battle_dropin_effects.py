@@ -476,8 +476,17 @@ class SealConditionType(IntEnum):
 
 
 def maximum_source_bps(effect: int) -> int:
-    """返回装备单项属性来源的万分比上限。"""
+    """返回装备单项属性来源的万分比上限（未强化表上限）。"""
     return _MAXIMUM_SOURCE_BPS.get(effect, 0)
+
+
+def maximum_effective_source_bps(effect: int) -> int:
+    """返回装备单项属性含 +11 控辅克制强化受益后的有效上限（速度恒定 200）。"""
+    if effect in (5, 6):
+        return 3584  # 3200 * (1 + 2400 * 5000 / 10000 / 10000)
+    if effect == 11:
+        return 1696  # 1600 * (1 + 2400 * 2500 / 10000 / 10000)
+    return maximum_source_bps(effect)
 
 
 def floor_bps(value: int, bps: int) -> int:
@@ -651,7 +660,18 @@ class SeasonBattleRules:
             return cls.SHARP_TEMPO_UNSHIELDED_BONUS_PCT
         return 0
 
-    # 赛季玩法 V3：S1「破阵之季」四组「技印共鸣」（零面板属性、零速度控制，对齐 C++ season_rules.h）
+    # 赛季玩法 V4：8 种表驱动「技印共鸣」原语（零面板属性、零速度控制，对齐 C++ season_rules.h）
+    RESONANCE_NONE = 0
+    RESONANCE_SHARP_MANA_REFUND = 1
+    RESONANCE_BREAK_EXTEND_DEBUFF = 2
+    RESONANCE_GUARD_SHIELD_BOOST = 3
+    RESONANCE_DEFEND_MANA_DISCOUNT = 4
+    RESONANCE_EMERGENCY_HEAL_REFUND = 5
+    RESONANCE_FIRST_SHIELD_MANA = 6
+    RESONANCE_GUARD_HEAL_BOOST = 7
+    RESONANCE_DEFEND_SHIELD_BOOST = 8
+    RESONANCE_EVENT_BASE = 100
+
     SEASON_1_ID = 1
     SEAL_POZHEN_RUIYIN = 101
     SEAL_POZHEN_XUANYIN = 102
@@ -667,23 +687,69 @@ class SeasonBattleRules:
     RESONANCE_EVENT_MYSTIC_EXTEND_DEBUFF = 102
     RESONANCE_EVENT_GUARD_SHIELD_BOOST = 103
     RESONANCE_EVENT_BREATH_HALF_MANA = 104
+    RESONANCE_EVENT_EMERGENCY_HEAL_REFUND = 105
+    RESONANCE_EVENT_FIRST_SHIELD_MANA = 106
+    RESONANCE_EVENT_GUARD_HEAL_BOOST = 107
+    RESONANCE_EVENT_DEFEND_SHIELD_BOOST = 108
 
     RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT = 30
     RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS = 1
     RESONANCE_GUARD_SHIELD_BONUS_PCT = 10
 
-    @classmethod
-    def resonance_sharp_mana_refund(cls, paid_mana: int) -> int:
-        if paid_mana <= 0:
+    @staticmethod
+    def compute_mana_pct_ceil(paid_mana: int, pct: int) -> int:
+        if paid_mana <= 0 or pct <= 0:
             return 0
-        q, r = divmod(paid_mana, 100)
-        return q * cls.RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT + (
-            r * cls.RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT + 99
-        ) // 100
+        bounded = min(int(pct), 100)
+        q, r = divmod(int(paid_mana), 100)
+        return q * bounded + (r * bounded + 99) // 100
 
     @staticmethod
-    def resonance_half_mana_cost(base_cost: int) -> int:
-        return max(0, base_cost) // 2
+    def compute_mana_discounted(base_cost: int, discount_pct: int) -> int:
+        if base_cost <= 0:
+            return 0
+        pct = max(0, int(discount_pct))
+        keep_pct = 0 if pct >= 100 else 100 - pct
+        q, r = divmod(int(base_cost), 100)
+        return q * keep_pct + (r * keep_pct) // 100
+
+    @classmethod
+    def resonance_sharp_mana_refund(cls, paid_mana: int) -> int:
+        return cls.compute_mana_pct_ceil(paid_mana, cls.RESONANCE_SHARP_SHATTER_MANA_REFUND_PCT)
+
+    @classmethod
+    def resonance_half_mana_cost(cls, base_cost: int) -> int:
+        return cls.compute_mana_discounted(base_cost, 50)
+
+    @classmethod
+    def valid_seal_resonance(
+        cls,
+        effect_id: int,
+        resonance_skill_id: int,
+        resonance_kind: int,
+        resonance_param: int,
+    ) -> bool:
+        if resonance_kind == cls.RESONANCE_NONE:
+            return True
+        if resonance_skill_id <= 0 or resonance_param <= 0:
+            return False
+        if resonance_kind == cls.RESONANCE_SHARP_MANA_REFUND:
+            return effect_id in (1, 2) and resonance_param <= 40
+        if resonance_kind == cls.RESONANCE_BREAK_EXTEND_DEBUFF:
+            return effect_id in (1, 2) and resonance_param <= 1
+        if resonance_kind == cls.RESONANCE_GUARD_SHIELD_BOOST:
+            return effect_id == 6 and resonance_param <= 15
+        if resonance_kind == cls.RESONANCE_DEFEND_MANA_DISCOUNT:
+            return effect_id == 7 and resonance_param <= 50
+        if resonance_kind == cls.RESONANCE_EMERGENCY_HEAL_REFUND:
+            return effect_id == 4 and resonance_param <= 35
+        if resonance_kind == cls.RESONANCE_FIRST_SHIELD_MANA:
+            return effect_id == 5 and resonance_param <= 300
+        if resonance_kind == cls.RESONANCE_GUARD_HEAL_BOOST:
+            return effect_id == 6 and resonance_param <= 15
+        if resonance_kind == cls.RESONANCE_DEFEND_SHIELD_BOOST:
+            return effect_id == 7 and resonance_param <= 12
+        return False
 
     @staticmethod
     def is_window_active(starts_at_ms: int, ends_at_ms: int, enabled: bool, now_ms: int) -> bool:
@@ -716,8 +782,8 @@ class SeasonBattleRules:
         active_rounds: int,
         health_threshold_bps: int,
     ) -> bool:
-        """校验单槽赛季印战斗机制参数是否合法。"""
-        if season_id <= 0 or seal_id <= 0:
+        """校验单槽赛季印战斗机制参数是否合法（严禁 effect_id=3 控命与 8 控抗）。"""
+        if season_id <= 0 or seal_id <= 0 or effect_id in (3, 8):
             return False
         return valid_artifact_definition(
             effect_id,
@@ -727,6 +793,36 @@ class SeasonBattleRules:
             battle_limit,
             active_rounds,
             health_threshold_bps,
+        )
+
+    @classmethod
+    def valid_seal_definition(
+        cls,
+        season_id: int,
+        seal_id: int,
+        effect_id: int,
+        bonus_bps: int,
+        cap_bps: int,
+        per_round_limit: int,
+        battle_limit: int,
+        active_rounds: int,
+        health_threshold_bps: int,
+        resonance_skill_id: int = 0,
+        resonance_kind: int = 0,
+        resonance_param: int = 0,
+    ) -> bool:
+        return cls.valid_seal_effect(
+            season_id,
+            seal_id,
+            effect_id,
+            bonus_bps,
+            cap_bps,
+            per_round_limit,
+            battle_limit,
+            active_rounds,
+            health_threshold_bps,
+        ) and cls.valid_seal_resonance(
+            effect_id, resonance_skill_id, resonance_kind, resonance_param
         )
 
     @classmethod
@@ -1092,12 +1188,18 @@ class PetAndSupportEffects:
 
             if equipment is not None:
                 effect_kind = 2 if is_shield else 1
+                max_eff_cap = maximum_effective_source_bps(6 if is_shield else 5)
+                has_explicit_cap = False
                 for source in equipment.support_sources:
                     if source.effect_kind != effect_kind:
                         continue
                     part.sources.add().CopyFrom(source)
                     if source.source_cap_bps > 0:
-                        part.equipment_cap_bps = min(part.equipment_cap_bps, source.source_cap_bps)
+                        bounded_cap = min(source.source_cap_bps, max_eff_cap)
+                        part.equipment_cap_bps = (
+                            min(part.equipment_cap_bps, bounded_cap) if has_explicit_cap else bounded_cap
+                        )
+                        has_explicit_cap = True
 
                 artifact_effect_id = 5 if is_shield else 4
                 available = set(self.engine.equipment_effects.available_artifacts(actor, artifact_effect_id, round_index))
@@ -1159,8 +1261,12 @@ class EquipmentBattleEffects:
         self._season_seal_runtime: dict[int, SeasonSealRuntimeState] = {}
         self.pending_mystic_extend_caster_id: int = 0
         self.pending_mystic_extend_target_id: int = 0
-        self.active_guard_shield_resonance_caster_id: int = 0
-        self.active_guard_shield_resonance_extra: int = 0
+        self.pending_mystic_extend_skill_id: int = 0
+        self.pending_mystic_extend_bonus_rounds: int = 0
+        self.active_next_round_boost_caster_id: int = 0
+        self.active_next_round_boost_kind: int = 0
+        self.active_next_round_boost_pct: int = 0
+        self.active_next_round_boost_extra: int = 0
 
     def season_seal_runtime(self, actor_id: int) -> SeasonSealRuntimeState:
         rt = self._season_seal_runtime.get(actor_id)
@@ -1190,19 +1296,25 @@ class EquipmentBattleEffects:
                 return True
         return False
 
-    def is_defend_breath_resonance_ready(self, actor: Message, skill_id: int, round_index: int) -> bool:
+    def defend_mana_discount_resonance_pct(self, actor: Message, skill_id: int, round_index: int) -> int:
         if (
             actor.actor_type != _ACTOR_PLAYER
-            or skill_id != SeasonBattleRules.SKILL_POZHEN_XUSHI
             or not actor.HasField("equipment_effects")
             or not actor.equipment_effects.HasField("season_seal")
         ):
-            return False
+            return 0
         seal = actor.equipment_effects.season_seal
-        if seal.season_id != SeasonBattleRules.SEASON_1_ID or seal.seal_id != SeasonBattleRules.SEAL_JUXI_YUANYIN:
-            return False
+        if (
+            int(getattr(seal, "resonance_kind", 0)) != SeasonBattleRules.RESONANCE_DEFEND_MANA_DISCOUNT
+            or int(getattr(seal, "resonance_skill_id", 0)) != skill_id
+            or int(getattr(seal, "resonance_param", 0)) <= 0
+        ):
+            return 0
         rt = self._season_seal_runtime.get(actor.actor_id)
-        return rt is not None and rt.defend_resonance_ready_round == round_index
+        return int(seal.resonance_param) if (rt is not None and rt.defend_resonance_ready_round == round_index) else 0
+
+    def is_defend_breath_resonance_ready(self, actor: Message, skill_id: int, round_index: int) -> bool:
+        return self.defend_mana_discount_resonance_pct(actor, skill_id, round_index) > 0
 
     def emit_season_resonance(
         self,
@@ -1268,19 +1380,19 @@ class EquipmentBattleEffects:
     def initialize_equipment(self, actor: Message, effects: Message) -> bool:
         """校验并初始化角色装备快照、法宝次数状态及赛季印轻属性（对照 `InitializeEquipment`）。"""
         if (
-            effects.physical_attack_bps > maximum_source_bps(1)
-            or effects.magic_attack_bps > maximum_source_bps(2)
-            or effects.max_health_bps > maximum_source_bps(3)
-            or effects.speed_bps > maximum_source_bps(4)
-            or effects.outgoing_heal_bps > maximum_source_bps(5)
-            or effects.shield_capacity_bps > maximum_source_bps(6)
-            or effects.physical_crit_bps > maximum_source_bps(7)
-            or effects.magic_crit_bps > maximum_source_bps(8)
-            or effects.physical_resist_bps > maximum_source_bps(9)
-            or effects.magic_resist_bps > maximum_source_bps(10)
-            or not self._bounded_map(effects.ailment_hit_bps, 7, maximum_source_bps(11))
-            or not self._bounded_map(effects.ailment_resist_bps, 7, maximum_source_bps(12))
-            or not self._bounded_map(effects.mana_reduction_bps, 12, maximum_source_bps(13))
+            effects.physical_attack_bps > maximum_effective_source_bps(1)
+            or effects.magic_attack_bps > maximum_effective_source_bps(2)
+            or effects.max_health_bps > maximum_effective_source_bps(3)
+            or effects.speed_bps > maximum_effective_source_bps(4)
+            or effects.outgoing_heal_bps > maximum_effective_source_bps(5)
+            or effects.shield_capacity_bps > maximum_effective_source_bps(6)
+            or effects.physical_crit_bps > maximum_effective_source_bps(7)
+            or effects.magic_crit_bps > maximum_effective_source_bps(8)
+            or effects.physical_resist_bps > maximum_effective_source_bps(9)
+            or effects.magic_resist_bps > maximum_effective_source_bps(10)
+            or not self._bounded_map(effects.ailment_hit_bps, 7, maximum_effective_source_bps(11))
+            or not self._bounded_map(effects.ailment_resist_bps, 7, maximum_effective_source_bps(12))
+            or not self._bounded_map(effects.mana_reduction_bps, 12, maximum_effective_source_bps(13))
             or len(effects.artifacts) > MAX_ARTIFACT_SLOTS
             or effects.season_max_health_bps > SeasonBattleRules.HARD_STAT_CAP_BPS
             or effects.season_defense_bps > SeasonBattleRules.HARD_STAT_CAP_BPS
@@ -1290,7 +1402,7 @@ class EquipmentBattleEffects:
 
         if effects.HasField("season_seal"):
             seal = effects.season_seal
-            if not SeasonBattleRules.valid_seal_effect(
+            if not SeasonBattleRules.valid_seal_definition(
                 seal.season_id,
                 seal.seal_id,
                 seal.effect_id,
@@ -1300,6 +1412,9 @@ class EquipmentBattleEffects:
                 seal.battle_limit,
                 seal.active_rounds,
                 seal.health_threshold_bps,
+                int(getattr(seal, "resonance_skill_id", 0)),
+                int(getattr(seal, "resonance_kind", 0)),
+                int(getattr(seal, "resonance_param", 0)),
             ):
                 _LOG.warning("rejected invalid season seal in equipment effects actor_id=%s", actor.actor_id)
                 return False
@@ -1518,9 +1633,9 @@ class EquipmentBattleEffects:
                 total += gain
                 SeasonBattleRules.use_seal(actor, actor.actor_id, gain, round_index, turn, group)
                 self.record_season_seal_use(actor.actor_id, gain)
-                if (
-                    seal.season_id == SeasonBattleRules.SEASON_1_ID
-                    and seal.seal_id == SeasonBattleRules.SEAL_JUXI_YUANYIN
+                if int(getattr(seal, "resonance_kind", 0)) in (
+                    SeasonBattleRules.RESONANCE_DEFEND_MANA_DISCOUNT,
+                    SeasonBattleRules.RESONANCE_DEFEND_SHIELD_BOOST,
                 ):
                     self.season_seal_runtime(actor.actor_id).defend_resonance_ready_round = round_index + 1
         if total <= 0:
@@ -1580,9 +1695,9 @@ class EquipmentBattleEffects:
                     reduction += part
                     SeasonBattleRules.use_seal(target, target.actor_id, part, round_index, turn, group)
                     self.record_season_seal_use(target.actor_id, part)
-                    if (
-                        seal.season_id == SeasonBattleRules.SEASON_1_ID
-                        and seal.seal_id == SeasonBattleRules.SEAL_GUZHEN_SHOUYIN
+                    if int(getattr(seal, "resonance_kind", 0)) in (
+                        SeasonBattleRules.RESONANCE_GUARD_SHIELD_BOOST,
+                        SeasonBattleRules.RESONANCE_GUARD_HEAL_BOOST,
                     ):
                         rt = self.season_seal_runtime(target.actor_id)
                         if not rt.guard_resonance_consumed:
@@ -1608,6 +1723,7 @@ class EquipmentBattleEffects:
         caster = source if source is not None else actor
         capacity_float = base_capacity
         contributions: list[int] = []
+        season_seal_shield_gain = 0
         if caster.actor_type == _ACTOR_PET:
             capacity_float = PetAndSupportEffects.apply_bonus(base_capacity, PetAndSupportEffects.pet_shield_bonus(caster))
         elif caster.actor_type == _ACTOR_PLAYER and caster.HasField("equipment_effects"):
@@ -1619,6 +1735,13 @@ class EquipmentBattleEffects:
                     if math.floor(after) > math.floor(base_capacity * (1.0 + bonus)):
                         contributions.append(idx)
                     bonus += bps / 10_000.0
+                if SeasonBattleRules.seal_available(caster, 5, round_index):
+                    seal = caster.equipment_effects.season_seal
+                    before_floor = math.floor(max(0.0, base_capacity * (1.0 + bonus)))
+                    bonus += seal.bonus_bps / 10_000.0
+                    after_floor = math.floor(max(0.0, base_capacity * (1.0 + bonus)))
+                    if after_floor > before_floor:
+                        season_seal_shield_gain = after_floor - before_floor
             capacity_float = PetAndSupportEffects.apply_bonus(base_capacity, bonus)
         if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WOOD:
             capacity_float *= 110.0 / 100.0
@@ -1632,23 +1755,27 @@ class EquipmentBattleEffects:
             capacity_float *= (100.0 + support_bonus_pct) / 100.0
         if getattr(self.engine, "escalation_stacks", 0) > 0:
             capacity_float *= self.engine.escalation_support_pct / 100.0
-        guard_resonance_gain = 0
+        next_round_shield_gain = 0
         if (
             not is_mirror
-            and skill_id == SeasonBattleRules.SKILL_GUZHEN_LINGZHANG
-            and self.active_guard_shield_resonance_caster_id == caster.actor_id
+            and self.active_next_round_boost_caster_id == caster.actor_id
+            and self.active_next_round_boost_kind in (
+                SeasonBattleRules.RESONANCE_GUARD_SHIELD_BOOST,
+                SeasonBattleRules.RESONANCE_DEFEND_SHIELD_BOOST,
+            )
+            and self.active_next_round_boost_pct > 0
         ):
             before_shield = PetAndSupportEffects.whole(capacity_float)
-            capacity_float *= (100.0 + SeasonBattleRules.RESONANCE_GUARD_SHIELD_BONUS_PCT) / 100.0
+            capacity_float *= (100.0 + self.active_next_round_boost_pct) / 100.0
             after_shield = PetAndSupportEffects.whole(capacity_float)
             if after_shield > before_shield:
-                guard_resonance_gain = after_shield - before_shield
+                next_round_shield_gain = after_shield - before_shield
         capacity = PetAndSupportEffects.whole(capacity_float)
         if capacity <= 0:
             return 0
-        if guard_resonance_gain > 0:
-            self.active_guard_shield_resonance_extra = min(
-                U64_MAX, self.active_guard_shield_resonance_extra + guard_resonance_gain,
+        if next_round_shield_gain > 0:
+            self.active_next_round_boost_extra = min(
+                U64_MAX, self.active_next_round_boost_extra + next_round_shield_gain,
             )
         buff_id = self._next_shield_buff_id
         self._next_shield_buff_id += 1
@@ -1679,6 +1806,40 @@ class EquipmentBattleEffects:
                     turn,
                     group,
                 )
+            if season_seal_shield_gain > 0 and SeasonBattleRules.seal_available(caster, 5, round_index):
+                seal = caster.equipment_effects.season_seal
+                SeasonBattleRules.use_seal(caster, actor.actor_id, season_seal_shield_gain, round_index, turn, group)
+                self.record_season_seal_use(caster.actor_id, season_seal_shield_gain)
+                if (
+                    int(getattr(seal, "resonance_kind", 0)) == SeasonBattleRules.RESONANCE_FIRST_SHIELD_MANA
+                    and int(getattr(seal, "resonance_skill_id", 0)) == skill_id
+                    and int(getattr(seal, "resonance_param", 0)) > 0
+                ):
+                    mana_before = caster.attributes.mana
+                    missing_mana = max(0, caster.max_mana - mana_before)
+                    entry_max_mana = caster.entry_max_mana or caster.max_mana
+                    gain = min(missing_mana, floor_bps(entry_max_mana, int(seal.resonance_param)))
+                    if gain > 0:
+                        caster.attributes.mana = mana_before + gain
+                        turn.events.add(
+                            event_type=_EVENT_MANA,
+                            source_id=caster.actor_id,
+                            target_id=caster.actor_id,
+                            group_id=group,
+                            skill_table_id=skill_id,
+                            value=gain,
+                            mana_delta=min(gain, _I64_MAX),
+                            target_health_after=caster.attributes.health,
+                            target_mana_after=caster.attributes.mana,
+                        )
+                        self.emit_season_resonance(
+                            caster,
+                            caster.actor_id,
+                            SeasonBattleRules.RESONANCE_EVENT_FIRST_SHIELD_MANA,
+                            gain,
+                            turn,
+                            group,
+                        )
         return capacity
 
     @staticmethod
@@ -1828,15 +1989,17 @@ class EquipmentBattleEffects:
                 SeasonBattleRules.use_seal(source, target.actor_id, removed, round_index, turn, group)
                 self.record_season_seal_use(source.actor_id, removed)
                 self.engine.trial_tracker.record_shield_break(source)
-                if seal.season_id == SeasonBattleRules.SEASON_1_ID:
+                res_kind = int(getattr(seal, "resonance_kind", 0))
+                res_skill = int(getattr(seal, "resonance_skill_id", 0))
+                res_param = int(getattr(seal, "resonance_param", 0))
+                if res_skill == skill_id and res_param > 0:
                     if (
-                        seal.seal_id == SeasonBattleRules.SEAL_POZHEN_RUIYIN
-                        and skill_id == SeasonBattleRules.SKILL_POZHEN_LIEFENG
+                        res_kind == SeasonBattleRules.RESONANCE_SHARP_MANA_REFUND
                         and not self.has_any_regular_shield(target)
                     ):
                         mana_before = source.attributes.mana
                         missing_mana = max(0, source.max_mana - mana_before)
-                        refund = min(missing_mana, SeasonBattleRules.resonance_sharp_mana_refund(paid_mana))
+                        refund = min(missing_mana, SeasonBattleRules.compute_mana_pct_ceil(paid_mana, res_param))
                         if refund > 0:
                             source.attributes.mana = mana_before + refund
                             turn.events.add(
@@ -1858,12 +2021,11 @@ class EquipmentBattleEffects:
                                 turn,
                                 group,
                             )
-                    elif (
-                        seal.seal_id == SeasonBattleRules.SEAL_POZHEN_XUANYIN
-                        and skill_id == SeasonBattleRules.SKILL_POZHEN_LINGLEI
-                    ):
+                    elif res_kind == SeasonBattleRules.RESONANCE_BREAK_EXTEND_DEBUFF:
                         self.pending_mystic_extend_caster_id = source.actor_id
                         self.pending_mystic_extend_target_id = target.actor_id
+                        self.pending_mystic_extend_skill_id = skill_id
+                        self.pending_mystic_extend_bonus_rounds = res_param
 
         return total_removed
 
@@ -4380,10 +4542,11 @@ class ConfiguredAbilitiesController:
             and self.engine.encounter.is_weekly_water_discount_skill(rule)
         ):
             cost = discount_water_mana_cost(cost)
-        if self.engine.equipment_effects.is_defend_breath_resonance_ready(
+        discount_pct = self.engine.equipment_effects.defend_mana_discount_resonance_pct(
             actor, action.skill_table_id, self.engine.round_index
-        ):
-            cost = SeasonBattleRules.resonance_half_mana_cost(cost)
+        )
+        if discount_pct > 0:
+            cost = SeasonBattleRules.compute_mana_discounted(cost, discount_pct)
         if cost > actor.attributes.mana:
             return 7004
         if action.target_id != 0:
@@ -4643,9 +4806,79 @@ class ConfiguredAbilitiesController:
                 raw *= (100.0 + support_bonus_pct) / 100.0
             if getattr(self.engine, "escalation_stacks", 0) > 0:
                 raw *= self.engine.escalation_support_pct / 100.0
+            eq = self.engine.equipment_effects
+            season_seal_heal_gain = 0
+            if (
+                not is_mirror
+                and hit == 0
+                and receiver.actor_id == primary_target_id
+                and receiver.max_health > 0
+                and SeasonBattleRules.seal_available(caster, 4, self.engine.round_index)
+            ):
+                seal = caster.equipment_effects.season_seal
+                if receiver.attributes.health * 10_000 <= receiver.max_health * seal.health_threshold_bps:
+                    before_seal = landed_heal(receiver, raw)
+                    raw_after_seal = raw * (1.0 + seal.bonus_bps / 10_000.0)
+                    after_seal = landed_heal(receiver, raw_after_seal)
+                    if after_seal > before_seal:
+                        season_seal_heal_gain = after_seal - before_seal
+                        raw = raw_after_seal
+            before_r7 = 0
+            apply_r7 = False
+            if (
+                not is_mirror
+                and eq.active_next_round_boost_caster_id == caster.actor_id
+                and eq.active_next_round_boost_kind == SeasonBattleRules.RESONANCE_GUARD_HEAL_BOOST
+                and eq.active_next_round_boost_pct > 0
+            ):
+                before_r7 = landed_heal(receiver, raw)
+                raw *= (100.0 + eq.active_next_round_boost_pct) / 100.0
+                apply_r7 = True
             value = landed_heal(receiver, raw)
+            if apply_r7 and value > before_r7:
+                eq.active_next_round_boost_extra = min(
+                    U64_MAX, eq.active_next_round_boost_extra + (value - before_r7),
+                )
             if value > 0:
                 receiver.attributes.health += value
+                if season_seal_heal_gain > 0 and SeasonBattleRules.seal_available(caster, 4, self.engine.round_index):
+                    seal = caster.equipment_effects.season_seal
+                    SeasonBattleRules.use_seal(
+                        caster, receiver.actor_id, season_seal_heal_gain, self.engine.round_index, turn, group
+                    )
+                    eq.record_season_seal_use(caster.actor_id, season_seal_heal_gain)
+                    if (
+                        int(getattr(seal, "resonance_kind", 0)) == SeasonBattleRules.RESONANCE_EMERGENCY_HEAL_REFUND
+                        and int(getattr(seal, "resonance_skill_id", 0)) == skill_id
+                        and int(getattr(seal, "resonance_param", 0)) > 0
+                    ):
+                        mana_before = caster.attributes.mana
+                        missing_mana = max(0, caster.max_mana - mana_before)
+                        refund = min(
+                            missing_mana,
+                            SeasonBattleRules.compute_mana_pct_ceil(paid_mana, int(seal.resonance_param)),
+                        )
+                        if refund > 0:
+                            caster.attributes.mana = mana_before + refund
+                            turn.events.add(
+                                event_type=_EVENT_MANA,
+                                source_id=caster.actor_id,
+                                target_id=caster.actor_id,
+                                group_id=group,
+                                skill_table_id=skill_id,
+                                value=refund,
+                                mana_delta=min(refund, _I64_MAX),
+                                target_health_after=caster.attributes.health,
+                                target_mana_after=caster.attributes.mana,
+                            )
+                            eq.emit_season_resonance(
+                                caster,
+                                caster.actor_id,
+                                SeasonBattleRules.RESONANCE_EVENT_EMERGENCY_HEAL_REFUND,
+                                refund,
+                                turn,
+                                group,
+                            )
                 self.engine._event(
                     turn, group, _EVENT_HEAL, caster, receiver, skill_table_id=skill_id, hit_index=hit,
                     value=value, target_health_after=receiver.attributes.health, target_mana_after=receiver.attributes.mana,
@@ -4720,19 +4953,25 @@ class ConfiguredAbilitiesController:
         instance_id = self.engine.effects.next_buff_id()
         remain = row.config_duration_rounds if row.config_duration_rounds > 0 else (0 if row.infinite else row.duration_rounds)
         mystic_resonance_extended = False
+        mystic_bonus_rounds = 0
         eq = self.engine.equipment_effects
         if (
             hostile
             and op == BattleEffectOp.MODIFIER
             and remain > 0
             and not is_mirror
-            and skill_id == SeasonBattleRules.SKILL_POZHEN_LINGLEI
+            and eq.pending_mystic_extend_skill_id != 0
+            and skill_id == eq.pending_mystic_extend_skill_id
             and caster.actor_id == eq.pending_mystic_extend_caster_id
             and receiver.actor_id == eq.pending_mystic_extend_target_id
+            and eq.pending_mystic_extend_bonus_rounds > 0
         ):
-            remain += SeasonBattleRules.RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS
+            mystic_bonus_rounds = eq.pending_mystic_extend_bonus_rounds
+            remain += mystic_bonus_rounds
             eq.pending_mystic_extend_caster_id = 0
             eq.pending_mystic_extend_target_id = 0
+            eq.pending_mystic_extend_skill_id = 0
+            eq.pending_mystic_extend_bonus_rounds = 0
             mystic_resonance_extended = True
         entry = receiver.buffs.add(
             buff_id=instance_id,
@@ -4765,7 +5004,7 @@ class ConfiguredAbilitiesController:
                 caster,
                 receiver.actor_id,
                 SeasonBattleRules.RESONANCE_EVENT_MYSTIC_EXTEND_DEBUFF,
-                SeasonBattleRules.RESONANCE_MYSTIC_DEBUFF_BONUS_ROUNDS,
+                mystic_bonus_rounds,
                 turn,
                 group,
             )
@@ -4824,9 +5063,10 @@ class ConfiguredAbilitiesController:
             ):
                 cost = discount_water_mana_cost(cost)
             full_cost = cost
-            consume_breath_resonance = eq.is_defend_breath_resonance_ready(actor, skill_id, self.engine.round_index)
+            discount_pct = eq.defend_mana_discount_resonance_pct(actor, skill_id, self.engine.round_index)
+            consume_breath_resonance = discount_pct > 0
             if consume_breath_resonance:
-                cost = SeasonBattleRules.resonance_half_mana_cost(cost)
+                cost = SeasonBattleRules.compute_mana_discounted(cost, discount_pct)
             paid_mana = cost
             if cost > 0:
                 cost = min(cost, actor.attributes.mana)
@@ -4859,23 +5099,47 @@ class ConfiguredAbilitiesController:
             and targets[0].actor_id == action.target_id
             and len(targets) < subject_max
         )
-        guard_resonance_active = False
+        next_round_boost_active = False
+        next_round_boost_kind = SeasonBattleRules.RESONANCE_NONE
         if (
             not is_mirror
             and actor.actor_type == _ACTOR_PLAYER
-            and skill_id == SeasonBattleRules.SKILL_GUZHEN_LINGZHANG
             and actor.HasField("equipment_effects")
             and actor.equipment_effects.HasField("season_seal")
         ):
             seal = actor.equipment_effects.season_seal
-            if seal.season_id == SeasonBattleRules.SEASON_1_ID and seal.seal_id == SeasonBattleRules.SEAL_GUZHEN_SHOUYIN:
+            res_kind = int(getattr(seal, "resonance_kind", 0))
+            res_skill = int(getattr(seal, "resonance_skill_id", 0))
+            res_param = int(getattr(seal, "resonance_param", 0))
+            if res_skill == skill_id and res_param > 0:
                 rt = eq.season_seal_runtime(actor.actor_id)
-                if not rt.guard_resonance_consumed and rt.guard_resonance_ready_round == self.engine.round_index:
+                if (
+                    res_kind in (
+                        SeasonBattleRules.RESONANCE_GUARD_SHIELD_BOOST,
+                        SeasonBattleRules.RESONANCE_GUARD_HEAL_BOOST,
+                    )
+                    and not rt.guard_resonance_consumed
+                    and rt.guard_resonance_ready_round == self.engine.round_index
+                ):
                     rt.guard_resonance_consumed = True
                     rt.guard_resonance_ready_round = 0
-                    guard_resonance_active = True
-                    eq.active_guard_shield_resonance_caster_id = actor.actor_id
-                    eq.active_guard_shield_resonance_extra = 0
+                    next_round_boost_active = True
+                    next_round_boost_kind = res_kind
+                    eq.active_next_round_boost_caster_id = actor.actor_id
+                    eq.active_next_round_boost_kind = res_kind
+                    eq.active_next_round_boost_pct = res_param
+                    eq.active_next_round_boost_extra = 0
+                elif (
+                    res_kind == SeasonBattleRules.RESONANCE_DEFEND_SHIELD_BOOST
+                    and rt.defend_resonance_ready_round == self.engine.round_index
+                ):
+                    rt.defend_resonance_ready_round = 0
+                    next_round_boost_active = True
+                    next_round_boost_kind = res_kind
+                    eq.active_next_round_boost_caster_id = actor.actor_id
+                    eq.active_next_round_boost_kind = res_kind
+                    eq.active_next_round_boost_pct = res_param
+                    eq.active_next_round_boost_extra = 0
         effects_begin = len(turn.events)
         primary_target_id = targets[0].actor_id
         for idx, target in enumerate(targets):
@@ -4895,18 +5159,22 @@ class ConfiguredAbilitiesController:
                 )
             eq.pending_mystic_extend_caster_id = 0
             eq.pending_mystic_extend_target_id = 0
-        if guard_resonance_active and eq.active_guard_shield_resonance_caster_id == actor.actor_id:
-            extra_shield = eq.active_guard_shield_resonance_extra
-            eq.active_guard_shield_resonance_caster_id = 0
-            eq.active_guard_shield_resonance_extra = 0
-            if extra_shield > 0:
+            eq.pending_mystic_extend_skill_id = 0
+            eq.pending_mystic_extend_bonus_rounds = 0
+        if next_round_boost_active and eq.active_next_round_boost_caster_id == actor.actor_id:
+            extra_val = eq.active_next_round_boost_extra
+            eq.active_next_round_boost_caster_id = 0
+            eq.active_next_round_boost_kind = SeasonBattleRules.RESONANCE_NONE
+            eq.active_next_round_boost_pct = 0
+            eq.active_next_round_boost_extra = 0
+            if extra_val > 0 and next_round_boost_kind > 0:
                 rt = eq.season_seal_runtime(actor.actor_id)
-                rt.contribution_value = min(U64_MAX, rt.contribution_value + extra_shield)
+                rt.contribution_value = min(U64_MAX, rt.contribution_value + extra_val)
                 eq.emit_season_resonance(
                     actor,
                     actor.actor_id,
-                    SeasonBattleRules.RESONANCE_EVENT_GUARD_SHIELD_BOOST,
-                    extra_shield,
+                    SeasonBattleRules.RESONANCE_EVENT_BASE + next_round_boost_kind,
+                    extra_val,
                     turn,
                     group,
                 )

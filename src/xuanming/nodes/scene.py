@@ -510,6 +510,9 @@ class SceneNode:
                 await self.commit_player_data(player, saved)
             if self.battle:
                 await self.battle.restore(player, notify=False)
+            proxy_dir = getattr(self, "craft_proxy_directory", None)
+            if proxy_dir is not None and saved.HasField("craft_component") and saved.craft_component.proxy_stall_open:
+                proxy_dir.sync_player(request.player_id, saved)
             if admission:
                 await self.travel.confirm(admission)
             return player

@@ -153,6 +153,87 @@ def proxy_net_gold(gross_fee: int) -> int:
     return gross_fee - tax if gross_fee > tax else 0
 
 
+class CraftProxyStallDirectory:
+    """同区跨节点/离线名匠代打共享摊位目录（内存镜像 + 可选外部共享存储同步）。"""
+
+    def __init__(self, protocol) -> None:
+        self.protocol = protocol
+        self._stalls: dict[int, object] = {}
+
+    @staticmethod
+    def _display_name(data, player_id: int) -> str:
+        name = getattr(data.profile_component, "name", "") if data.HasField("profile_component") else ""
+        return name or f"宗师#{player_id}"
+
+    def build_stall_info(self, player_id: int, data):
+        if not player_id or not data.HasField("craft_component"):
+            return None
+        craft = data.craft_component
+        if not craft.proxy_stall_open:
+            return None
+        f_tier = mastery_tier_for_exp(int(craft.forge_mastery_exp))
+        s_tier = mastery_tier_for_exp(int(craft.scroll_mastery_exp))
+        forge_ready = f_tier >= MASTERY_MASTER and valid_proxy_fee(int(craft.proxy_forge_fee_gold))
+        scroll_ready = s_tier >= MASTERY_MASTER and valid_proxy_fee(int(craft.proxy_scroll_fee_gold))
+        if not forge_ready and not scroll_ready:
+            return None
+        return self.protocol.message(
+            "CraftProxyStallInfo",
+            master_player_id=player_id,
+            master_name=self._display_name(data, player_id),
+            forge_mastery_tier=f_tier,
+            scroll_mastery_tier=s_tier,
+            top_quality_rate_bps=forge_top_quality_rate_bps(f_tier),
+            scroll_bonus_rate_bps=scroll_bonus_fragment_rate_bps(s_tier),
+            proxy_forge_fee_gold=int(craft.proxy_forge_fee_gold) if forge_ready else 0,
+            proxy_scroll_fee_gold=int(craft.proxy_scroll_fee_gold) if scroll_ready else 0,
+        )
+
+    @staticmethod
+    def is_valid_stall(info) -> bool:
+        if info is None or not info.master_player_id:
+            return False
+        forge_ready = (
+            info.forge_mastery_tier >= MASTERY_MASTER
+            and valid_proxy_fee(int(info.proxy_forge_fee_gold))
+        )
+        scroll_ready = (
+            info.scroll_mastery_tier >= MASTERY_MASTER
+            and valid_proxy_fee(int(info.proxy_scroll_fee_gold))
+        )
+        return forge_ready or scroll_ready
+
+    def sync_player(self, player_id: int, data) -> None:
+        if not player_id:
+            return
+        info = self.build_stall_info(player_id, data)
+        if info is not None:
+            self._stalls[player_id] = info
+        else:
+            self._stalls.pop(player_id, None)
+
+    def remove(self, master_player_id: int) -> None:
+        self._stalls.pop(master_player_id, None)
+
+    def find(self, master_player_id: int):
+        info = self._stalls.get(master_player_id)
+        return info if self.is_valid_stall(info) else None
+
+    def list_stalls(self) -> list:
+        valid = [info for info in self._stalls.values() if self.is_valid_stall(info)]
+        valid.sort(key=lambda info: int(info.master_player_id))
+        return valid
+
+
+def get_proxy_stall_directory(scene) -> CraftProxyStallDirectory:
+    """获取或按需初始化挂在 scene 上的共享名匠代打摊位目录。"""
+    directory = getattr(scene, "craft_proxy_directory", None)
+    if directory is None:
+        directory = CraftProxyStallDirectory(scene.protocol)
+        scene.craft_proxy_directory = directory
+    return directory
+
+
 class SceneSkillCraft:
     """Scene 分卷宗永久技能制书、研习、拆页与主城宗师代打摊位模块。"""
 
@@ -567,27 +648,31 @@ class SceneSkillCraft:
             return self._finish(response, data, INVALID)
 
         proxy_master_id = int(request.proxy_master_player_id)
-        proxy_master = None
-        proxy_master_data = None
         proxy_fee_gold = 0
+        proxy_net_fee = 0
         proxy_master_name = ""
         effective_tier = mastery_tier_for_exp(int(craft.scroll_mastery_exp))
+        outbox = getattr(self.scene, "mail_outbox", None)
         if proxy_master_id != 0:
             if proxy_master_id == player.player_id:
                 return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            proxy_master = self._find_online_player(proxy_master_id)
-            if proxy_master is None or not self.scene.mutable(proxy_master):
-                return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            proxy_master_data = self.scene.rows.assemble(proxy_master.snapshot)
-            mc = proxy_master_data.craft_component
+            directory = get_proxy_stall_directory(self.scene)
+            stall = directory.find(proxy_master_id)
             if (
-                not mc.proxy_stall_open
-                or mastery_tier_for_exp(int(mc.scroll_mastery_exp)) < MASTERY_MASTER
-                or not valid_proxy_fee(int(mc.proxy_scroll_fee_gold))
+                stall is None
+                or stall.scroll_mastery_tier < MASTERY_MASTER
+                or not valid_proxy_fee(int(stall.proxy_scroll_fee_gold))
             ):
                 return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            proxy_fee_gold = int(mc.proxy_scroll_fee_gold)
-            proxy_master_name = self._display_name(proxy_master_data, proxy_master_id)
+            proxy_fee_gold = int(stall.proxy_scroll_fee_gold)
+            proxy_net_fee = proxy_net_gold(proxy_fee_gold)
+            if proxy_net_fee > 0 and (
+                outbox is None
+                or not outbox.can_accept(data)
+                or (hasattr(self.assets, "currency_globally_blocked") and self.assets.currency_globally_blocked(CURRENCY_GOLD))
+            ):
+                return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
+            proxy_master_name = stall.master_name or f"宗师#{proxy_master_id}"
             effective_tier = MASTERY_MASTER
 
         # 防洗白硬隔离：代工费(proxy_fee_gold)永远只扣流通银两；仅稀世绝学定向制书的系统手续费允许优先抵扣绑定银两。
@@ -651,6 +736,17 @@ class SceneSkillCraft:
         if proxy_master_id == 0 and sc.scroll_mastery_exp < _MAX_UINT32:
             sc.scroll_mastery_exp += 1
 
+        if proxy_master_id != 0 and proxy_net_fee > 0:
+            prepared_outbox = await outbox.prepare_proxy_fee(
+                staged,
+                recipient_player_id=proxy_master_id,
+                net_gold=proxy_net_fee,
+                source_id=request.client_request_id,
+                buyer_name=self._display_name(staged, player.player_id),
+            )
+            if not prepared_outbox:
+                return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
+
         client_request.remember(
             staged.client_request_ledger,
             request.client_request_id,
@@ -666,18 +762,6 @@ class SceneSkillCraft:
             await self.scene.commit_player_data(player, staged)
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
-
-        if proxy_master is not None and proxy_master_data is not None:
-            net_fee = proxy_net_gold(proxy_fee_gold)
-            if net_fee > 0:
-                master_staged = clone(proxy_master_data)
-                if self._add_gold(master_staged, net_fee):
-                    try:
-                        await self.scene.commit_player_data(proxy_master, master_staged)
-                    except (StoreRejected, StoreUnavailable, OSError):
-                        logger.warning(
-                            "Proxy master fee credit failed master_id=%s fee=%s", proxy_master_id, net_fee,
-                        )
 
         logger.info(
             "Skill book crafted player_id=%s book_id=%s skill_id=%s scroll_id=%s bound=%s bonus=%s",
@@ -1077,6 +1161,7 @@ class SceneSkillCraft:
                 await self.scene.commit_player_data(player, staged)
             except (StoreRejected, StoreUnavailable, OSError):
                 return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+            get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
             return self._finish(response, staged)
 
         forge_master = mastery_tier_for_exp(int(sc.forge_mastery_exp)) >= MASTERY_MASTER
@@ -1102,37 +1187,12 @@ class SceneSkillCraft:
             await self.scene.commit_player_data(player, staged)
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+        get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
         return self._finish(response, staged)
 
     def list_proxy_stalls(self, _world, _player, _route, _request):
-        """列出当前在线且处于可交易状态的宗师原子代打/代制摊位（按 player_id 升序）。"""
+        """列出同区跨节点/离线营业中的宗师原子代打/代制摊位（按 player_id 升序）。"""
         response = self.protocol.message("ListCraftProxyStallsResponse")
-        masters = []
-        seen_pids: set[int] = set()
-        for location in getattr(self.scene, "locations", {}).values():
-            for pid, target in location.players.items():
-                if not pid or pid in seen_pids or not self.scene.mutable(target):
-                    continue
-                seen_pids.add(pid)
-                tdata = self.scene.rows.assemble(target.snapshot)
-                craft = tdata.craft_component
-                if not craft.proxy_stall_open:
-                    continue
-                f_tier = mastery_tier_for_exp(int(craft.forge_mastery_exp))
-                s_tier = mastery_tier_for_exp(int(craft.scroll_mastery_exp))
-                if f_tier < MASTERY_MASTER and s_tier < MASTERY_MASTER:
-                    continue
-                masters.append((pid, tdata, craft, f_tier, s_tier))
-        masters.sort(key=lambda item: item[0])
-        for pid, tdata, craft, f_tier, s_tier in masters:
-            response.stalls.add(
-                master_player_id=pid,
-                master_name=self._display_name(tdata, pid),
-                forge_mastery_tier=f_tier,
-                scroll_mastery_tier=s_tier,
-                top_quality_rate_bps=forge_top_quality_rate_bps(f_tier),
-                scroll_bonus_rate_bps=scroll_bonus_fragment_rate_bps(s_tier),
-                proxy_forge_fee_gold=craft.proxy_forge_fee_gold if f_tier >= MASTERY_MASTER else 0,
-                proxy_scroll_fee_gold=craft.proxy_scroll_fee_gold if s_tier >= MASTERY_MASTER else 0,
-            )
+        for info in get_proxy_stall_directory(self.scene).list_stalls():
+            response.stalls.add().CopyFrom(info)
         return response

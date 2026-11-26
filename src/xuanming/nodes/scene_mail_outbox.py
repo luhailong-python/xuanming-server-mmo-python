@@ -20,7 +20,12 @@ _BODY = "背包已满,本场战斗获得的物品改由邮件发放,请腾出背
 _MAX_ENTRIES = 32
 _MAX_LINES = 16
 _MAX_ITEMS = 4096
+_MAX_CURRENCIES = 4
+_MAX_INT64 = (1 << 63) - 1
+SOURCE_BATTLE_OVERFLOW = 1
+SOURCE_CRAFT_PROXY_FEE = 2
 _REJECTED = {1005, 17002, 17003, 17004}
+_RECIPIENT_DELETED = 17011
 
 
 def split_items(items):
@@ -44,16 +49,29 @@ def split_items(items):
 
 
 def valid_entry(entry):
-    last = total = 0
-    if not entry.request_id or not entry.source or not entry.title or not 1 <= len(entry.items) <= _MAX_LINES:
+    if not entry.request_id or not entry.source or not entry.title:
         return False
-    for item in entry.items:
+    items = entry.items
+    currencies = getattr(entry, "currencies", ())
+    if not items and not currencies:
+        return False
+    if len(items) > _MAX_LINES or len(currencies) > _MAX_CURRENCIES:
+        return False
+    last = total = 0
+    for item in items:
         if item.config_id <= last or not item.count:
             return False
         last = item.config_id
         total += item.count
         if total > _MAX_ITEMS:
             return False
+    last_currency = -1
+    for currency in currencies:
+        ctype = int(currency.currency_type)
+        amount = int(currency.amount)
+        if ctype <= last_currency or not 1 <= amount <= _MAX_INT64:
+            return False
+        last_currency = ctype
     return not carries_unknown(entry)
 
 
@@ -97,10 +115,13 @@ class MailSender:
         client = self.clients.get(address)
         if client is None:
             client = self.clients[address] = GrpcClient(address, timeout=5, enable_retries=False)
+        recipient = int(getattr(entry, "recipient_player_id", 0)) or player_id
         request = self.protocol.message("mailpb.SendMailRequest", sender_kind=5, request_id=entry.request_id,
-                                        recipient_player_id=player_id, title=entry.title, body=entry.body)
+                                        recipient_player_id=recipient, title=entry.title, body=entry.body)
         for item in entry.items:
             request.attachments.items.add(config_id=item.config_id, count=item.count)
+        for currency in getattr(entry, "currencies", ()):
+            request.attachments.currencies.add(currency_type=currency.currency_type, amount=currency.amount)
         sign_service_call(_PATH, request, "battle", time.time_ns() // 1_000_000, secret)
         self._inflight[client] = self._inflight.get(client, 0) + 1
         try:
@@ -129,6 +150,51 @@ class SceneMailOutbox:
         self._jobs, self._due, self._failures = {}, {}, {}
         self._next_tick = 0.0
         self._closed = False
+
+    def can_accept(self, data) -> bool:
+        return (
+            self.allocate_id is not None
+            and bool(self.sender.secret())
+            and len(data.mail_outbox.entries) < _MAX_ENTRIES
+        )
+
+    async def prepare_proxy_fee(
+        self,
+        data,
+        *,
+        recipient_player_id: int,
+        net_gold: int,
+        source_id: int,
+        buyer_name: str,
+    ) -> bool:
+        """将跨节点/离线名匠代打 95% 净银两分成写入买家同事务 WALLET 出箱。"""
+        if not recipient_player_id or net_gold <= 0 or net_gold > _MAX_INT64 or not self.can_accept(data):
+            return False
+        try:
+            request_id = await self.allocate_id()
+        except Exception:
+            _LOG.warning("mail outbox cannot allocate proxy fee request id", exc_info=True)
+            return False
+        if not 0 < request_id < (1 << 64) - 1:
+            return False
+        if any(entry.request_id == request_id for entry in data.mail_outbox.entries):
+            return False
+        stamp = time.time_ns() // 1_000_000
+        display_buyer = buyer_name or "侠士"
+        entry = data.mail_outbox.entries.add(
+            request_id=request_id,
+            source=SOURCE_CRAFT_PROXY_FEE,
+            source_id=source_id,
+            title="名匠代打收益到账",
+            body=(
+                f"侠士【{display_buyer}】使用您的名匠代打服务，"
+                f"扣除 5% 摆摊税后净收益 {net_gold} 银两已随邮件奉上，请及时查收。"
+            ),
+            created_at_ms=stamp,
+            recipient_player_id=recipient_player_id,
+        )
+        entry.currencies.add(currency_type=0, amount=net_gold)
+        return True
 
     async def prepare(self, data, battle_id, items):
         if not battle_id or self.allocate_id is None or not self.sender.secret():
@@ -208,9 +274,15 @@ class SceneMailOutbox:
                 if not valid_entry(entry):
                     raise ValueError("invalid persisted mail outbox entry")
             reply = await self.sender(key, entry)
-            if reply.error_message.id not in (0, 1000) or not reply.mail_id:
-                rejected = reply.error_message.id in _REJECTED
-                raise RuntimeError(f"mail did not confirm delivery: {reply.error_message.id}")
+            err_id = reply.error_message.id
+            if err_id == _RECIPIENT_DELETED:
+                _LOG.warning(
+                    "mail_outbox_recipient_deleted player=%s recipient=%s request_id=%s; dropping entry",
+                    key, getattr(entry, "recipient_player_id", 0) or key, entry.request_id,
+                )
+            elif err_id not in (0, 1000) or not reply.mail_id:
+                rejected = err_id in _REJECTED
+                raise RuntimeError(f"mail did not confirm delivery: {err_id}")
             async with self.scene._lock(key):
                 if not self._current(player):
                     return

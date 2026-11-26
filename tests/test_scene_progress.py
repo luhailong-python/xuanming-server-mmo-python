@@ -63,7 +63,7 @@ def test_client_mission_dungeon_and_durable_battle_inbox(tmp_path):
                     data = await control.call("/scene_node.SceneNodeGrpc/PrepareBattle", prepare.SerializeToString())
                     ready = p.parse("PrepareBattleResponse", data)
                     assert not ready.error_message.id
-                    assert ready.table_fingerprint == "e4df3cff8460b6662f614a28ed706cc6"
+                    assert ready.table_fingerprint == "ce5439a9b9ee673e070a1eeb5dc769c1"
                     assert ready.snapshot.max_health >= ready.snapshot.base_attributes.health > 0
                     await scene.battle.confirm(p.message("BattleConfirmedEvent", player_id=1, battle_id=42,
                                                          deadline_ms=now + 60000))

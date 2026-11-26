@@ -6,7 +6,9 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from itertools import count
+from types import SimpleNamespace
 
+import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from xuanming.data import ConfigTables, PlayerRowCodec, SqlitePlayerStore
@@ -49,8 +51,16 @@ from xuanming.match.tournament import (
     STAGE_REGISTRATION,
     STAGE_SETTLED,
 )
+from xuanming.nodes.battle import BattleError, TurnEngine
 from xuanming.nodes.scene import SceneNode
 from xuanming.nodes.scene_assets import SceneAssets
+from xuanming.nodes.scene_equip_craft import (
+    CRAFTING_MATERIAL_ID,
+    POLISH_SAND_ID,
+    SceneEquipCraft,
+)
+from xuanming.nodes.scene_mail_outbox import SceneMailOutbox
+from xuanming.nodes.scene_player import _fill_item
 from xuanming.nodes.scene_festival_beast import (
     BLOCK_ALREADY_CLAIMED,
     BLOCK_NONE,
@@ -100,8 +110,8 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 82
-    assert len(pb_tables.tables) == 82
+    assert len(json_tables.tables) == 83
+    assert len(pb_tables.tables) == 83
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {
@@ -403,9 +413,35 @@ async def _make_multi_player_scene(tmp_path, players_spec: list[dict], *, clock_
     scene.assets = assets
     clock = (lambda: clock_ref[0]) if clock_ref is not None else (lambda: 1_760_000_000_000)
 
+    sent_mails = []
+    outbox_clock = [10.0]
+
+    class _FakeMailSender:
+        def secret(self):
+            return b"x" * 32
+
+        async def __call__(self, player_id, entry):
+            sent_mails.append((
+                player_id,
+                int(entry.recipient_player_id),
+                int(entry.source),
+                [(int(c.currency_type), int(c.amount)) for c in entry.currencies],
+            ))
+            return SimpleNamespace(error_message=SimpleNamespace(id=0), mail_id=next(guids))
+
+        async def close(self):
+            pass
+
+    scene.mail_outbox = SceneMailOutbox(scene, alloc_guid, _FakeMailSender(), clock=lambda: outbox_clock[0])
+    scene._test_sent_mails = sent_mails
+    scene._test_outbox_clock = outbox_clock
+
+    equip_craft = SceneEquipCraft(scene, tables, assets, clock=clock)
+    scene.equip_craft = equip_craft
     skill_craft = SceneSkillCraft(scene, tables, assets, clock=clock, roll_fn=roll_fn)
     festival_beast = SceneFestivalBeast(scene, tables, assets, clock=clock, activities=fb_activities)
     assets.register_client_handlers()
+    equip_craft.register()
     skill_craft.register()
     festival_beast.register()
 
@@ -511,9 +547,19 @@ def test_skill_craft_six_rpcs_and_proxy_stall(tmp_path):
             assert c1.crafted_book.crafter_name == "陆大师" and not c1.crafted_book.bound
             assert c1.bonus_fragments_granted == 2
             assert c1.state.gold_balance == 870 and c1.state.fragment_owned == 42  # 60 - 20 + 2
-            # 验证宗师 2 收到扣除 5% 税后的净手续费（80 - 4 = 76）。
+            # 验证宗师 2 不直接改本地钱包，而是由买家同事务邮件出箱异步派发 95% 净银两（80 - 4 = 76）。
             st_master = await rpc(2, "SceneSkillClientPlayer", "GetSkillCraftingState")
-            assert st_master.state.gold_balance == 500 + proxy_net_gold(80)
+            assert st_master.state.gold_balance == 500
+            buyer_saved = scene.rows.assemble(scene.locations[1].players[1].snapshot)
+            assert len(buyer_saved.mail_outbox.entries) == 1
+            out_entry = buyer_saved.mail_outbox.entries[0]
+            assert out_entry.recipient_player_id == 2 and out_entry.source == 2
+            assert [(c.currency_type, c.amount) for c in out_entry.currencies] == [(0, proxy_net_gold(80))]
+            scene._test_outbox_clock[0] += 2.0
+            scene.mail_outbox.tick()
+            await asyncio.gather(*tuple(scene.mail_outbox._jobs.values()))
+            assert scene._test_sent_mails == [(1, 2, 2, [(0, 76)])]
+            assert not scene.rows.assemble(scene.locations[1].players[1].snapshot).mail_outbox.entries
 
             # 同键幂等重放不重复扣料/扣费。
             c1_rep = await rpc(
@@ -773,6 +819,278 @@ def test_festival_beast_three_rpcs_and_permanent_reward_claim(tmp_path):
             saved = scene.rows.assemble(player.snapshot)
             granted = [p for p in saved.pet_component.pets if p.pet_table_id == 101]
             assert len(granted) == 1 and granted[0].pet_id == cl1.pet_id
+        finally:
+            await scene.close()
+
+    asyncio.run(exercise())
+
+
+# ── 5. 跨节点/离线名匠代打 + 控辅强化公平受益测试 ───────────────────────────────────────────────────────
+
+
+def test_offline_proxy_craft_equip_and_skill_outbox_payout(tmp_path):
+    async def exercise():
+        scene, _, _, rpc = await _make_multi_player_scene(
+            tmp_path,
+            [
+                {
+                    "player_id": 1,
+                    "name": "墨竹",
+                    "gold": 2000,
+                    "items": [
+                        (CRAFTING_MATERIAL_ID, 40, False),
+                        (POLISH_SAND_ID, 10, False),
+                        (SCROLL_FRAGMENT_ITEM_ID, 40, False),
+                    ],
+                },
+                {
+                    "player_id": 2,
+                    "name": "陆大师",
+                    "gold": 500,
+                    "forge_exp": 60,
+                    "scroll_exp": 60,
+                },
+            ],
+            roll_fn=lambda bound: 0,
+        )
+        try:
+            # 1. 宗师 2 开摊（锻造手工费 100 银两、制书手工费 80 银两），随后让宗师正式下线离场（释放归属锁）。
+            opened = await rpc(
+                2, "SceneSkillClientPlayer", "SetCraftProxyStall",
+                open=True, proxy_forge_fee_gold=100, proxy_scroll_fee_gold=80,
+            )
+            assert not opened.error_message.id and opened.state.proxy_stall_open
+            master_world = scene.locations[2]
+            master_player = master_world.players[2]
+            await scene._remove(master_world, master_player, release_credential=True)
+            assert 2 not in scene.locations
+
+            # 2. 宗师已不在本节点，但共享摊位目录仍能查到并 24 小时接单。
+            stalls = await rpc(1, "SceneSkillClientPlayer", "ListCraftProxyStalls")
+            assert not stalls.error_message.id and len(stalls.stalls) == 1
+            assert stalls.stalls[0].master_player_id == 2 and stalls.stalls[0].proxy_forge_fee_gold == 100
+
+            # 3. 买家离线走宗师 2 代打打造 V1 武器（3101）+ 安装固定词条 103（固定出 5 档极品以触发宗师署名）。
+            scene.equip_craft._roll_fn = lambda _tier: 5
+            rules = await rpc(1, "SceneBagClientPlayer", "GetEquipmentCraftRules")
+            assert not rules.error_message.id
+            created = await rpc(
+                1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                choice=scene.protocol.message("EquipmentCraftChoice", operation=1, config_id=3101),
+                rules_fingerprint=rules.rules_fingerprint,
+                expected_forge_revision=0,
+                client_request_id=901,
+            )
+            assert not created.error_message.id and created.outcome == 2
+            weapon_id = created.item_id
+
+            installed = await rpc(
+                1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                choice=scene.protocol.message(
+                    "EquipmentCraftChoice",
+                    operation=2,
+                    item_id=weapon_id,
+                    affix_slot=1,
+                    affix_id=103,
+                    proxy_master_player_id=2,
+                ),
+                rules_fingerprint=rules.rules_fingerprint,
+                expected_forge_revision=1,
+                client_request_id=902,
+            )
+            assert not installed.error_message.id and installed.outcome == 2
+            weapon_info = next(it for it in installed.bag.items if it.item_id == weapon_id)
+            assert weapon_info.crafter_player_id == 2 and weapon_info.crafter_name == "陆大师"
+
+            # 4. 买家同时离线走宗师 2 代制随机常规技能书。
+            c_book = await rpc(
+                1, "SceneSkillClientPlayer", "CraftSkillBook",
+                mode=CRAFT_MODE_RANDOM_REGULAR,
+                scroll_id=1,
+                target_skill_table_id=0,
+                expected_revision=0,
+                client_request_id=903,
+                proxy_master_player_id=2,
+            )
+            assert not c_book.error_message.id and c_book.crafted_book.crafter_player_id == 2
+            assert c_book.crafted_book.crafter_name == "陆大师"
+
+            # 5. 两笔代打的 95% 净银两（95、76）全部落入买家持久化出箱，派发后依次通过 MailAdmin 发出。
+            outbox_entries = scene.rows.assemble(scene.locations[1].players[1].snapshot).mail_outbox.entries
+            assert len(outbox_entries) == 2
+            assert [(e.recipient_player_id, [(c.currency_type, c.amount) for c in e.currencies]) for e in outbox_entries] == [
+                (2, [(0, 95)]),
+                (2, [(0, 76)]),
+            ]
+            for _ in range(2):
+                scene._test_outbox_clock[0] += 2.0
+                scene.mail_outbox.tick()
+                await asyncio.gather(*tuple(scene.mail_outbox._jobs.values()))
+            assert scene._test_sent_mails == [
+                (1, 2, 2, [(0, 95)]),
+                (1, 2, 2, [(0, 76)]),
+            ]
+            assert not scene.rows.assemble(scene.locations[1].players[1].snapshot).mail_outbox.entries
+
+            # 6. 节点重启清空内存目录后，宗师重新登录载入存档会自动把持久化营业摊位同步回共享目录。
+            scene.craft_proxy_directory._stalls.clear()
+            assert len((await rpc(1, "SceneSkillClientPlayer", "ListCraftProxyStalls")).stalls) == 0
+            await scene.enter(
+                scene.protocol.message(
+                    "PlayerEnterGameNodeRequest",
+                    player_id=2, session_id=102, scene_id=1, owner_revision=2, login_generation=2,
+                ),
+                "gate",
+            )
+            reloaded_stalls = await rpc(1, "SceneSkillClientPlayer", "ListCraftProxyStalls")
+            assert len(reloaded_stalls.stalls) == 1 and reloaded_stalls.stalls[0].master_player_id == 2
+        finally:
+            await scene.close()
+
+    asyncio.run(exercise())
+
+
+def test_support_control_fair_enhance_benefit_and_speed_never_scaled(tmp_path):
+    async def exercise():
+        scene, _, _, rpc = await _make_multi_player_scene(
+            tmp_path,
+            [{"player_id": 1, "name": "奶妈", "level": 30, "gold": 5000}],
+        )
+        try:
+            tables = scene.tables
+            protocol = scene.protocol
+            player = scene.locations[1].players[1]
+            equip_craft = scene.equip_craft
+
+            # 1. 校验 V1 鞋子（3104，含防御 attr=8 与速度 attr=11）在 +11 (+24%) 时：防御放大，速度永不随强化放大。
+            shoe_item = protocol.message("ItemComp", item_id=70001, config_id=3104, size=1, acquire_seq=1)
+            shoe_item.equip.enhance_level = 11
+            shoe_info = protocol.message("BagItemInfo", item_id=70001, config_id=3104, count=1)
+            _fill_item(tables, shoe_info, shoe_item.equip)
+            assert shoe_info.enhance_level == 11 and shoe_info.enhance_bonus_permyriad == 2400
+            by_attr = {a.attr_id: a for a in shoe_info.base_attrs}
+            assert by_attr[8].value == 14 and by_attr[8].enhance_bonus == 2  # floor(12 * 12400 / 10000) = 14
+            assert by_attr[11].value == 12 and by_attr[11].enhance_bonus == 0  # 速度严禁放大
+
+            # 2. 把 4 件 V1 满品相基础装穿在装备栏（bag_type=2）：
+            #    全部带治疗 103 (effect=5, 800bps) 与封灵命中 105 (effect=11, 400bps)，其中 3101 额外校验物攻 101 (effect=1) 不放大。
+            def _build_equipped_data(enhance_level: int, slot1_affix_id: int):
+                data = scene.rows.assemble(player.snapshot)
+                data.bag_component.ClearField("items")
+                for pos, cfg_id in enumerate((3101, 3102, 3103, 3104)):
+                    it = protocol.message("ItemComp", item_id=80000 + pos, config_id=cfg_id, size=1, acquire_seq=pos + 1)
+                    it.equip.enhance_level = enhance_level
+                    it.equip.fixed_affixes.add(slot=1, affix_id=slot1_affix_id, quality_tier=5)
+                    it.equip.fixed_affixes.add(slot=2, affix_id=201, quality_tier=5)
+                    slot_entry = data.bag_component.items.add(pos=pos, bag_type=2)
+                    slot_entry.instance.CopyFrom(it)
+                return data
+
+            # +0 基线：4 件满品相治疗 = 3200 bps，单件展示 = 800 bps，cap = 3200。
+            d0 = _build_equipped_data(0, 103)
+            eff0 = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d0, eff0)
+            assert eff0.outgoing_heal_bps == 3200
+
+            # +10 (+20%)：奶盾享受 50% 折算 (+10%) => 单件 880 bps，4 件 3520 bps；控场 105 享受 25% 折算 (+5%) => 单件 420 bps，4 件 1680 bps。
+            d10_heal = _build_equipped_data(10, 103)
+            eff10_heal = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d10_heal, eff10_heal)
+            assert eff10_heal.outgoing_heal_bps == 3520
+            disp10 = protocol.message("BagItemInfo", item_id=80000, config_id=3101, count=1)
+            equip_craft.fill_v1_display(d10_heal.bag_component.items[0].instance, disp10)
+            assert disp10.fixed_affix_slots[0].selected.value_bps == 880
+            assert disp10.fixed_affix_slots[0].selected.source_cap_bps == 3520
+
+            d10_ctrl = _build_equipped_data(10, 105)
+            eff10_ctrl = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d10_ctrl, eff10_ctrl)
+            assert eff10_ctrl.ailment_hit_bps[1] == 1680
+
+            # +11 (+24%)：奶盾 +12% => 单件 896 bps，4 件 3584 bps；控场 +6% => 单件 424 bps，4 件 1696 bps；物攻 101 不二次放大仍为 3200 bps。
+            d11_heal = _build_equipped_data(11, 103)
+            eff11_heal = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d11_heal, eff11_heal)
+            assert eff11_heal.outgoing_heal_bps == 3584
+            assert eff11_heal.support_sources[0].source_cap_bps == 3584
+            assert eff11_heal.support_sources[0].effective_bonus_bps == 896
+
+            d11_ctrl = _build_equipped_data(11, 105)
+            eff11_ctrl = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d11_ctrl, eff11_ctrl)
+            assert eff11_ctrl.ailment_hit_bps[1] == 1696
+
+            d11_atk = _build_equipped_data(11, 101)
+            eff11_atk = protocol.message("EquipmentEffects")
+            equip_craft.collect_effects(d11_atk, eff11_atk)
+            assert eff11_atk.physical_attack_bps == 3200
+
+            # 3. 写入 +11 穿戴鞋到存档并调用 GetBag(bag_type=2)，验证满级预览下速度增强加值依然为 0。
+            await scene.commit_player_data(player, d11_heal)
+            bag_res = await rpc(1, "SceneBagClientPlayer", "GetBag", bag_type=2)
+            assert not bag_res.error_message.id
+            shoe_bag = next(it for it in bag_res.bag.items if it.config_id == 3104)
+            shoe_bag_attrs = {a.attr_id: a for a in shoe_bag.base_attrs}
+            assert shoe_bag_attrs[8].value == 14 and shoe_bag_attrs[8].enhance_bonus == 2
+            assert shoe_bag_attrs[11].value == 12 and shoe_bag_attrs[11].enhance_bonus == 0
+
+            # 4. 战斗入口上限护栏：接受 +11 满配 3584 / 1696，拒绝越界 3585 / 1697 / 速度 201。
+            def _make_battle_req(eq_msg):
+                req = protocol.message(
+                    "CreateBattleRequest",
+                    battle_id=99001,
+                    battle_config_id=101,
+                    seed=7,
+                    match_mode=1,
+                    created_at_ms=10_000,
+                    deadline_ms=1_000_000,
+                    admit_before_ms=50_000,
+                    required_physical_region=1,
+                    placement_operation_id="op-cap-check",
+                    target_instance_id="battle-1",
+                    outcome_protocol_version=1,
+                )
+                for pid, team, eq in ((1, 0, eq_msg), (2, 1, None)):
+                    snap = req.players.add(
+                        player_id=pid,
+                        player_name=f"P{pid}",
+                        level=30,
+                        max_health=1000,
+                        max_mana=200,
+                        physical_attack=100,
+                        magic_attack=100,
+                        defense=100,
+                        team_index=team,
+                        class_id=1,
+                        base_attributes=protocol.message(
+                            "BaseAttributesComp", health=1000, mana=200, strength=10, armor=20, speed=100,
+                        ),
+                        routing=protocol.message("BattleRouting", gate_instance_id="g1", scene_instance_id="s1"),
+                    )
+                    if eq is not None:
+                        snap.equipment_effects.CopyFrom(eq)
+                return req
+
+            ok_eq = protocol.message(
+                "EquipmentEffects",
+                outgoing_heal_bps=3584,
+                shield_capacity_bps=3584,
+                speed_bps=200,
+            )
+            ok_eq.ailment_hit_bps[1] = 1696
+            TurnEngine(protocol, _make_battle_req(ok_eq), skills={}, items={}, max_rounds=10)
+
+            for bad_eq in (
+                protocol.message("EquipmentEffects", outgoing_heal_bps=3585),
+                protocol.message("EquipmentEffects", shield_capacity_bps=3585),
+                protocol.message("EquipmentEffects", speed_bps=201),
+            ):
+                with pytest.raises(BattleError):
+                    TurnEngine(protocol, _make_battle_req(bad_eq), skills={}, items={}, max_rounds=10)
+            bad_ctrl = protocol.message("EquipmentEffects")
+            bad_ctrl.ailment_hit_bps[1] = 1697
+            with pytest.raises(BattleError):
+                TurnEngine(protocol, _make_battle_req(bad_ctrl), skills={}, items={}, max_rounds=10)
         finally:
             await scene.close()
 
