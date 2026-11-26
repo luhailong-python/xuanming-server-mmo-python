@@ -201,6 +201,32 @@ navBinFile
 BaseSceneTableData#
 data (2.BaseSceneTableRdataB@
 com.game.tableBBaseSceneTableOuterClassPZgenerated/pb/tablebproto3
+Æ
+.table_wire/battleprogressionreward_table.proto"Ã
+BattleProgressionRewardTable
+id (Rid
+
+match_mode (R	matchMode
+
+difficulty (R
+difficulty!
+outcome_tier (RoutcomeTier
+exp_gain (RexpGain
+silver_gain (R
+silverGain"U
+ BattleProgressionRewardTableData1
+data (2.BattleProgressionRewardTableRdataBN
+com.game.tableB&BattleProgressionRewardTableOuterClassPZgenerated/pb/tablebproto3
+¨
+,table_wire/battleprogressionrule_table.proto"“
+BattleProgressionRuleTable
+id (Rid3
+weekly_silver_soft_cap (RweeklySilverSoftCap:
+diminished_rate_permyriad (RdiminishedRatePermyriad3
+weekly_silver_hard_cap (RweeklySilverHardCap"Q
+BattleProgressionRuleTableData/
+data (2.BattleProgressionRuleTableRdataBL
+com.game.tableB$BattleProgressionRuleTableOuterClassPZgenerated/pb/tablebproto3
 ¢
 table_wire/buff_table.proto"å
 	BuffTable
@@ -888,6 +914,29 @@ init_speed
 PetTableData
 data (2	.PetTableRdataB:
 com.game.tableBPetTableOuterClassPZgenerated/pb/tablebproto3
+ö
+"table_wire/petcosmetic_table.proto"Ë
+PetCosmeticTable
+id (Rid!
+cosmetic_key (	RcosmeticKey
+name (	Rname-
+target_pet_table_id (RtargetPetTableId-
+visual_pet_table_id (RvisualPetTableId$
+visual_art_key (	RvisualArtKey
+enabled (Renabled
+
+sort_order (R	sortOrder
+mall_sku_id	 (R	mallSkuId!
+acquire_hint
+ (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId"=
+PetCosmeticTableData%
+data (2.PetCosmeticTableRdataBB
+com.game.tableBPetCosmeticTableOuterClassPZgenerated/pb/tablebproto3
 †
 table_wire/petentry_table.proto"˙
 PetEntryTable
@@ -937,6 +986,14 @@ nameMaxLen(
 PetTierTableData!
 data (2.PetTierTableRdataB>
 com.game.tableBPetTierTableOuterClassPZgenerated/pb/tablebproto3
+ê
+%table_wire/playerlevelexp_table.proto"S
+PlayerLevelExpTable
+id (Rid,
+required_total_exp (RrequiredTotalExp"C
+PlayerLevelExpTableData(
+data (2.PlayerLevelExpTableRdataBE
+com.game.tableBPlayerLevelExpTableOuterClassPZgenerated/pb/tablebproto3
 ˙
 table_wire/playmode_table.proto"‘
 PlayModeTable
@@ -977,8 +1034,9 @@ weight_agi
 RankedPresetTableData&
 data (2.RankedPresetTableRdataBC
 com.game.tableBRankedPresetTableOuterClassPZgenerated/pb/tablebproto3
-Û	
-!table_wire/rankedrule_table.proto"≈
+Á
+
+!table_wire/rankedrule_table.proto"π	
 RankedRuleTable
 id (Rid!
 rule_version (RruleVersion(
@@ -1003,7 +1061,9 @@ weight_agi
 tier_tianshu_centi (RtierTianshuCenti.
 tier_wushuang_centi (RtierWushuangCenti
 desc (	Rdesc2
-milestone_win_matches (RmilestoneWinMatches";
+milestone_win_matches (RmilestoneWinMatches6
+skill_ban_slots_per_team (RskillBanSlotsPerTeam:
+skill_ban_min_rating_centi (RskillBanMinRatingCenti";
 RankedRuleTableData$
 data (2.RankedRuleTableRdataBA
 com.game.tableBRankedRuleTableOuterClassPZgenerated/pb/tablebproto3
@@ -1019,6 +1079,26 @@ rewardItem!
 RewardTableData 
 data (2.RewardTableRdataB=
 com.game.tableBRewardTableOuterClassPZgenerated/pb/tablebproto3
+∫
+%table_wire/rewardedadslot_table.proto"¸
+RewardedAdSlotTable
+id (Rid
+enabled (Renabled
+	min_level (RminLevel
+daily_limit (R
+dailyLimit!
+cooldown_sec (RcooldownSec"
+min_watch_sec (RminWatchSec&
+session_ttl_sec (RsessionTtlSec#
+currency_type (RcurrencyType#
+reward_amount	 (RrewardAmount
+require_ssv
+ (R
+requireSsv#
+platform_mask (RplatformMask"C
+RewardedAdSlotTableData(
+data (2.RewardedAdSlotTableRdataBE
+com.game.tableBRewardedAdSlotTableOuterClassPZgenerated/pb/tablebproto3
 ı
 #table_wire/rolenamerule_table.proto"ø
 RoleNameRuleTable
@@ -1037,8 +1117,8 @@ rewardItem!
 RoleNameRuleTableData&
 data (2.RoleNameRuleTableRdataBC
 com.game.tableBRoleNameRuleTableOuterClassPZgenerated/pb/tablebproto3
-◊
-!table_wire/seasonrule_table.proto"©
+≤
+!table_wire/seasonrule_table.proto"Ñ
 SeasonRuleTable
 id (Rid
 name (	Rname 
@@ -1057,7 +1137,9 @@ ends_at_ms (RendsAtMs
 catchup_currency_type (RcatchupCurrencyType5
 catchup_price_per_point (RcatchupPricePerPoint&
 default_seal_id (RdefaultSealId
-desc (	Rdesc";
+desc (	Rdesc(
+honor_title_name (	RhonorTitleName/
+honor_badge_icon_key (	RhonorBadgeIconKey";
 SeasonRuleTableData$
 data (2.SeasonRuleTableRdataBA
 com.game.tableBSeasonRuleTableOuterClassPZgenerated/pb/tablebproto3
@@ -1080,7 +1162,7 @@ ends_at_ms (RendsAtMs
 SeasonSealTableData$
 data (2.SeasonSealTableRdataBA
 com.game.tableBSeasonSealTableOuterClassPZgenerated/pb/tablebproto3
-‹
+à
 table_wire/skill_table.proto"r
 Skillrequired_item,
 required_item_type (RrequiredItemType.
@@ -1090,7 +1172,7 @@ ends_at_ms (RendsAtMs
 required_resource_value (RrequiredResourceValue"l
 Skillcost_resource(
 cost_resource_id (RcostResourceId,
-cost_resource_cost (RcostResourceCost"◊
+cost_resource_cost (RcostResourceCost"É
 
 SkillTable
 id (Rid
@@ -1166,7 +1248,8 @@ forbidCopy
 rarity_tier< (R
 rarityTier6
 secondary_target_policy= (RsecondaryTargetPolicy'
-exclusive_group> (RexclusiveGroup8
+exclusive_group> (RexclusiveGroup*
+ban_pool_category? (RbanPoolCategory8
 required_item (2.Skillrequired_itemRrequiredItemD
 required_resource (2.Skillrequired_resourceRrequiredResource8
 cost_resource (2.Skillcost_resourceRcostResource"1
@@ -1206,8 +1289,33 @@ rarityTier(
 SkillScrollCraftTableData*
 data (2.SkillScrollCraftTableRdataBG
 com.game.tableBSkillScrollCraftTableOuterClassPZgenerated/pb/tablebproto3
-Ò
-&table_wire/spiritshopgoods_table.proto"Ø
+Õ
+'table_wire/skillvfxcosmetic_table.proto"á
+SkillVfxCosmeticTable
+id (Rid
+vfx_key (	RvfxKey
+name (	Rname$
+skill_table_id (RskillTableId
+fx_id (	RfxId(
+projectile_fx_id (	RprojectileFxId&
+telegraph_fx_id (	RtelegraphFxId
+tint_hex (	RtintHex
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder
+mall_sku_id (R	mallSkuId!
+acquire_hint (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId"G
+SkillVfxCosmeticTableData*
+data (2.SkillVfxCosmeticTableRdataBG
+com.game.tableBSkillVfxCosmeticTableOuterClassPZgenerated/pb/tablebproto3
+ı	
+&table_wire/spiritshopgoods_table.proto"≥
 SpiritShopGoodsTable
 id (Rid
 tab_id (RtabId
@@ -1237,7 +1345,24 @@ limitCount$
 limit_group_id (RlimitGroupId,
 limit_group_weight (RlimitGroupWeight
 
-badge_text (	R	badgeText"E
+badge_text (	R	badgeText"
+start_time_ms (RstartTimeMs
+end_time_ms (R	endTimeMs
+
+grant_mode (R	grantMode
+	item_id_3 (RitemId3 
+item_count_3 (R
+itemCount3 
+item_bound_3 (R
+itemBound3
+	item_id_4 (RitemId4 
+item_count_4 (R
+itemCount4 
+item_bound_4 (R
+itemBound4%
+original_price (RoriginalPrice
+	min_level  (RminLevel
+	max_level! (RmaxLevel"E
 SpiritShopGoodsTableData)
 data (2.SpiritShopGoodsTableRdataBF
 com.game.tableBSpiritShopGoodsTableOuterClassPZgenerated/pb/tablebproto3
@@ -1336,9 +1461,8 @@ mail_title
 TournamentRewardTableData*
 data (2.TournamentRewardTableRdataBG
 com.game.tableBTournamentRewardTableOuterClassPZgenerated/pb/tablebproto3
-¥
-
-%table_wire/tournamentrule_table.proto"ˆ
+Û
+%table_wire/tournamentrule_table.proto"µ
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -1366,10 +1490,64 @@ mail_title
 public_knockout_replay (RpublicKnockoutReplay,
 salute_gold_amount (RsaluteGoldAmount$
 salute_item_id (RsaluteItemId*
-salute_item_count (RsaluteItemCount"C
+salute_item_count (RsaluteItemCount.
+warmup_spar_enabled (RwarmupSparEnabled-
+prediction_enabled (RpredictionEnabled;
+prediction_reward_min_hits (RpredictionRewardMinHits9
+third_place_match_enabled (RthirdPlaceMatchEnabled.
+leyline_ban_enabled (RleylineBanEnabled6
+skill_ban_slots_per_team  (RskillBanSlotsPerTeam"C
 TournamentRuleTableData(
 data (2.TournamentRuleTableRdataBE
 com.game.tableBTournamentRuleTableOuterClassPZgenerated/pb/tablebproto3
+˙
+'table_wire/travelpassseason_table.proto"¥
+TravelPassSeasonTable
+id (Rid
+enabled (Renabled
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey(
+banner_asset_key (	RbannerAssetKey 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+
+max_points	 (R	maxPoints$
+pve_win_points
+ (RpveWinPoints2
+hard_or_pvp_win_points (RhardOrPvpWinPoints;
+pvp_qualified_other_points (RpvpQualifiedOtherPoints2
+premium_currency_type (RpremiumCurrencyType#
+premium_price (RpremiumPrice'
+config_revision (RconfigRevision"G
+TravelPassSeasonTableData*
+data (2.TravelPassSeasonTableRdataBG
+com.game.tableBTravelPassSeasonTableOuterClassPZgenerated/pb/tablebproto3
+‰
+%table_wire/travelpasstier_table.proto"¶
+TravelPassTierTable
+id (Rid
+pass_id (RpassId
+
+tier_index (R	tierIndex'
+required_points (RrequiredPoints 
+free_item_id (R
+freeItemId&
+free_item_count (RfreeItemCount
+	free_gold (RfreeGold*
+free_cosmetic_key (	RfreeCosmeticKey,
+free_cosmetic_name	 (	RfreeCosmeticName&
+premium_item_id
+ (RpremiumItemId,
+premium_item_count (RpremiumItemCount!
+premium_gold (RpremiumGold0
+premium_cosmetic_key (	RpremiumCosmeticKey2
+premium_cosmetic_name (	RpremiumCosmeticName"C
+TravelPassTierTableData(
+data (2.TravelPassTierTableRdataBE
+com.game.tableBTravelPassTierTableOuterClassPZgenerated/pb/tablebproto3
 œ
 (table_wire/trialjournalentry_table.proto"Ö
 TrialJournalEntryTable
@@ -2036,6 +2214,36 @@ navBinFile
 spawn_x (RspawnX
 spawn_y (RspawnY
 spawn_z (RspawnZ:%ä¶	BaseSceneí¶BaseScene.xlsxö¶idbproto3
+≤
+#battleprogressionreward_table.protommorpg.cfgtable.v1cfg_options.proto"€
+BattleProgressionRewardTable
+id (B
+≤¨serverRid)
+
+match_mode (B
+≤¨serverR	matchMode*
+
+difficulty (B
+≤¨serverR
+difficulty-
+outcome_tier (B
+≤¨serverRoutcomeTier%
+exp_gain (B
+≤¨serverRexpGain+
+silver_gain (B
+≤¨serverR
+silverGain:Eä¶BattleProgressionRewardí¶BattleProgressionReward.xlsxö¶id∞¶bproto3
+ö
+!battleprogressionrule_table.protommorpg.cfgtable.v1cfg_options.proto"≈
+BattleProgressionRuleTable
+id (B
+≤¨serverRid?
+weekly_silver_soft_cap (B
+≤¨serverRweeklySilverSoftCapF
+diminished_rate_permyriad (B
+≤¨serverRdiminishedRatePermyriad?
+weekly_silver_hard_cap (B
+≤¨serverRweeklySilverHardCap:Aä¶BattleProgressionRuleí¶BattleProgressionRule.xlsxö¶id∞¶bproto3
 ¬
 buff_table.protommorpg.cfgtable.v1cfg_options.proto"˛
 	BuffTable
@@ -2630,6 +2838,26 @@ init_speed
 transfer_policy (RtransferPolicy0
 exclusive_gift_slots (RexclusiveGiftSlots4
 fixed_initial_aptitude (RfixedInitialAptitude:ä¶Petí¶Pet.xlsxö¶id®¶bproto3
+Ë
+petcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"ù
+PetCosmeticTable
+id (B‡¨Rid!
+cosmetic_key (	RcosmeticKey
+name (	Rname-
+target_pet_table_id (RtargetPetTableId-
+visual_pet_table_id (RvisualPetTableId$
+visual_art_key (	RvisualArtKey
+enabled (Renabled
+
+sort_order (R	sortOrder
+mall_sku_id	 (R	mallSkuId!
+acquire_hint
+ (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId:-ä¶PetCosmeticí¶PetCosmetic.xlsxö¶id®¶bproto3
 Î
 petentry_table.protommorpg.cfgtable.v1cfg_options.proto"£
 PetEntryTable
@@ -2670,6 +2898,11 @@ nameMaxLen(
 ascend_cost_gold (RascendCostGold/
 ascend_min_pet_level (RascendMinPetLevel,
 bonus_entry_points	 (RbonusEntryPoints:%ä¶PetTierí¶PetTier.xlsxö¶id®¶bproto3
+÷
+playerlevelexp_table.protommorpg.cfgtable.v1cfg_options.proto"à
+PlayerLevelExpTable
+id (Rid,
+required_total_exp (RrequiredTotalExp:3ä¶PlayerLevelExpí¶PlayerLevelExp.xlsxö¶id∞¶bproto3
 ‘
 playmode_table.protommorpg.cfgtable.v1cfg_options.proto"å
 PlayModeTable
@@ -2704,8 +2937,9 @@ weight_agi
 pet_entry_points (B∏¨RpetEntryPoints
 sort (Rsort
 desc (	Rdesc:+ä¶RankedPresetí¶RankedPreset.xlsxö¶idbproto3
-–	
-rankedrule_table.protommorpg.cfgtable.v1cfg_options.proto"Ü	
+ƒ
+
+rankedrule_table.protommorpg.cfgtable.v1cfg_options.proto"˙	
 RankedRuleTable
 id (Rid!
 rule_version (RruleVersion5
@@ -2730,7 +2964,9 @@ weight_agi
 tier_tianshu_centi (RtierTianshuCenti.
 tier_wushuang_centi (RtierWushuangCenti
 desc (	Rdesc2
-milestone_win_matches (RmilestoneWinMatches:'ä¶
+milestone_win_matches (RmilestoneWinMatches6
+skill_ban_slots_per_team (RskillBanSlotsPerTeam:
+skill_ban_min_rating_centi (RskillBanMinRatingCenti:'ä¶
 RankedRuleí¶RankedRule.xlsxö¶idbproto3
 û
 reward_table.protommorpg.cfgtable.v1cfg_options.proto"R
@@ -2741,6 +2977,34 @@ rewardItem!
 RewardTable
 id (B‡¨Rid>
 reward (2 .mmorpg.cfgtable.v1.RewardrewardB∏¨Rreward:ä¶Rewardí¶Reward.xlsxö¶idbproto3
+É
+rewardedadslot_table.protommorpg.cfgtable.v1cfg_options.proto"µ
+RewardedAdSlotTable
+id (B
+≤¨serverRid$
+enabled (B
+≤¨serverRenabled'
+	min_level (B
+≤¨serverRminLevel+
+daily_limit (B
+≤¨serverR
+dailyLimit-
+cooldown_sec (B
+≤¨serverRcooldownSec.
+min_watch_sec (B
+≤¨serverRminWatchSec2
+session_ttl_sec (B
+≤¨serverRsessionTtlSec/
+currency_type (B
+≤¨serverRcurrencyType/
+reward_amount	 (B
+≤¨serverRrewardAmount+
+require_ssv
+ (B
+≤¨serverR
+requireSsv/
+platform_mask (B
+≤¨serverRplatformMask:3ä¶RewardedAdSlotí¶RewardedAdSlot.xlsxö¶id∞¶bproto3
 ∏
 rolenamerule_table.protommorpg.cfgtable.v1cfg_options.proto"Ï
 RoleNameRuleTable
@@ -2756,8 +3020,8 @@ rewardItem!
 rename_item_id
  (RrenameItemId*
 rename_item_count (RrenameItemCount:+ä¶RoleNameRuleí¶RoleNameRule.xlsxö¶idbproto3
-†
-seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"÷
+˚
+seasonrule_table.protommorpg.cfgtable.v1cfg_options.proto"±
 SeasonRuleTable
 id (Rid
 name (	Rname 
@@ -2776,7 +3040,9 @@ ends_at_ms (RendsAtMs
 catchup_currency_type (RcatchupCurrencyType5
 catchup_price_per_point (RcatchupPricePerPoint&
 default_seal_id (RdefaultSealId
-desc (	Rdesc:+ä¶
+desc (	Rdesc(
+honor_title_name (	RhonorTitleName/
+honor_badge_icon_key (	RhonorBadgeIconKey:+ä¶
 SeasonRuleí¶SeasonRule.xlsxö¶id∞¶bproto3
 è
 seasonseal_table.protommorpg.cfgtable.v1cfg_options.proto"≈
@@ -2796,7 +3062,7 @@ SeasonRuleRseasonId
 active_rounds (RactiveRounds0
 health_threshold_bps (RhealthThresholdBps:+ä¶
 SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3
-¢
+Œ
 skill_table.protommorpg.cfgtable.v1cfg_options.proto"l
 Skillcost_resource(
 cost_resource_id (RcostResourceId,
@@ -2806,7 +3072,7 @@ SeasonSealí¶SeasonSeal.xlsxö¶id∞¶bproto3
 required_item_value (RrequiredItemValue"Ü
 Skillrequired_resource4
 required_resource_type (RrequiredResourceType6
-required_resource_value (RrequiredResourceValue"Ú
+required_resource_value (RrequiredResourceValue"û
 
 SkillTable
 id (Rid#
@@ -2885,7 +3151,8 @@ forbidCopy
 rarity_tier< (R
 rarityTier6
 secondary_target_policy= (RsecondaryTargetPolicy'
-exclusive_group> (RexclusiveGroup:!ä¶Skillí¶
+exclusive_group> (RexclusiveGroup*
+ban_pool_category? (RbanPoolCategory:!ä¶Skillí¶
 Skill.xlsxö¶id∞¶bproto3
 ’
 skillpermission_table.protommorpg.cfgtable.v1cfg_options.proto"Ü
@@ -2914,8 +3181,30 @@ rarityTier2
 rare_ink_count (RrareInkCount$
 rare_gold_cost (RrareGoldCost
 enabled (Renabled:7ä¶SkillScrollCraftí¶SkillScrollCraft.xlsxö¶id∞¶bproto3
-ø
-spiritshopgoods_table.protommorpg.cfgtable.v1cfg_options.proto"
+°
+skillvfxcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"—
+SkillVfxCosmeticTable
+id (B‡¨Rid
+vfx_key (	RvfxKey
+name (	Rname/
+skill_table_id (B	Ú¨SkillRskillTableId
+fx_id (	RfxId(
+projectile_fx_id (	RprojectileFxId&
+telegraph_fx_id (	RtelegraphFxId
+tint_hex (	RtintHex
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder
+mall_sku_id (R	mallSkuId!
+acquire_hint (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId:7ä¶SkillVfxCosmeticí¶SkillVfxCosmetic.xlsxö¶id®¶bproto3
+√	
+spiritshopgoods_table.protommorpg.cfgtable.v1cfg_options.proto"Ù
 SpiritShopGoodsTable
 id (Rid
 tab_id (RtabId
@@ -2945,7 +3234,24 @@ limitCount$
 limit_group_id (RlimitGroupId,
 limit_group_weight (RlimitGroupWeight
 
-badge_text (	R	badgeText:5ä¶SpiritShopGoodsí¶SpiritShopGoods.xlsxö¶id∞¶bproto3
+badge_text (	R	badgeText"
+start_time_ms (RstartTimeMs
+end_time_ms (R	endTimeMs
+
+grant_mode (R	grantMode
+	item_id_3 (RitemId3 
+item_count_3 (R
+itemCount3 
+item_bound_3 (R
+itemBound3
+	item_id_4 (RitemId4 
+item_count_4 (R
+itemCount4 
+item_bound_4 (R
+itemBound4%
+original_price (RoriginalPrice
+	min_level  (RminLevel
+	max_level! (RmaxLevel:5ä¶SpiritShopGoodsí¶SpiritShopGoods.xlsxö¶id∞¶bproto3
 í
  spiritshoplimitgroup_table.protommorpg.cfgtable.v1cfg_options.proto"æ
 SpiritShopLimitGroupTable
@@ -3028,8 +3334,8 @@ mail_title
  (	R	mailTitle
 	mail_body (	RmailBody
 desc (	Rdesc:3ä¶TournamentRewardí¶TournamentReward.xlsxö¶idbproto3
-„
-tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"ï
+À
+tournamentrule_table.protommorpg.cfgtable.v1cfg_options.proto"˝
 TournamentRuleTable
 id (Rid!
 rule_version (RruleVersion
@@ -3061,130 +3367,9 @@ mail_title
 warmup_spar_enabled (RwarmupSparEnabled-
 prediction_enabled (RpredictionEnabled;
 prediction_reward_min_hits (RpredictionRewardMinHits9
-third_place_match_enabled (RthirdPlaceMatchEnabled:/ä¶TournamentRuleí¶TournamentRule.xlsxö¶idbproto3
-õ
-trialjournalentry_table.protommorpg.cfgtable.v1cfg_options.proto" 
-TrialJournalEntryTable
-id (Rid#
-
-chapter_id (Bÿ¨R	chapterId
-	season_id (RseasonId
-source_kind (R
-sourceKind
-
-difficulty (R
-difficulty
-variant_key (	R
-variantKey!
-rule_version (RruleVersion*
-rule_version_name (	RruleVersionName
-enabled	 (Renabled
-
-sort_order
- (R	sortOrder!
-display_name (	RdisplayName!
-chapter_name (	RchapterName
-icon_key (	RiconKey
-unlock_mode (R
-unlockMode
-jump_target (	R
-jumpTarget
-desc (	Rdesc:=ä¶TrialJournalEntryí¶TrialJournalEntry.xlsxö¶id®¶∞¶bproto3
-ÿ
-!trialjournalmilestone_table.protommorpg.cfgtable.v1cfg_options.proto"É
-TrialJournalMilestoneTable
-id (B‡¨Rid.
-scope_chapter_id (Bÿ¨RscopeChapterId
-	season_id (RseasonId%
-required_seals (RrequiredSeals(
-bound_sand_count (RboundSandCount?
-bound_artifact_voucher_count (RboundArtifactVoucherCount
-	badge_key (	RbadgeKey
-
-badge_name (	R	badgeName%
-commentary_key	 (	RcommentaryKey)
-commentary_title
- (	RcommentaryTitle'
-commentary_body (	RcommentaryBody.
-grant_appearance_id (	RgrantAppearanceId
-enabled (Renabled
-title (	Rtitle
-desc (	Rdesc:Eä¶TrialJournalMilestoneí¶TrialJournalMilestone.xlsxö¶id®¶∞¶bproto3
-™
-trialjournalseal_table.protommorpg.cfgtable.v1cfg_options.proto"⁄
-TrialJournalSealTable
-id (B‡¨Rid4
-entry_id (Bÿ¨Ú¨TrialJournalEntryRentryId$
-seal_slot_kind (RsealSlotKind%
-condition_type (RconditionType'
-condition_param (RconditionParam
-enabled (Renabled
-title (	Rtitle
-desc (	Rdesc:;ä¶TrialJournalSealí¶TrialJournalSeal.xlsxö¶id®¶∞¶bproto3
-©
-world_table.protommorpg.cfgtable.v1cfg_options.proto"e
-
-WorldTable
-id (Rid(
-scene_id (BÚ¨	BaseSceneRsceneId:ä¶Worldí¶
-World.xlsxö¶idbproto3
-à
-zonegroup_table.protommorpg.cfgtable.v1cfg_options.proto"ø
-ZoneGroupTable
-id (Rid
-group_id (RgroupId
-
-zone_begin (R	zoneBegin
-zone_end (RzoneEnd!
-name©F (	B≤¨designerRname:%ä¶	ZoneGroupí¶ZoneGroup.xlsxö¶idbproto3
-˙
-'table_wire/travelpassseason_table.proto"¥
-TravelPassSeasonTable
-id (Rid
-enabled (Renabled
-name (	Rname 
-description (	Rdescription
-icon_key (	RiconKey(
-banner_asset_key (	RbannerAssetKey 
-starts_at_ms (R
-startsAtMs
-
-ends_at_ms (RendsAtMs
-
-max_points	 (R	maxPoints$
-pve_win_points
- (RpveWinPoints2
-hard_or_pvp_win_points (RhardOrPvpWinPoints;
-pvp_qualified_other_points (RpvpQualifiedOtherPoints2
-premium_currency_type (RpremiumCurrencyType#
-premium_price (RpremiumPrice'
-config_revision (RconfigRevision"G
-TravelPassSeasonTableData*
-data (2.TravelPassSeasonTableRdataBG
-com.game.tableBTravelPassSeasonTableOuterClassPZgenerated/pb/tablebproto3
-‰
-%table_wire/travelpasstier_table.proto"¶
-TravelPassTierTable
-id (Rid
-pass_id (RpassId
-
-tier_index (R	tierIndex'
-required_points (RrequiredPoints 
-free_item_id (R
-freeItemId&
-free_item_count (RfreeItemCount
-	free_gold (RfreeGold*
-free_cosmetic_key (	RfreeCosmeticKey,
-free_cosmetic_name	 (	RfreeCosmeticName&
-premium_item_id
- (RpremiumItemId,
-premium_item_count (RpremiumItemCount!
-premium_gold (RpremiumGold0
-premium_cosmetic_key (	RpremiumCosmeticKey2
-premium_cosmetic_name (	RpremiumCosmeticName"C
-TravelPassTierTableData(
-data (2.TravelPassTierTableRdataBE
-com.game.tableBTravelPassTierTableOuterClassPZgenerated/pb/tablebproto3
+third_place_match_enabled (RthirdPlaceMatchEnabled.
+leyline_ban_enabled (RleylineBanEnabled6
+skill_ban_slots_per_team  (RskillBanSlotsPerTeam:/ä¶TournamentRuleí¶TournamentRule.xlsxö¶idbproto3
 Ω
 travelpassseason_table.protommorpg.cfgtable.v1cfg_options.proto"Ì
 TravelPassSeasonTable
@@ -3227,93 +3412,80 @@ freeItemId&
 premium_gold (RpremiumGold0
 premium_cosmetic_key (	RpremiumCosmeticKey2
 premium_cosmetic_name (	RpremiumCosmeticName:3ä¶TravelPassTierí¶TravelPassTier.xlsxö¶id∞¶bproto3
-ö
-"table_wire/petcosmetic_table.proto"Ë
-PetCosmeticTable
-id (Rid!
-cosmetic_key (	RcosmeticKey
-name (	Rname-
-target_pet_table_id (RtargetPetTableId-
-visual_pet_table_id (RvisualPetTableId$
-visual_art_key (	RvisualArtKey
-enabled (Renabled
+õ
+trialjournalentry_table.protommorpg.cfgtable.v1cfg_options.proto" 
+TrialJournalEntryTable
+id (Rid#
 
-sort_order (R	sortOrder
-mall_sku_id	 (R	mallSkuId!
-acquire_hint
- (	RacquireHint
-desc (	Rdesc 
-card_item_id (R
-cardItemId&
-card_item_count (RcardItemCount/
-spirit_shop_goods_id (RspiritShopGoodsId"=
-PetCosmeticTableData%
-data (2.PetCosmeticTableRdataBB
-com.game.tableBPetCosmeticTableOuterClassPZgenerated/pb/tablebproto3
-Õ
-'table_wire/skillvfxcosmetic_table.proto"á
-SkillVfxCosmeticTable
-id (Rid
-vfx_key (	RvfxKey
-name (	Rname$
-skill_table_id (RskillTableId
-fx_id (	RfxId(
-projectile_fx_id (	RprojectileFxId&
-telegraph_fx_id (	RtelegraphFxId
-tint_hex (	RtintHex
-enabled	 (Renabled
+chapter_id (Bÿ¨R	chapterId
+	season_id (RseasonId
+source_kind (R
+sourceKind
+
+difficulty (R
+difficulty
+variant_key (	R
+variantKey!
+rule_version (RruleVersion*
+rule_version_name (	RruleVersionName
+enabled	 (Renabled
 
 sort_order
- (R	sortOrder
-mall_sku_id (R	mallSkuId!
-acquire_hint (	RacquireHint
-desc (	Rdesc 
-card_item_id (R
-cardItemId&
-card_item_count (RcardItemCount/
-spirit_shop_goods_id (RspiritShopGoodsId"G
-SkillVfxCosmeticTableData*
-data (2.SkillVfxCosmeticTableRdataBG
-com.game.tableBSkillVfxCosmeticTableOuterClassPZgenerated/pb/tablebproto3
-Ë
-petcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"ù
-PetCosmeticTable
-id (B‡¨Rid!
-cosmetic_key (	RcosmeticKey
-name (	Rname-
-target_pet_table_id (RtargetPetTableId-
-visual_pet_table_id (RvisualPetTableId$
-visual_art_key (	RvisualArtKey
-enabled (Renabled
+ (R	sortOrder!
+display_name (	RdisplayName!
+chapter_name (	RchapterName
+icon_key (	RiconKey
+unlock_mode (R
+unlockMode
+jump_target (	R
+jumpTarget
+desc (	Rdesc:=ä¶TrialJournalEntryí¶TrialJournalEntry.xlsxö¶id®¶∞¶bproto3
+∏
+!trialjournalmilestone_table.protommorpg.cfgtable.v1cfg_options.proto"„
+TrialJournalMilestoneTable
+id (B‡¨Rid.
+scope_chapter_id (Bÿ¨RscopeChapterId
+	season_id (RseasonId%
+required_seals (RrequiredSeals(
+bound_sand_count (RboundSandCount?
+bound_artifact_voucher_count (RboundArtifactVoucherCount
+	badge_key (	RbadgeKey
 
-sort_order (R	sortOrder
-mall_sku_id	 (R	mallSkuId!
-acquire_hint
- (	RacquireHint
-desc (	Rdesc 
-card_item_id (R
-cardItemId&
-card_item_count (RcardItemCount/
-spirit_shop_goods_id (RspiritShopGoodsId:-ä¶PetCosmeticí¶PetCosmetic.xlsxö¶id®¶bproto3
-°
-skillvfxcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"—
-SkillVfxCosmeticTable
-id (B‡¨Rid
-vfx_key (	RvfxKey
-name (	Rname/
-skill_table_id (B	Ú¨SkillRskillTableId
-fx_id (	RfxId(
-projectile_fx_id (	RprojectileFxId&
-telegraph_fx_id (	RtelegraphFxId
-tint_hex (	RtintHex
-enabled	 (Renabled
+badge_name (	R	badgeName%
+commentary_key	 (	RcommentaryKey)
+commentary_title
+ (	RcommentaryTitle'
+commentary_body (	RcommentaryBody.
+grant_appearance_id (	RgrantAppearanceId
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc1
+grant_pet_cosmetic_id (RgrantPetCosmeticId+
+grant_skill_vfx_id (RgrantSkillVfxId:Eä¶TrialJournalMilestoneí¶TrialJournalMilestone.xlsxö¶id®¶∞¶bproto3
+™
+trialjournalseal_table.protommorpg.cfgtable.v1cfg_options.proto"⁄
+TrialJournalSealTable
+id (B‡¨Rid4
+entry_id (Bÿ¨Ú¨TrialJournalEntryRentryId$
+seal_slot_kind (RsealSlotKind%
+condition_type (RconditionType'
+condition_param (RconditionParam
+enabled (Renabled
+title (	Rtitle
+desc (	Rdesc:;ä¶TrialJournalSealí¶TrialJournalSeal.xlsxö¶id®¶∞¶bproto3
+©
+world_table.protommorpg.cfgtable.v1cfg_options.proto"e
 
-sort_order
- (R	sortOrder
-mall_sku_id (R	mallSkuId!
-acquire_hint (	RacquireHint
-desc (	Rdesc 
-card_item_id (R
-cardItemId&
-card_item_count (RcardItemCount/
-spirit_shop_goods_id (RspiritShopGoodsId:7ä¶SkillVfxCosmeticí¶SkillVfxCosmetic.xlsxö¶id®¶bproto3
+WorldTable
+id (Rid(
+scene_id (BÚ¨	BaseSceneRsceneId:ä¶Worldí¶
+World.xlsxö¶idbproto3
+à
+zonegroup_table.protommorpg.cfgtable.v1cfg_options.proto"ø
+ZoneGroupTable
+id (Rid
+group_id (RgroupId
+
+zone_begin (R	zoneBegin
+zone_end (RzoneEnd!
+name©F (	B≤¨designerRname:%ä¶	ZoneGroupí¶ZoneGroup.xlsxö¶idbproto3

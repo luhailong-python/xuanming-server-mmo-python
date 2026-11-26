@@ -44,6 +44,28 @@ message SeasonSkillSummary {
   uint32 action_tags = 16;
 }
 
+// 单季永久零数值纪念印记与称谓展示视图（源自 PlayerSeasonComp.records，换季永久留存且零战斗属性）。
+message SeasonHonorView {
+  uint32 season_id = 1;
+  string season_name = 2;
+  string honor_title_name = 3;
+  string honor_badge_icon_key = 4;
+  uint32 progress_points = 5;
+  uint32 max_points = 6;
+  bool unlocked = 7;
+  bool is_current_season = 8;
+}
+
+// 当前活跃赛季的全员对称周环境词缀视图（不卖数值、零养成门槛，每周自动轮换）。
+message SeasonWeeklyAffixView {
+  uint32 week_index = 1;
+  uint32 affix_id = 2; // 0=无，1护盾过载/2灵息充盈/3先机守势/4锋芒竞速
+  string name = 3;
+  string description = 4;
+  string strategy_tip = 5;
+  repeated uint32 recommended_seal_ids = 6;
+}
+
 message SeasonStateSnapshot {
   bool available = 1;
   string unavailable_reason = 2;
@@ -85,6 +107,10 @@ message SeasonStateSnapshot {
   uint32 equipped_formation_id = 31;
   // 战报一键收藏的脱敏公开配装列表（上限 12 条）。
   repeated SavedBattleBuildBookmarkView saved_builds = 32;
+  // 历季与当季零数值永久纪念印记与称谓（休赛期亦返回已达成历史荣誉）。
+  repeated SeasonHonorView honors = 33;
+  // 本周全员对称环境词缀（无活跃赛季时为空）。
+  SeasonWeeklyAffixView weekly_affix = 34;
 }
 
 message SavedBattleBuildBookmarkView {

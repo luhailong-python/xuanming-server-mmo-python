@@ -53,6 +53,7 @@ TX_PAYMENT_REVERSAL = 31
 CURRENCY_GOLD = 0
 CURRENCY_DIAMOND = 1
 CURRENCY_BIND_DIAMOND = 2
+CURRENCY_BIND_GOLD = 3
 
 # P1 商品存储状态（ListingStatus）
 LISTING_STATUS_UNSPECIFIED = 0
@@ -199,14 +200,19 @@ MAX_SUBCATEGORIES: dict[int, int] = {
 }
 
 
+def is_bound_currency(currency_type: int) -> bool:
+    """判定币种是否属于禁止玩家间交易/寄售的绑定货币（绑定灵石 2 / 绑定银两 3）。"""
+    return currency_type in (CURRENCY_BIND_DIAMOND, CURRENCY_BIND_GOLD)
+
+
 def is_tradable_currency(currency_type: int) -> bool:
-    """交易与人民币寄售允许的币种：仅银两(0)与灵石(1)，绑定灵石(2)禁售。"""
+    """交易与人民币寄售允许的币种：仅银两(0)与灵石(1)，绑定灵石(2)与绑定银两(3)禁售。"""
     return currency_type in (CURRENCY_GOLD, CURRENCY_DIAMOND)
 
 
 def is_known_currency(currency_type: int) -> bool:
-    """协议 CurrencyType 完整取值表校验（银两/灵石/绑定灵石，供官方商城发放校验）。"""
-    return currency_type in (CURRENCY_GOLD, CURRENCY_DIAMOND, CURRENCY_BIND_DIAMOND)
+    """协议 CurrencyType 完整取值表校验（银两/灵石/绑定灵石/绑定银两）。"""
+    return currency_type in (CURRENCY_GOLD, CURRENCY_DIAMOND, CURRENCY_BIND_DIAMOND, CURRENCY_BIND_GOLD)
 
 
 def valid_account(account: str) -> bool:
@@ -275,7 +281,7 @@ class TradePolicy:
             raise TradeRejection(ERR_INVALID_PARAMETER, "invalid asset selection bounds")
         if (cur_amount == 0 and cur_type != 0) or cur_amount > INT64_MAX:
             raise TradeRejection(ERR_INVALID_PARAMETER, "invalid currency selection")
-        if cur_amount > 0 and (cur_type == CURRENCY_BIND_DIAMOND or cur_type not in self.currencies):
+        if cur_amount > 0 and (is_bound_currency(cur_type) or cur_type not in self.currencies):
             raise TradeRejection(ERR_TRADE_ASSET_NOT_TRADABLE, "currency not tradable")
         total = 0
         for cfg_id, count in items.items():
@@ -304,7 +310,7 @@ class TradePolicy:
         return True
 
     def valid_price(self, price: int, currency_type: int) -> bool:
-        return 0 < price <= INT64_MAX and currency_type != CURRENCY_BIND_DIAMOND and currency_type in self.currencies
+        return 0 < price <= INT64_MAX and not is_bound_currency(currency_type) and currency_type in self.currencies
 
 
 class MergedZones:

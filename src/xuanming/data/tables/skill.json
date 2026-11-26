@@ -3844,6 +3844,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 0.7,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -3911,6 +3912,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 1.6,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -3973,6 +3975,7 @@
   {
    "ability_kind": 1,
    "action_tags": 4,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4005,6 +4008,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4065,6 +4069,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4129,6 +4134,7 @@
   {
    "ability_kind": 1,
    "action_tags": 18,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4159,6 +4165,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4189,6 +4196,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4219,6 +4227,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4249,6 +4258,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4279,6 +4289,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4309,6 +4320,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4340,6 +4352,7 @@
    "ability_kind": 1,
    "action_tags": 4,
    "allow_dead_target": 1,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4370,6 +4383,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4400,6 +4414,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4431,6 +4446,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 0.5,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4465,6 +4481,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 0.85,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4498,6 +4515,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4528,6 +4546,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 3,
    "category": "主动",
@@ -4558,6 +4577,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4588,6 +4608,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4618,6 +4639,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4649,6 +4671,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 1.6,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4681,6 +4704,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -4711,6 +4735,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4741,6 +4766,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4771,6 +4797,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4801,6 +4828,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4831,6 +4859,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4924,6 +4953,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -4956,6 +4986,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -5017,6 +5048,7 @@
   {
    "ability_kind": 1,
    "action_tags": 4,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -5613,6 +5645,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5645,6 +5678,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 0.85,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5681,6 +5715,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 0.85,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5716,6 +5751,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5748,6 +5784,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5864,6 +5901,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5898,6 +5936,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5932,6 +5971,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -5966,6 +6006,7 @@
   {
    "ability_kind": 1,
    "action_tags": 16,
+   "ban_pool_category": 1,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6001,6 +6042,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 1.0,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6038,6 +6080,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 1.0,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6074,6 +6117,7 @@
   {
    "ability_kind": 1,
    "action_tags": 4,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6108,6 +6152,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6142,6 +6187,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6176,6 +6222,7 @@
   {
    "ability_kind": 1,
    "action_tags": 8,
+   "ban_pool_category": 3,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6211,6 +6258,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 1.05,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6248,6 +6296,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 1.05,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6285,6 +6334,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 1.0,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6322,6 +6372,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 1.0,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6359,6 +6410,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 0.9,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -6396,6 +6448,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 0.9,
+   "ban_pool_category": 4,
    "battle_model": 1,
    "caster_mask": 2,
    "category": "主动",
@@ -6433,6 +6486,7 @@
    "ability_kind": 1,
    "action_tags": 1,
    "attack_multiplier": 2.15,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6470,6 +6524,7 @@
    "ability_kind": 1,
    "action_tags": 2,
    "attack_multiplier": 2.15,
+   "ban_pool_category": 2,
    "battle_model": 1,
    "caster_mask": 1,
    "category": "主动",
@@ -6686,6 +6741,314 @@
    "season_id": 0,
    "secondary_target_policy": 0,
    "target_team": 2,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 1,
+   "action_tags": 1,
+   "attack_multiplier": 0.85,
+   "ban_pool_category": 2,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "主动",
+   "cooldown_rounds": 2,
+   "damage": "4*level",
+   "damage_type": 1,
+   "description": "【玄脉之季免费】物理攻击敌方最多3个目标并附加2回合破甲（防御-15%）；第二季预埋模板。",
+   "effect": [
+    150010,
+    150011
+   ],
+   "icon_key": "UI/Skills/15001",
+   "id": 15101,
+   "mana_percent": 0.06,
+   "max_rank": 10,
+   "max_targets": 3,
+   "name": "玄脉破军",
+   "pet_max_targets": 1,
+   "prototype_code": "SS201",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 0,
+   "season_id": 2,
+   "skill_type": [
+    1
+   ],
+   "target_team": 1,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 1,
+   "action_tags": 2,
+   "attack_multiplier": 0.85,
+   "ban_pool_category": 2,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "主动",
+   "cooldown_rounds": 2,
+   "damage": "4*level",
+   "damage_type": 0,
+   "description": "【玄脉之季免费】法术攻击敌方最多3个目标并附加2回合破阵减防（防御-15%）；第二季预埋模板。",
+   "effect": [
+    150020,
+    150021
+   ],
+   "icon_key": "UI/Skills/15002",
+   "id": 15102,
+   "mana_percent": 0.06,
+   "max_rank": 10,
+   "max_targets": 3,
+   "name": "玄脉天罚",
+   "pet_max_targets": 1,
+   "prototype_code": "SS202",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 0,
+   "season_id": 2,
+   "skill_type": [
+    1
+   ],
+   "target_team": 1,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 1,
+   "action_tags": 8,
+   "ban_pool_category": 3,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "主动",
+   "cooldown_rounds": 2,
+   "description": "【玄脉之季免费】为友方最多3个目标施加2回合护盾，短冷却保人；第二季预埋模板。",
+   "effect": [
+    150030
+   ],
+   "icon_key": "UI/Skills/15003",
+   "id": 15103,
+   "mana_percent": 0.06,
+   "max_rank": 10,
+   "max_targets": 3,
+   "name": "玄脉灵幕",
+   "pet_max_targets": 1,
+   "prototype_code": "SS203",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 0,
+   "season_id": 2,
+   "skill_type": [
+    1
+   ],
+   "target_team": 2,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 1,
+   "action_tags": 8,
+   "ban_pool_category": 3,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "主动",
+   "cooldown_rounds": 2,
+   "description": "【玄脉之季免费】为友方最多3个目标提升2回合双攻势能（+15%）；第二季预埋模板。",
+   "effect": [
+    150040
+   ],
+   "icon_key": "UI/Skills/15004",
+   "id": 15104,
+   "mana_percent": 0.05,
+   "max_rank": 10,
+   "max_targets": 3,
+   "name": "玄脉归元",
+   "pet_max_targets": 1,
+   "prototype_code": "SS204",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 0,
+   "season_id": 2,
+   "skill_type": [
+    1
+   ],
+   "target_team": 2,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "被动",
+   "description": "每回合首次承受敌方直接伤害或援护分担扣血时叠 1 层，每层使自身直接伤害提高 1%，持续至战斗结束，最多叠加 300 层；阵亡暂停，复活保留已有层，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12023",
+   "id": 12023,
+   "init_effect": [
+    120230
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "承锋蓄势",
+   "pet_max_targets": 1,
+   "prototype_code": "G04",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "被动",
+   "description": "每回合主动攻击（普攻或主动攻击技）首次命中敌方造成扣血时叠 1 层，每层使自身攻击无视目标护甲与防御 1%，持续至战斗结束，最多叠加 50 层（50%）；阵亡暂停，复活保留已有层，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12024",
+   "id": 12024,
+   "init_effect": [
+    120240
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "循隙破甲",
+   "pet_max_targets": 1,
+   "prototype_code": "G05",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "被动",
+   "description": "每回合自己施加的中毒或灼烧首次造成实际扣血时叠 1 层，每层使自身持续伤害提高 1%，持续至战斗结束，最多叠加 300 层；阵亡暂停，复活保留已有层，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12025",
+   "id": 12025,
+   "init_effect": [
+    120250
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "蚀骨愈深",
+   "pet_max_targets": 1,
+   "prototype_code": "G06",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "被动",
+   "description": "每回合首次成为敌方行动控制目标时（命中、抵抗或护阵抵挡皆计）叠 1 层，每层使自身全部行动控制抵抗提高 1%，持续至战斗结束，最多叠加 40 层（+40%）；阵亡暂停，复活保留已有层，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12026",
+   "id": 12026,
+   "init_effect": [
+    120260
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "磐石道心",
+   "pet_max_targets": 1,
+   "prototype_code": "G07",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 1,
+   "category": "被动",
+   "description": "每回合主动施放治疗、护盾或回生印技能时叠 1 层（每轮限 1 层），每层使自身施放护盾的容量提高 1%，持续至战斗结束，最多叠加 50 层（+50%）；阵亡暂停，复活保留已有层，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12027",
+   "id": 12027,
+   "init_effect": [
+    120270
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "厚泽蓄灵",
+   "pet_max_targets": 1,
+   "prototype_code": "G08",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
+   "targeting_mode": [
+    1
+   ],
+   "unlock_level": 1
+  },
+  {
+   "ability_kind": 2,
+   "action_tags": 8,
+   "battle_model": 1,
+   "caster_mask": 2,
+   "category": "被动",
+   "description": "灵宠专属被动：每回合主动攻击（普攻或主动攻击技）首次命中敌方造成扣血时叠 1 层，每层使自身直接伤害提高 1%，持续至战斗结束，最多叠加 300 层；阵亡或被劝退即清零层数，复活或重召后可重新叠加，不可被普通驱散。",
+   "forbid_copy": 1,
+   "icon_key": "UI/Skills/12028",
+   "id": 12028,
+   "init_effect": [
+    120280
+   ],
+   "max_rank": 10,
+   "max_targets": 1,
+   "name": "兽威渐盛",
+   "pet_max_targets": 1,
+   "prototype_code": "G09",
+   "rarity_tier": 0,
+   "require_target": 1,
+   "scroll_id": 7,
+   "season_id": 0,
+   "target_team": 3,
    "targeting_mode": [
     1
    ],

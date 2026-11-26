@@ -76,6 +76,15 @@ message BattleStateS2C {
   WuxingTowerBattleContext tower_context = 30;     // 五行幻境周常爬塔上下文（层数/灵脉/本轮已选符印）
   CustomDuelRules custom_duel_rules = 31;          // 道友切磋坊生效自定义规则（供参战与观众展示）
   bool wuxing_synergy_active_this_round = 32;      // 本回合是否激活人宠五行相生合击（每 3 回合）
+  uint32 season_weekly_affix_id = 33;              // 本局生效的赛季全员对称周环境词缀（0=无，1..4）
+  uint32 boss_weekly_affix_id = 34;                // 首领试炼本周冻结五行词缀（0=无/非首领试炼，1金/2木/3水/4火/5土）
+  repeated BattleTacticalPing team_pings = 35;     // 论剑 V4 队内一键战术标点（仅同队可见；敌方与观众视图由节点清空）
+  repeated BattlePrepPetOption self_standby_pets = 36; // 论剑 V5 临阵唤灵本人剩余备选灵宠（仅本人可见，对手与观众清空）
+  uint32 self_summon_pet_remaining = 37;               // 论剑 V5 临阵唤灵本人剩余可用次数（0/1，仅本人可见，对手与观众清空）
+  uint32 summon_pet_unlock_round = 38;                 // 论剑 V5 临阵唤灵解锁回合号（正式自养竞技为 2，其余模式为 0）
+  repeated uint32 banned_skill_ids = 39;               // 本局最终生效的全场双边共同禁用技能（升序去重，0..6 个；观战/重连/回放全可见）
+  repeated uint32 team_a_banned_skill_ids = 40;        // A 队（team_index=0）最终生效的禁用技能（0..3 个）
+  repeated uint32 team_b_banned_skill_ids = 41;        // B 队（team_index=1）最终生效的禁用技能（0..3 个）
 }
 
 message BattleStartS2C {
@@ -122,6 +131,18 @@ message BattleEndS2C {
   uint32 material_tradable_units_added = 7; // 本局实际新增材料中可交易份数（0 或 1）
   bool material_pvp_loss_ineligible = 8;    // true = PVP 负/平未达有效对抗门槛（+0 且不扣永久 660 额度）
   FestivalBeastSettlementSummary festival_beast_settlement = 9; // 瑞兽迎春活动局结算摘要
+  uint32 season_seal_points_added = 10;     // 本局实际新增赛季印进度点（0/1/2）
+  uint32 season_seal_progress_after = 11;   // 本局结算后本季赛季印累计进度点
+  uint32 season_seal_max_points = 12;       // 本季赛季印满级上限（0 = 非赛季合格局）
+  bool season_honor_newly_unlocked = 13;    // true = 本局刚满级永久解锁本季零数值纪念称谓与徽章
+  // 角色升级与战斗银两结算增量（与 PlayerBattleResult 同源，docs/planning/player-leveling-and-battle-economy-v1.md §2.3）。
+  uint32 level_before = 14;
+  uint32 level_after = 15;
+  uint64 exp_gain = 16;
+  uint64 silver_gain = 17;
+  uint64 total_exp_after = 18;
+  uint64 next_level_total_exp = 19;
+  bool battle_silver_diminished = 20;
 }
 
 // 重连提示:scene 在换会话(RECONNECT / REPLACE)或登录重建出 FIGHTING 冻结时经大厅推送;
@@ -208,12 +229,14 @@ message SurrenderVoteS2C {
   BattleSurrenderVoteState vote_state = 2;
 }
 
-// 论剑 V3 战前 15 秒明牌变阵提交（参战者；经战斗直连发往 battle 节点，仅战前变阵期有效）。
+// 论剑 V3 战前明牌变阵提交（参战者；经战斗直连发往 battle 节点，仅战前变阵期有效）。
 message UpdateBattlePrepRequest {
   uint64 battle_id = 1;
   uint32 selected_seal_id = 2; // 0 = 保持当前赛季印不变
   uint64 selected_pet_id = 3;  // 0 = 保持当前首发灵宠不变
   bool ready = 4;              // true = 锁定本场出战方案（锁定后不可再改；全员锁定立即开打）
+  bool update_banned_skills = 5;        // true = 用下方 banned_skill_ids 原子替换本人禁用提名（允许空列表=清空）；false = 保持不变
+  repeated uint32 banned_skill_ids = 6; // 本人有序禁招提名列表（0..3，去重，须全部在白名单内）
 }
 
 message UpdateBattlePrepResponse {
@@ -225,6 +248,24 @@ message UpdateBattlePrepResponse {
 message BattlePrepUpdateS2C {
   uint64 battle_id = 1;
   BattlePrepState prep_state = 2;
+}
+
+// 论剑 V4 队内一键战术标点提交（参战者；经战斗直连发往 battle 节点，变阵期与每回合行动窗皆可用）。
+message SendBattlePingRequest {
+  uint64 battle_id = 1;
+  uint64 target_actor_id = 2;
+  BattlePingKind kind = 3;
+}
+
+message SendBattlePingResponse {
+  TipInfoMessage error_message = 1;
+  BattleTacticalPing ping = 2; // 成功时回填本次生效标点
+}
+
+// 论剑 V4 队内战术标点推送（严格仅向发送者所属同队成员单播，绝不向对手或观众推送）。
+message BattlePingS2C {
+  uint64 battle_id = 1;
+  BattleTacticalPing ping = 2;
 }
 
 // ==== 客户端直连 battle 节点(设计文档 turn-based-battle-server.md §18,D23-D28)====
@@ -330,6 +371,10 @@ service BattleClientPlayer {
   // ---- 论剑 V3 战前 15 秒明牌变阵(docs/design/ranked-play-v3-tactical-prep.md):换赛季印/换首发宠与锁定 ----
   rpc UpdateBattlePrep (UpdateBattlePrepRequest) returns (UpdateBattlePrepResponse);
   rpc NotifyBattlePrepUpdate (BattlePrepUpdateS2C) returns (Empty) { option (OptionClientRpcKind) = CLIENT_RPC_PUSH; }
+
+  // ---- 论剑 V4 队内一键战术标点(docs/planning/ranked-play-v4-team-tactics-and-highlights.md):零文字同队战术信号 ----
+  rpc SendBattlePing (SendBattlePingRequest) returns (SendBattlePingResponse);
+  rpc NotifyBattlePing (BattlePingS2C) returns (Empty) { option (OptionClientRpcKind) = CLIENT_RPC_PUSH; }
 }
 
 // ==== 战报回放(docs/design/battle-report-replay.md)====

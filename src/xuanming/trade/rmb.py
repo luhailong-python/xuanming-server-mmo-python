@@ -52,7 +52,6 @@ from .model import (
     COMMERCE_REFUND_PENDING,
     COMMERCE_SETTLED,
     COMMERCE_WAITING,
-    CURRENCY_BIND_DIAMOND,
     CURRENCY_GOLD,
     MAX_RMB_PRICE_FEN,
     MAX_RMB_TITLE_UTF16,
@@ -60,6 +59,7 @@ from .model import (
     RoleOriginal,
     TradePolicy,
     build_asset_bundle,
+    is_bound_currency,
     transfer_bundle,
     truncate_utf8,
     valid_account,
@@ -312,8 +312,8 @@ class RmbConsignments:
             return "CHARACTER"
         if count != 1 or sel is None:
             raise TradeRejection(ERR_INVALID_PARAMETER, "rmb consignment requires exactly one asset category")
-        if int(sel.currency_type) == CURRENCY_BIND_DIAMOND:
-            raise TradeRejection(ERR_TRADE_ASSET_NOT_TRADABLE, "bind diamond is not tradable")
+        if is_bound_currency(int(sel.currency_type)):
+            raise TradeRejection(ERR_TRADE_ASSET_NOT_TRADABLE, "bound currency is not tradable")
         rmb_policy = TradePolicy(
             items=self.engine.policy.items,
             item_titles=self.engine.policy.item_titles,

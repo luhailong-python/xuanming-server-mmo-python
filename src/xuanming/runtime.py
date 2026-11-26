@@ -33,6 +33,7 @@ from .nodes.scene_attributes import SceneAttributes, initialize_attribute_scheme
 from .nodes.scene_battle import SceneBattle
 from .nodes.scene_connection_hold import afk_pass_key
 from .nodes.scene_equip_craft import SceneEquipCraft
+from .nodes.scene_equip_loadout import SceneEquipLoadout
 from .nodes.scene_festival_beast import SceneFestivalBeast
 from .nodes.scene_gm_commands import SceneGmCommands
 from .nodes.scene_landing import SceneLanding
@@ -42,6 +43,7 @@ from .nodes.scene_mission import Missions
 from .nodes.scene_pets import ScenePets
 from .nodes.scene_planned_drain import budget_from_env, planned_drain
 from .nodes.scene_rename import SceneRename
+from .nodes.scene_rewarded_ad import SceneRewardedAd
 from .nodes.scene_season import SceneSeason
 from .nodes.scene_skill_craft import SceneSkillCraft
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
@@ -748,6 +750,10 @@ class Runtime:
         scene.spirit_shop.register()
         scene.travel_pass = SceneTravelPass(scene, tables, scene.assets)
         scene.travel_pass.register()
+        scene.rewarded_ad = SceneRewardedAd(scene, tables, scene.assets)
+        scene.rewarded_ad.register()
+        scene.equip_loadout = SceneEquipLoadout(scene, tables, scene.assets)
+        scene.equip_loadout.register()
         scene_cg_call = self.local_services.call_raw if (self.local and self.local_services is not None) else None
         if not self.local:
             cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()

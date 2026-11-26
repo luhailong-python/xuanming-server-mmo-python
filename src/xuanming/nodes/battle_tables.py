@@ -152,6 +152,7 @@ class BattleSkill:
     health_cost_mode: int = 0
     secondary_target_policy: int = 0
     exclusive_group: int = 0
+    ban_pool_category: int = 0
 
     @property
     def castable(self) -> bool:
@@ -212,6 +213,7 @@ class BattleBuff:
     stack_limit: int = 0
     start_round: int = 0
     require_living_caster: bool = False
+    keep_on_death: bool = False
 
 
 class BattleTables:
@@ -253,6 +255,7 @@ class BattleTables:
                 stack_limit=int(getattr(row, "stack_limit", 0)),
                 start_round=int(getattr(row, "start_round", 0)),
                 require_living_caster=bool(getattr(row, "require_living_caster", 0)),
+                keep_on_death=bool(getattr(row, "keep_on_death", 0)),
             ) for row in tables["Buff"].rows()
         }
         self.silence_permissions = {
@@ -327,8 +330,24 @@ class BattleTables:
                 health_cost_mode=int(getattr(row, "health_cost_mode", 0)),
                 secondary_target_policy=int(getattr(row, "secondary_target_policy", 0)),
                 exclusive_group=int(getattr(row, "exclusive_group", 0)),
+                ban_pool_category=int(getattr(row, "ban_pool_category", 0)),
             )
         return result
+
+    def ban_eligible_skill_ids(self, active_season_id: int = 0) -> list[int]:
+        """返回可被战前 3-Ban 禁用的配置化主动战法 ID 列表（升序）。"""
+        ids = [
+            skill_id
+            for skill_id, rule in self.skills.items()
+            if (
+                rule.battle_model == 1
+                and rule.ability_kind == 1
+                and 1 <= rule.ban_pool_category <= 4
+                and (rule.season_id == 0 or (active_season_id != 0 and rule.season_id == active_season_id))
+            )
+        ]
+        ids.sort()
+        return ids
 
     def dungeon_meta(self, battle_config_id: int) -> tuple[int, int, int]:
         """返回副本表 `(boss_trial_kind, difficulty, round_limit)`。"""

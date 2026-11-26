@@ -8,12 +8,14 @@
    "item_counts": [
     30,
     30,
-    60
+    60,
+    3
    ],
    "item_ids": [
     3403,
     3406,
-    20
+    20,
+    3407
    ],
    "mail_body": "恭喜你的战队夺得本赛季群仙问道赛全服总冠军！随信奉上冠军奖励与专属荣耀。",
    "mail_title": "群仙问道赛·全服总冠军奖励",
@@ -30,12 +32,14 @@
    "item_counts": [
     20,
     20,
-    40
+    40,
+    2
    ],
    "item_ids": [
     3403,
     3406,
-    20
+    20,
+    3407
    ],
    "mail_body": "恭喜你的战队斩获本赛季群仙问道赛全服亚军！请查收赛季奖励。",
    "mail_title": "群仙问道赛·全服亚军奖励",
@@ -52,12 +56,14 @@
    "item_counts": [
     14,
     14,
-    30
+    30,
+    2
    ],
    "item_ids": [
     3403,
     3406,
-    20
+    20,
+    3407
    ],
    "mail_body": "恭喜你的战队晋级本赛季群仙问道赛全服四强！请查收赛季奖励。",
    "mail_title": "群仙问道赛·全服四强奖励",
@@ -74,12 +80,14 @@
    "item_counts": [
     10,
     10,
-    20
+    20,
+    1
    ],
    "item_ids": [
     3403,
     3406,
-    20
+    20,
+    3407
    ],
    "mail_body": "恭喜你的战队闯入本赛季群仙问道赛全服八强！请查收赛季奖励。",
    "mail_title": "群仙问道赛·全服八强奖励",
@@ -95,12 +103,14 @@
    "item_counts": [
     6,
     6,
-    15
+    15,
+    1
    ],
    "item_ids": [
     3403,
     3406,
-    20
+    20,
+    3407
    ],
    "mail_body": "恭喜你的战队入围本赛季群仙问道赛十六强！请查收赛季奖励。",
    "mail_title": "群仙问道赛·全服十六强奖励",
@@ -147,6 +157,50 @@
    "max_rank": 0,
    "min_rank": 0,
    "tier_kind": 7
+  },
+  {
+   "badge_code": "badge_tournament_third_place",
+   "desc": "季军争夺战第3名专属奖励(绑定自用)",
+   "gold_amount": 65000,
+   "id": 8,
+   "item_counts": [
+    18,
+    18,
+    35,
+    2
+   ],
+   "item_ids": [
+    3403,
+    3406,
+    20,
+    3407
+   ],
+   "mail_body": "恭喜阁下在群仙问道赛季军争夺战中力克群雄斩获季军！特赐绑定修炼物资与季军荣耀。",
+   "mail_title": "群仙问道赛·季军嘉奖",
+   "max_rank": 3,
+   "min_rank": 3,
+   "tier_kind": 8,
+   "title_code": "tournament_third_place"
+  },
+  {
+   "badge_code": "badge_tournament_oracle",
+   "desc": "免费神机竞猜命中达标奖励(绑定自用)",
+   "gold_amount": 12000,
+   "id": 9,
+   "item_counts": [
+    6,
+    10
+   ],
+   "item_ids": [
+    3406,
+    20
+   ],
+   "mail_body": "恭喜道友在群仙问道赛神机竞猜中料事如神达到领奖门槛！特赐绑定修炼物资与慧眼识仙称号。",
+   "mail_title": "群仙问道赛·神机慧眼礼",
+   "max_rank": 0,
+   "min_rank": 0,
+   "tier_kind": 9,
+   "title_code": "tournament_oracle"
   }
  ]
 }

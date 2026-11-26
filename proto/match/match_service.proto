@@ -92,11 +92,15 @@ service MatchService {
   rpc SendTournamentSpectateCheer(SendTournamentSpectateCheerRequest) returns (SendTournamentSpectateCheerResponse) {}
   rpc GetTournamentSpectateCheer(GetTournamentSpectateCheerRequest) returns (GetTournamentSpectateCheerResponse) {}
 
-  // ---- 全服赛季战队锦标赛《群仙问道赛》V3(docs/design/season-team-tournament-v3.md):请求只认会话本人 ----
+  // ---- 全服赛季战队锦标赛《群仙问道赛》V3(docs/planning/season-team-tournament-v3.md):请求只认会话本人 ----
   rpc UpdateTournamentSquadEmblem(UpdateTournamentSquadEmblemRequest) returns (UpdateTournamentSquadEmblemResponse) {}
   rpc StartTournamentWarmup(StartTournamentWarmupRequest) returns (StartTournamentWarmupResponse) {}
   rpc PredictTournamentMatch(PredictTournamentMatchRequest) returns (PredictTournamentMatchResponse) {}
   rpc GetTournamentPredictionBoard(GetTournamentPredictionBoardRequest) returns (GetTournamentPredictionBoardResponse) {}
+
+  // ---- 全服赛季战队锦标赛《群仙问道赛》V4(docs/planning/season-team-tournament-v4.md):请求只认会话本人 ----
+  rpc BanTournamentLeyline(BanTournamentLeylineRequest) returns (BanTournamentLeylineResponse) {}
+  rpc GetTournamentHighlights(GetTournamentHighlightsRequest) returns (GetTournamentHighlightsResponse) {}
 }
 
 // ----- Match mode config -----
@@ -559,6 +563,8 @@ message RankedPlayerSeasonSummary {
   uint32 milestone_bits = 13;      // bit0=4场头像纹样, bit1=8场名片底纹, bit2=12场青云玉符, bit3=6胜锋芒称号
   uint64 final_rank = 14;          // 封榜后最终名次;0=未上榜或未封榜
   bool champion_awarded = 15;      // 封榜第 1 且终分达到无双
+  uint32 current_win_streak = 16;  // 本季当前有效连胜场次（胜+1、负归0、平/作废不变；纯荣誉）
+  uint32 best_win_streak = 17;     // 本季最高连胜纪录（纯荣誉）
 }
 
 message RankedBattleSettlementView {
@@ -582,6 +588,42 @@ message RankedBattleSettlementView {
   uint64 settled_at_ms = 18;
   uint32 character_preset_id = 19;
   uint32 pet_preset_id = 20;
+  uint32 win_streak_after = 21;      // 本局结算后的当前连胜数
+  uint32 ended_opponent_streak = 22; // 若本方获胜并终结了 >=3 连胜对手，记录被终结的最高连胜数（否则 0）
+  bool revenged_rival = 23;          // 论剑 V6：本局是否触发「雪耻复仇」荣誉印章
+  string revenged_opponent_name = 24;// 论剑 V6：雪耻复仇对手名
+  uint32 revenged_wins_after = 25;   // 论剑 V6：含本局后的对阵胜场
+  uint32 revenged_losses_after = 26; // 论剑 V6：含本局后的对阵负场
+}
+
+// 论剑 V6 个人宿敌账本摘要（用于大厅/赛季记录展示常遇宿敌战绩）。
+message RankedRivalrySummary {
+  uint64 opponent_id = 1;
+  string opponent_name = 2;
+  uint32 wins = 3;
+  uint32 losses = 4;
+  uint32 draws = 5;
+  uint32 last_outcome = 6; // 1 胜 / 2 负 / 3 平
+  uint64 last_battle_id = 7;
+  uint64 updated_ms = 8;
+}
+
+// 论剑 V6 大厅「问道名局」高段热门流派卡片（支持公开战报回放观摩 + 一键套用赛季印与首发宠）。
+message RankedFeaturedBuildView {
+  string build_key = 1;
+  uint32 season_seal_id = 2;
+  uint32 starter_pet_table_id = 3;
+  repeated uint32 core_skill_ids = 4; // 最多 4 招
+  uint32 appearances = 5;
+  uint32 wins = 6;
+  uint32 high_tier_wins = 7;          // 达到青锋及以上段位的胜场数
+  uint64 featured_battle_id = 8;      // 可直接调用 GetBattleReport 观摩的高段真实名局战报 ID
+  uint64 featured_player_id = 9;
+  string featured_player_name = 10;
+  int64 featured_rating_centi = 11;
+  uint32 featured_team_size = 12;
+  uint32 featured_total_rounds = 13;
+  uint64 updated_ms = 14;
 }
 
 message GetRankedProfileRequest {
@@ -598,6 +640,8 @@ message GetRankedProfileResponse {
   repeated RankedPlayerSeasonSummary history = 8;    // 往季记录(season_id 降序)
   repeated RankedSeasonInfo past_seasons = 9;        // 往季赛季摘要(含封榜/榜首题名)
   uint64 server_time_ms = 10;
+  repeated RankedFeaturedBuildView featured_builds = 11; // 论剑 V6：本季问道名局高段热门流派（Top 5）
+  repeated RankedRivalrySummary top_rivals = 12;         // 论剑 V6：本人本季宿敌恩怨账本（Top 8）
 }
 
 message SaveRankedPresetRequest {
@@ -736,6 +780,7 @@ message TournamentSeasonView {
   uint64 final_mvp_player_id = 30;                    // V3: 总决赛问鼎之星(MVP)玩家 ID
   string final_mvp_player_name = 31;                  // V3: 总决赛 MVP 角色名
   uint32 final_mvp_score = 32;                        // V3: 总决赛 MVP 综合战功分
+  uint32 champion_honor_bits = 33;                    // V4: 冠军战队赛季荣耀铭牌位图(bit 0..5)
 }
 
 message TournamentMemberView {
@@ -767,7 +812,8 @@ message TournamentSquadView {
   uint32 cheer_count = 14; // 全服免费助威票数
   uint64 registered_ms = 15;
   repeated TournamentMemberView members = 16;
-  uint32 emblem_id = 17; // V3: 官方预设道家队徽(1..8)
+  uint32 emblem_id = 17;  // V3: 官方预设道家队徽(1..8)
+  uint32 honor_bits = 18; // V4: 战队赛季荣耀铭牌位图(bit 0..5)
 }
 
 message TournamentInviteView {
@@ -826,6 +872,8 @@ message TournamentMatchView {
   uint64 my_predicted_squad_id = 41;                         // V3: 当前查询玩家对本场淘汰赛的免费预测战队 ID(0=未预测)
   uint32 predict_count_a = 42;                               // V3: 全服预测 A 队胜票数
   uint32 predict_count_b = 43;                               // V3: 全服预测 B 队胜票数
+  TournamentLeylineElement banned_leyline_a = 44;            // V4: BO3 赛前 A 队队长禁选的灵脉(0=未禁)
+  TournamentLeylineElement banned_leyline_b = 45;            // V4: BO3 赛前 B 队队长禁选的灵脉(0=未禁)
 }
 
 message TournamentRewardItem {
@@ -1092,4 +1140,39 @@ message GetTournamentPredictionBoardResponse {
   repeated TournamentPredictionEntryView my_predictions = 7;
   repeated TournamentPredictionRankEntry top_predictors = 8;
   uint64 server_time_ms = 9;
+}
+
+// ---- 《群仙问道赛》V4 增量协议：BO3 五行灵脉禁选 + 本季名局录 ----
+
+enum TournamentHighlightTag {
+  TOURNAMENT_HIGHLIGHT_TAG_UNSPECIFIED = 0;
+  TOURNAMENT_HIGHLIGHT_TAG_FINAL = 1;        // 总决赛巅峰局
+  TOURNAMENT_HIGHLIGHT_TAG_BO3_THRILLER = 2; // 决胜三局激战
+  TOURNAMENT_HIGHLIGHT_TAG_THIRD_PLACE = 3;  // 季军争夺战
+  TOURNAMENT_HIGHLIGHT_TAG_HIGH_MVP = 4;     // 高光问鼎局
+}
+
+message BanTournamentLeylineRequest {
+  uint64 match_id = 1;
+  TournamentLeylineElement leyline_element = 2; // 必须为 1..5(金/木/水/火/土)
+}
+message BanTournamentLeylineResponse {
+  TipInfoMessage error_message = 1;
+  TournamentMatchView match = 2;
+}
+
+message TournamentHighlightEntry {
+  TournamentHighlightTag tag = 1;
+  string tag_label = 2;
+  TournamentMatchView match = 3;
+}
+
+message GetTournamentHighlightsRequest {
+  uint32 season_id = 1; // 0 = 当前赛季
+}
+message GetTournamentHighlightsResponse {
+  TipInfoMessage error_message = 1;
+  uint32 season_id = 2;
+  repeated TournamentHighlightEntry highlights = 3;
+  uint64 server_time_ms = 4;
 }
