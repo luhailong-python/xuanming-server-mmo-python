@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
   "schema_digest": "e8408ff7f70f67cc",
-  "version": 72,
-  "content_digest": "b69fc2bad47ca757e3290467b70b3f54d341aa85974dddcee322f6ce2bfd7b45",
+  "version": 73,
+  "content_digest": "706b1335297d89adaac682d26aa44f8c8d26473029b350dafe83cd4b82a79c34",
   "generated_at": "2026-11-25T15:19:34Z",
   "source_rev": {
     "commit": "0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9",
     "data_dirty": true
   },
-  "table_count": 74,
+  "table_count": 76,
   "tables": [
     {
       "name": "ActivitySchedule",
@@ -1064,7 +1064,7 @@
       "name": "MessageLimiter",
       "hot_reload": true,
       "ids_permanent": false,
-      "rows": 109,
+      "rows": 113,
       "source": {
         "file": "MessageLimiter.xlsx",
         "size": 6784,
@@ -1074,14 +1074,14 @@
         {
           "kind": "json",
           "file": "messagelimiter.json",
-          "size": 9737,
-          "sha256": "1fda38df4791394ae359e4003953880064fe989f611d86a8e3c457b1ebed9786"
+          "size": 11906,
+          "sha256": "50a2d74f440f98500d9fa215f1f306e382bf1a692da710602306e21cc9370426"
         },
         {
           "kind": "binary",
           "file": "messagelimiter.pb",
-          "size": 1288,
-          "sha256": "7b4fdfc879f93302bc3fa7e4ee3a082a3bc9e81bcd6c87af150f248661ea92d4"
+          "size": 1336,
+          "sha256": "247ac800ee1257494429ec8fd2eb54651b4b24e08e31ec9773bccedfb4d6e908"
         }
       ]
     },
@@ -1732,6 +1732,56 @@
           "file": "tournamentrule.pb",
           "size": 246,
           "sha256": "77c936193ae545bc448f74bfd148ead04f10562f777c70f27e42e6e8e10dea9f"
+        }
+      ]
+    },
+    {
+      "name": "TravelPassSeason",
+      "hot_reload": true,
+      "ids_permanent": false,
+      "rows": 1,
+      "source": {
+        "file": "TravelPassSeason.xlsx",
+        "size": 5991,
+        "sha256": "72bc0f215d0fe49b130b7a46f5093711f1299b83e3bf270a6b4882719c0d79c1"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "travelpassseason.json",
+          "size": 664,
+          "sha256": "2a445ce3e767f42e9fcf8ad4bbf49d835e33f214d8f19a9a4bc0048594d9f4cf"
+        },
+        {
+          "kind": "binary",
+          "file": "travelpassseason.pb",
+          "size": 320,
+          "sha256": "cf49f4a3a1564a6eb2be408712adf0791430419ba4e2352034842092aa7ac746"
+        }
+      ]
+    },
+    {
+      "name": "TravelPassTier",
+      "hot_reload": true,
+      "ids_permanent": false,
+      "rows": 10,
+      "source": {
+        "file": "TravelPassTier.xlsx",
+        "size": 6116,
+        "sha256": "24b41a6d91256651956b0ee335973bd9a7a292229f8e63938002584e06246dee"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "travelpasstier.json",
+          "size": 2643,
+          "sha256": "755c1059992de6eee2bee93e378a5dcf8fd4a83c40e88b50bf0f56321a160884"
+        },
+        {
+          "kind": "binary",
+          "file": "travelpasstier.pb",
+          "size": 319,
+          "sha256": "4a225401a802cbc3206c5398a6710a5feb34312cddc4bc6c8074a2ddc6138c75"
         }
       ]
     },

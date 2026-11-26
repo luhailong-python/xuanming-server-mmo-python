@@ -164,6 +164,9 @@ class BattleSettlement:
         fb_delta = self._apply_festival_beast_credit(data, settlement, stamp)
         if fb_delta is None:
             return False
+        travel_pass = getattr(self.scene, "travel_pass", None)
+        if travel_pass is not None and hasattr(travel_pass, "apply_battle_credit"):
+            travel_pass.apply_battle_credit(data, settlement, stamp)
         self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
         self._record(
             data.battle_results, settlement, currencies, gained, consumed, stamp,

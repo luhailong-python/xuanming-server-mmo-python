@@ -3137,3 +3137,93 @@ World.xlsxš¦idbproto3
 zone_begin (R	zoneBegin
 zone_end (RzoneEnd!
 name©F (	B²¬designerRname:%Š¦	ZoneGroup’¦ZoneGroup.xlsxš¦idbproto3
+ú
+'table_wire/travelpassseason_table.proto"´
+TravelPassSeasonTable
+id (Rid
+enabled (Renabled
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey(
+banner_asset_key (	RbannerAssetKey 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+
+max_points	 (R	maxPoints$
+pve_win_points
+ (RpveWinPoints2
+hard_or_pvp_win_points (RhardOrPvpWinPoints;
+pvp_qualified_other_points (RpvpQualifiedOtherPoints2
+premium_currency_type (RpremiumCurrencyType#
+premium_price (RpremiumPrice'
+config_revision (RconfigRevision"G
+TravelPassSeasonTableData*
+data (2.TravelPassSeasonTableRdataBG
+com.game.tableBTravelPassSeasonTableOuterClassPZgenerated/pb/tablebproto3
+ä
+%table_wire/travelpasstier_table.proto"¦
+TravelPassTierTable
+id (Rid
+pass_id (RpassId
+
+tier_index (R	tierIndex'
+required_points (RrequiredPoints 
+free_item_id (R
+freeItemId&
+free_item_count (RfreeItemCount
+	free_gold (RfreeGold*
+free_cosmetic_key (	RfreeCosmeticKey,
+free_cosmetic_name	 (	RfreeCosmeticName&
+premium_item_id
+ (RpremiumItemId,
+premium_item_count (RpremiumItemCount!
+premium_gold (RpremiumGold0
+premium_cosmetic_key (	RpremiumCosmeticKey2
+premium_cosmetic_name (	RpremiumCosmeticName"C
+TravelPassTierTableData(
+data (2.TravelPassTierTableRdataBE
+com.game.tableBTravelPassTierTableOuterClassPZgenerated/pb/tablebproto3
+½
+travelpassseason_table.protommorpg.cfgtable.v1cfg_options.proto"í
+TravelPassSeasonTable
+id (Rid
+enabled (Renabled
+name (	Rname 
+description (	Rdescription
+icon_key (	RiconKey(
+banner_asset_key (	RbannerAssetKey 
+starts_at_ms (R
+startsAtMs
+
+ends_at_ms (RendsAtMs
+
+max_points	 (R	maxPoints$
+pve_win_points
+ (RpveWinPoints2
+hard_or_pvp_win_points (RhardOrPvpWinPoints;
+pvp_qualified_other_points (RpvpQualifiedOtherPoints2
+premium_currency_type (RpremiumCurrencyType#
+premium_price (RpremiumPrice'
+config_revision (RconfigRevision:7Š¦TravelPassSeason’¦TravelPassSeason.xlsxš¦id°¦bproto3
+¿
+travelpasstier_table.protommorpg.cfgtable.v1cfg_options.proto"ñ
+TravelPassTierTable
+id (Rid-
+pass_id (Bò¬TravelPassSeasonRpassId
+
+tier_index (R	tierIndex'
+required_points (RrequiredPoints 
+free_item_id (R
+freeItemId&
+free_item_count (RfreeItemCount
+	free_gold (RfreeGold*
+free_cosmetic_key (	RfreeCosmeticKey,
+free_cosmetic_name	 (	RfreeCosmeticName&
+premium_item_id
+ (RpremiumItemId,
+premium_item_count (RpremiumItemCount!
+premium_gold (RpremiumGold0
+premium_cosmetic_key (	RpremiumCosmeticKey2
+premium_cosmetic_name (	RpremiumCosmeticName:3Š¦TravelPassTier’¦TravelPassTier.xlsxš¦id°¦bproto3

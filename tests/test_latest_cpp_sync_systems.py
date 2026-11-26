@@ -100,8 +100,8 @@ def test_seven_new_config_tables_json_and_pb_parity():
     json_tables = ConfigTables(fmt="json")
     pb_tables = ConfigTables(fmt="pb")
 
-    assert len(json_tables.tables) == 74
-    assert len(pb_tables.tables) == 74
+    assert len(json_tables.tables) == 76
+    assert len(pb_tables.tables) == 76
     assert json_tables.content_digest == pb_tables.content_digest
 
     expected_counts = {

@@ -46,6 +46,7 @@ from .nodes.scene_season import SceneSeason
 from .nodes.scene_skill_craft import SceneSkillCraft
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_spirit_shop import SceneSpiritShop
+from .nodes.scene_travel_pass import SceneTravelPass
 from .nodes.scene_stats import initialize_base
 from .nodes.scene_team import SceneTeam
 from .nodes.scene_travel import create_scene_travel
@@ -745,6 +746,8 @@ class Runtime:
         scene.festival_beast.register()
         scene.spirit_shop = SceneSpiritShop(scene, tables, scene.assets)
         scene.spirit_shop.register()
+        scene.travel_pass = SceneTravelPass(scene, tables, scene.assets)
+        scene.travel_pass.register()
         scene_cg_call = self.local_services.call_raw if (self.local and self.local_services is not None) else None
         if not self.local:
             cg_endpoint = os.getenv("SCENE_CONTENT_GUARD", "").strip()
