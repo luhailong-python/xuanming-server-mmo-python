@@ -102,6 +102,8 @@ message BattlePlayerSnapshot {
   uint32 formation_id = 28;
   // 五行幻境·轻肉鸽周常爬塔权威上下文（由 Scene 从 PlayerSeasonComp 注入，客户端不可伪造）。
   WuxingTowerBattleContext tower_context = 29;
+  // 玩家已启用的技能特效外观映射（skill_table_id -> SkillVfxCosmetic.id，纯战斗画面表现零数值）。
+  map<uint32, uint32> equipped_skill_vfx = 31;
 }
 
 // ---- 宝宝战斗快照:与主人同队、独立行动的战斗单位(设计文档 player-pet.md §5)----
@@ -129,6 +131,9 @@ message BattlePetSnapshot {
   bool competitive_temporary = 15;
   // 排位竞技战斗物种(Pet.id);展示外观仍看 pet_table_id(有出战宝宝时沿用其外观,零宠时与本字段相同)。
   uint32 combat_pet_table_id = 16;
+  // 当前穿戴的灵宠幻化 ID 与客户端稳定外观资源键（空串/0 = 原形，纯外观零数值）。
+  uint32 cosmetic_id = 17;
+  string cosmetic_art_key = 18;
 }
 
 // ---- 战斗单位运行时状态(玩家与怪物统一;引擎状态用 proto 承载,宪法 §3) ----
@@ -188,6 +193,8 @@ message BattleActorState {
   bool is_boss = 43; // true = 首领单位（来自 MonsterTable.is_boss）；不可被复制技能选中，客户端选目标阶段置灰。
   BattleArtifactState season_seal_state = 44; // 单槽赛季印的局内次数状态（不占用永久法宝 item_id 列表，下发客户端前清除）。
   uint32 charging_skill_id = 45; // 非 0 表示当前处于明牌蓄力状态（如 E01/E02），下回合正常行动自动释放；对敌我双方均可见。
+  string pet_cosmetic_art_key = 46; // 仅灵宠有效：生效幻化外观客户端资源键（空串 = 原形，缺图回退原形）。
+  map<uint32, uint32> equipped_skill_vfx = 47; // 仅玩家有效：生效技能特效外观映射（skill_table_id -> SkillVfxCosmetic.id）。
 }
 
 // 法宝按物品实例记录次数；死亡不刷新已用次数，仅清除待用补偿。

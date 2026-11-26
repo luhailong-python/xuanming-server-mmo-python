@@ -2,13 +2,13 @@
   "schema_version": 2,
   "schema_digest": "e8408ff7f70f67cc",
   "version": 73,
-  "content_digest": "706b1335297d89adaac682d26aa44f8c8d26473029b350dafe83cd4b82a79c34",
+  "content_digest": "da0292c3febf31c0ef807ee26a65ebab760cfc1953f016c5e64336f39593fc67",
   "generated_at": "2026-11-25T15:19:34Z",
   "source_rev": {
     "commit": "0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9",
     "data_dirty": true
   },
-  "table_count": 76,
+  "table_count": 78,
   "tables": [
     {
       "name": "ActivitySchedule",
@@ -1039,24 +1039,24 @@
       "name": "Item",
       "hot_reload": false,
       "ids_permanent": true,
-      "rows": 142,
+      "rows": 145,
       "source": {
         "file": "Item.xlsx",
-        "size": 15430,
-        "sha256": "3cbc195a1d436c234826a2213979a14aea1b9d6efeaca57b4d837ace7f44dbf1"
+        "size": 15868,
+        "sha256": "40734e05a33f03595a2de7503c765310c8cbbb4f911d719cf06b746c6b45982e"
       },
       "artifacts": [
         {
           "kind": "json",
           "file": "item.json",
-          "size": 56369,
-          "sha256": "c047879479e06ac8c1aa5e60941eac1ae08febdf54001005ce51ffd33ffca869"
+          "size": 58145,
+          "sha256": "27b16ad25ea0a50b9481ba3ff1407cc29cbc69bc375af0cb3e4d691f10131f38"
         },
         {
           "kind": "binary",
           "file": "item.pb",
-          "size": 13146,
-          "sha256": "ad67e0d41f693b1ba9f291f24a83a1340e46d093f14c17e7208eb3cf2852ddbc"
+          "size": 13832,
+          "sha256": "7d6d186ec3ac6269f5ddd99fbdba3746aa13a96510dc19f3bda3908b3213039b"
         }
       ]
     },
@@ -1064,24 +1064,24 @@
       "name": "MessageLimiter",
       "hot_reload": true,
       "ids_permanent": false,
-      "rows": 113,
+      "rows": 115,
       "source": {
         "file": "MessageLimiter.xlsx",
-        "size": 6784,
-        "sha256": "5d3fa5ace672e37ff257c7e2e2cc3587ca3f1f32876dcc7443c7fdb569b106f1"
+        "size": 6902,
+        "sha256": "686d81395b8ae30bb00825c321445dc20e0f24b140deb747847cf05826981c07"
       },
       "artifacts": [
         {
           "kind": "json",
           "file": "messagelimiter.json",
-          "size": 11906,
-          "sha256": "50a2d74f440f98500d9fa215f1f306e382bf1a692da710602306e21cc9370426"
+          "size": 10274,
+          "sha256": "65385e6a80f8e3acbf42801a039271bd7305be7ddb3e756a314bc443f159454b"
         },
         {
           "kind": "binary",
           "file": "messagelimiter.pb",
-          "size": 1336,
-          "sha256": "247ac800ee1257494429ec8fd2eb54651b4b24e08e31ec9773bccedfb4d6e908"
+          "size": 1360,
+          "sha256": "57948e0e0dc60a4e40995829e451c3c8aabd3ddfb316caacee7278aa598b3831"
         }
       ]
     },
@@ -1257,6 +1257,31 @@
           "file": "pet.pb",
           "size": 2328,
           "sha256": "d5eba88f2123bfa9c68fa3a2310b88704f4cbf6e5096faced4e5f440d431bd6f"
+        }
+      ]
+    },
+    {
+      "name": "PetCosmetic",
+      "hot_reload": false,
+      "ids_permanent": true,
+      "rows": 3,
+      "source": {
+        "file": "PetCosmetic.xlsx",
+        "size": 6172,
+        "sha256": "c14172734999b4f3861ed2c30661f8a68ecc9b8f99e0e6719ca4b18903a6af88"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "petcosmetic.json",
+          "size": 1576,
+          "sha256": "34cdf72dcb6f8d51b0046d2c1a573e5857ffe41da4273d4db146a63424f31485"
+        },
+        {
+          "kind": "binary",
+          "file": "petcosmetic.pb",
+          "size": 681,
+          "sha256": "59bb1338f97807ac3e6a2d8569c98ab00e76e688f4aae6a79fc2d29f445eae25"
         }
       ]
     },
@@ -1586,27 +1611,52 @@
       ]
     },
     {
+      "name": "SkillVfxCosmetic",
+      "hot_reload": false,
+      "ids_permanent": true,
+      "rows": 3,
+      "source": {
+        "file": "SkillVfxCosmetic.xlsx",
+        "size": 6331,
+        "sha256": "13393d4532729c6a1d1a35f9e75ecd75b16ae016207053c6866a976f13a640fd"
+      },
+      "artifacts": [
+        {
+          "kind": "json",
+          "file": "skillvfxcosmetic.json",
+          "size": 1702,
+          "sha256": "6e0fd86d00774a6f0f9b6250a5eafcd4b19f00f2a0fa60b6859d031845d504b6"
+        },
+        {
+          "kind": "binary",
+          "file": "skillvfxcosmetic.pb",
+          "size": 825,
+          "sha256": "3597736a6397ff56a5d9d76f001235917bccd7e42b90db174a124f246c2fd6f1"
+        }
+      ]
+    },
+    {
       "name": "SpiritShopGoods",
       "hot_reload": true,
       "ids_permanent": false,
-      "rows": 7,
+      "rows": 9,
       "source": {
         "file": "SpiritShopGoods.xlsx",
-        "size": 7265,
-        "sha256": "1d3140da66742b61cbb12851f6251dc42ae3c0eb4d7a478a5bd1591bf404dfcd"
+        "size": 7577,
+        "sha256": "452fb60898534d5f2bc8767e19845d08612f30a42cfe363755aef0b98c9c155a"
       },
       "artifacts": [
         {
           "kind": "json",
           "file": "spiritshopgoods.json",
-          "size": 4617,
-          "sha256": "548d5e4f2897582aa1a1016a42016f5b73d6182814b77370961b2bbe85d7e47f"
+          "size": 5948,
+          "sha256": "1b72aa936a2699cb05d4fd6a3b93f274ca42860a2b549b9a311f18c33a8bf2ed"
         },
         {
           "kind": "binary",
           "file": "spiritshopgoods.pb",
-          "size": 1735,
-          "sha256": "a2dbc98db93802d5bbc05c7ec4494696fac774a71cab139b8305bed77a789a5b"
+          "size": 2235,
+          "sha256": "4f2fcbbd75bc4da8d7e8faea0a5eadb518198bec2ba88bea68d914e7dc8ac899"
         }
       ]
     },

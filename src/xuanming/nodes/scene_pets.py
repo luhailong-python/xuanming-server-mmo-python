@@ -222,8 +222,11 @@ def build_single_pet_battle_snapshot(
     *,
     full_resources: bool,
     out,
+    pet_owned_bits: bytes = b"",
 ) -> bool:
     """构建单只灵宠的 BattlePetSnapshot（出战主宠与论剑 V3 备选灵宠共用同一口径）。"""
+    from .scene_appearance import resolve_pet_cosmetic_visual
+
     row = tables["Pet"].get(pet.pet_table_id)
     if row is None or owner_level < pet_level(pet.level, row):
         return False
@@ -240,6 +243,9 @@ def build_single_pet_battle_snapshot(
     out.pet_name = pet.name or row.name
     out.pet_table_id = pet.pet_table_id
     out.level = eff_level
+    cosmetic_id, cosmetic_art = resolve_pet_cosmetic_visual(tables, pet_owned_bits, pet)
+    out.cosmetic_id = cosmetic_id
+    out.cosmetic_art_key = cosmetic_art
     out.max_health = stats["max_health"]
     out.max_mana = stats["max_mana"]
     out.physical_attack = stats["physical_attack"]
@@ -278,6 +284,7 @@ def build_standby_battle_snapshots(
     if max_count <= 0 or not data.HasField("pet_component") or not data.HasField("level_component"):
         return []
     owner_level = effective_level(data)
+    pet_owned_bits = bytes(data.profile_component.pet_cosmetic_owned_bits) if data.HasField("profile_component") else b""
     result = []
     for pet in data.pet_component.pets:
         if len(result) >= max_count:
@@ -286,7 +293,7 @@ def build_standby_battle_snapshots(
             continue
         snap = protocol.message("BattlePetSnapshot")
         if build_single_pet_battle_snapshot(
-            tables, player_id, pet, owner_level, full_resources=full_resources, out=snap,
+            tables, player_id, pet, owner_level, full_resources=full_resources, out=snap, pet_owned_bits=pet_owned_bits,
         ):
             result.append(snap)
     return result
@@ -393,15 +400,23 @@ class ScenePets:
         listing.max_pets, listing.rename_cost_gold = self.max_pets, self.rename_cost
         if self.pool is None:
             return
+        from .scene_appearance import resolve_pet_cosmetic_visual
+        pet_owned_bits = (
+            bytes(data.profile_component.pet_cosmetic_owned_bits)
+            if data is not None and data.HasField("profile_component")
+            else b""
+        )
         for pet in comp.pets:
             row = self.tables["Pet"].get(pet.pet_table_id)
             level = pet_level(pet.level, row)
             current, allocation = self._allocation(pet, level)
+            cosmetic_id, cosmetic_art = resolve_pet_cosmetic_visual(self.tables, pet_owned_bits, pet)
             info = listing.pets.add(
                 pet_id=pet.pet_id, pet_table_id=pet.pet_table_id, level=level,
                 name=pet.name or (row.name if row is not None else ""), is_active=comp.active_pet_id == pet.pet_id,
                 pool_id=self.pool.id, total_points=allocation.total, remaining_points=allocation.remaining,
                 reset_cost_gold=self._reset_cost(level, allocation),
+                cosmetic_id=cosmetic_id, cosmetic_art_key=cosmetic_art,
             )
             if row is not None:
                 info.quality, info.model_id, info.desc = row.quality, row.model_id, row.desc

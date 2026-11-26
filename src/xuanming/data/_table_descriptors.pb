@@ -3227,3 +3227,93 @@ freeItemId&
 premium_gold (RpremiumGold0
 premium_cosmetic_key (	RpremiumCosmeticKey2
 premium_cosmetic_name (	RpremiumCosmeticName:3ä¶TravelPassTierí¶TravelPassTier.xlsxö¶id∞¶bproto3
+ö
+"table_wire/petcosmetic_table.proto"Ë
+PetCosmeticTable
+id (Rid!
+cosmetic_key (	RcosmeticKey
+name (	Rname-
+target_pet_table_id (RtargetPetTableId-
+visual_pet_table_id (RvisualPetTableId$
+visual_art_key (	RvisualArtKey
+enabled (Renabled
+
+sort_order (R	sortOrder
+mall_sku_id	 (R	mallSkuId!
+acquire_hint
+ (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId"=
+PetCosmeticTableData%
+data (2.PetCosmeticTableRdataBB
+com.game.tableBPetCosmeticTableOuterClassPZgenerated/pb/tablebproto3
+Õ
+'table_wire/skillvfxcosmetic_table.proto"á
+SkillVfxCosmeticTable
+id (Rid
+vfx_key (	RvfxKey
+name (	Rname$
+skill_table_id (RskillTableId
+fx_id (	RfxId(
+projectile_fx_id (	RprojectileFxId&
+telegraph_fx_id (	RtelegraphFxId
+tint_hex (	RtintHex
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder
+mall_sku_id (R	mallSkuId!
+acquire_hint (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId"G
+SkillVfxCosmeticTableData*
+data (2.SkillVfxCosmeticTableRdataBG
+com.game.tableBSkillVfxCosmeticTableOuterClassPZgenerated/pb/tablebproto3
+Ë
+petcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"ù
+PetCosmeticTable
+id (B‡¨Rid!
+cosmetic_key (	RcosmeticKey
+name (	Rname-
+target_pet_table_id (RtargetPetTableId-
+visual_pet_table_id (RvisualPetTableId$
+visual_art_key (	RvisualArtKey
+enabled (Renabled
+
+sort_order (R	sortOrder
+mall_sku_id	 (R	mallSkuId!
+acquire_hint
+ (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId:-ä¶PetCosmeticí¶PetCosmetic.xlsxö¶id®¶bproto3
+°
+skillvfxcosmetic_table.protommorpg.cfgtable.v1cfg_options.proto"—
+SkillVfxCosmeticTable
+id (B‡¨Rid
+vfx_key (	RvfxKey
+name (	Rname/
+skill_table_id (B	Ú¨SkillRskillTableId
+fx_id (	RfxId(
+projectile_fx_id (	RprojectileFxId&
+telegraph_fx_id (	RtelegraphFxId
+tint_hex (	RtintHex
+enabled	 (Renabled
+
+sort_order
+ (R	sortOrder
+mall_sku_id (R	mallSkuId!
+acquire_hint (	RacquireHint
+desc (	Rdesc 
+card_item_id (R
+cardItemId&
+card_item_count (RcardItemCount/
+spirit_shop_goods_id (RspiritShopGoodsId:7ä¶SkillVfxCosmeticí¶SkillVfxCosmetic.xlsxö¶id®¶bproto3

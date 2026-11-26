@@ -521,6 +521,8 @@ class SceneBattle:
         profile = data.profile_component
         snapshot.player_id, snapshot.player_name = player.player_id, profile.name
         snapshot.appearance_id, snapshot.gender = profile.appearance_id, profile.gender
+        from .scene_appearance import fill_battle_skill_vfx
+        fill_battle_skill_vfx(self.tables, data, snapshot)
         snapshot.class_id, snapshot.level = class_id(data), effective_level(data)
         snapshot.base_attributes.CopyFrom(base)
         if isolate_temp_state:
@@ -577,6 +579,7 @@ class SceneBattle:
                 wire = self.protocol.message("BattlePetSnapshot")
                 if build_single_pet_battle_snapshot(
                     self.tables, player.player_id, pet, snapshot.level, full_resources=False, out=wire,
+                    pet_owned_bits=bytes(profile.pet_cosmetic_owned_bits),
                 ):
                     if isolate_temp_state:
                         wire.base_attributes.health = wire.max_health

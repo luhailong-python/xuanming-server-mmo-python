@@ -35,7 +35,7 @@ def test_config_tables_keep_source_indices_and_encoding_parity(tmp_path):
     text = ConfigTables()
     binary = ConfigTables(fmt="pb")
     assert text.content_digest == binary.content_digest
-    assert len(text.tables) == 76
+    assert len(text.tables) == 78
     for name, table in text.tables.items():
         assert table.rows() == binary[name].rows()
 

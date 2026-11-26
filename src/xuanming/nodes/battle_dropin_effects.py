@@ -51,6 +51,8 @@ EVENT_WUXING_SYNERGY = 23
 
 _HIT_COUNTER = 2
 _HIT_REFLECT = 3
+_HIT_MIRROR = 5
+_DAMAGE_ORIGIN_MIRROR = 6
 _DAMAGE_MAGIC = 0
 _DAMAGE_PHYSICAL = 1
 
@@ -3752,6 +3754,56 @@ class ConfiguredAbilitiesController:
                 return False
         return True
 
+    def has_valid_target(self, caster: Message, rule: BattleSkill) -> bool:
+        """判定当前战场是否存在至少一名满足该配置化战法目标条件的单位。"""
+        return any(self.target_allowed(caster, cand, rule) for cand in self.engine.actors.values())
+
+    def is_skill_copyable_for(self, caster: Message, rule: BattleSkill) -> bool:
+        """判定指定技能是否可被 A41 玄镜映法镜像复制（对照 `IsSkillCopyableFor`）。"""
+        if rule.battle_model != 1 or rule.ability_kind != 1:
+            return False
+        if rule.forbid_copy or rule.health_cost_mode != 0 or rule.max_battle_uses != 0:
+            return False
+        buff_rules = self.engine.effects.rules
+        for eff_id in rule.effects:
+            eff = buff_rules.get(eff_id)
+            if eff is None:
+                continue
+            if eff.battle_op == BattleEffectOp.COPY_TARGET_SKILL:
+                return False
+            # 依赖已付气血/法力的转换技在零耗蓝镜像中无有效基数，结构上禁止复制。
+            if eff.value_basis in (5, 6):
+                return False
+        return self.has_valid_target(caster, rule)
+
+    def has_copyable_skill_for(self, caster: Message, target: Message) -> bool:
+        """判定目标是否非首领且至少持有一项可复制主动技能。"""
+        if target.is_boss:
+            return False
+        for sid in target.skill_table_ids:
+            cand = self.engine.skills.rules.get(sid)
+            if cand is not None and self.is_skill_copyable_for(caster, cand):
+                return True
+        return False
+
+    def select_copied_skill_id(self, caster: Message, target: Message) -> int | None:
+        """优先复制目标本回合选定的可复制主动技能，否则按方案 A 从其已学池确定性抽取。"""
+        planned_action = self.engine.pending.get(target.actor_id)
+        if planned_action is not None and planned_action.action_type == _ACTION_SKILL:
+            planned = self.engine.skills.rules.get(planned_action.skill_table_id)
+            if planned is not None and self.is_skill_copyable_for(caster, planned):
+                return planned_action.skill_table_id
+        candidates = sorted({
+            sid
+            for sid in target.skill_table_ids
+            if (cand := self.engine.skills.rules.get(sid)) is not None
+            and self.is_skill_copyable_for(caster, cand)
+        })
+        if not candidates:
+            return None
+        pick = 0 if len(candidates) == 1 else int(self.engine.rng.next() % len(candidates))
+        return candidates[pick]
+
     def check_skill(self, actor: Message, action: Message, rule: BattleSkill) -> int:
         """校验配置化战法的封印/专修禁攻、蓄力防重、冷却、次数、耗蓝与目标合法性。"""
         if not self.subject_allowed(actor, rule) or not rule.castable:
@@ -3786,7 +3838,7 @@ class ConfiguredAbilitiesController:
         if action.target_id != 0:
             target = self.engine.actors.get(action.target_id)
             return 0 if (target is not None and self.target_allowed(actor, target, rule)) else 7002
-        return 0
+        return 0 if self.has_valid_target(actor, rule) else 7002
 
     def _compare_secondary(self, policy: int, lhs: Message, rhs: Message) -> int:
         if policy == SecondaryTargetPolicy.HIGHEST_PHYSICAL_ATTACK:
@@ -3906,6 +3958,8 @@ class ConfiguredAbilitiesController:
         hit: int,
         is_multi_target: bool = False,
         primary_focus_bonus: bool = False,
+        scale: float = 1.0,
+        is_mirror: bool = False,
         depth: int = 0,
     ) -> None:
         """执行单条配置化 Buff/技能子效果（对照 `ApplyConfiguredEffect` 核心分支）。"""
@@ -3923,6 +3977,57 @@ class ConfiguredAbilitiesController:
         if hostile and self.has_state(receiver, BattleStateKind.FREEZE):
             return
 
+        if op == BattleEffectOp.COPY_TARGET_SKILL:
+            if is_mirror:
+                return
+            if receiver.is_boss or self.engine.effects.immune(receiver, row):
+                turn.events.add(
+                    event_type=_EVENT_RESIST,
+                    source_id=caster.actor_id,
+                    target_id=receiver.actor_id,
+                    buff_table_id=buff_id,
+                    group_id=group,
+                    hit_index=hit,
+                )
+                return
+            copied_skill_id = self.select_copied_skill_id(caster, receiver)
+            if copied_skill_id is None:
+                turn.events.add(
+                    event_type=_EVENT_RESIST,
+                    source_id=caster.actor_id,
+                    target_id=receiver.actor_id,
+                    buff_table_id=buff_id,
+                    group_id=group,
+                    hit_index=hit,
+                )
+                return
+            copied_rule = self.engine.skills.rules.get(copied_skill_id)
+            if copied_rule is None:
+                return
+            if copied_rule.target_team in (2, 3):
+                # 复制到友方辅助/治疗/护盾或自身技能时，自动切回己方阵营，避免反手资敌。
+                copied_target_id = caster.actor_id if self.target_allowed(caster, caster, copied_rule) else 0
+            else:
+                copied_target_id = receiver.actor_id if self.target_allowed(caster, receiver, copied_rule) else 0
+            mirror_scale = row.ratio if row.ratio > 0.0 else 1.0
+            copied_action = self.engine.protocol.message(
+                "BattleAction",
+                action_type=_ACTION_SKILL,
+                skill_table_id=copied_skill_id,
+                target_id=copied_target_id,
+            )
+            self.execute_skill(
+                caster,
+                copied_action,
+                copied_rule,
+                turn,
+                group,
+                is_mirror=True,
+                scale=mirror_scale,
+                rank_override=rank,
+            )
+            return
+
         if op == BattleEffectOp.DAMAGE:
             if rule is None:
                 return
@@ -3933,9 +4038,12 @@ class ConfiguredAbilitiesController:
                 base = 10.0
             is_primary = receiver.actor_id == primary_target_id
             self.engine._damage(
-                turn, group, caster, receiver, rule, skill_id=skill_id, hit_kind=0, hit_index=hit,
+                turn, group, caster, receiver, rule, skill_id=skill_id,
+                hit_kind=(_HIT_MIRROR if is_mirror else 0), hit_index=hit,
                 base=base, rank=rank, is_multi_target=is_multi_target,
                 is_primary_target=is_primary, is_primary_focus=(primary_focus_bonus and is_primary),
+                damage_scale=scale,
+                damage_origin=(_DAMAGE_ORIGIN_MIRROR if is_mirror else 0),
             )
             return
 
@@ -3944,8 +4052,20 @@ class ConfiguredAbilitiesController:
             if rule is not None and (rule.heal_multiplier > 0 or rule.heal_per_level > 0):
                 raw = self.engine.skills._heal_amount(caster, receiver, rule, rank)
             else:
-                basis = float(caster.magic_attack) if row.value_basis == 2 else float(receiver.max_health) if row.value_basis == 4 else float(caster.physical_attack)
+                basis = (
+                    float(caster.magic_attack)
+                    if row.value_basis == 2
+                    else float(receiver.max_health)
+                    if row.value_basis == 3
+                    else float(receiver.max_mana)
+                    if row.value_basis == 4
+                    else float(caster.physical_attack)
+                    if row.value_basis == 1
+                    else 0.0
+                )
                 raw = PetAndSupportEffects.support_base_value(row.flat_value, row.per_level, caster.level, basis, row.ratio, rank)
+            if scale != 1.0:
+                raw *= scale
             if getattr(self.engine, "active_leyline", 0) == TOURNAMENT_LEYLINE_WOOD:
                 raw *= 110.0 / 100.0
             support_bonus_pct = getattr(self.engine, "wuxing_support_bonus_pct", lambda _a: 0)(caster)
@@ -3962,15 +4082,27 @@ class ConfiguredAbilitiesController:
                 )
             return
 
-        if op == BattleEffectOp.SHIELD:
-            basis = float(caster.magic_attack) if row.value_basis == 2 else float(receiver.max_health) if row.value_basis == 4 else float(caster.physical_attack)
+        if op in (BattleEffectOp.SHIELD, BattleEffectOp.DAMAGE_REDUCE):
+            basis = (
+                float(caster.magic_attack)
+                if row.value_basis == 2
+                else float(receiver.max_health)
+                if row.value_basis == 3
+                else float(receiver.max_mana)
+                if row.value_basis == 4
+                else float(caster.physical_attack)
+                if row.value_basis == 1
+                else 0.0
+            )
             raw = PetAndSupportEffects.support_base_value(row.flat_value, row.per_level, caster.level, basis, row.ratio, rank)
+            if scale != 1.0:
+                raw *= scale
             if raw <= 0.0:
                 raw = max(1.0, float(receiver.max_health) * 0.1)
             self.engine.equipment_effects.grant_shield(
                 receiver, raw, source=caster, buff_table_id=buff_id,
                 remain_rounds=row.config_duration_rounds or row.duration_rounds or 2,
-                round_index=self.engine.round_index, turn=turn, group=group, commit_artifacts=(hit == 0),
+                round_index=self.engine.round_index, turn=turn, group=group, commit_artifacts=(hit == 0 and not is_mirror),
             )
             return
 
@@ -4048,33 +4180,51 @@ class ConfiguredAbilitiesController:
                     primary_target_id=primary_target_id, turn=turn, group=group, hit=hit, depth=depth + 1,
                 )
 
-    def execute_skill(self, actor: Message, action: Message, rule: BattleSkill, turn: Message, group: int) -> None:
-        """执行 `battle_model == 1` 配置化主动战法（含副目标策略、蓄力入态与一次性攻击标记消耗）。"""
+    def execute_skill(
+        self,
+        actor: Message,
+        action: Message,
+        rule: BattleSkill,
+        turn: Message,
+        group: int,
+        *,
+        is_mirror: bool = False,
+        scale: float = 1.0,
+        rank_override: int = 0,
+    ) -> None:
+        """执行 `battle_model == 1` 配置化主动战法（含镜像复制、副目标策略、蓄力入态与一次性攻击标记消耗）。"""
         skill_id = action.skill_table_id
-        if self.check_skill(actor, action, rule) != 0:
+        if not is_mirror and self.check_skill(actor, action, rule) != 0:
             if rule.target_team == 1 and not self.is_physical_forbidden(actor):
                 self.engine._attack_target(turn, group, actor, action.target_id)
             return
         targets = self.select_targets(actor, rule, action.target_id)
         if not targets:
             return
-        rank = max(1, actor.skill_ranks.get(skill_id, 1))
-        if rule.cooldown_rounds > 0:
-            actor.skill_cooldown_rounds[skill_id] = rule.cooldown_rounds + 1
-        if rule.max_battle_uses > 0:
-            actor.ability_use_counts[skill_id] = actor.ability_use_counts.get(skill_id, 0) + 1
-        self.engine._event(turn, group, 2, actor, targets[0], skill_table_id=skill_id)
-        from .battle_skills import mana_cost as _mana_cost
-        cost = _mana_cost(actor, rule)
-        if cost > 0:
-            cost = min(cost, actor.attributes.mana)
-            actor.attributes.mana -= cost
-            self.engine.skills._mana_event(turn, group, 0, actor, actor, skill_id, -cost)
+        rank = max(1, rank_override if rank_override > 0 else actor.skill_ranks.get(skill_id, 1))
+        if not is_mirror:
+            if rule.cooldown_rounds > 0:
+                actor.skill_cooldown_rounds[skill_id] = rule.cooldown_rounds + 1
+            if rule.max_battle_uses > 0:
+                actor.ability_use_counts[skill_id] = actor.ability_use_counts.get(skill_id, 0) + 1
+        self.engine._event(
+            turn, group, 2, actor, targets[0],
+            skill_table_id=skill_id,
+            hit_kind=(_HIT_MIRROR if is_mirror else 0),
+        )
+        if not is_mirror:
+            from .battle_skills import mana_cost as _mana_cost
+            cost = _mana_cost(actor, rule)
+            if cost > 0:
+                cost = min(cost, actor.attributes.mana)
+                actor.attributes.mana -= cost
+                self.engine.skills._mana_event(turn, group, 0, actor, actor, skill_id, -cost)
 
         subject_max = (rule.pet_max_targets or rule.max_targets) if actor.actor_type == _ACTOR_PET else rule.max_targets
         is_multi = subject_max > 1
         primary_focus = (
-            self.engine.is_competitive_pvp_battle
+            not is_mirror
+            and self.engine.is_competitive_pvp_battle
             and actor.actor_type == _ACTOR_PLAYER
             and subject_max > 1
             and action.target_id != 0
@@ -4096,8 +4246,11 @@ class ConfiguredAbilitiesController:
                     actor, target, eff_id, rule=rule, skill_id=skill_id, rank=rank,
                     primary_target_id=primary_target_id, turn=turn, group=group, hit=idx,
                     is_multi_target=is_multi, primary_focus_bonus=primary_focus,
+                    scale=scale, is_mirror=is_mirror,
                 )
 
+        if is_mirror:
+            return
         hit_directly = False
         landed_direct_strike = False
         for ev in turn.events[effects_begin:]:

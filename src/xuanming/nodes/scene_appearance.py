@@ -35,6 +35,8 @@ _NOTIFY_APPEARANCE_STATE = "SceneAppearanceClientPlayerNotifyAppearanceState"
 
 _SWITCH_APPEARANCE_KIND = 7
 _START_TRIAL_KIND = 8
+_EQUIP_PET_COSMETIC_KIND = 18
+_EQUIP_SKILL_VFX_KIND = 19
 
 MIN_TRIAL_DURATION_SECONDS = 60
 MAX_TRIAL_DURATION_SECONDS = 86_400
@@ -42,7 +44,8 @@ MAX_CARD_ITEM_COUNT = 99
 MAX_MALL_PRICE_FEN = 1_000_000
 _UINT32_MAX = 0xFFFF_FFFF
 
-# 对应 C++ appearance_error_tip.pb.h 错误码。
+# 对应 C++ appearance_error_tip.pb.h / pet_error_tip.pb.h 错误码。
+PET_NOT_FOUND = 26000
 APPEARANCE_INVALID = 33000
 APPEARANCE_ALREADY_CURRENT = 33001
 APPEARANCE_NO_CARD = 33002
@@ -180,6 +183,70 @@ def biography_fields_valid(
     return has_archive and has_summary and has_title and has_body
 
 
+def is_valid_tint_hex(value: str) -> bool:
+    """特效色调覆盖必须为空串或严格 #RRGGBB。"""
+    if not value:
+        return True
+    if len(value) != 7 or value[0] != "#":
+        return False
+    return all(ch in "0123456789abcdefABCDEF" for ch in value[1:])
+
+
+def _cosmetic_bit_index(tables, table_name: str, config_id: int) -> int | None:
+    try:
+        table = tables[table_name]
+    except KeyError:
+        return None
+    try:
+        return table.bit_index(config_id)
+    except KeyError:
+        return None
+
+
+def resolve_pet_cosmetic_visual(tables, pet_owned_bits: bytes, pet) -> tuple[int, str]:
+    """解析灵宠当前权威幻化展示 ID 与资源键；未拥有/停用/不适配一律回落原形 (0, '')。"""
+    cosmetic_id = int(getattr(pet, "cosmetic_id", 0))
+    if cosmetic_id <= 0:
+        return 0, ""
+    try:
+        pet_cosmetic_table = tables["PetCosmetic"]
+    except KeyError:
+        return 0, ""
+    row = pet_cosmetic_table.get(cosmetic_id)
+    if row is None or not getattr(row, "enabled", 0):
+        return 0, ""
+    bit_idx = _cosmetic_bit_index(tables, "PetCosmetic", int(row.id))
+    if bit_idx is None or not test_packed_bit(pet_owned_bits, bit_idx):
+        return 0, ""
+    target_pet_id = int(getattr(row, "target_pet_table_id", 0))
+    if target_pet_id and target_pet_id != int(pet.pet_table_id):
+        return 0, ""
+    art_key = str(getattr(row, "visual_art_key", "") or "")
+    return int(row.id), art_key
+
+
+def fill_battle_skill_vfx(tables, data, snapshot) -> None:
+    """将角色已拥有且启用的技能特效透传至 BattlePlayerSnapshot（纯战斗画面零数值）。"""
+    if not data.HasField("profile_component"):
+        return
+    try:
+        vfx_table = tables["SkillVfxCosmetic"]
+    except KeyError:
+        return
+    profile = data.profile_component
+    vfx_bits = bytes(getattr(profile, "skill_vfx_owned_bits", b""))
+    for skill_id, cosmetic_id in dict(getattr(profile, "equipped_skill_vfx", {})).items():
+        if not skill_id or not cosmetic_id:
+            continue
+        row = vfx_table.get(int(cosmetic_id))
+        if row is None or not getattr(row, "enabled", 0) or int(row.skill_table_id) != int(skill_id):
+            continue
+        bit_idx = _cosmetic_bit_index(tables, "SkillVfxCosmetic", int(row.id))
+        if bit_idx is None or not test_packed_bit(vfx_bits, bit_idx):
+            continue
+        snapshot.equipped_skill_vfx[int(skill_id)] = int(cosmetic_id)
+
+
 class SceneAppearance:
     """角色形象衣柜、形象卡永久解锁与 1 小时免费试用处理器。"""
 
@@ -206,6 +273,8 @@ class SceneAppearance:
         self.scene.register(_SERVICE, "SwitchAppearance", self.switch_appearance, mutating=True)
         self.scene.register(_SERVICE, "StartAppearanceTrial", self.start_trial, mutating=True)
         self.scene.register(_SERVICE, "CancelAppearanceTrial", self.cancel_trial, mutating=True)
+        self.scene.register(_SERVICE, "EquipPetCosmetic", self.equip_pet_cosmetic, mutating=True)
+        self.scene.register(_SERVICE, "EquipSkillVfx", self.equip_skill_vfx, mutating=True)
 
     def _table(self, name: str):
         try:
@@ -278,6 +347,72 @@ class SceneAppearance:
                 if series_id and series_id not in enabled_series:
                     logger.error("Appearance table validation failed: missing enabled series_id=%s for id=%s", series_id, row.id)
                     return False
+
+        item_table = self._table("Item")
+        pet_table = self._table("Pet")
+        skill_table = self._table("Skill")
+        shop_table = self._table("SpiritShopGoods")
+        pet_cosmetic_table = self._table("PetCosmetic")
+        if pet_cosmetic_table is not None:
+            seen_pet_keys: set[str] = set()
+            for row in pet_cosmetic_table.rows():
+                if not row.id or is_blank_text(str(row.cosmetic_key)) or is_blank_text(str(row.name)):
+                    logger.error("PetCosmetic table validation failed: invalid row id=%s", row.id)
+                    return False
+                if _cosmetic_bit_index(self.tables, "PetCosmetic", int(row.id)) is None:
+                    logger.error("PetCosmetic table validation failed: missing bit_index id=%s", row.id)
+                    return False
+                if row.target_pet_table_id and pet_table is not None and pet_table.get(int(row.target_pet_table_id)) is None:
+                    return False
+                if not row.visual_pet_table_id and is_blank_text(str(row.visual_art_key)):
+                    return False
+                if row.visual_pet_table_id and pet_table is not None and pet_table.get(int(row.visual_pet_table_id)) is None:
+                    return False
+                card_id = int(getattr(row, "card_item_id", 0))
+                card_cnt = int(getattr(row, "card_item_count", 0))
+                if card_id:
+                    if (item_table is not None and item_table.get(card_id) is None) or not (1 <= card_cnt <= MAX_CARD_ITEM_COUNT):
+                        return False
+                elif card_cnt:
+                    return False
+                goods_id = int(getattr(row, "spirit_shop_goods_id", 0))
+                if goods_id and shop_table is not None:
+                    goods_row = shop_table.get(goods_id)
+                    if goods_row is None or (card_id and int(goods_row.item_id_1) != card_id):
+                        return False
+                if row.enabled:
+                    if row.cosmetic_key in seen_pet_keys:
+                        return False
+                    seen_pet_keys.add(row.cosmetic_key)
+
+        vfx_table = self._table("SkillVfxCosmetic")
+        if vfx_table is not None:
+            seen_vfx_keys: set[str] = set()
+            for row in vfx_table.rows():
+                if not row.id or is_blank_text(str(row.vfx_key)) or is_blank_text(str(row.name)) or is_blank_text(str(row.fx_id)):
+                    return False
+                if _cosmetic_bit_index(self.tables, "SkillVfxCosmetic", int(row.id)) is None:
+                    return False
+                if skill_table is not None and skill_table.get(int(row.skill_table_id)) is None:
+                    return False
+                if not is_valid_tint_hex(str(getattr(row, "tint_hex", ""))):
+                    return False
+                card_id = int(getattr(row, "card_item_id", 0))
+                card_cnt = int(getattr(row, "card_item_count", 0))
+                if card_id:
+                    if (item_table is not None and item_table.get(card_id) is None) or not (1 <= card_cnt <= MAX_CARD_ITEM_COUNT):
+                        return False
+                elif card_cnt:
+                    return False
+                goods_id = int(getattr(row, "spirit_shop_goods_id", 0))
+                if goods_id and shop_table is not None:
+                    goods_row = shop_table.get(goods_id)
+                    if goods_row is None or (card_id and int(goods_row.item_id_1) != card_id):
+                        return False
+                if row.enabled:
+                    if row.vfx_key in seen_vfx_keys:
+                        return False
+                    seen_vfx_keys.add(row.vfx_key)
         return True
 
     def _find_enabled_appearance(self, appearance_id: str):
@@ -402,46 +537,117 @@ class SceneAppearance:
             )
 
         series_table = self._table("AppearanceSeries")
-        if series_table is None:
-            return
-        series_map: dict[int, dict] = {}
-        for row in series_table.rows():
-            if not row.enabled:
-                continue
-            series_map[int(row.id)] = {
-                "series_id": int(row.id),
-                "series_key": row.series_key,
-                "name": row.name,
-                "sort_order": int(row.sort_order),
-                "completion_badge_name": row.completion_badge_name,
-                "epilogue_title": row.epilogue_title,
-                "owned_count": 0,
-                "total_count": 0,
-                "members": [],
-            }
-        for _, _, app_id, _, _, owned, _, series_id in entries:
-            agg = series_map.get(series_id)
-            if agg is None:
-                continue
-            agg["total_count"] += 1
-            if owned:
-                agg["owned_count"] += 1
-            agg["members"].append(app_id)
-        for agg in sorted(series_map.values(), key=lambda item: (item["sort_order"], item["series_id"])):
-            if not agg["total_count"]:
-                continue
-            info.series_progress.add(
-                series_id=agg["series_id"],
-                series_key=agg["series_key"],
-                name=agg["name"],
-                sort_order=agg["sort_order"],
-                owned_count=agg["owned_count"],
-                total_count=agg["total_count"],
-                completed=agg["total_count"] > 0 and agg["owned_count"] >= agg["total_count"],
-                completion_badge_name=agg["completion_badge_name"],
-                epilogue_title=agg["epilogue_title"],
-                member_appearance_ids=agg["members"],
-            )
+        if series_table is not None:
+            series_map: dict[int, dict] = {}
+            for row in series_table.rows():
+                if not row.enabled:
+                    continue
+                series_map[int(row.id)] = {
+                    "series_id": int(row.id),
+                    "series_key": row.series_key,
+                    "name": row.name,
+                    "sort_order": int(row.sort_order),
+                    "completion_badge_name": row.completion_badge_name,
+                    "epilogue_title": row.epilogue_title,
+                    "owned_count": 0,
+                    "total_count": 0,
+                    "members": [],
+                }
+            for _, _, app_id, _, _, owned, _, series_id in entries:
+                agg = series_map.get(series_id)
+                if agg is None:
+                    continue
+                agg["total_count"] += 1
+                if owned:
+                    agg["owned_count"] += 1
+                agg["members"].append(app_id)
+            for agg in sorted(series_map.values(), key=lambda item: (item["sort_order"], item["series_id"])):
+                if not agg["total_count"]:
+                    continue
+                info.series_progress.add(
+                    series_id=agg["series_id"],
+                    series_key=agg["series_key"],
+                    name=agg["name"],
+                    sort_order=agg["sort_order"],
+                    owned_count=agg["owned_count"],
+                    total_count=agg["total_count"],
+                    completed=agg["total_count"] > 0 and agg["owned_count"] >= agg["total_count"],
+                    completion_badge_name=agg["completion_badge_name"],
+                    epilogue_title=agg["epilogue_title"],
+                    member_appearance_ids=agg["members"],
+                )
+
+        # 灵宠幻化目录与当前实例穿戴快照（纯外观零数值）
+        pet_bits = bytes(getattr(profile, "pet_cosmetic_owned_bits", b""))
+        info.pet_cosmetic_owned_bits = pet_bits
+        pet_cosmetic_table = self._table("PetCosmetic")
+        if pet_cosmetic_table is not None:
+            pet_rows = [row for row in pet_cosmetic_table.rows() if getattr(row, "enabled", 0)]
+            pet_rows.sort(key=lambda r: (int(r.sort_order), int(r.id)))
+            for row in pet_rows:
+                bit_idx = _cosmetic_bit_index(self.tables, "PetCosmetic", int(row.id))
+                card_id = int(getattr(row, "card_item_id", 0))
+                info.pet_cosmetics.add(
+                    config_id=int(row.id),
+                    cosmetic_key=str(row.cosmetic_key),
+                    name=str(row.name),
+                    target_pet_table_id=int(row.target_pet_table_id),
+                    visual_pet_table_id=int(row.visual_pet_table_id),
+                    visual_art_key=str(row.visual_art_key),
+                    sort_order=int(row.sort_order),
+                    owned=bit_idx is not None and test_packed_bit(pet_bits, bit_idx),
+                    mall_sku_id=int(row.mall_sku_id),
+                    acquire_hint=str(row.acquire_hint),
+                    desc=str(row.desc),
+                    card_item_id=card_id,
+                    card_item_count=int(getattr(row, "card_item_count", 0)),
+                    owned_card_count=self._owned_card_count(data, card_id) if card_id else 0,
+                    spirit_shop_goods_id=int(getattr(row, "spirit_shop_goods_id", 0)),
+                )
+        if data.HasField("pet_component"):
+            for pet in data.pet_component.pets:
+                resolved_id, _ = resolve_pet_cosmetic_visual(self.tables, pet_bits, pet)
+                info.equipped_pet_cosmetics.add(pet_id=int(pet.pet_id), cosmetic_id=resolved_id)
+
+        # 技能特效目录与当前启用映射（纯战斗画面零数值）
+        vfx_bits = bytes(getattr(profile, "skill_vfx_owned_bits", b""))
+        info.skill_vfx_owned_bits = vfx_bits
+        vfx_table = self._table("SkillVfxCosmetic")
+        if vfx_table is not None:
+            vfx_rows = [row for row in vfx_table.rows() if getattr(row, "enabled", 0)]
+            vfx_rows.sort(key=lambda r: (int(r.sort_order), int(r.id)))
+            for row in vfx_rows:
+                bit_idx = _cosmetic_bit_index(self.tables, "SkillVfxCosmetic", int(row.id))
+                card_id = int(getattr(row, "card_item_id", 0))
+                info.skill_vfx_cosmetics.add(
+                    config_id=int(row.id),
+                    vfx_key=str(row.vfx_key),
+                    name=str(row.name),
+                    skill_table_id=int(row.skill_table_id),
+                    fx_id=str(row.fx_id),
+                    projectile_fx_id=str(row.projectile_fx_id),
+                    telegraph_fx_id=str(row.telegraph_fx_id),
+                    tint_hex=str(row.tint_hex),
+                    sort_order=int(row.sort_order),
+                    owned=bit_idx is not None and test_packed_bit(vfx_bits, bit_idx),
+                    mall_sku_id=int(row.mall_sku_id),
+                    acquire_hint=str(row.acquire_hint),
+                    desc=str(row.desc),
+                    card_item_id=card_id,
+                    card_item_count=int(getattr(row, "card_item_count", 0)),
+                    owned_card_count=self._owned_card_count(data, card_id) if card_id else 0,
+                    spirit_shop_goods_id=int(getattr(row, "spirit_shop_goods_id", 0)),
+                )
+        if vfx_table is not None:
+            for skill_id, cosmetic_id in dict(getattr(profile, "equipped_skill_vfx", {})).items():
+                if not skill_id or not cosmetic_id:
+                    continue
+                row = vfx_table.get(int(cosmetic_id))
+                if row is None or not getattr(row, "enabled", 0) or int(row.skill_table_id) != int(skill_id):
+                    continue
+                bit_idx = _cosmetic_bit_index(self.tables, "SkillVfxCosmetic", int(row.id))
+                if bit_idx is not None and test_packed_bit(vfx_bits, bit_idx):
+                    info.equipped_skill_vfx[int(skill_id)] = int(cosmetic_id)
 
     def _broadcast_appearance_changed(
         self,
@@ -691,6 +897,273 @@ class SceneAppearance:
         response = self.protocol.message(route.response_type)
         self.fill_info(data, now_sec, response.info)
         return response
+
+    def _player_has_usable_skill(self, data, skill_table_id: int) -> bool:
+        if not skill_table_id:
+            return False
+        skill_table = self._table("Skill")
+        row = skill_table.get(int(skill_table_id)) if skill_table is not None else None
+        if row is None:
+            return False
+        skill_class = int(getattr(row, "class_id", 0))
+        if skill_class:
+            player_class = (
+                int(getattr(data.uint32_pb_component, "class", 0))
+                if data.HasField("uint32_pb_component")
+                else 0
+            )
+            if player_class and player_class != skill_class:
+                return False
+        if int(getattr(row, "season_id", 0)) != 0:
+            return True
+        if not data.HasField("skill_list"):
+            return False
+        for entry in data.skill_list.skill_list:
+            if int(entry.skill_table_id) != int(skill_table_id):
+                continue
+            if skill_class == 0 or int(entry.rank) > 0:
+                return True
+        return False
+
+    async def equip_pet_cosmetic(self, _world, player, route, request):
+        now_sec = self.now_s()
+        if not request.client_request_id or not request.pet_id:
+            return self._reject(route, INVALID)
+        data = self.scene.rows.assemble(player.snapshot)
+        ledger = data.client_request_ledger
+        error, fingerprint, prior = client_request.check(ledger, request, _EQUIP_PET_COSMETIC_KIND)
+        if error:
+            return self._reject(route, error)
+        if prior is not None:
+            response = self.protocol.message(
+                route.response_type,
+                pet_id=request.pet_id,
+                equipped_cosmetic_id=request.cosmetic_id,
+                replayed=True,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        if mut_tip := self._check_mutability(player):
+            return self._reject(route, mut_tip)
+
+        pet = next((p for p in data.pet_component.pets if int(p.pet_id) == int(request.pet_id)), None)
+        if pet is None:
+            return self._reject(route, PET_NOT_FOUND)
+
+        target_id = int(request.cosmetic_id)
+        profile = data.profile_component
+        consume_voucher = False
+        voucher_item_id = 0
+        voucher_item_count = 0
+        target_bit = None
+        if target_id != 0:
+            pet_cosmetic_table = self._table("PetCosmetic")
+            row = pet_cosmetic_table.get(target_id) if pet_cosmetic_table is not None else None
+            if row is None or not getattr(row, "enabled", 0):
+                return self._reject(route, APPEARANCE_INVALID)
+            target_bit = _cosmetic_bit_index(self.tables, "PetCosmetic", int(row.id))
+            if target_bit is None:
+                return self._reject(route, APPEARANCE_UNAVAILABLE)
+            target_pet_id = int(getattr(row, "target_pet_table_id", 0))
+            if target_pet_id and target_pet_id != int(pet.pet_table_id):
+                return self._reject(route, APPEARANCE_INVALID)
+            already_owned = test_packed_bit(bytes(profile.pet_cosmetic_owned_bits), target_bit)
+            voucher_item_id = int(getattr(row, "card_item_id", 0))
+            voucher_item_count = int(getattr(row, "card_item_count", 0))
+            plan = plan_switch(already_owned, bool(request.expect_free_equip), voucher_item_id > 0 and voucher_item_count > 0)
+            if plan is SwitchPlan.REFUSE_NOT_OWNED:
+                return self._reject(route, APPEARANCE_NOT_OWNED)
+            if plan is SwitchPlan.REFUSE_NOT_CARD_UNLOCKABLE:
+                return self._reject(route, APPEARANCE_NOT_CARD_UNLOCKABLE)
+            consume_voucher = plan is SwitchPlan.CARD_UNLOCK
+
+        if consume_voucher:
+            before_data = clone(data) if self.assets.audit_enabled else None
+            if self._owned_card_count(data, voucher_item_id) < voucher_item_count:
+                return self._reject(route, APPEARANCE_NO_CARD)
+            consume_err = self._consume_card(data, voucher_item_id, voucher_item_count)
+            if consume_err == BAG_INSUFFICIENT:
+                return self._reject(route, APPEARANCE_NO_CARD)
+            if consume_err:
+                return self._reject(route, APPEARANCE_UNAVAILABLE)
+            profile.pet_cosmetic_owned_bits = set_packed_bit(bytes(profile.pet_cosmetic_owned_bits), target_bit)
+            pet.cosmetic_id = target_id
+            client_request.remember(ledger, request.client_request_id, _EQUIP_PET_COSMETIC_KIND, fingerprint)
+            audit = self.assets.make_audit_callback(
+                player, before_data, data, self.switch_tx, correlation=request.client_request_id,
+            )
+            try:
+                await self.scene.commit_player_data(player, data, on_committed=audit)
+            except (StoreRejected, StoreUnavailable, OSError):
+                return self._reject(route, UNAVAILABLE)
+            self._push_state_notify(player, data, now_sec, trial_expired=False)
+            response = self.protocol.message(
+                route.response_type, pet_id=int(pet.pet_id), equipped_cosmetic_id=target_id, replayed=False,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        if int(pet.cosmetic_id) == target_id:
+            response = self.protocol.message(
+                route.response_type, pet_id=int(pet.pet_id), equipped_cosmetic_id=target_id, replayed=True,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        pet.cosmetic_id = target_id
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._reject(route, UNAVAILABLE)
+        self._push_state_notify(player, data, now_sec, trial_expired=False)
+        response = self.protocol.message(
+            route.response_type, pet_id=int(pet.pet_id), equipped_cosmetic_id=target_id, replayed=False,
+        )
+        self.fill_info(data, now_sec, response.info)
+        return response
+
+    async def equip_skill_vfx(self, _world, player, route, request):
+        now_sec = self.now_s()
+        if not request.client_request_id or not request.skill_table_id:
+            return self._reject(route, INVALID)
+        data = self.scene.rows.assemble(player.snapshot)
+        ledger = data.client_request_ledger
+        error, fingerprint, prior = client_request.check(ledger, request, _EQUIP_SKILL_VFX_KIND)
+        if error:
+            return self._reject(route, error)
+        if prior is not None:
+            response = self.protocol.message(
+                route.response_type,
+                skill_table_id=request.skill_table_id,
+                equipped_cosmetic_id=request.cosmetic_id,
+                replayed=True,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        if mut_tip := self._check_mutability(player):
+            return self._reject(route, mut_tip)
+
+        skill_table_id = int(request.skill_table_id)
+        target_id = int(request.cosmetic_id)
+        profile = data.profile_component
+        consume_voucher = False
+        voucher_item_id = 0
+        voucher_item_count = 0
+        target_bit = None
+        if target_id != 0:
+            vfx_table = self._table("SkillVfxCosmetic")
+            row = vfx_table.get(target_id) if vfx_table is not None else None
+            if row is None or not getattr(row, "enabled", 0) or int(row.skill_table_id) != skill_table_id:
+                return self._reject(route, APPEARANCE_INVALID)
+            target_bit = _cosmetic_bit_index(self.tables, "SkillVfxCosmetic", int(row.id))
+            if target_bit is None:
+                return self._reject(route, APPEARANCE_UNAVAILABLE)
+            if not self._player_has_usable_skill(data, skill_table_id):
+                return self._reject(route, APPEARANCE_INVALID)
+            already_owned = test_packed_bit(bytes(profile.skill_vfx_owned_bits), target_bit)
+            voucher_item_id = int(getattr(row, "card_item_id", 0))
+            voucher_item_count = int(getattr(row, "card_item_count", 0))
+            plan = plan_switch(already_owned, bool(request.expect_free_equip), voucher_item_id > 0 and voucher_item_count > 0)
+            if plan is SwitchPlan.REFUSE_NOT_OWNED:
+                return self._reject(route, APPEARANCE_NOT_OWNED)
+            if plan is SwitchPlan.REFUSE_NOT_CARD_UNLOCKABLE:
+                return self._reject(route, APPEARANCE_NOT_CARD_UNLOCKABLE)
+            consume_voucher = plan is SwitchPlan.CARD_UNLOCK
+
+        if consume_voucher:
+            before_data = clone(data) if self.assets.audit_enabled else None
+            if self._owned_card_count(data, voucher_item_id) < voucher_item_count:
+                return self._reject(route, APPEARANCE_NO_CARD)
+            consume_err = self._consume_card(data, voucher_item_id, voucher_item_count)
+            if consume_err == BAG_INSUFFICIENT:
+                return self._reject(route, APPEARANCE_NO_CARD)
+            if consume_err:
+                return self._reject(route, APPEARANCE_UNAVAILABLE)
+            profile.skill_vfx_owned_bits = set_packed_bit(bytes(profile.skill_vfx_owned_bits), target_bit)
+            profile.equipped_skill_vfx[skill_table_id] = target_id
+            client_request.remember(ledger, request.client_request_id, _EQUIP_SKILL_VFX_KIND, fingerprint)
+            audit = self.assets.make_audit_callback(
+                player, before_data, data, self.switch_tx, correlation=request.client_request_id,
+            )
+            try:
+                await self.scene.commit_player_data(player, data, on_committed=audit)
+            except (StoreRejected, StoreUnavailable, OSError):
+                return self._reject(route, UNAVAILABLE)
+            self._push_state_notify(player, data, now_sec, trial_expired=False)
+            response = self.protocol.message(
+                route.response_type, skill_table_id=skill_table_id, equipped_cosmetic_id=target_id, replayed=False,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        current_id = int(profile.equipped_skill_vfx.get(skill_table_id, 0))
+        if current_id == target_id:
+            response = self.protocol.message(
+                route.response_type, skill_table_id=skill_table_id, equipped_cosmetic_id=target_id, replayed=True,
+            )
+            self.fill_info(data, now_sec, response.info)
+            return response
+
+        if target_id == 0:
+            profile.equipped_skill_vfx.pop(skill_table_id, None)
+        else:
+            profile.equipped_skill_vfx[skill_table_id] = target_id
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._reject(route, UNAVAILABLE)
+        self._push_state_notify(player, data, now_sec, trial_expired=False)
+        response = self.protocol.message(
+            route.response_type, skill_table_id=skill_table_id, equipped_cosmetic_id=target_id, replayed=False,
+        )
+        self.fill_info(data, now_sec, response.info)
+        return response
+
+    async def grant_pet_cosmetic(self, player, cosmetic_id: int) -> int:
+        if mut_tip := self._check_mutability(player):
+            return mut_tip
+        pet_cosmetic_table = self._table("PetCosmetic")
+        row = pet_cosmetic_table.get(int(cosmetic_id)) if pet_cosmetic_table is not None else None
+        if row is None or not getattr(row, "enabled", 0):
+            return APPEARANCE_INVALID
+        bit_idx = _cosmetic_bit_index(self.tables, "PetCosmetic", int(row.id))
+        if bit_idx is None:
+            return APPEARANCE_UNAVAILABLE
+        data = self.scene.rows.assemble(player.snapshot)
+        profile = data.profile_component
+        if test_packed_bit(bytes(profile.pet_cosmetic_owned_bits), bit_idx):
+            return 0
+        profile.pet_cosmetic_owned_bits = set_packed_bit(bytes(profile.pet_cosmetic_owned_bits), bit_idx)
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return UNAVAILABLE
+        self._push_state_notify(player, data, self.now_s(), trial_expired=False)
+        return 0
+
+    async def grant_skill_vfx(self, player, cosmetic_id: int) -> int:
+        if mut_tip := self._check_mutability(player):
+            return mut_tip
+        vfx_table = self._table("SkillVfxCosmetic")
+        row = vfx_table.get(int(cosmetic_id)) if vfx_table is not None else None
+        if row is None or not getattr(row, "enabled", 0):
+            return APPEARANCE_INVALID
+        bit_idx = _cosmetic_bit_index(self.tables, "SkillVfxCosmetic", int(row.id))
+        if bit_idx is None:
+            return APPEARANCE_UNAVAILABLE
+        data = self.scene.rows.assemble(player.snapshot)
+        profile = data.profile_component
+        if test_packed_bit(bytes(profile.skill_vfx_owned_bits), bit_idx):
+            return 0
+        profile.skill_vfx_owned_bits = set_packed_bit(bytes(profile.skill_vfx_owned_bits), bit_idx)
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return UNAVAILABLE
+        self._push_state_notify(player, data, self.now_s(), trial_expired=False)
+        return 0
 
     def track_player(self, player, *, now_sec: int | None = None) -> None:
         """玩家载入后登记在途试用时刻，供 ``expire_trials`` 定时回收。"""

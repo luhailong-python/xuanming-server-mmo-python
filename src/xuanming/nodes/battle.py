@@ -335,6 +335,9 @@ class TurnEngine:
                 team_formation_min_slot[player.team_index] = actor.formation_slot
                 self.team_formation_ids[player.team_index] = fid if is_valid_formation_id(fid) else 0
             actor.appearance_id = player.appearance_id
+            for skill_id, vfx_id in dict(getattr(player, "equipped_skill_vfx", {})).items():
+                if skill_id and vfx_id:
+                    actor.equipped_skill_vfx[int(skill_id)] = int(vfx_id)
             actor.class_id = player.class_id
             actor.gender = player.gender
             if bool(getattr(player, "ai_controlled", False)):
@@ -464,6 +467,8 @@ class TurnEngine:
             is_auto=True,
         )
         actor.name = pet.pet_name
+        if getattr(pet, "cosmetic_art_key", ""):
+            actor.pet_cosmetic_art_key = pet.cosmetic_art_key
         self.skills.initialize(actor, pet, pet=True)
         if pet.HasField("pet_cultivation"):
             self.pet_support.initialize_pet_cultivation(actor, pet.pet_cultivation)
@@ -1467,7 +1472,8 @@ class TurnEngine:
                 target = self.actors.get(event.target_id)
                 if target is not None:
                     self.equipment_effects.amplify_heal_event(
-                        actor, target, event, self.round_index, turn, group, is_primary_first_hit=first_heal,
+                        actor, target, event, self.round_index, turn, group,
+                        is_primary_first_hit=(first_heal and event.skill_table_id == action.skill_table_id),
                     )
                     first_heal = False
                     self.trial_tracker.record_effective_contribution(actor)
@@ -1612,7 +1618,8 @@ class TurnEngine:
                 *, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
                 base: float | None = None, rank: int = 0,
                 is_multi_target: bool = False, is_primary_target: bool = True,
-                is_primary_focus: bool = False) -> None:
+                is_primary_focus: bool = False, damage_scale: float = 1.0,
+                damage_origin: int = 0) -> None:
         damage = self._damage_before_critical(actor, target, rule, rule.base_damage if base is None else base)
         critical_rate = self._critical_chance(actor, rule)
         critical = critical_rate > 0 and self.rng.unit() < critical_rate
@@ -1622,6 +1629,8 @@ class TurnEngine:
                 crit_mult += self.tower_sigil_bonuses.crit_damage_pct / 100.0
             damage *= crit_mult
         damage *= rank_factor(rank)
+        if damage_scale != 1.0:
+            damage *= damage_scale
         if hit_kind == 1:
             damage *= 0.5
         if is_primary_focus:
@@ -1631,9 +1640,13 @@ class TurnEngine:
                 actor,
                 BattleModifier.OUTGOING_PHYSICAL_DAMAGE if rule.damage_kind == 1 else BattleModifier.OUTGOING_MAGIC_DAMAGE,
             )
-            one_shot_out = self.configured.modifier(
-                actor,
-                BattleModifier.NEXT_PHYSICAL_ATTACK if rule.damage_kind == 1 else BattleModifier.NEXT_MAGIC_ATTACK,
+            one_shot_out = (
+                self.configured.modifier(
+                    actor,
+                    BattleModifier.NEXT_PHYSICAL_ATTACK if rule.damage_kind == 1 else BattleModifier.NEXT_MAGIC_ATTACK,
+                )
+                if damage_origin == 0
+                else 0.0
             )
             out_bonus = self.configured.modifier(actor, BattleModifier.OUTGOING_DAMAGE) + typed_out + one_shot_out
             if out_bonus != 0.0:
@@ -1723,13 +1736,14 @@ class TurnEngine:
                 turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
                 hit_kind=hit_kind, hit_index=hit_index, absorbed=opening_absorbed,
                 is_splash_reduced=splash_reduced, is_primary_focus=is_primary_focus,
+                damage_origin=damage_origin,
             )
         if not skill_id:
             self.encounter.apply_breaker_sunder_on_basic_hit(actor, target, dealt, hit_kind, turn, group)
         if (dealt + absorbed) > 0 and hit_kind in (0, 1):
             self.trial_tracker.record_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
             self.encounter.record_player_direct_damage(actor, target, rule.damage_kind, dealt + absorbed)
-        if (dealt + absorbed) > 0 and hit_kind != 3 and _active(target):
+        if (dealt + absorbed) > 0 and hit_kind != 3 and damage_origin in (0, 5) and _active(target):
             self.configured.increment_hit_vulnerability(target, self.round_index, group)
         if dealt > 0:
             self.equipment_effects.apply_lifesteal(actor, dealt, turn, group)
@@ -1759,11 +1773,14 @@ class TurnEngine:
 
     def _apply_damage(self, turn: Message, group: int, source: Message, target: Message, value: int,
                       *, critical: bool = False, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
-                      absorbed: int = 0, is_splash_reduced: bool = False, is_primary_focus: bool = False) -> None:
+                      absorbed: int = 0, is_splash_reduced: bool = False, is_primary_focus: bool = False,
+                      damage_origin: int = 0) -> None:
         target.attributes.health -= value
         ev = self._event(turn, group, 3, source, target, value=value, absorbed=absorbed, is_critical=critical,
                          skill_table_id=skill_id, hit_kind=hit_kind, hit_index=hit_index,
                          target_health_after=target.attributes.health, target_mana_after=target.attributes.mana)
+        if damage_origin:
+            ev.damage_origin = damage_origin
         if is_splash_reduced:
             ev.is_splash_reduced = True
         if is_primary_focus:
