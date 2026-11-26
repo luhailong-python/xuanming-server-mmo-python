@@ -41,10 +41,12 @@ from .model import (
     has_session_metadata,
     sign_internal_reply,
     unique_ints,
+    valid_trial_vow_mask,
     verify_internal_hmac,
 )
 from .ranked import RankedManager
 from .store import MatchStore, TeamMutationOutcome, TeamSnapshotResult
+from .trial_cards import supports_trial_vows
 
 logger = logging.getLogger(__name__)
 
@@ -654,6 +656,16 @@ class TeamGrpcService:
         if target_size < len(member_ids) or target_size > min(max_size, MAX_TEAM_SIZE):
             return await self._error_team_response(caller, ERR_TEAM_SIZE_EXCEEDED)
 
+        trial_vow_mask = int(getattr(request, "trial_vow_mask", 0))
+        if trial_vow_mask != 0:
+            if (
+                not valid_trial_vow_mask(trial_vow_mask)
+                or mode != MODE_PVE_TEAM
+                or target_size != len(member_ids)
+                or not supports_trial_vows(config_id)
+            ):
+                return await self._error_team_response(caller, ERR_TEAM_DUNGEON_NOT_OPEN)
+
         member_zones: dict[int, int] = {}
         for pid in member_ids:
             pres = await self.presence.get_presence(pid)
@@ -683,6 +695,7 @@ class TeamGrpcService:
                 immediate_battle_node=immediate_node,
                 battle_deadline_ms=self.config.battle_deadline_sec * 1000,
                 queue_ttl_ms=self.config.queue_ttl_sec * 1000,
+                trial_vow_mask=trial_vow_mask,
             )
         except TeamBusinessError as exc:
             return await self._error_team_response(caller, exc.code, *exc.params)

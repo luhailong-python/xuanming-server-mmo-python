@@ -56,6 +56,7 @@ from .model import (
     MODE_5V5,
     MODE_GUILD_WAR_PVP,
     MODE_GUILD_WAR_SIEGE,
+    MODE_JIANGHU_DUEL,
     MODE_PVE_SOLO,
     MODE_PVE_TEAM,
     MODE_PVP_TEAM,
@@ -82,10 +83,12 @@ from .model import (
     sign_internal_reply,
     sign_probe_message,
     valid_operator_text,
+    valid_trial_vow_mask,
     validate_custom_duel_rules,
     verify_internal_hmac,
     verify_probe_message,
 )
+from .jianghu import JianghuManager
 from .outbox import OutcomeOutboxWorker
 from .ranked import RankedManager, _default_config_tables
 from .rating import RankOutboxPublisher
@@ -93,6 +96,7 @@ from .spectate import SpectateManager
 from .store import MatchStore, StrandedFormationEntry
 from .team_service import TeamGrpcService
 from .tournament import TournamentManager
+from .trial_cards import TrialChallengeCardManager, supports_trial_vows
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +123,8 @@ class MatchGrpcService:
         battle_scripts: BattleScriptManager | None = None,
         ranked: RankedManager | None = None,
         tournament: TournamentManager | None = None,
+        jianghu: JianghuManager | None = None,
+        trial_cards: TrialChallengeCardManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -135,10 +141,24 @@ class MatchGrpcService:
         self.battle_scripts = battle_scripts if battle_scripts is not None else BattleScriptManager(protocol, store)
         self.ranked = ranked if ranked is not None else RankedManager(protocol, store, clock_ms=self._clock_ms)
         self.tournament = tournament if tournament is not None else TournamentManager(protocol, clock_ms=self._clock_ms)
+        self.jianghu = (
+            jianghu
+            if jianghu is not None
+            else JianghuManager(protocol, store, presence, clock_ms=self._clock_ms)
+        )
+        if self.jianghu.battle_launcher is None:
+            self.jianghu.battle_launcher = self._launch_jianghu_duel_formation
+        self.trial_cards = (
+            trial_cards
+            if trial_cards is not None
+            else TrialChallengeCardManager(protocol, store, clock_ms=self._clock_ms)
+        )
         if self.gather.on_tournament_profiles is None:
             self.gather.on_tournament_profiles = self.tournament.sync_member_profiles
         if getattr(self.gather, "on_tournament_captains", None) is None:
             self.gather.on_tournament_captains = self.tournament.load_squad_captains
+        if getattr(self.gather, "on_jianghu_duel_started", None) is None:
+            self.gather.on_jianghu_duel_started = self.jianghu.publish_duel_start_notice
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -185,6 +205,16 @@ class MatchGrpcService:
                 "GetTournamentPredictionBoard": self.get_tournament_prediction_board,
                 "BanTournamentLeyline": self.ban_tournament_leyline,
                 "GetTournamentHighlights": self.get_tournament_highlights,
+                "CreateJianghuDuelInvite": self.create_jianghu_duel_invite,
+                "ConfirmJianghuDuelMember": self.confirm_jianghu_duel_member,
+                "RespondJianghuDuelInvite": self.respond_jianghu_duel_invite,
+                "ListJianghuGrudges": self.list_jianghu_grudges,
+                "DismissJianghuGrudge": self.dismiss_jianghu_grudge,
+                "NotifyJianghuDuelInvite": self.push_noop,
+                "NotifyJianghuDuelStatus": self.push_noop,
+                "CreateTrialChallengeCard": self.create_trial_challenge_card,
+                "GetTrialChallengeCard": self.get_trial_challenge_card,
+                "GetSharedTrialReplay": self.get_shared_trial_replay,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -392,6 +422,15 @@ class MatchGrpcService:
         else:
             team_size = 1
 
+        is_wuxing_tower = bool(getattr(request, "is_wuxing_tower", False))
+        trial_vow_mask = int(getattr(request, "trial_vow_mask", 0))
+        if trial_vow_mask != 0:
+            if not valid_trial_vow_mask(trial_vow_mask):
+                return fail(ERR_MATCH_MODE_NOT_OPEN)
+            is_solo_direct = mode == MODE_PVE_SOLO or (mode == MODE_PVE_TEAM and team_size == 1)
+            if is_wuxing_tower or not is_solo_direct or not supports_trial_vows(config_id):
+                return fail(ERR_MATCH_MODE_NOT_OPEN)
+
         pres = await self.presence.get_presence(caller.player_id)
         if pres.in_battle:
             return fail(ERR_MATCH_IN_BATTLE)
@@ -426,7 +465,8 @@ class MatchGrpcService:
                 network_profile=profile_bytes,
                 pool_region=pool_reg,
                 queue_ttl_ms=self.config.queue_ttl_sec * 1000,
-                is_wuxing_tower=bool(getattr(request, "is_wuxing_tower", False)),
+                is_wuxing_tower=is_wuxing_tower,
+                trial_vow_mask=trial_vow_mask,
             )
         except MatchBusinessError as exc:
             return fail(exc.code)
@@ -696,6 +736,80 @@ class MatchGrpcService:
     async def get_tournament_highlights(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
         return self.tournament.get_tournament_highlights(caller, request)
+
+    # -- 江湖恩怨与天墉生死状一期客户端 RPCs（548..554）----------------------------------------------
+
+    async def _launch_jianghu_duel_formation(
+        self,
+        invite_view: Message,
+        side_a: list[int],
+        side_b: list[int],
+        duel_ctx: Message,
+    ) -> int:
+        """将已抢占 MATCHED 的天墉生死状写入成局记录并驱动 GatherPipeline 开局。"""
+        nodes = await self.battle_nodes.list_nodes(release_track="stable")
+        node = select_battle_node(nodes, release_track="stable")
+        if node is None:
+            raise RuntimeError("no battle node available for jianghu duel")
+        invite_id = int(invite_view.duel_invite_id)
+        members: list[tuple[int, str, int, bool]] = []
+        for pid in side_a:
+            members.append((pid, f"jh-{invite_id}-{pid}", 0, pid == int(duel_ctx.challenger_captain_id)))
+        for pid in side_b:
+            members.append((pid, f"jh-{invite_id}-{pid}", 1, pid == int(duel_ctx.target_captain_id)))
+        formation = await self.store.claim_formation(
+            mode=MODE_JIANGHU_DUEL,
+            config_id=0,
+            members=members,
+            physical_region=node.physical_region,
+            target_node_id=node.node_id,
+            target_instance_id=node.node_uuid,
+            target_endpoint=node.grpc_endpoint,
+            release_track=node.release_track or "stable",
+            battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+            requeue_on_failure=False,
+            jianghu_duel_context=duel_ctx.SerializeToString(deterministic=True),
+            skip_ticket_check=True,
+        )
+        if self._inline_gather:
+            await self.gather.run_formation(formation)
+        else:
+            self._spawn(self.gather.run_formation(formation), name=f"jianghu-gather-{formation.battle_id}")
+        return int(formation.battle_id)
+
+    async def create_jianghu_duel_invite(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.jianghu.create_invite(caller, request)
+
+    async def confirm_jianghu_duel_member(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.jianghu.confirm_member(caller, request)
+
+    async def respond_jianghu_duel_invite(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.jianghu.respond_invite(caller, request)
+
+    async def list_jianghu_grudges(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.jianghu.list_grudges(caller)
+
+    async def dismiss_jianghu_grudge(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.jianghu.dismiss_grudge(caller, request)
+
+    # -- 五行试炼志 V3 好友约战帖与受控 PVE 录像客户端 RPCs（570..572）------------------------------
+
+    async def create_trial_challenge_card(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.trial_cards.create_card(caller, request)
+
+    async def get_trial_challenge_card(self, request: Message, context, path: str) -> Message:
+        await self._admit_client(context, path)
+        return await self.trial_cards.get_card(request)
+
+    async def get_shared_trial_replay(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.trial_cards.get_shared_replay(caller, request)
 
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 

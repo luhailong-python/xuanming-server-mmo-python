@@ -26,10 +26,12 @@ from .battle_dropin_effects import (
     BOSS_AFFIX_WATER,
     BOSS_AFFIX_WATER_CHARGE_OR_PERIODIC_DAMAGE_BONUS_PCT,
     BOSS_TRIAL_ACTION_TIMEOUT_MS,
+    BOSS_TRIAL_KIND_CHARACTER_TALE,
     BOSS_TRIAL_KIND_FESTIVAL_BEAST,
     BOSS_TRIAL_KIND_GUARDIAN_RESCUE,
     BOSS_TRIAL_KIND_NONE,
     BOSS_TRIAL_KIND_POLARITY_5V5,
+    BOSS_TRIAL_KIND_PRACTICE_DUMMY,
     CLUTCH_COMEBACK_LOW_HP_DENOMINATOR,
     CLUTCH_COMEBACK_MIN_ESCALATION_STACKS,
     ERR_RATE_LIMIT_EXCEEDED,
@@ -40,8 +42,13 @@ from .battle_dropin_effects import (
     EVENT_SUMMON_PET,
     EVENT_WUXING_SYNERGY,
     HIGHLIGHT_CONTROL_MIN_COUNT,
+    JIANGHU_DUEL_DEFAULT_MAX_ROUNDS,
+    MATCH_MODE_GUILD_WAR_PVP,
+    MATCH_MODE_GUILD_WAR_SIEGE,
+    MATCH_MODE_JIANGHU_DUEL,
     MATCH_MODE_POLARITY_5V5,
     MATCH_MODE_PVE_SOLO,
+    MATCH_MODE_PVE_TEAM,
     MATCH_MODE_SEASON_TOURNAMENT,
     MAX_BATTLE_PINGS_PER_ROUND,
     MIN_WIN_STREAK_HIGHLIGHT,
@@ -70,6 +77,10 @@ from .battle_dropin_effects import (
     TOURNAMENT_LEYLINE_UNSPECIFIED,
     TOURNAMENT_LEYLINE_WATER,
     TOURNAMENT_LEYLINE_WOOD,
+    VOW_BAN_CONTROL,
+    VOW_NO_PET,
+    VOW_SINGLE_ARTIFACT,
+    VOW_TIGHT_ROUNDS,
     WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
     WUXING_SYNERGY_BONUS_PCT,
     WUXING_TOWER_MAX_FLOORS,
@@ -102,7 +113,9 @@ from .battle_dropin_effects import (
     is_valid_custom_duel_round_limit,
     is_valid_formation_id,
     is_valid_tower_sigil_id,
+    is_valid_vow_mask,
     mix_seed_u64,
+    tighten_round_limit,
     tower_monster_attack_pct,
     tower_monster_health_pct,
 )
@@ -235,6 +248,10 @@ class TurnEngine:
             self.custom_duel_rules: Message | None = request.custom_duel_rules
         else:
             self.custom_duel_rules = None
+        if "jianghu_duel_context" in request.DESCRIPTOR.fields_by_name and request.HasField("jianghu_duel_context"):
+            self.jianghu_duel_context: Message | None = request.jianghu_duel_context
+        else:
+            self.jianghu_duel_context = None
         if self.custom_duel_rules is not None:
             if not is_valid_custom_duel_round_limit(self.custom_duel_rules.round_limit_override):
                 raise BattleError("invalid custom duel round_limit_override")
@@ -271,13 +288,46 @@ class TurnEngine:
                     self.tower_sigil_bonuses = aggregate_tower_sigils(tc.active_sigil_ids)
                     break
 
-        # 排位默认回合上限收敛到 20，物法易势 5V5 默认 16，瑞兽迎春硬性校验并取冻结 round_limit。
+        # 排位默认回合上限收敛到 20，物法易势 5V5 默认 16，天墉生死状默认 30，瑞兽迎春硬性校验并取冻结 round_limit。
         if self.is_ranked_battle and not has_explicit_round_limit:
             max_rounds = min(max_rounds, RANKED_DEFAULT_MAX_ROUNDS)
+        if self.is_jianghu_duel_battle:
+            duel_rounds = JIANGHU_DUEL_DEFAULT_MAX_ROUNDS
+            if self.jianghu_duel_context is not None and self.jianghu_duel_context.round_limit_override > 0:
+                duel_rounds = max(1, min(100, int(self.jianghu_duel_context.round_limit_override)))
+            max_rounds = duel_rounds
         if request.match_mode == MATCH_MODE_POLARITY_5V5 and boss_trial_kind == BOSS_TRIAL_KIND_NONE:
             boss_trial_kind = BOSS_TRIAL_KIND_POLARITY_5V5
             if max_rounds == _MAX_ROUNDS:
                 max_rounds = POLARITY_DEFAULT_MAX_ROUNDS
+
+        effective_trial_ctx = trial_context
+        if effective_trial_ctx is None and hasattr(request, "trial_context") and request.HasField("trial_context"):
+            effective_trial_ctx = request.trial_context
+
+        # 五行试炼志 V3 自选试炼誓约校验与冻结（bit0 禁控 / bit1 单宝 / bit2 无宠 / bit3 紧缩回合）。
+        self.trial_vow_mask: int = 0
+        requested_vow_mask = (
+            int(getattr(effective_trial_ctx, "challenge_vow_mask", 0))
+            if effective_trial_ctx is not None
+            else 0
+        )
+        if not is_valid_vow_mask(requested_vow_mask):
+            raise BattleError("invalid trial challenge_vow_mask")
+        if requested_vow_mask != 0:
+            is_pve_request = request.match_mode in (MATCH_MODE_PVE_SOLO, MATCH_MODE_PVE_TEAM)
+            is_npc_isolated = BOSS_TRIAL_KIND_PRACTICE_DUMMY <= boss_trial_kind <= BOSS_TRIAL_KIND_CHARACTER_TALE
+            if (
+                not is_pve_request
+                or not is_boss_trial_kind(boss_trial_kind)
+                or self.tower_context is not None
+                or self.custom_duel_rules is not None
+                or is_npc_isolated
+            ):
+                raise BattleError("trial challenge_vow_mask unsupported for battle")
+            self.trial_vow_mask = requested_vow_mask
+            if self.has_trial_vow(VOW_TIGHT_ROUNDS):
+                max_rounds = tighten_round_limit(max_rounds)
 
         has_festival_activity = (
             request.HasField("activity_context") and request.activity_context.kind == 2
@@ -333,9 +383,6 @@ class TurnEngine:
         self.equipment_effects = EquipmentBattleEffects(self)
         self.pet_support = PetAndSupportEffects(self)
         self.season_rules = SeasonBattleRules
-        effective_trial_ctx = trial_context
-        if effective_trial_ctx is None and hasattr(request, "trial_context") and request.HasField("trial_context"):
-            effective_trial_ctx = request.trial_context
         self.trial_tracker = TrialFactTracker(self, effective_trial_ctx)
         self.monster_ai = MonsterAiRuntime(self, monster_ai_profiles)
         self.encounter = EncounterV2Controller(
@@ -426,8 +473,19 @@ class TurnEngine:
             actor.buffs.extend(player.buffs)
             self.skills.initialize(actor, player)
             if player.HasField("equipment_effects"):
-                if not self.equipment_effects.initialize_equipment(actor, player.equipment_effects):
-                    raise BattleError("invalid equipment effects snapshot")
+                if (
+                    player.team_index == 0
+                    and self.has_trial_vow(VOW_SINGLE_ARTIFACT)
+                    and len(player.equipment_effects.artifacts) > 1
+                ):
+                    trimmed = type(player.equipment_effects)()
+                    trimmed.CopyFrom(player.equipment_effects)
+                    del trimmed.artifacts[1:]
+                    if not self.equipment_effects.initialize_equipment(actor, trimmed):
+                        raise BattleError("invalid equipment effects snapshot")
+                else:
+                    if not self.equipment_effects.initialize_equipment(actor, player.equipment_effects):
+                        raise BattleError("invalid equipment effects snapshot")
             self.items[actor_id] = []
             for item in player.items:
                 if item.count:
@@ -437,6 +495,8 @@ class TurnEngine:
 
         pet_ids: set[int] = set()
         for player in request.players:
+            if player.team_index == 0 and self.has_trial_vow(VOW_NO_PET):
+                continue
             for pet in player.pets:
                 if pet.pet_id and pet.pet_id in pet_ids:
                     raise BattleError("invalid pet snapshot")
@@ -1098,6 +1158,20 @@ class TurnEngine:
     def ban_control_skills(self) -> bool:
         return self.custom_duel_rules is not None and bool(self.custom_duel_rules.ban_control_skills)
 
+    def has_trial_vow(self, vow_bit: int) -> bool:
+        return bool(self.trial_vow_mask & vow_bit)
+
+    def is_control_banned_for_actor(self, actor: Message) -> bool:
+        return self.ban_control_skills or (actor.team_index == 0 and self.has_trial_vow(VOW_BAN_CONTROL))
+
+    @property
+    def is_guild_war_battle(self) -> bool:
+        return self.match_mode in (MATCH_MODE_GUILD_WAR_PVP, MATCH_MODE_GUILD_WAR_SIEGE)
+
+    @property
+    def is_jianghu_duel_battle(self) -> bool:
+        return self.match_mode == MATCH_MODE_JIANGHU_DUEL
+
     @property
     def custom_duel_polarity_enabled(self) -> bool:
         return self.custom_duel_rules is not None and bool(self.custom_duel_rules.enable_polarity_rotation)
@@ -1362,6 +1436,8 @@ class TurnEngine:
             self.is_ranked_battle
             or self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5
             or self.match_mode in (MATCH_MODE_POLARITY_5V5, MATCH_MODE_SEASON_TOURNAMENT)
+            or self.is_guild_war_battle
+            or self.is_jianghu_duel_battle
         )
 
     @property
@@ -1556,6 +1632,8 @@ class TurnEngine:
             state.wuxing_synergy_active_this_round = True
         if self.active_season_weekly_affix_id:
             state.season_weekly_affix_id = self.active_season_weekly_affix_id
+        if self.trial_vow_mask:
+            state.trial_vow_mask = self.trial_vow_mask
         if self.banned_skill_ids:
             state.banned_skill_ids.extend(self.banned_skill_ids)
         if self.team_a_banned_skill_ids:
@@ -1624,6 +1702,9 @@ class TurnEngine:
         if action_type == _FLEE:
             return 0 if self.pve else _INVALID
         if action_type == _SKILL:
+            rule = self.skills.rules.get(action.skill_table_id)
+            if rule is not None and self.is_control_banned_for_actor(actor) and self.is_control_skill(rule):
+                return 7004
             error = self.skills.validate(actor, action)
             if error == 7004 and actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
                 rule = self.skills.rules.get(action.skill_table_id)
@@ -1688,7 +1769,14 @@ class TurnEngine:
         elif not side_b:
             self.outcome = 1
         elif self.round_index >= self.max_rounds:
-            if self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5 or self.match_mode == MATCH_MODE_POLARITY_5V5:
+            if (
+                self.is_ranked_battle
+                or self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5
+                or self.match_mode == MATCH_MODE_POLARITY_5V5
+                or self.is_guild_war_battle
+                or self.custom_duel_rules is not None
+                or self.is_jianghu_duel_battle
+            ):
                 self.outcome = 3
             else:
                 self.outcome = 2
@@ -3225,6 +3313,8 @@ class BattleNode:
             event.activity_context.CopyFrom(request.activity_context)
         if engine.is_ranked_battle and engine.ranked_context is not None:
             event.ranked_context.CopyFrom(engine.ranked_context)
+        if engine.jianghu_duel_context is not None:
+            event.jianghu_duel_context.CopyFrom(engine.jianghu_duel_context)
         teams: dict[int, list[int]] = {}
         for player in sorted(room.routing):
             actor = engine.actors[player]
@@ -3323,6 +3413,8 @@ class BattleNode:
                 settlement.competitive_ranked = True
                 settlement.season_id = engine.ranked_context.season_id
                 settlement.ranked_rule_version = engine.ranked_context.rule_version
+            if engine.jianghu_duel_context is not None:
+                settlement.jianghu_duel.CopyFrom(engine.jianghu_duel_context)
             if actor.fled:
                 event.fled_player_ids.append(player)
             if actor.is_dead:

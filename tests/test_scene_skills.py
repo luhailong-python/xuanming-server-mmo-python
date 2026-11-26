@@ -36,7 +36,7 @@ def test_scene_skill_catalog_and_partial_upgrade_commit_together(tmp_path, skill
 
             original = service.list_skills(None, player, None, None)
             assert original.HasField("skill_list") and original.currency_balance == 2000
-            assert original.HasField("loadout") and len(original.loadout.schemes) == 3
+            assert original.HasField("loadout") and len(original.loadout.schemes) == 2
             owned_ranks = {e.skill_table_id: e.rank for e in original.skill_list.skill_list}
             assert owned_ranks[skill_id] == 1
             assert any(entry.skill_table_id == 10002 for entry in original.catalog)

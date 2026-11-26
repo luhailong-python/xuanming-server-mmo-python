@@ -35,8 +35,37 @@ SCOPE_ALL_PERMANENT = 0
 CHAPTER_BREAKTHROUGH = 1
 CHAPTER_THREE_REALMS = 2
 CHAPTER_SEASONAL = 3
+CHAPTER_WILD_REALMS = 4
 UNLOCK_MODE_OPEN = 0
 UNLOCK_MODE_REQUIRE_NORMAL_CLEAR = 1
+
+# 五行试炼志 V3 自选试炼誓约位图（bit 0..3，仅常驻 PVE 首领试炼可勾选，零额外材料产出）。
+VOW_NONE = 0
+VOW_BAN_CONTROL = 1 << 0
+VOW_SINGLE_ARTIFACT = 1 << 1
+VOW_NO_PET = 1 << 2
+VOW_TIGHT_ROUNDS = 1 << 3
+VOW_MASK_ALL = VOW_BAN_CONTROL | VOW_SINGLE_ARTIFACT | VOW_NO_PET | VOW_TIGHT_ROUNDS
+
+
+def is_valid_vow_mask(mask: int) -> bool:
+    """校验试炼誓约位掩码仅包含合法位 0..3。"""
+    return (int(mask) & ~VOW_MASK_ALL) == 0
+
+
+def count_vows(mask: int) -> int:
+    """统计试炼誓约位掩码中启用的誓约条数（0..4）。"""
+    return (int(mask) & VOW_MASK_ALL).bit_count()
+
+
+def tighten_round_limit(base_rounds: int) -> int:
+    """紧缩回合誓约：将基础回合上限压缩至 ceil(base_rounds * 0.7)，下限保护 6 回合。"""
+    if base_rounds <= 0:
+        return 0
+    if base_rounds <= 6:
+        return base_rounds
+    scaled = (base_rounds * 7 + 9) // 10
+    return max(6, scaled)
 
 # 试炼志错误码（与 C++ trial_journal_error_tip.pb.h 严格对齐）。
 TRIAL_JOURNAL_UNAVAILABLE = 35000
@@ -767,9 +796,20 @@ class SceneTrialJournal:
         teammate_names: tuple[str, ...] = (),
         achieved_at_ms: int | None = None,
         seal_ids: tuple[int, ...] | None = None,
+        challenge_vow_mask: int = 0,
+        battle_id: int = 0,
     ) -> dict:
-        """写入试炼进度：点亮达标战法印并刷新对应可比规则版的单人/合战最佳回合。"""
-        delta = {"entry_id": 0, "newly_lit_seal_ids": [], "new_solo_best": False, "new_coop_best": False, "changed": False}
+        """写入试炼进度：点亮达标战法印并刷新对应可比规则版的单人/合战/誓约最佳回合。"""
+        delta = {
+            "entry_id": 0,
+            "newly_lit_seal_ids": [],
+            "new_solo_best": False,
+            "new_coop_best": False,
+            "vow_mask": 0,
+            "new_vow_best": False,
+            "battle_id": 0,
+            "changed": False,
+        }
         if settlement is not None:
             if (
                 not settlement.battle_id or not settlement.player_id or settlement.fled
@@ -809,6 +849,8 @@ class SceneTrialJournal:
             used_season_seal_id = facts.used_season_seal_id
             teammate_names = tuple(facts.teammate_names)
             achieved_at_ms = settlement.finished_at_ms or self.clock()
+            challenge_vow_mask = int(getattr(facts, "challenge_vow_mask", 0))
+            battle_id = int(settlement.battle_id)
 
         entry = self._entry_by_id(entry_id)
         if entry is None:
@@ -816,6 +858,8 @@ class SceneTrialJournal:
         comp = data.trial_journal_component
         comp.SetInParent()
         delta["entry_id"] = entry.id
+        delta["battle_id"] = int(battle_id)
+        delta["vow_mask"] = int(challenge_vow_mask)
         effective_version = rule_version or entry.rule_version
 
         seals = self._seals_for_entry(entry.id)
@@ -859,6 +903,7 @@ class SceneTrialJournal:
                     record.solo_best.Clear()
                     record.solo_best.best_rounds = total_rounds
                     record.solo_best.achieved_at_ms = stamp
+                    record.solo_best.battle_id = int(battle_id)
                     record.solo_best.loadout.pet_table_id = used_pet_table_id
                     record.solo_best.loadout.artifact_effect_ids.extend(
                         _normalize_artifact_effects(used_artifact_effect_ids),
@@ -876,10 +921,28 @@ class SceneTrialJournal:
                     record.coop_best.party_size = initial_human_count
                     record.coop_best.achieved_at_ms = stamp
                     record.coop_best.pet_table_id = used_pet_table_id
+                    record.coop_best.battle_id = int(battle_id)
                     for name in teammate_names[:MAX_COOP_TEAMMATES]:
                         if name:
                             record.coop_best.teammate_names.append(name)
                     delta["new_coop_best"] = True
+                    delta["changed"] = True
+            # 五行试炼志 V3：常驻 PVE 首领试炼带试炼誓约胜出时刷新个人最高誓约纪录（誓约条数优先，同数比更短回合）。
+            vow_mask = int(challenge_vow_mask)
+            if entry.season_id == 0 and entry.source_kind == 1 and vow_mask != 0 and is_valid_vow_mask(vow_mask):
+                vow_count = count_vows(vow_mask)
+                existing = _find_entry_record(comp, entry.id, effective_version)
+                old_vow_count = int(existing.best_vow_count) if existing is not None else 0
+                old_vow_rounds = int(existing.best_vow_rounds) if existing is not None else 0
+                if vow_count > old_vow_count or (
+                    vow_count == old_vow_count and (old_vow_rounds == 0 or total_rounds < old_vow_rounds)
+                ):
+                    record = _find_or_add_entry_record(comp, entry.id, effective_version)
+                    record.best_vow_mask = vow_mask
+                    record.best_vow_count = vow_count
+                    record.best_vow_rounds = total_rounds
+                    record.best_vow_battle_id = int(battle_id)
+                    delta["new_vow_best"] = True
                     delta["changed"] = True
 
         if won and entry.chapter_id in (CHAPTER_BREAKTHROUGH, CHAPTER_THREE_REALMS) and entry.difficulty == 1:
@@ -983,6 +1046,12 @@ class SceneTrialJournal:
                 entry_view.has_legacy_record_only = (
                     not has_solo and not has_coop and _has_legacy_record(comp, entry.id, entry.rule_version)
                 )
+                entry_view.vow_supported = entry.season_id == 0 and entry.source_kind == 1
+                if record is not None and record.best_vow_count > 0:
+                    entry_view.best_vow_mask = record.best_vow_mask
+                    entry_view.best_vow_count = record.best_vow_count
+                    entry_view.best_vow_rounds = record.best_vow_rounds
+                    entry_view.best_vow_battle_id = record.best_vow_battle_id
 
                 if writable_err == TRIAL_JOURNAL_IN_BATTLE:
                     entry_view.can_enter = False

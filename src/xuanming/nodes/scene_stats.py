@@ -2,6 +2,8 @@
 
 import math
 from collections import Counter
+from dataclasses import dataclass
+from enum import IntEnum
 
 from .scene_mission import effective_level
 from .scene_player import _fill_item
@@ -14,18 +16,173 @@ PASSIVE_NAMES = {
 UINT64_MAX = (1 << 64) - 1
 UINT32_MAX = (1 << 32) - 1
 
-# 人物战法构筑装配常量（与 C++ skill_loadout_rules.h 对齐：免费 3 套，仙途轻享卡生效扩展至 6 套）。
-LOADOUT_BASE_MAX_SCHEMES = 3
-LOADOUT_MAX_SCHEMES = 6
-LOADOUT_MAX_ROLE_TAG = 3
+# 人物「战法·加点」一体化流派方案纯规则常量（与 C++ skill_loadout_rules.h 严格对齐）：
+# 永久免费 2 套 + 85 级满级永久赠 1 套（共 3 套）+ 仙途轻享卡 +2 套 + 按套按月租用 0..5 套，总计 7 套封顶。
+LOADOUT_BASE_FREE_SCHEMES = 2
+LOADOUT_MAX_LEVEL_FREE_SCHEME_UNLOCK_LEVEL = 85
+LOADOUT_MAX_LEVEL_BONUS_FREE_SCHEMES = 1
+LOADOUT_BASE_MAX_SCHEMES = LOADOUT_BASE_FREE_SCHEMES  # 兼容旧调用方别名
+LOADOUT_LIGHT_CARD_BONUS_SCHEMES = 2
+LOADOUT_MAX_RENTED_EXTRA_SLOTS = 5
+LOADOUT_MAX_SCHEMES = 7
+LOADOUT_MAX_ROLE_TAG = 4  # 0默认 / 1输出 / 2控场 / 3辅助 / 4生存
 LOADOUT_MAX_PASSIVE_SLOTS = 3
 LOADOUT_MAX_PURSUIT_SLOTS = 1
 LOADOUT_MAX_OPENING_SLOTS = 1
+LOADOUT_MAX_NAME_CODE_POINTS = 12
+
+LOADOUT_RENT_UNIT_PRICE_DIAMOND = 30
+LOADOUT_RENT_PERIOD_DAYS = 30
+LOADOUT_SECONDS_PER_DAY = 86_400
+LOADOUT_RENT_PERIOD_SECONDS = LOADOUT_RENT_PERIOD_DAYS * LOADOUT_SECONDS_PER_DAY
+LOADOUT_RENT_MAX_REMAINING_DAYS = 180
+LOADOUT_RENT_MAX_REMAINING_SECONDS = LOADOUT_RENT_MAX_REMAINING_DAYS * LOADOUT_SECONDS_PER_DAY
+LOADOUT_RENT_MAX_PERIODS_PER_CALL = 6
+
+_LOADOUT_DEFAULT_NAMES = ("方案一", "方案二", "方案三", "方案四", "方案五", "方案六", "方案七")
+_LOADOUT_BLOCKED_TERMS = ("官方", "客服", "管理员", "系统消息", "外挂", "代充", "私服", "gm", "admin")
+_LOADOUT_INVISIBLE_CPS = frozenset({
+    0x20, 0xA0, 0x2028, 0x2029, 0x202F, 0x205F, 0x2060, 0x3000, 0xFEFF,
+})
 
 
-def unlocked_skill_schemes(light_card_active: bool) -> int:
-    """返回当前可用的战法构筑方案槽位数（免费 3 套；仙途轻享卡生效 6 套）。"""
-    return LOADOUT_MAX_SCHEMES if light_card_active else LOADOUT_BASE_MAX_SCHEMES
+class LoadoutRentError(IntEnum):
+    NONE = 0
+    INVALID_PARAM = 1
+    SLOTS_INVALID = 2
+    STACK_LIMIT = 3
+
+
+@dataclass(frozen=True, slots=True)
+class LoadoutRentPlan:
+    error: LoadoutRentError = LoadoutRentError.NONE
+    new_rented_slots: int = 0
+    new_expires_at_sec: int = 0
+    prorate_cost_diamond: int = 0
+    renew_cost_diamond: int = 0
+    total_cost_diamond: int = 0
+
+
+def active_rented_loadout_slots(stored_rented_slots: int, rent_expires_at_sec: int, now_unix_sec: int) -> int:
+    """计算当前时刻仍在有效期内的付费租用额外槽位数（过期即锁不删）。"""
+    if rent_expires_at_sec <= now_unix_sec:
+        return 0
+    return min(max(0, int(stored_rented_slots)), LOADOUT_MAX_RENTED_EXTRA_SLOTS)
+
+
+def free_loadout_schemes_for_level(level: int) -> int:
+    """角色有效等级对应的永久免费流派方案数（<85 级 2 套，达 85 级满级永久赠第 3 套）。"""
+    return LOADOUT_BASE_FREE_SCHEMES + (
+        LOADOUT_MAX_LEVEL_BONUS_FREE_SCHEMES if int(level) >= LOADOUT_MAX_LEVEL_FREE_SCHEME_UNLOCK_LEVEL else 0
+    )
+
+
+def max_rentable_extra_loadout_slots(free_schemes: int, light_card_active: bool) -> int:
+    """防溢买可租上限：保证 免费 + 轻享卡附赠 + 租用 <= 7。"""
+    base = int(free_schemes) + (LOADOUT_LIGHT_CARD_BONUS_SCHEMES if light_card_active else 0)
+    return 0 if base >= LOADOUT_MAX_SCHEMES else LOADOUT_MAX_SCHEMES - base
+
+
+def unlocked_skill_schemes(
+    light_card_active: bool,
+    stored_rented_slots: int = 0,
+    rent_expires_at_sec: int = 0,
+    now_unix_sec: int = 0,
+    *,
+    free_schemes: int = LOADOUT_BASE_FREE_SCHEMES,
+) -> int:
+    """返回当前生效的战法·加点一体化流派方案槽位数（2..7）。"""
+    total = (
+        int(free_schemes)
+        + (LOADOUT_LIGHT_CARD_BONUS_SCHEMES if light_card_active else 0)
+        + active_rented_loadout_slots(stored_rented_slots, rent_expires_at_sec, now_unix_sec)
+    )
+    return min(LOADOUT_MAX_SCHEMES, total)
+
+
+def default_loadout_scheme_name(scheme_id: int) -> str:
+    """返回方案默认中文名（方案一..七）。"""
+    if 1 <= scheme_id <= len(_LOADOUT_DEFAULT_NAMES):
+        return _LOADOUT_DEFAULT_NAMES[scheme_id - 1]
+    return f"方案{scheme_id}"
+
+
+def validate_loadout_scheme_name(name: str, sensitive_word_filter=None) -> bool:
+    """校验流派方案名：1..12 字符、非全空白、无控制字符/富文本尖括号、过敏感词检查。"""
+    if not name or len(name) > LOADOUT_MAX_NAME_CODE_POINTS:
+        return False
+    has_visible = False
+    for ch in name:
+        cp = ord(ch)
+        if cp < 0x20 or cp == 0x7F or ch in "<>" or 0x80 <= cp <= 0x9F or 0xD800 <= cp <= 0xDFFF:
+            return False
+        if cp not in _LOADOUT_INVISIBLE_CPS and not (0x2000 <= cp <= 0x200F):
+            has_visible = True
+    if not has_visible:
+        return False
+    if sensitive_word_filter is not None:
+        return bool(sensitive_word_filter(name))
+    lowered = name.lower()
+    return not any(term in lowered for term in _LOADOUT_BLOCKED_TERMS)
+
+
+def plan_skill_loadout_rent(
+    light_card_active: bool,
+    stored_rented_slots: int,
+    current_expires_at_sec: int,
+    now_unix_sec: int,
+    target_rented_slots: int,
+    add_periods: int,
+    free_schemes: int = LOADOUT_BASE_FREE_SCHEMES,
+) -> LoadoutRentPlan:
+    """按套按月租用 / 扩容补差价 / 续期纯规划（向上取整防拆单套利、防溢买、180 天封顶）。"""
+    max_rentable = max_rentable_extra_loadout_slots(free_schemes, light_card_active)
+    active_rented = active_rented_loadout_slots(stored_rented_slots, current_expires_at_sec, now_unix_sec)
+    rent_active = active_rented > 0 and current_expires_at_sec > now_unix_sec
+    remaining_sec = (current_expires_at_sec - now_unix_sec) if rent_active else 0
+
+    if target_rented_slots < 1 or target_rented_slots > max_rentable:
+        return LoadoutRentPlan(error=LoadoutRentError.SLOTS_INVALID)
+    min_allowed_in_term = min(active_rented, max_rentable)
+    if rent_active and target_rented_slots < min_allowed_in_term:
+        return LoadoutRentPlan(error=LoadoutRentError.SLOTS_INVALID)
+    if add_periods > LOADOUT_RENT_MAX_PERIODS_PER_CALL:
+        return LoadoutRentPlan(error=LoadoutRentError.STACK_LIMIT)
+    if not rent_active and add_periods == 0:
+        return LoadoutRentPlan(error=LoadoutRentError.INVALID_PARAM)
+    if rent_active and add_periods == 0 and target_rented_slots <= active_rented:
+        return LoadoutRentPlan(error=LoadoutRentError.INVALID_PARAM)
+
+    add_sec = add_periods * LOADOUT_RENT_PERIOD_SECONDS
+    if add_periods > 0:
+        if remaining_sec > LOADOUT_RENT_MAX_REMAINING_SECONDS or (
+            LOADOUT_RENT_MAX_REMAINING_SECONDS - remaining_sec < add_sec
+        ):
+            return LoadoutRentPlan(error=LoadoutRentError.STACK_LIMIT)
+        if now_unix_sec > UINT64_MAX - remaining_sec - add_sec:
+            return LoadoutRentPlan(error=LoadoutRentError.STACK_LIMIT)
+
+    added_slots = (target_rented_slots - active_rented) if (rent_active and target_rented_slots > active_rented) else 0
+    prorate_cost = 0
+    if added_slots > 0 and remaining_sec > 0:
+        per_period = added_slots * LOADOUT_RENT_UNIT_PRICE_DIAMOND
+        full_periods = remaining_sec // LOADOUT_RENT_PERIOD_SECONDS
+        rem_sec = remaining_sec % LOADOUT_RENT_PERIOD_SECONDS
+        prorate_cost = full_periods * per_period + (
+            0 if rem_sec == 0 else (per_period * rem_sec + LOADOUT_RENT_PERIOD_SECONDS - 1) // LOADOUT_RENT_PERIOD_SECONDS
+        )
+        if prorate_cost == 0:
+            prorate_cost = 1
+    renew_cost = target_rented_slots * LOADOUT_RENT_UNIT_PRICE_DIAMOND * add_periods
+    new_expires = (now_unix_sec + remaining_sec + add_sec) if add_periods > 0 else current_expires_at_sec
+    return LoadoutRentPlan(
+        error=LoadoutRentError.NONE,
+        new_rented_slots=target_rented_slots,
+        new_expires_at_sec=new_expires,
+        prorate_cost_diamond=prorate_cost,
+        renew_cost_diamond=renew_cost,
+        total_cost_diamond=prorate_cost + renew_cost,
+    )
 
 
 def rank_limit(level, row) -> int:

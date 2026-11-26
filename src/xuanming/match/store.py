@@ -359,6 +359,7 @@ class MatchStore(TypingProtocol):
         immediate_battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
         queue_ttl_ms: int,
+        trial_vow_mask: int = 0,
     ) -> tuple[TeamMutationOutcome, Message | None, Message]: ...
 
     # Network probe
@@ -383,6 +384,7 @@ class MatchStore(TypingProtocol):
         pool_region: int,
         queue_ttl_ms: int,
         is_wuxing_tower: bool = False,
+        trial_vow_mask: int = 0,
     ) -> Message: ...
     async def cancel_queue(self, caller: CallerIdentity, queue_ticket: str, request_id: str) -> None: ...
     async def get_queue_status(self, caller: CallerIdentity, request_id: str = "") -> QueueStatusInfo: ...
@@ -430,6 +432,9 @@ class MatchStore(TypingProtocol):
         is_wuxing_tower: bool = False,
         ranked_context: bytes = b"",
         ranked_season_id: int = 0,
+        jianghu_duel_context: bytes = b"",
+        trial_vow_mask: int = 0,
+        skip_ticket_check: bool = False,
     ) -> Message: ...
     async def mark_formation_prepared(self, battle_id: int, player_id: int, endpoint: str) -> None: ...
     async def save_formation_intent(
@@ -814,6 +819,8 @@ class _MemState:
 
     # Wuxing Tower V1 (记录单人排队票是否来自五行幻境爬塔)
     tower_tickets: set[int] = field(default_factory=set)
+    # Trial Journal V3 (记录排队票携带的自选试炼誓约掩码)
+    trial_vow_tickets: dict[int, int] = field(default_factory=dict)
 
 
 class MemoryMatchStore:
@@ -1940,6 +1947,7 @@ class MemoryMatchStore:
         immediate_battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
         queue_ttl_ms: int,
+        trial_vow_mask: int = 0,
     ) -> tuple[TeamMutationOutcome, Message | None, Message]:
         now = await self.now_ms()
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
@@ -2039,6 +2047,7 @@ class MemoryMatchStore:
                     retry_at_ms=now + 60_000,
                     requeue_on_failure=False,
                     release_track=b_track,
+                    trial_vow_mask=int(trial_vow_mask),
                 )
                 for idx, pid in enumerate(member_ids):
                     tk_id = f"tk-{battle_id}-{pid}"
@@ -2174,6 +2183,7 @@ class MemoryMatchStore:
         pool_region: int,
         queue_ttl_ms: int,
         is_wuxing_tower: bool = False,
+        trial_vow_mask: int = 0,
     ) -> Message:
         now = await self.now_ms()
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
@@ -2226,6 +2236,10 @@ class MemoryMatchStore:
                 s.tower_tickets.add(caller.player_id)
             else:
                 s.tower_tickets.discard(caller.player_id)
+            if trial_vow_mask and mode in (MODE_PVE_SOLO, MODE_PVE_TEAM):
+                s.trial_vow_tickets[caller.player_id] = int(trial_vow_mask)
+            else:
+                s.trial_vow_tickets.pop(caller.player_id, None)
             s.join_intents[(caller.player_id, h, l)] = _MemJoinIntentRow(
                 player_id=caller.player_id,
                 request_high=h,
@@ -2507,17 +2521,24 @@ class MemoryMatchStore:
         is_wuxing_tower: bool = False,
         ranked_context: bytes = b"",
         ranked_season_id: int = 0,
+        jianghu_duel_context: bytes = b"",
+        trial_vow_mask: int = 0,
+        skip_ticket_check: bool = False,
     ) -> Message:
         now = await self.now_ms()
 
         def work(s: _MemState) -> Message:
             tower_flag = bool(is_wuxing_tower)
-            for pid, ticket_str, _, _ in members:
-                tk = s.tickets.get(pid)
-                if tk is None or tk.ticket != ticket_str or int(tk.state) != TICKET_STATE_QUEUED:
-                    raise StoreUnavailableError(f"ticket not claimable player={pid}")
-                if mode == MODE_PVE_SOLO and pid in s.tower_tickets:
-                    tower_flag = True
+            vow_mask = int(trial_vow_mask)
+            if not skip_ticket_check:
+                for pid, ticket_str, _, _ in members:
+                    tk = s.tickets.get(pid)
+                    if tk is None or tk.ticket != ticket_str or int(tk.state) != TICKET_STATE_QUEUED:
+                        raise StoreUnavailableError(f"ticket not claimable player={pid}")
+                    if mode == MODE_PVE_SOLO and pid in s.tower_tickets:
+                        tower_flag = True
+                    if not vow_mask and pid in s.trial_vow_tickets:
+                        vow_mask = s.trial_vow_tickets[pid]
             battle_id = self._alloc_id_locked()
             op_id = str(uuid.uuid4())
             formation = self.protocol.message(
@@ -2542,14 +2563,18 @@ class MemoryMatchStore:
                 tournament_context=tournament_context,
                 custom_duel_rules=custom_duel_rules,
                 is_wuxing_tower=tower_flag,
+                jianghu_duel_context=jianghu_duel_context,
+                trial_vow_mask=vow_mask,
             )
             for pid, ticket_str, side, captain in members:
                 formation.members.add(player_id=pid, ticket=ticket_str, team_index=side, captain=captain)
-                tk = s.tickets[pid]
-                tk.state = TICKET_STATE_FORMING
-                tk.formation_id = battle_id
-                tk.selected_region = physical_region
-                s.tower_tickets.discard(pid)
+                if not skip_ticket_check:
+                    tk = s.tickets[pid]
+                    tk.state = TICKET_STATE_FORMING
+                    tk.formation_id = battle_id
+                    tk.selected_region = physical_region
+                    s.tower_tickets.discard(pid)
+                    s.trial_vow_tickets.pop(pid, None)
             for key in team_launch_keys or ():
                 launch = s.team_launches.get(key)
                 if launch is not None:

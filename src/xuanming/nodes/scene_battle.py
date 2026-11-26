@@ -26,6 +26,12 @@ from .battle_dropin_effects import (
 )
 from .battle_tables import battle_table_fingerprint
 from .scene_festival_beast import FESTIVAL_BEAST_PET_CHANGED, FESTIVAL_BEAST_PET_DEAD, SceneFestivalBeast
+from .scene_jianghu import (
+    MATCH_MODE_JIANGHU_DUEL,
+    TX_JIANGHU_DUEL_FEE,
+    TX_JIANGHU_DUEL_REFUND,
+    SceneJianghu,
+)
 from .scene_mission import effective_level
 from .scene_pets import build_single_pet_battle_snapshot, build_standby_battle_snapshots
 from .scene_season import find_active_season_rule, valid_seal_row
@@ -388,22 +394,66 @@ class SceneBattle:
                 if not error and deadline <= self._clock():
                     error = 1005
                 held = False
-                if not error and response.snapshot.items:
+                silver_charged = False
+                is_jianghu_duel = int(getattr(request, "match_mode", 0)) == MATCH_MODE_JIANGHU_DUEL
+                has_jianghu_fee = (
+                    is_jianghu_duel
+                    and "jianghu_duel_fee" in request.DESCRIPTOR.fields_by_name
+                    and request.HasField("jianghu_duel_fee")
+                )
+                jianghu_sys = (
+                    getattr(self.scene, "jianghu", None)
+                    or SceneJianghu(self.scene, self.tables, getattr(self.scene, "assets", None), clock=self._clock)
+                )
+                if not error and (response.snapshot.items or has_jianghu_fee):
                     data = self.scene.rows.assemble(player.snapshot)
-                    counts = {item.item_table_id: item.count for item in response.snapshot.items}
-                    error = self._inventory.place_item_hold(
-                        data, request.battle_id, counts, created_at_ms=self._clock(),
-                        review_after_ms=min(_UINT64_MAX, request.deadline_ms + _SETTLEMENT_GRACE_MS),
+                    assets = getattr(self.scene, "assets", None)
+                    before_fee = (
+                        type(data).FromString(data.SerializeToString())
+                        if (has_jianghu_fee and assets is not None and assets.audit_enabled)
+                        else None
                     )
-                    if error:
-                        error = 1006
-                    if not error:
+                    counts = {item.item_table_id: item.count for item in response.snapshot.items}
+                    jianghu_silver_to_deduct = 0
+                    if has_jianghu_fee:
+                        fee_err, jianghu_silver_to_deduct = jianghu_sys.validate_and_collect_prepare_fee(
+                            data, request.battle_id, request.jianghu_duel_fee, counts,
+                        )
+                        if fee_err:
+                            error = fee_err
+                    if not error and counts:
+                        hold_err = self._inventory.place_item_hold(
+                            data, request.battle_id, counts, created_at_ms=self._clock(),
+                            review_after_ms=min(_UINT64_MAX, request.deadline_ms + _SETTLEMENT_GRACE_MS),
+                        )
+                        if hold_err:
+                            error = 1006
+                    if not error and jianghu_silver_to_deduct > 0:
+                        debit_err = jianghu_sys.commit_prepare_silver_fee(
+                            data, request.battle_id, jianghu_silver_to_deduct,
+                        )
+                        if debit_err:
+                            error = debit_err
+                    if not error and (counts or jianghu_silver_to_deduct > 0):
+                        audit_cb = (
+                            assets.make_audit_callback(
+                                player, before_fee, data, TX_JIANGHU_DUEL_FEE, correlation=request.battle_id,
+                            )
+                            if (before_fee is not None and jianghu_silver_to_deduct > 0)
+                            else None
+                        )
                         try:
-                            await self.scene.commit_player_data(player, data)
+                            if audit_cb is not None:
+                                await self.scene.commit_player_data(player, data, on_committed=audit_cb)
+                            else:
+                                await self.scene.commit_player_data(player, data)
                         except (StoreRejected, StoreUnavailable):
                             error = 1003
                         else:
-                            held = True
+                            held = bool(counts)
+                            silver_charged = jianghu_silver_to_deduct > 0
+                            if silver_charged:
+                                response.jianghu_silver_fee_charged = True
                             # The commit yields to the event loop. A deadline that was
                             # valid before the write may have passed while it was in flight.
                             if deadline <= self._clock():
@@ -424,10 +474,17 @@ class SceneBattle:
                     else:
                         self._freezes[player_id] = entry
                         player.motion.velocity = (0., 0., 0.)
-                if error and held:
+                if error and (held or silver_charged):
+                    response.jianghu_silver_fee_charged = False
                     try:
                         data = self.scene.rows.assemble(player.snapshot)
-                        if release_item_hold(data, request.battle_id):
+                        changed = bool(release_item_hold(data, request.battle_id)) if held else False
+                        if silver_charged:
+                            j_changed, _ = jianghu_sys.on_battle_prepare_cancelled(
+                                data, request.battle_id, skip_silver_refund=False,
+                            )
+                            changed = changed or j_changed
+                        if changed:
                             await self.scene.commit_player_data(player, data)
                     except (StoreRejected, StoreUnavailable):
                         # Keep an uncertain hold for the regular terminal review.
@@ -482,6 +539,9 @@ class SceneBattle:
         is_pvp_challenge = bool(
             request is not None and int(getattr(request, "match_mode", 0)) == MATCH_MODE_PVP_CHALLENGE
         )
+        is_jianghu_duel = bool(
+            request is not None and int(getattr(request, "match_mode", 0)) == MATCH_MODE_JIANGHU_DUEL
+        )
         if has_custom_duel:
             if not is_valid_custom_duel_round_limit(request.custom_duel_rules.round_limit_override):
                 return 1005
@@ -505,6 +565,16 @@ class SceneBattle:
                 logger.warning(
                     "PrepareBattle rejected: wild pet tide habitat inactive player_id=%s battle_config_id=%s required=%s",
                     player.player_id, request.battle_config_id, req_scene,
+                )
+                return 1006
+
+        # 卷四·三境明雷野外首领试炼（boss_trial_kind 12..14）：玩家必须身处对应野外图，防原地跨图偷开。
+        if 12 <= boss_trial_kind <= 14 and dungeon_row is not None and int(getattr(dungeon_row, "scene_id", 0)) > 1:
+            req_scene = int(dungeon_row.scene_id)
+            if current_scene_config_id != req_scene:
+                logger.warning(
+                    "PrepareBattle rejected: wild boss trial scene mismatch player_id=%s battle_config_id=%s required=%s current=%s",
+                    player.player_id, request.battle_config_id, req_scene, current_scene_config_id,
                 )
                 return 1006
 
@@ -572,6 +642,7 @@ class SceneBattle:
             or is_guard_rescue
             or is_npc_isolated_encounter
             or is_guild_war
+            or is_jianghu_duel
             or is_festival_beast
             or is_wuxing_tower
             or has_custom_duel
@@ -681,6 +752,11 @@ class SceneBattle:
 
     async def cancel(self, request):
         player_id = request.player_id
+        skip_silver_refund = bool(getattr(request, "skip_jianghu_silver_refund", False))
+        jianghu_sys = (
+            getattr(self.scene, "jianghu", None)
+            or SceneJianghu(self.scene, self.tables, getattr(self.scene, "assets", None), clock=self._clock)
+        )
         async with self.scene._lock(player_id):
             entry = self._freezes.get(player_id)
             if entry is None and self._player(player_id) is None:
@@ -688,13 +764,68 @@ class SceneBattle:
             if entry and entry.context.battle_id == request.battle_id and entry.context.state == 1:
                 await self._eval(_REMOVE, player_id, str(request.battle_id), entry.context.SerializeToString(deterministic=True))
                 self._thaw(player_id)
-                if (player := self._player(player_id)) is not None and self.scene.mutable(player):
+                if (
+                    (player := self._player(player_id)) is not None
+                    and callable(getattr(self.scene, "mutable", None))
+                    and self.scene.mutable(player)
+                ):
                     await self.scene.flush_player_rows(player)
                     data = self.scene.rows.assemble(player.snapshot)
+                    assets = getattr(self.scene, "assets", None)
+                    before = (
+                        type(data).FromString(data.SerializeToString())
+                        if (assets is not None and assets.audit_enabled)
+                        else None
+                    )
                     changed = bool(release_item_hold(data, request.battle_id))
                     if SceneFestivalBeast.on_battle_prepare_cancelled_or_void(data, request.battle_id):
                         changed = True
+                    j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
+                        data, request.battle_id, skip_silver_refund=skip_silver_refund,
+                    )
+                    if j_changed:
+                        changed = True
                     if changed:
+                        audit_cb = (
+                            assets.make_audit_callback(
+                                player, before, data, TX_JIANGHU_DUEL_REFUND, correlation=request.battle_id,
+                            )
+                            if (before is not None and refunded > 0)
+                            else None
+                        )
+                        if audit_cb is not None:
+                            await self.scene.commit_player_data(player, data, on_committed=audit_cb)
+                        else:
+                            await self.scene.commit_player_data(player, data)
+            elif (
+                entry is None
+                and (player := self._player(player_id)) is not None
+                and callable(getattr(self.scene, "mutable", None))
+                and self.scene.mutable(player)
+            ):
+                # 即使 PREPARING 冻结已先被过期回收，仍须幂等核销/退还待退的普通战书银两，防 500 银两永久滞留。
+                await self.scene.flush_player_rows(player)
+                data = self.scene.rows.assemble(player.snapshot)
+                assets = getattr(self.scene, "assets", None)
+                before = (
+                    type(data).FromString(data.SerializeToString())
+                    if (assets is not None and assets.audit_enabled)
+                    else None
+                )
+                j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
+                    data, request.battle_id, skip_silver_refund=skip_silver_refund,
+                )
+                if j_changed:
+                    audit_cb = (
+                        assets.make_audit_callback(
+                            player, before, data, TX_JIANGHU_DUEL_REFUND, correlation=request.battle_id,
+                        )
+                        if (before is not None and refunded > 0)
+                        else None
+                    )
+                    if audit_cb is not None:
+                        await self.scene.commit_player_data(player, data, on_committed=audit_cb)
+                    else:
                         await self.scene.commit_player_data(player, data)
         return self.protocol.message("Empty")
 

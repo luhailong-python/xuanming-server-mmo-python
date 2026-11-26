@@ -511,8 +511,12 @@ class SceneNode:
             if self.battle:
                 await self.battle.restore(player, notify=False)
             proxy_dir = getattr(self, "craft_proxy_directory", None)
-            if proxy_dir is not None and saved.HasField("craft_component") and saved.craft_component.proxy_stall_open:
-                proxy_dir.sync_player(request.player_id, saved)
+            if proxy_dir is not None:
+                from .scene_skill_craft import drain_pending_proxy_reputation
+                if await drain_pending_proxy_reputation(self, player):
+                    saved = self.rows.assemble(player.snapshot)
+                if saved.HasField("craft_component") and saved.craft_component.proxy_stall_open:
+                    proxy_dir.sync_player(request.player_id, saved)
             if admission:
                 await self.travel.confirm(admission)
             return player

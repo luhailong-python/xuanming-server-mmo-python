@@ -1,7 +1,7 @@
 """角色属性面板、加点方案、战斗平滑升级曲线及存档入口。"""
 
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from inspect import isawaitable
 import logging
 import time
@@ -11,7 +11,16 @@ from ..data.asset_inventory import FEATURE_UNAVAILABLE, INSUFFICIENT, INVALID, U
 from ..data.attribute_allocation import AllocationError, distribute_points, evaluate_pool, is_unlocked, validate_allocation
 from .scene_mission import LEVEL, effective_level
 from .scene_skills import _rescale
-from .scene_stats import STATS, UINT32_MAX, UINT64_MAX, _equipment, class_id, player_stats
+from .scene_stats import (
+    STATS,
+    UINT32_MAX,
+    UINT64_MAX,
+    _equipment,
+    class_id,
+    free_loadout_schemes_for_level,
+    player_stats,
+    unlocked_skill_schemes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +37,8 @@ _IN_BATTLE = 25011
 _INSUFFICIENT_GOLD = 25012
 _NO_PLAN = 25013
 _NO_CHANGE = 25014
+_LOADOUT_ATTRIBUTE_INVALID = 7034
+_LOADOUT_ATTRIBUTE_RESET_REQUIRED = 7035
 _ALLOCATION_TIPS = {
     AllocationError.POOL_LOCKED: _POOL_LOCKED,
     AllocationError.DIMENSION_NOT_IN_POOL: 25002,
@@ -113,6 +124,25 @@ class BattleProgressionDelta:
     silver_diminished: bool = False
     leveled_up: bool = False
     ledger_changed: bool = False
+
+
+@dataclass(slots=True)
+class SchemeAllocationSummary:
+    """7 套战法·加点一体化方案的单个方案四维加点摘要。"""
+
+    allocated: dict[int, int] = field(default_factory=dict)
+    remaining: int = 0
+    total_points: int = 0
+
+
+@dataclass(slots=True)
+class PreparedSchemeAllocation:
+    """战法保存前预校验并准备好的四维加点变更计划。"""
+
+    pool_id: int = 0
+    reset_cost_gold: int = 0
+    needs_reset: bool = False
+    target: dict[int, int] = field(default_factory=dict)
 
 
 def capped_level(stored_level: int) -> int:
@@ -424,7 +454,187 @@ class SceneAttributes:
 
     def _max_schemes_for(self, data) -> int:
         base = self._max_schemes()
-        return base + LIGHT_CARD_BONUS_SCHEMES if self._afk_pass_active(data) else base
+        skills = getattr(self.scene, "skills", None)
+        if skills is not None and hasattr(skills, "unlocked_loadout_scheme_count"):
+            return max(base, int(skills.unlocked_loadout_scheme_count(data)))
+        rented = int(data.skill_list.rented_extra_slots) if data.HasField("skill_list") else 0
+        expires = int(data.skill_list.rent_expires_at_sec) if data.HasField("skill_list") else 0
+        free = free_loadout_schemes_for_level(effective_level(data))
+        unlocked = unlocked_skill_schemes(
+            self._afk_pass_active(data), rented, expires, int(self.now_s()), free_schemes=free,
+        )
+        return max(base, unlocked)
+
+    def _primary_player_pool(self):
+        return next(iter(self.pools.values()), None)
+
+    def _find_or_create_unified_scheme(self, comp, scheme_id: int, fallback_name: str):
+        existing = self._scheme(comp, scheme_id)
+        if existing is not None:
+            return existing
+        created = comp.schemes.add(scheme_id=scheme_id, name=fallback_name or _default_name(scheme_id))
+        if comp.next_scheme_id <= scheme_id:
+            comp.next_scheme_id = min(scheme_id + 1, UINT32_MAX)
+        return created
+
+    def fill_scheme_allocation_summary(self, data, scheme_id: int) -> SchemeAllocationSummary | None:
+        """读取指定流派方案号（1..7）的四维加点摘要（不依赖是否已创建）。"""
+        if not self._present(data):
+            return None
+        pool = self._primary_player_pool()
+        if pool is None:
+            return None
+        comp = data.attribute_component
+        scheme = self._scheme(comp, scheme_id)
+        allocated = scheme.allocated if scheme is not None else {}
+        current, state = self._pool_state(comp, allocated, pool, effective_level(data))
+        return SchemeAllocationSummary(
+            allocated=dict(current),
+            remaining=int(state.remaining),
+            total_points=int(state.total),
+        )
+
+    def player_pool_reset_cost_gold(self, data) -> int:
+        """返回角色当前等级及激活方案下洗点所需银两（30 级以下为 0）。"""
+        if not self._present(data):
+            return 0
+        pool = self._primary_player_pool()
+        if pool is None:
+            return 0
+        comp = data.attribute_component
+        scheme = self._scheme(comp, comp.active_scheme_id)
+        allocated = scheme.allocated if scheme is not None else {}
+        level = effective_level(data)
+        _, state = self._pool_state(comp, allocated, pool, level)
+        return int(self._reset_cost(pool, level, state))
+
+    def switch_cooldown_until(self, data) -> int:
+        """返回属性加点方案切换冷却截止 Unix 秒。"""
+        if not data.HasField("attribute_component") or not self.rule or not self.rule.switch_cooldown_seconds:
+            return 0
+        return min(UINT64_MAX, int(data.attribute_component.last_switch_time) + int(self.rule.switch_cooldown_seconds))
+
+    @staticmethod
+    def active_scheme_id(data) -> int:
+        return int(data.attribute_component.active_scheme_id) if data.HasField("attribute_component") else 0
+
+    def prepare_scheme_allocation(
+        self, player, data, scheme_id: int, target: dict[int, int], reset_if_needed: bool,
+    ) -> tuple[int, PreparedSchemeAllocation]:
+        """预检战法·加点一体化方案的四维加点目标，支持降点洗点费校验。"""
+        prepared = PreparedSchemeAllocation()
+        if error := self._write_error(player, data):
+            return error, prepared
+        pool = self._primary_player_pool()
+        if pool is None:
+            return _POOL_NOT_FOUND, prepared
+        comp = data.attribute_component
+        existing = self._scheme(comp, scheme_id)
+        allocated = existing.allocated if existing is not None else {}
+        level = effective_level(data)
+        current, state = self._pool_state(comp, allocated, pool, level)
+        foreign = sum(value for key, value in allocated.items() if key not in self.dimensions)
+
+        for dim_id, want in target.items():
+            if dim_id not in current:
+                return _LOADOUT_ATTRIBUTE_INVALID, prepared
+            if pool.dimension_cap and want > pool.dimension_cap:
+                return _LOADOUT_ATTRIBUTE_INVALID, prepared
+
+        new_known_used = 0
+        decreased = False
+        changed = False
+        for dim_id, cur_val in current.items():
+            want = int(target.get(dim_id, 0))
+            new_known_used += want
+            if want < cur_val:
+                decreased = True
+            if want != cur_val:
+                changed = True
+            prepared.target[dim_id] = want
+
+        if not is_unlocked(pool, level) and new_known_used > 0:
+            return _LOADOUT_ATTRIBUTE_INVALID, prepared
+        if new_known_used > state.total or foreign > state.total - new_known_used:
+            return _LOADOUT_ATTRIBUTE_INVALID, prepared
+
+        needs_reset = decreased or (not state.effective and changed)
+        if needs_reset:
+            if not reset_if_needed:
+                return _LOADOUT_ATTRIBUTE_RESET_REQUIRED, prepared
+            reset_cost = self._reset_cost(pool, level, state) if state.known_used > 0 else 0
+            if reset_cost > 0:
+                if hasattr(self.assets, "can_afford_gold_with_bind"):
+                    can_afford = self.assets.can_afford_gold_with_bind(data, reset_cost)
+                else:
+                    can_afford = (
+                        len(data.currency.values) > self.gold and data.currency.values[self.gold] >= reset_cost
+                    )
+                if not can_afford:
+                    return _INSUFFICIENT_GOLD, prepared
+            prepared.needs_reset = True
+            prepared.reset_cost_gold = int(reset_cost)
+        prepared.pool_id = pool.id
+        return 0, prepared
+
+    def commit_scheme_allocation_and_switch(
+        self,
+        data,
+        scheme_id: int,
+        scheme_name: str,
+        apply_allocation: bool,
+        prepared: PreparedSchemeAllocation,
+    ) -> tuple[int, str]:
+        """原地提交一体化方案四维加点与名称，并在无冷却时同步激活对应属性方案。"""
+        if not data.HasField("attribute_component"):
+            return (UNAVAILABLE if apply_allocation else 0), ""
+        if apply_allocation and prepared.needs_reset and prepared.reset_cost_gold > 0:
+            if err := self._debit(data, prepared.reset_cost_gold):
+                return err, ""
+        comp = data.attribute_component
+        scheme = self._find_or_create_unified_scheme(comp, scheme_id, scheme_name)
+        if scheme_name:
+            scheme.name = scheme_name
+        if apply_allocation:
+            for dim_id, want in prepared.target.items():
+                if want == 0:
+                    scheme.allocated.pop(dim_id, None)
+                else:
+                    scheme.allocated[dim_id] = want
+            logger.info(
+                "Unified loadout allocation saved scheme=%s reset_gold=%s",
+                scheme_id, prepared.reset_cost_gold,
+            )
+        notice = ""
+        if comp.active_scheme_id != scheme_id:
+            now = int(self.now_s())
+            if self.rule and self.rule.switch_cooldown_seconds and (
+                comp.last_switch_time + self.rule.switch_cooldown_seconds > now
+            ):
+                notice = "战法与加点方案已保存，但加点切换处于冷却中，冷却结束后可切换生效"
+            else:
+                comp.active_scheme_id = scheme_id
+                comp.last_switch_time = now
+        return 0, notice
+
+    def try_sync_linked_scheme_for_skill(self, data, scheme_id: int, scheme_name: str) -> str:
+        """战法方案切换时同步切换同名同号属性方案；处于切换冷却时仅返回提示不报错。"""
+        if not data.HasField("attribute_component"):
+            return ""
+        comp = data.attribute_component
+        scheme = self._find_or_create_unified_scheme(comp, scheme_id, scheme_name)
+        if scheme_name and not scheme.name:
+            scheme.name = scheme_name
+        if comp.active_scheme_id == scheme_id:
+            return ""
+        now = int(self.now_s())
+        if self.rule and self.rule.switch_cooldown_seconds and (
+            comp.last_switch_time + self.rule.switch_cooldown_seconds > now
+        ):
+            return "战法已切换；加点方案处于60秒切换冷却中，冷却结束后可重新切换同步"
+        comp.active_scheme_id = scheme_id
+        comp.last_switch_time = now
+        return ""
 
     def load_level_exp_rows(self) -> list[LevelExpRow]:
         if "PlayerLevelExp" not in self.tables.tables:

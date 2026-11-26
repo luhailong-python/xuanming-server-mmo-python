@@ -63,6 +63,7 @@ from .model import (
     newest_rows,
     normalize_spam_hash,
     policy_hash,
+    render_system_world_notice,
     stream_key,
     utc_day_ymd,
     valid_account,
@@ -884,6 +885,53 @@ class ChatStoreCore:
         if tip == 0 and self._world_window is not None:
             self._world_window.invalidate()
         return retracted, tip
+
+    async def publish_system_world_notice(self, request: Message) -> SendResult:
+        """幂等写入系统全服模板播报至世界频道权威历史（player_id=0, request_id=notice_id）。"""
+        content, ok = render_system_world_notice(request)
+        if not ok:
+            raise InvalidChatError("invalid system world notice request")
+        notice_id_bytes = request.notice_id.strip().encode("utf-8")
+        raw_request = request.SerializeToString(deterministic=True)
+        digest = hashlib.sha256(raw_request).digest()
+        stream_bytes = world_stream_key(0).encode("utf-8")
+
+        async def tx_work(tx: ChatTx) -> SendResult:
+            existing = await tx.read_receipt(0, notice_id_bytes)
+            if existing is not None:
+                raise _TxRollbackReturn(SendResult(duplicate=True))
+            now_ms = await tx.now_ms()
+            if now_ms <= 0 or now_ms > INT64_MAX:
+                raise StoreUnavailableError(f"invalid SQL timestamp: {now_ms}")
+            message = self._protocol.message(
+                "chatpb.ChatMessage",
+                sender_player_id=0,
+                target_player_id=0,
+                channel=CHANNEL_WORLD,
+                content=content,
+                send_time_ms=now_ms,
+            )
+            payload = message.SerializeToString(deterministic=True)
+            inserted = await tx.insert_send_authority(
+                0,
+                notice_id_bytes,
+                b"system",
+                0,
+                digest,
+                raw_request,
+                payload,
+                stream_bytes,
+                now_ms,
+                accepted_at_utc(now_ms),
+            )
+            if not inserted:
+                raise _TxRollbackReturn(SendResult(duplicate=True))
+            return SendResult(message=message)
+
+        result = await self._driver.run_tx(tx_work)
+        if not result.duplicate and result.message is not None and self._world_window is not None:
+            self._world_window.invalidate()
+        return result
 
     async def report_message(self, identity: ActorIdentity, request: Message) -> int:
         """核验目标消息存在且对当前举报人可见后，幂等写入举报审计表 chat_report。"""

@@ -20,6 +20,12 @@ from .scene_attributes import (
 )
 from .scene_equip_craft import resolve_game_week
 from .scene_festival_beast import SceneFestivalBeast
+from .scene_jianghu import (
+    CURRENCY_GOLD,
+    MATCH_MODE_JIANGHU_DUEL,
+    TX_JIANGHU_DUEL_REFUND,
+    SceneJianghu,
+)
 from .scene_mission import LEVEL, now_ms
 from .scene_stats import pet_pool, pet_stats, player_stats
 
@@ -88,6 +94,16 @@ class BattleSettlement:
                 return False
             release_item_hold(data, settlement.battle_id)
             SceneFestivalBeast.on_battle_prepare_cancelled_or_void(data, settlement.battle_id)
+            jianghu_sys = getattr(self.scene, "jianghu", None) or SceneJianghu(
+                self.scene, self.tables, self.assets, clock=self.clock,
+            )
+            checkpoint = self._checkpoint(data, audits)
+            _, refunded = jianghu_sys.on_battle_void(data, settlement.battle_id)
+            if refunded > 0:
+                self._audit(
+                    player, checkpoint, data, TX_JIANGHU_DUEL_REFUND, audits,
+                    correlation=settlement.battle_id, credit=True,
+                )
             if not any(entry.battle_id == settlement.battle_id for entry in data.battle_results.entries):
                 self._record(data.battle_results, settlement, {}, {}, {}, self.clock())
             return True
@@ -113,9 +129,47 @@ class BattleSettlement:
         boss_trial_kind = int(getattr(settlement, "boss_trial_kind", 0))
         is_npc_isolated_encounter = 9 <= boss_trial_kind <= 11
         is_guild_war = int(settlement.match_mode) in (9, 10)
+        is_jianghu_duel = int(settlement.match_mode) == MATCH_MODE_JIANGHU_DUEL
         is_festival_beast = (
             settlement.HasField("festival_beast") and settlement.festival_beast.activity_instance_id != 0
         ) or boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST
+
+        # 天墉生死状一期：零材料/零经验/零银两产出，严格隔离场外血蓝宠；同收件箱原子写 30 分钟败者印记/复仇清标并核销预留金帖或退 0 回合银两。
+        if is_jianghu_duel:
+            jianghu_sys = getattr(self.scene, "jianghu", None) or SceneJianghu(
+                self.scene, self.tables, self.assets, clock=self.clock,
+            )
+            j_err, jianghu_candidate, jianghu_changed, gold_writ_to_consume, silver_refund = (
+                jianghu_sys.prepare_battle_settlement(player, data, settlement, stamp)
+            )
+            if j_err:
+                return False
+            isolated_consumed: dict[int, int] = {}
+            if silver_refund > 0:
+                checkpoint = self._checkpoint(data, audits)
+                if self.assets.add_currency(data, CURRENCY_GOLD, silver_refund, counts_as_gain=False):
+                    return False
+                self._audit(
+                    player, checkpoint, data, TX_JIANGHU_DUEL_REFUND, audits,
+                    correlation=settlement.battle_id, credit=True,
+                )
+            if gold_writ_to_consume:
+                checkpoint = self._checkpoint(data, audits)
+                if self.assets.consume_items(data, {gold_writ_to_consume: 1}, except_hold_id=settlement.battle_id):
+                    return False
+                isolated_consumed[gold_writ_to_consume] = 1
+                self._audit(
+                    player, checkpoint, data, 13, audits,
+                    correlation=settlement.battle_id, item_extra={"source": "jianghu-duel-writ"},
+                )
+            if jianghu_changed:
+                data.jianghu_component.CopyFrom(jianghu_candidate)
+            release_item_hold(data, settlement.battle_id)
+            self._record(
+                data.battle_results, settlement, {}, {}, isolated_consumed, stamp,
+                items_mailed=False, fb_delta=None, prog_delta=None, season_delta=None, trial_delta=None,
+            )
+            return True
 
         # 计算全玩法战斗经验/银两与周银两软上限候选账本（与货币入账同一次提交）。
         attributes = getattr(self.scene, "attributes", None)
@@ -241,11 +295,15 @@ class BattleSettlement:
         if not is_npc_isolated_encounter and travel_pass is not None and hasattr(travel_pass, "apply_battle_credit"):
             travel_pass.apply_battle_credit(data, settlement, stamp)
         season_delta = None
+        trial_delta = None
         if not is_npc_isolated_encounter:
-            season_delta = self._apply_progression_hooks(player, data, settlement, stamp, is_festival_beast=is_festival_beast)
+            season_delta, trial_delta = self._apply_progression_hooks(
+                player, data, settlement, stamp, is_festival_beast=is_festival_beast,
+            )
         self._record(
             data.battle_results, settlement, currencies, gained, consumed, stamp,
-            items_mailed=items_mailed, fb_delta=fb_delta, prog_delta=prog_delta, season_delta=season_delta,
+            items_mailed=items_mailed, fb_delta=fb_delta, prog_delta=prog_delta,
+            season_delta=season_delta, trial_delta=trial_delta,
         )
         # 离线托管期间的真实战斗结算同帧记入收获简报（不额外发产出）。
         hosting_active = bool(getattr(player, "hosting_active", False) or getattr(player, "disconnect_at", None) is not None)
@@ -280,7 +338,7 @@ class BattleSettlement:
 
     def _apply_progression_hooks(
         self, player, data, settlement, stamp: int, *, is_festival_beast: bool = False,
-    ) -> dict | None:
+    ) -> tuple[dict | None, dict | None]:
         """在战斗终局落盘前，安全推进赛季印、试炼志与装备每日材料自选额度。"""
         if (
             settlement.fled
@@ -288,12 +346,13 @@ class BattleSettlement:
             or settlement.player_team_index > 1
             or settlement.outcome not in (1, 2, 3)
         ):
-            return None
+            return None, None
         player_won = (
             (settlement.outcome == 1 and settlement.player_team_index == 0)
             or (settlement.outcome == 2 and settlement.player_team_index == 1)
         )
         season_delta = None
+        trial_delta = None
 
         if not is_festival_beast:
             season = getattr(self.scene, "season", None)
@@ -336,9 +395,9 @@ class BattleSettlement:
             if trial_journal is not None:
                 try:
                     if _has_trial_facts(settlement):
-                        trial_journal.record_trial_progress(data, settlement=settlement)
+                        trial_delta = trial_journal.record_trial_progress(data, settlement=settlement)
                     elif settlement.battle_config_id:
-                        trial_journal.record_trial_progress(
+                        trial_delta = trial_journal.record_trial_progress(
                             data,
                             settlement.battle_config_id,
                             won=player_won,
@@ -346,6 +405,7 @@ class BattleSettlement:
                             total_rounds=settlement.total_rounds,
                             self_or_pet_ever_died=bool(settlement.is_dead),
                             achieved_at_ms=settlement.finished_at_ms or stamp,
+                            battle_id=int(settlement.battle_id),
                         )
                 except Exception:
                     logger.warning(
@@ -373,7 +433,7 @@ class BattleSettlement:
                     "Battle settlement material reward hook failed player_id=%s battle_id=%s",
                     player.player_id, settlement.battle_id, exc_info=True,
                 )
-        return season_delta
+        return season_delta, trial_delta
 
     def _checkpoint(self, data, audits):
         if audits is not None and self.assets.audit_enabled:
@@ -527,7 +587,7 @@ class BattleSettlement:
     def _record(
         history, settlement, currencies, gained, consumed, stamp, *,
         items_mailed=False, fb_delta=None, prog_delta: BattleProgressionDelta | None = None,
-        season_delta: dict | None = None,
+        season_delta: dict | None = None, trial_delta: dict | None = None,
     ):
         seq = max(history.last_result_seq, max((entry.result_seq for entry in history.entries), default=0)) + 1
         history.last_result_seq = seq
@@ -566,6 +626,14 @@ class BattleSettlement:
             entry.festival_wins_after = int(fb_delta.get("wins_after", 0))
             entry.festival_required_wins = int(fb_delta.get("required_wins", 0))
             entry.festival_newly_eligible = bool(fb_delta.get("newly_eligible", False))
+        if trial_delta and trial_delta.get("entry_id"):
+            entry.trial_journal_entry_id = int(trial_delta["entry_id"])
+            entry.trial_newly_lit_seal_ids.extend(int(sid) for sid in trial_delta.get("newly_lit_seal_ids", ()))
+            entry.trial_new_solo_best = bool(trial_delta.get("new_solo_best", False))
+            entry.trial_new_coop_best = bool(trial_delta.get("new_coop_best", False))
+            entry.trial_vow_mask = int(trial_delta.get("vow_mask", 0))
+            entry.trial_new_vow_best = bool(trial_delta.get("new_vow_best", False))
+            entry.trial_battle_id = int(trial_delta.get("battle_id", 0))
         for kind, amount in sorted(currencies.items()):
             entry.currencies.add(currency_type=kind, amount=amount)
         for items, lines in ((gained, entry.items_gained), (consumed, entry.items_consumed)):

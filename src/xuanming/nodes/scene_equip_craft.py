@@ -25,6 +25,7 @@ from .scene_skill_craft import (
     mastery_tier_for_exp,
     mastery_tier_name,
     proxy_net_gold,
+    record_proxy_order_reputation,
     valid_proxy_fee,
 )
 
@@ -82,6 +83,7 @@ UPGRADE_TIER_ACCESSORY_GOLD_PER_STEP = 60
 MIN_QUALITY_TIER = 1
 MAX_QUALITY_TIER = 5
 POLISH_PITY_LIMIT = 8
+MAX_BATCH_POLISH_ATTEMPTS = POLISH_PITY_LIMIT
 SPEED_AFFIX_EFFECT = 4
 
 _OUTCOME_UNKNOWN = 0
@@ -1303,6 +1305,11 @@ class SceneEquipCraft:
         if carries_unknown(choice):
             return FEATURE_UNAVAILABLE, None
         op = choice.operation
+        if op != _OP_POLISH_AFFIX and (
+            int(getattr(choice, "target_quality_tier", 0)) != 0
+            or int(getattr(choice, "max_polish_attempts", 0)) != 0
+        ):
+            return INVALID, None
         if op == _OP_CREATE_ITEM:
             if (
                 choice.item_id or choice.affix_slot or choice.affix_id or choice.source_item_id
@@ -1500,6 +1507,16 @@ class SceneEquipCraft:
                 return EQUIP_AFFIX_ALREADY_MAX_QUALITY, None
             if choice.HasField("expected_polish_pity_count") and choice.expected_polish_pity_count != current.polish_pity_count:
                 return EQUIP_POLISH_PITY_CHANGED, None
+            req_target_tier = int(getattr(choice, "target_quality_tier", 0))
+            req_max_attempts = int(getattr(choice, "max_polish_attempts", 0))
+            if req_max_attempts > MAX_BATCH_POLISH_ATTEMPTS:
+                return INVALID, None
+            if req_target_tier != 0 and (
+                req_target_tier < 2 or req_target_tier > MAX_QUALITY_TIER or req_target_tier <= current_tier
+            ):
+                return INVALID, None
+            if choice.use_guarantee_charm and (req_target_tier != 0 or req_max_attempts > 1):
+                return INVALID, None
             consumed = {POLISH_SAND_ID: 1}
             extra_id = GUARANTEE_CHARM_ID if choice.use_guarantee_charm else 0
             extra_count = 1 if choice.use_guarantee_charm else 0
@@ -1527,6 +1544,44 @@ class SceneEquipCraft:
             if err := self._resolve_proxy_master(buyer_id, data, int(choice.proxy_master_player_id), prepared):
                 return err, None
             self._plan_bound_policy(data, choice, is_create_new=False, prepared=prepared)
+
+            pity_remaining = (
+                POLISH_PITY_LIMIT - int(current.polish_pity_count)
+                if int(current.polish_pity_count) < POLISH_PITY_LIMIT
+                else 1
+            )
+            batch_requested = (not choice.use_guarantee_charm) and (req_target_tier != 0 or req_max_attempts > 1)
+            if batch_requested:
+                polish_target_tier = req_target_tier if req_target_tier != 0 else MAX_QUALITY_TIER
+                requested_cap = req_max_attempts if req_max_attempts != 0 else MAX_BATCH_POLISH_ATTEMPTS
+                max_by_pity = min(requested_cap, pity_remaining)
+                sand_avail = (
+                    self.assets.removable_tradable_count(data, POLISH_SAND_ID)
+                    if prepared.get("tradable_only") and hasattr(self.assets, "removable_tradable_count")
+                    else self._available_material(data, POLISH_SAND_ID)
+                )
+                max_by_sand = min(max_by_pity, sand_avail)
+                allow_bind_for_base = bool(prepared["result"].bound)
+                unit_strict = prepared["proxy_fee_gold"] + (0 if allow_bind_for_base else prepared["base_gold_cost"])
+                unit_prefer_bind = prepared["base_gold_cost"] if allow_bind_for_base else 0
+                max_by_gold = 0
+                for n in range(1, max_by_sand + 1):
+                    if (unit_strict == 0 and unit_prefer_bind == 0) or self.assets.can_afford_split_gold(
+                        data, unit_strict * n, unit_prefer_bind * n,
+                    ):
+                        max_by_gold = n
+                    else:
+                        break
+                max_polish_attempts = max(1, max_by_gold)
+            else:
+                polish_target_tier = 0
+                max_polish_attempts = 1
+            prepared["polish_target_tier"] = polish_target_tier
+            prepared["max_polish_attempts"] = max_polish_attempts
+            prepared["max_polish_sand_cost"] = max_polish_attempts
+            prepared["max_polish_gold_cost"] = max_polish_attempts * (
+                prepared["base_gold_cost"] + prepared["proxy_fee_gold"]
+            )
             return 0, prepared
 
         if op == _OP_UNSEAL_TO_TRADABLE:
@@ -1700,10 +1755,12 @@ class SceneEquipCraft:
 
         return INVALID, None
 
-    def _split_gold_costs(self, op: int, prepared: dict) -> tuple[int, int]:
+    def _split_gold_costs(
+        self, op: int, prepared: dict, *, base_gold_override: int | None = None, proxy_fee_override: int | None = None,
+    ) -> tuple[int, int]:
         allow_bind_for_base_fee = (op != _OP_UNSEAL_TO_TRADABLE) and bool(prepared["result"].bound)
-        base_gold = int(prepared.get("base_gold_cost", 0))
-        proxy_fee = int(prepared.get("proxy_fee_gold", 0))
+        base_gold = int(prepared.get("base_gold_cost", 0)) if base_gold_override is None else int(base_gold_override)
+        proxy_fee = int(prepared.get("proxy_fee_gold", 0)) if proxy_fee_override is None else int(proxy_fee_override)
         strict_gold = proxy_fee + (0 if allow_bind_for_base_fee else base_gold)
         prefer_bind_gold = base_gold if allow_bind_for_base_fee else 0
         return strict_gold, prefer_bind_gold
@@ -1807,6 +1864,9 @@ class SceneEquipCraft:
         preview.proxy_fee_gold = int(prepared.get("proxy_fee_gold", 0))
         if prepared.get("proxy_master_name"):
             preview.proxy_master_name = prepared["proxy_master_name"]
+        preview.max_polish_attempts = int(prepared.get("max_polish_attempts", 1))
+        preview.max_polish_sand_cost = int(prepared.get("max_polish_sand_cost", 0))
+        preview.max_polish_gold_cost = int(prepared.get("max_polish_gold_cost", 0))
         unavailable = self._check_availability(player, data, request.choice.operation, prepared)
         preview.available = unavailable == 0
         if unavailable:
@@ -1822,6 +1882,7 @@ class SceneEquipCraft:
     def _fill_craft_applied(
         self, player, data, response, *, item_id: int, result_rev: int, replayed: bool,
         quality_tier: int = 0, polish_pity_count: int = 0, guaranteed_by_pity: bool = False,
+        polish_attempts_used: int = 0, actual_gold_spent: int = 0, polish_steps: list | None = None,
     ):
         response.outcome = _OUTCOME_APPLIED
         response.replayed = replayed
@@ -1832,6 +1893,11 @@ class SceneEquipCraft:
         response.result_quality_tier = quality_tier
         response.result_polish_pity_count = polish_pity_count
         response.guaranteed_by_pity = guaranteed_by_pity
+        response.polish_attempts_used = int(polish_attempts_used)
+        response.actual_gold_spent = int(actual_gold_spent)
+        if polish_steps:
+            for step in polish_steps:
+                response.polish_steps.add().CopyFrom(step)
         self._fill_forge_mastery(data, response.forge_mastery)
         inv = _bag(self.scene, self.tables, player, 0)
         eq = _bag(self.scene, self.tables, player, 2)
@@ -1882,6 +1948,8 @@ class SceneEquipCraft:
                 quality_tier=int(getattr(prior, "equipment_quality_tier", 0)),
                 polish_pity_count=int(getattr(prior, "equipment_polish_pity_count", 0)),
                 guaranteed_by_pity=bool(getattr(prior, "equipment_guaranteed_by_pity", False)),
+                polish_attempts_used=int(getattr(prior, "equipment_polish_attempts_used", 0)),
+                actual_gold_spent=int(getattr(prior, "equipment_actual_gold_spent", 0)),
             )
 
         if request.expected_forge_revision != current_rev:
@@ -1903,6 +1971,8 @@ class SceneEquipCraft:
         res_quality_tier = 0
         res_polish_pity = 0
         res_guaranteed = False
+        actual_polish_attempts = 1
+        polish_steps = []
         target_idx = prepared["target_affix_index"]
         if (op == _OP_INSTALL_AFFIX or prepared["reroll_quality_on_reforge"]) and target_idx >= 0:
             target = prepared["result"].equip.fixed_affixes[target_idx]
@@ -1920,23 +1990,47 @@ class SceneEquipCraft:
             res_polish_pity = int(target.polish_pity_count)
         elif op == _OP_POLISH_AFFIX and target_idx >= 0:
             target = prepared["result"].equip.fixed_affixes[target_idx]
-            cur_tier = effective_quality_tier(int(target.quality_tier), False)
-            rolled_tier = self._roll_quality_for_mastery(prepared["effective_mastery_tier"])
-            new_tier, new_pity, guaranteed = resolve_polish(
-                cur_tier, int(target.polish_pity_count), rolled_tier, bool(request.choice.use_guarantee_charm),
-            )
-            target.quality_tier = new_tier
-            target.polish_pity_count = new_pity
-            res_quality_tier = new_tier
-            res_polish_pity = new_pity
+            tier = effective_quality_tier(int(target.quality_tier), False)
+            pity = int(target.polish_pity_count)
+            guaranteed = False
+            actual_polish_attempts = 0
+            max_attempts = int(prepared.get("max_polish_attempts", 1))
+            polish_target_tier = int(prepared.get("polish_target_tier", 0))
+            for step_idx in range(1, max_attempts + 1):
+                rolled_tier = self._roll_quality_for_mastery(prepared["effective_mastery_tier"])
+                new_tier, new_pity, step_guaranteed = resolve_polish(
+                    tier, pity, rolled_tier, bool(request.choice.use_guarantee_charm),
+                )
+                polish_steps.append(
+                    self.protocol.message(
+                        "PolishStepTrace",
+                        attempt_index=step_idx,
+                        rolled_tier=rolled_tier,
+                        tier_before=tier,
+                        tier_after=new_tier,
+                        guaranteed_by_pity=step_guaranteed,
+                    )
+                )
+                tier = new_tier
+                pity = new_pity
+                guaranteed = guaranteed or step_guaranteed
+                actual_polish_attempts = step_idx
+                if tier >= MAX_QUALITY_TIER or (polish_target_tier > 0 and tier >= polish_target_tier):
+                    break
+            target.quality_tier = tier
+            target.polish_pity_count = pity
+            res_quality_tier = tier
+            res_polish_pity = pity
             res_guaranteed = guaranteed
+            # 仅按实际执行手数精准扣除重铸砂，绝不多扣未使用手数。
+            prepared["consumed"][POLISH_SAND_ID] = actual_polish_attempts
 
-        if (
+        supreme_produced = (
             op in (_OP_INSTALL_AFFIX, _OP_POLISH_AFFIX)
             and not prepared["polish_exempt"]
             and res_quality_tier == MAX_QUALITY_TIER
-            and prepared["effective_mastery_tier"] == MASTERY_MASTER
-        ):
+        )
+        if supreme_produced and prepared["effective_mastery_tier"] == MASTERY_MASTER:
             signer_id = prepared["proxy_master_player_id"] or player.player_id
             signer_name = (
                 prepared["proxy_master_name"]
@@ -1962,7 +2056,20 @@ class SceneEquipCraft:
             if used_bound:
                 consumed_bound = True
 
-        strict_gold, prefer_bind_gold = self._split_gold_costs(op, prepared)
+        total_base_gold = (
+            actual_polish_attempts * int(prepared.get("base_gold_cost", 0))
+            if op == _OP_POLISH_AFFIX
+            else int(prepared.get("base_gold_cost", 0))
+        )
+        total_proxy_fee = (
+            actual_polish_attempts * int(prepared.get("proxy_fee_gold", 0))
+            if op == _OP_POLISH_AFFIX
+            else int(prepared.get("proxy_fee_gold", 0))
+        )
+        actual_gold_spent = total_base_gold + total_proxy_fee
+        strict_gold, prefer_bind_gold = self._split_gold_costs(
+            op, prepared, base_gold_override=total_base_gold, proxy_fee_override=total_proxy_fee,
+        )
         if strict_gold > 0 or prefer_bind_gold > 0:
             if self.assets.deduct_split_gold(staged, strict_gold, prefer_bind_gold):
                 return reject(EQUIP_CRAFT_GOLD_NOT_ENOUGH)
@@ -2002,12 +2109,19 @@ class SceneEquipCraft:
         next_rev = current_rev + 1
         if hasattr(staged.client_request_ledger, "forge_revision"):
             staged.client_request_ledger.forge_revision = next_rev
-        # 本人打造/装条/打磨自然涨 1 点铸器熟练度；重铸/解封/继承/无损升档不涨熟练度。
+        # 本人打造/装条/打磨自然涨铸器熟练度（按实际手数累加）；重铸/解封/继承/无损升档不涨熟练度。
         if op in (_OP_CREATE_ITEM, _OP_INSTALL_AFFIX, _OP_POLISH_AFFIX) and not prepared["proxy_master_player_id"]:
-            if staged.HasField("craft_component") and staged.craft_component.forge_mastery_exp < (1 << 32) - 1:
-                staged.craft_component.forge_mastery_exp += 1
+            if hasattr(staged, "craft_component"):
+                exp_gain = actual_polish_attempts if op == _OP_POLISH_AFFIX else 1
+                staged.craft_component.forge_mastery_exp = min(
+                    (1 << 32) - 1, int(staged.craft_component.forge_mastery_exp) + exp_gain,
+                )
+                if supreme_produced and hasattr(staged.craft_component, "supreme_forged_count"):
+                    staged.craft_component.supreme_forged_count = min(
+                        (1 << 32) - 1, int(staged.craft_component.supreme_forged_count) + 1,
+                    )
         if prepared["proxy_master_player_id"]:
-            net_fee = proxy_net_gold(prepared["proxy_fee_gold"])
+            net_fee = proxy_net_gold(total_proxy_fee)
             if net_fee > 0:
                 outbox = getattr(self.scene, "mail_outbox", None)
                 if outbox is None or not await outbox.prepare_proxy_fee(
@@ -2029,6 +2143,8 @@ class SceneEquipCraft:
             equipment_quality_tier=res_quality_tier,
             equipment_polish_pity_count=res_polish_pity,
             equipment_guaranteed_by_pity=res_guaranteed,
+            equipment_polish_attempts_used=actual_polish_attempts if op == _OP_POLISH_AFFIX else 0,
+            equipment_actual_gold_spent=actual_gold_spent,
         )
         saved = await self.assets._save(
             player, staged, 27, correlation=request.client_request_id,
@@ -2037,6 +2153,16 @@ class SceneEquipCraft:
         if not saved:
             return reject(UNAVAILABLE, known=False)
 
+        if prepared["proxy_master_player_id"]:
+            await record_proxy_order_reputation(
+                self.scene,
+                int(prepared["proxy_master_player_id"]),
+                supreme_delta=1 if supreme_produced else 0,
+                rare_delta=0,
+                net_gold_earned=proxy_net_gold(total_proxy_fee),
+                buyer_name=self._display_name(staged, player.player_id),
+            )
+
         self._set_forge_revision(player.player_id, staged, next_rev)
         if op != _OP_CREATE_ITEM and prepared["holder"] == 2:
             attributes = getattr(self.scene, "attributes", None)
@@ -2044,12 +2170,16 @@ class SceneEquipCraft:
                 attributes.notify(player)
         self._remember_craft(player.player_id, request.client_request_id, target_item_id, next_rev)
         logger.info(
-            "Equipment craft committed player_id=%s op=%s item_id=%s revision=%s quality=%s",
+            "Equipment craft committed player_id=%s op=%s item_id=%s revision=%s quality=%s attempts=%s",
             player.player_id, op, target_item_id, next_rev, res_quality_tier,
+            actual_polish_attempts if op == _OP_POLISH_AFFIX else 0,
         )
         return self._fill_craft_applied(
             player, staged, response, item_id=target_item_id, result_rev=next_rev, replayed=False,
             quality_tier=res_quality_tier, polish_pity_count=res_polish_pity, guaranteed_by_pity=res_guaranteed,
+            polish_attempts_used=actual_polish_attempts if op == _OP_POLISH_AFFIX else 0,
+            actual_gold_spent=actual_gold_spent,
+            polish_steps=polish_steps,
         )
 
     def _light_card_active(self, data, stamp: int) -> bool:

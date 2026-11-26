@@ -145,7 +145,7 @@ def test_skill_loadout_502_503_exclusive_group_stats_and_snapshot(tmp_path):
                 initial.loadout.max_pursuit_slots,
                 initial.loadout.max_opening_slots,
             ) == (3, 1, 1)
-            assert len(initial.loadout.schemes) == 3
+            assert len(initial.loadout.schemes) == 2
             by_id = {e.skill_table_id: e for e in initial.catalog}
             assert by_id[12101].exclusive_group == 1 and by_id[12102].exclusive_group == 1
             assert by_id[12101].equipped and not by_id[12102].equipped  # 兼容态同互斥组按 ID 升序取首条

@@ -404,10 +404,10 @@ def test_skill_book_seal_unseal_and_light_card_6_schemes(tmp_path):
         env = await _make_full_scene(tmp_path, level=60, gold=500, bind_gold=5000, now_ms_ref=now_ref)
         player = env.scene.locations[1].players[1]
 
-        # 免费期仅解锁 3 套战法方案
+        # 免费期（<85级）仅解锁 2 套战法方案，最高 7 套（含等级/轻享卡/月租扩容）
         skills0 = await env.rpc("SceneSkillClientPlayer", "ListSkills")
-        assert skills0.loadout.unlocked_schemes == 3
-        assert skills0.loadout.max_schemes == 6
+        assert skills0.loadout.unlocked_schemes == 2
+        assert skills0.loadout.max_schemes == 7
         assert skills0.currency_balance == 5500  # 500 流通 + 5000 绑银
 
         # 切到方案 4 拒绝
@@ -417,13 +417,13 @@ def test_skill_book_seal_unseal_and_light_card_6_schemes(tmp_path):
         )
         assert fail4.error_message.id == 7026
 
-        # GM 开通轻享卡后解锁 6 套战法方案 + 属性面板 max_schemes +3
+        # GM 开通轻享卡后解锁 4 套战法方案（基础 2 + 轻享卡 2）
         gm_pass = await env.rpc("SceneAfkPassClientPlayer", "GmSetAfkPass", remaining_seconds=86400)
         assert not gm_pass.error_message.id
         assert gm_pass.info.unlocked_loadout_slots == LIGHT_CARD_LOADOUT_SLOTS
         assert gm_pass.info.stage2_tradable_enabled is True
         skills1 = await env.rpc("SceneSkillClientPlayer", "ListSkills")
-        assert skills1.loadout.unlocked_schemes == 6
+        assert skills1.loadout.unlocked_schemes == 4
         ok4 = await env.rpc(
             "SceneSkillClientPlayer", "SwitchSkillLoadout",
             scheme_id=4, state_version=1, request_id="req-skill-slot4-pass",
@@ -774,7 +774,7 @@ def test_spirit_shop_v2_season_honors_trial_journal_and_pet_bind_gold(tmp_path):
         player = env.scene.locations[1].players[1]
 
         info_out = await env.rpc("SceneSpiritShopClientPlayer", "GetSpiritShopInfo")
-        assert len(info_out.info.goods) == 9
+        assert len(info_out.info.goods) == 11
         buy_out = await env.rpc(
             "SceneSpiritShopClientPlayer", "BuySpiritShopGoods",
             client_request_id=6101, goods_id=401, count=1,

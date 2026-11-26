@@ -541,7 +541,7 @@ def test_battle_settlement_progression_hooks_season_trial_and_material(tmp_path)
                 mana=50,
                 total_rounds=5,
                 finished_at_ms=now[0],
-                match_mode=1,
+                match_mode=4,
                 battle_config_id=101,
                 participated=True,
             )
@@ -606,7 +606,7 @@ def test_battle_settlement_progression_hooks_season_trial_and_material(tmp_path)
                 mana=50,
                 fled=True,
                 total_rounds=2,
-                match_mode=1,
+                match_mode=4,
                 battle_config_id=102,
             )
             assert await settlement_svc.apply(env.player, data_skip, fled_battle) is True
@@ -619,7 +619,7 @@ def test_battle_settlement_progression_hooks_season_trial_and_material(tmp_path)
                 player_id=3001,
                 outcome=4,
                 player_team_index=0,
-                match_mode=1,
+                match_mode=4,
                 battle_config_id=102,
             )
             assert await settlement_svc.apply(env.player, data_skip, void_battle) is True
@@ -650,7 +650,7 @@ def test_battle_settlement_progression_hooks_season_trial_and_material(tmp_path)
                 mana=50,
                 total_rounds=6,
                 finished_at_ms=now[0] + 10_000,
-                match_mode=2,
+                match_mode=5,
                 battle_config_id=0,
                 participated=True,
             )

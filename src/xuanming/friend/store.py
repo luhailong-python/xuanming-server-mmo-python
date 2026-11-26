@@ -249,6 +249,10 @@ class FriendTxHandle(TypingProtocol):
 
     async def friend_edge_exists_plain(self, a: int, b: int) -> bool: ...
 
+    async def pair_blocked_either_way_plain(self, a: int, b: int) -> bool: ...
+
+    async def pair_mutual_friends_plain(self, a: int, b: int) -> bool: ...
+
     async def query_friend_list(self, player_id: int, limit: int) -> list[FriendEntry]: ...
 
     async def query_pending_requests(self, player_id: int, limit: int) -> list[FriendRequestEntry]: ...
@@ -286,6 +290,21 @@ class FriendDriver(TypingProtocol):
     async def run_tx(self, work: Callable[[FriendTxHandle], Awaitable[T]]) -> T: ...
 
     async def apply_role_fence_direct(self, state: Message, now_ms: int) -> bool: ...
+
+
+def _dedupe_positive_ids(ids: Sequence[int]) -> list[int]:
+    """去重并校验全为正整数玩家 ID。"""
+    seen: set[int] = set()
+    out: list[int] = []
+    for raw in ids:
+        pid = int(raw)
+        if pid <= 0:
+            raise ValueError("player id 0 not allowed")
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
 
 
 def _check_role_fence(row: RoleFenceRow | None, expect: RoleFenceExpect) -> str:
@@ -840,6 +859,29 @@ class FriendStoreCore:
 
         return await self._run_role_tx(actor, (actor.player_id,), _anchor_work, read_only=True)
 
+    async def batch_check_social_relations(
+        self, side_a: Sequence[int], side_b: Sequence[int]
+    ) -> tuple[bool, bool]:
+        """内部只读批量关系检查（供 match 生死状校验两队拉黑与好友关系，不加容量守卫、不创建任何行）。"""
+        uniq_a = _dedupe_positive_ids(side_a)
+        uniq_b = _dedupe_positive_ids(side_b)
+        if not uniq_a or not uniq_b or len(uniq_a) > 5 or len(uniq_b) > 5:
+            raise ValueError(f"invalid team sizes for social relation check: {len(uniq_a)} vs {len(uniq_b)}")
+        if set(uniq_a) & set(uniq_b):
+            raise ValueError("overlapping player id across sides")
+
+        async def _work(tx: FriendTxHandle) -> tuple[bool, bool]:
+            all_friends = True
+            for a in uniq_a:
+                for b in uniq_b:
+                    if await tx.pair_blocked_either_way_plain(a, b):
+                        raise _TxRollbackReturn((True, False))
+                    if all_friends and not await tx.pair_mutual_friends_plain(a, b):
+                        all_friends = False
+            raise _TxRollbackReturn((False, all_friends))
+
+        return await self._driver.run_tx(_work)
+
     # -- RoleFenceParticipant（NoPending + RolePurge）-----------------------------------------------
 
     async def prepare_role_freeze(self, state: Message, *, dry_run: bool = False) -> Message:
@@ -1065,6 +1107,12 @@ class _MemoryTx:
 
     async def friend_edge_exists_plain(self, a: int, b: int) -> bool:
         return (a, b) in self._s.friends or (b, a) in self._s.friends
+
+    async def pair_blocked_either_way_plain(self, a: int, b: int) -> bool:
+        return (a, b) in self._s.blocks or (b, a) in self._s.blocks
+
+    async def pair_mutual_friends_plain(self, a: int, b: int) -> bool:
+        return (a, b) in self._s.friends and (b, a) in self._s.friends
 
     async def query_friend_list(self, player_id: int, limit: int) -> list[FriendEntry]:
         items = sorted(

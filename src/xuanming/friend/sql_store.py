@@ -333,6 +333,32 @@ class _SqlTx:
         )
         return await self._cur.fetchone() is not None
 
+    async def pair_blocked_either_way_plain(self, a: int, b: int) -> bool:
+        await self._cur.execute(
+            "SELECT 1 FROM friend_block WHERE player_id = %s AND blocked_player_id = %s LIMIT 1",
+            (a, b),
+        )
+        if await self._cur.fetchone() is not None:
+            return True
+        await self._cur.execute(
+            "SELECT 1 FROM friend_block WHERE player_id = %s AND blocked_player_id = %s LIMIT 1",
+            (b, a),
+        )
+        return await self._cur.fetchone() is not None
+
+    async def pair_mutual_friends_plain(self, a: int, b: int) -> bool:
+        await self._cur.execute(
+            "SELECT 1 FROM friend WHERE player_id = %s AND friend_player_id = %s LIMIT 1",
+            (a, b),
+        )
+        if await self._cur.fetchone() is None:
+            return False
+        await self._cur.execute(
+            "SELECT 1 FROM friend WHERE player_id = %s AND friend_player_id = %s LIMIT 1",
+            (b, a),
+        )
+        return await self._cur.fetchone() is not None
+
     async def query_friend_list(self, player_id: int, limit: int) -> list[FriendEntry]:
         await self._cur.execute(
             "SELECT friend_player_id, since_ms FROM friend WHERE player_id = %s LIMIT %s",

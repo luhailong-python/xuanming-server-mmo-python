@@ -223,7 +223,7 @@ def test_spirit_shop_shelf_shared_group_cap_bound_isolation_and_audit(tmp_path):
             assert shop.validate_tables() is True
             assert shop.buy_tx == TX_SPIRIT_SHOP_BUY == 44
 
-            # 509 查询货架与双余额，核对 9 款商品定案单价
+            # 509 查询货架与双余额，核对 11 款非限时窗口商品定案单价（含 305/306 江湖/道籍商品）
             info_resp = await _dispatch(scene, player, "GetSpiritShopInfo", protocol.message("GetSpiritShopInfoRequest"))
             assert not info_resp.error_message.id
             info = info_resp.info
@@ -231,9 +231,9 @@ def test_spirit_shop_shelf_shared_group_cap_bound_isolation_and_audit(tmp_path):
             assert info.bind_diamond_balance == 500
             assert len(info.limit_groups) == 1
             assert (info.limit_groups[0].group_id, info.limit_groups[0].max_weight, info.limit_groups[0].used_weight) == (1, 300, 0)
-            assert len(info.goods) == 9
+            assert len(info.goods) == 11
             prices = {g.goods_id: g.unit_price for g in info.goods}
-            assert prices == {101: 60, 102: 180, 103: 300, 201: 60, 202: 180, 301: 100, 302: 100, 303: 120, 304: 180}
+            assert prices == {101: 60, 102: 180, 103: 300, 201: 60, 202: 180, 301: 100, 302: 100, 303: 120, 304: 180, 305: 20, 306: 10}
 
             # 预先放入 10 份可交易打造材料（3001, bound=False），验证购买绑定提速包绝不与之合堆洗白
             data = scene.rows.assemble(player.snapshot)
@@ -450,7 +450,7 @@ def test_spirit_shop_real_tcp_local_runtime_persistence_across_restart(tmp_path)
                 assert not info_reply.error_message.id
                 assert info_reply.info.diamond_balance == 500
                 assert info_reply.info.bind_diamond_balance == 200
-                assert len(info_reply.info.goods) == 9
+                assert len(info_reply.info.goods) == 11
 
                 req_101 = _build_buy_req_from_info(runtime.protocol, info_reply.info, 101, 1, 77001)
                 buy_101 = await client.rpc(

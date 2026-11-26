@@ -1415,6 +1415,7 @@ class SqlMatchStore:
         immediate_battle_node: tuple[int, str, str, int, str] | None,
         battle_deadline_ms: int,
         queue_ttl_ms: int,
+        trial_vow_mask: int = 0,
     ) -> tuple[TeamMutationOutcome, Message | None, Message]:
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
         h, l = uuid_to_pair(req_uuid)
@@ -1593,6 +1594,7 @@ class SqlMatchStore:
         pool_region: int,
         queue_ttl_ms: int,
         is_wuxing_tower: bool = False,
+        trial_vow_mask: int = 0,
     ) -> Message:
         req_uuid = request_id if is_valid_uuid(request_id) else str(uuid.uuid4())
         h, l = uuid_to_pair(req_uuid)
@@ -1876,19 +1878,23 @@ class SqlMatchStore:
         is_wuxing_tower: bool = False,
         ranked_context: bytes = b"",
         ranked_season_id: int = 0,
+        jianghu_duel_context: bytes = b"",
+        trial_vow_mask: int = 0,
+        skip_ticket_check: bool = False,
     ) -> Message:
         battle_id = await self.next_id()
 
         async def work(cur) -> Message:
             now = await self._db_now(cur)
-            for pid, tk_id, _, _ in sorted(members, key=lambda x: x[0]):
-                await cur.execute(
-                    "SELECT `ticket`,`state` FROM `match_authority_ticket` WHERE `player_id`=%s FOR UPDATE",
-                    (pid,),
-                )
-                row = await cur.fetchone()
-                if not row or _to_str(row[0]) != tk_id or int(row[1]) != TICKET_STATE_QUEUED:
-                    raise StoreUnavailableError(f"ticket not claimable player={pid}")
+            if not skip_ticket_check:
+                for pid, tk_id, _, _ in sorted(members, key=lambda x: x[0]):
+                    await cur.execute(
+                        "SELECT `ticket`,`state` FROM `match_authority_ticket` WHERE `player_id`=%s FOR UPDATE",
+                        (pid,),
+                    )
+                    row = await cur.fetchone()
+                    if not row or _to_str(row[0]) != tk_id or int(row[1]) != TICKET_STATE_QUEUED:
+                        raise StoreUnavailableError(f"ticket not claimable player={pid}")
             op_id = str(uuid.uuid4())
             formation = self.protocol.message(
                 "match.MatchFormationRecord",
@@ -1900,14 +1906,17 @@ class SqlMatchStore:
                 ranked_context=ranked_context, ranked_season_id=ranked_season_id,
                 tournament_context=tournament_context, custom_duel_rules=custom_duel_rules,
                 is_wuxing_tower=is_wuxing_tower,
+                jianghu_duel_context=jianghu_duel_context,
+                trial_vow_mask=int(trial_vow_mask),
             )
             for pid, tk_id, side, captain in members:
                 formation.members.add(player_id=pid, ticket=tk_id, team_index=side, captain=captain)
-                await cur.execute(
-                    "UPDATE `match_authority_ticket` SET `state`=%s,`formation_id`=%s,`selected_region`=%s "
-                    "WHERE `player_id`=%s AND `ticket`=%s",
-                    (TICKET_STATE_FORMING, battle_id, physical_region, pid, tk_id),
-                )
+                if not skip_ticket_check:
+                    await cur.execute(
+                        "UPDATE `match_authority_ticket` SET `state`=%s,`formation_id`=%s,`selected_region`=%s "
+                        "WHERE `player_id`=%s AND `ticket`=%s",
+                        (TICKET_STATE_FORMING, battle_id, physical_region, pid, tk_id),
+                    )
             for a, h, l in team_launch_keys or ():
                 await cur.execute(
                     "UPDATE `team_launch` SET `state`=%s,`battle_id`=%s WHERE `actor_id`=%s AND `request_high`=%s AND `request_low`=%s",

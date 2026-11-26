@@ -126,10 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`1212e017ed1db628af1e3d2a335c0c884f5bf06a`（短哈希 `1212e017e`）
-  - 追平范围：涵盖 `0f9bc81d6..1212e017e` 全部 16 笔提交（战斗 V5 战前 3 禁技能/战术标记 `532~533`/赛季与首领周词缀/天梯战中召唤灵宠、Match V4 禁灵脉 `534`/精彩集锦 `535`/宿敌连胜、Team V4 队形 `524`/一键召回 `525`、装备预设方案 `536~539`、技能书封印与解封 `543~544`、成长被动技能 V2 与战斗成长升级、挂机月卡托管设置与战报 `522~523`、合规激励视频 `540~542` 与 `CURRENCY_TYPE_BIND_GOLD=3` 绑金禁交易红线、82 张最新配表 version 93 及 516 条路由）。
+  - Commit SHA：`60b0bd6b30feb6fd60bc0654ebff73a4b5bdf11b`（短哈希 `60b0bd6b3`，并已同步 C++ 工作区至消息号 `573` / 83 张配表 v101）
+  - 追平范围：涵盖 `1212e017e..60b0bd6b3` 及 C++ 最新工作区全部 28 条新 RPC（`545~573`）与 83 张最新配表 version 101（`battle_table_fingerprint = ce5439a9b9ee673e070a1eeb5dc769c1`，544 条路由）：江湖恩怨与决斗约战（`545~557`、`564`、`566`，含世界公告模板、批量好友/黑名单核查、帮会恩怨墙、Match 约战状态机与 Scene 资格/备战费托管）、帮会战世仇宣战与应战（`567~568`）、试炼志第四章荒境/试炼誓约/战帖挑战卡与共享回放（`570~572`）、野外首领试炼 `12~14` 与 Battle V6 江湖决斗/誓约结算、装备批量洗炼 V3（保底目标品质+步进轨迹+幂等重放）、技能书悬赏单（`560~563`）/残卷收集里程碑（`558`）/批量分解（`559`）/名匠代工离线战报确认（`573`）、战法与属性统一 7 方案扩容与月租（`565`，2 基础+1 85级+2 轻享卡+月租封顶 7），并完整保留 Python 仓既有的赛季 V3 与邮件外发箱改动。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 1212e017ed1db628af1e3d2a335c0c884f5bf06a..HEAD`。
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 60b0bd6b30feb6fd60bc0654ebff73a4b5bdf11b..HEAD`。
   2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

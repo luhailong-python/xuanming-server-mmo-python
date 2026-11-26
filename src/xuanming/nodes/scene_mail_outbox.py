@@ -313,4 +313,6 @@ class SceneMailOutbox:
         tasks = tuple(self._jobs.values())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self.sender.close()
+        close_fn = getattr(self.sender, "close", None)
+        if callable(close_fn):
+            await close_fn()

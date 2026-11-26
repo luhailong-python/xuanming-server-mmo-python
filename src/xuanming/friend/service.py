@@ -129,6 +129,7 @@ class FriendService:
                 "ListBlocks": self.list_blocks,
                 "RecommendFriends": self.recommend_friends,
                 "NotifyFriendEvent": self.notify_friend_event,
+                "BatchCheckSocialRelations": self.batch_check_social_relations,
             },
             ROLE_FENCE_SERVICE: {
                 "PrepareRoleFreeze": self.prepare_role_freeze,
@@ -221,6 +222,41 @@ class FriendService:
         """S2C 推送方向方法：带客户端会话拒为 PERMISSION_DENIED，其余返回 UNIMPLEMENTED。"""
         await self._reject_client_session(context, path)
         await context.abort(CODE.UNIMPLEMENTED, "NotifyFriendEvent is a server-to-client push method")
+
+    async def batch_check_social_relations(self, request: Message, context, path: str) -> Message:
+        """546 内部只读批量关系检查（CLIENT_RPC_SERVER_ONLY，拒绝客户端会话头）。"""
+        await self._reject_client_session(context, path)
+
+        def fail(tip):
+            return self._protocol.message("friendpb.BatchCheckSocialRelationsResponse", error_message=tip)
+
+        side_a = [int(pid) for pid in request.side_a_player_ids] if request is not None else []
+        side_b = [int(pid) for pid in request.side_b_player_ids] if request is not None else []
+        if not side_a or not side_b or len(side_a) > 5 or len(side_b) > 5:
+            return fail(self._tip(ERR_INVALID_PARAMETER, "invalid side player list"))
+        set_a: set[int] = set()
+        for pid in side_a:
+            if pid <= 0:
+                return fail(self._tip(ERR_INVALID_PARAMETER, "zero player id"))
+            set_a.add(pid)
+        for pid in side_b:
+            if pid <= 0:
+                return fail(self._tip(ERR_INVALID_PARAMETER, "zero player id"))
+            if pid in set_a:
+                return fail(self._tip(ERR_INVALID_PARAMETER, "overlapping player id across sides"))
+
+        try:
+            has_any_block, all_are_friends = await self._with_budget(
+                self._store.batch_check_social_relations(side_a, side_b)
+            )
+        except Exception as exc:
+            return fail(self._storage_failure_tip("BatchCheckSocialRelations", exc))
+
+        return self._protocol.message(
+            "friendpb.BatchCheckSocialRelationsResponse",
+            has_any_block=has_any_block,
+            all_are_friends=all_are_friends,
+        )
 
     async def add_friend(self, request: Message, context, path: str) -> Message:
         actor = await self._authenticate_client(context, path)

@@ -32,6 +32,7 @@ from .model import (
     TEXT_SCENE_CHAT_WORLD,
     channel_accepted,
     clamp_history_limit,
+    render_system_world_notice,
     valid_account,
 )
 from .store import ChatStoreCore, ContentReviewer, WorldPusher
@@ -63,13 +64,14 @@ class ChatService:
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict]:
-        """仅暴露 4 个业务 RPC；NotifyWorldChat / NotifyWorldChatRetracted 保持未实现。"""
+        """暴露 5 个业务 RPC（含 545 系统播报）；NotifyWorldChat / NotifyWorldChatRetracted 保持未实现。"""
         return {
             CHAT_SERVICE: {
                 "SendChat": self.send_chat,
                 "PullChatHistory": self.pull_chat_history,
                 "ReportChat": self.report_chat,
                 "RetractWorldChat": self.retract_world_chat,
+                "PublishSystemWorldNotice": self.publish_system_world_notice,
             }
         }
 
@@ -342,3 +344,31 @@ class ChatService:
             )
             await self._publish_world_retract(notify)
         return self._protocol.message("chatpb.RetractWorldChatResponse", retracted=retracted)
+
+    async def publish_system_world_notice(self, request, context, path: str):
+        """545 内部白名单模板全服系统播报（CLIENT_RPC_SERVER_ONLY，拒绝客户端会话头）。"""
+        await self._reject_client_session(context, path)
+
+        def fail(tip_code: int):
+            return self._protocol.message("chatpb.PublishSystemWorldNoticeResponse", error_message=self._tip(tip_code))
+
+        _, ok = render_system_world_notice(request)
+        if not ok:
+            return fail(ERR_INVALID_PARAMETER)
+
+        cloned = type(request)()
+        cloned.CopyFrom(request)
+        try:
+            result = await self._store.publish_system_world_notice(cloned)
+        except InvalidChatError:
+            return fail(ERR_INVALID_PARAMETER)
+        except StoreUnavailableError as exc:
+            logger.error("chat system world notice SQL write failed error=%s", exc)
+            return fail(ERR_STORAGE)
+        except Exception:
+            logger.exception("chat system world notice failed unexpectedly")
+            return fail(ERR_STORAGE)
+
+        if not result.duplicate and result.message is not None:
+            await self._publish_world(result.message)
+        return self._protocol.message("chatpb.PublishSystemWorldNoticeResponse", deduplicated=result.duplicate)

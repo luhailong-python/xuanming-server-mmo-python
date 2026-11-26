@@ -34,8 +34,8 @@ MAX_PRICE = 1_000_000_000
 MAX_REMAINING_DAYS_CAP = 3660
 MAX_REMIND_BEFORE_HOURS = 720
 GM_MAX_REMAINING_SECONDS = 366 * SECONDS_PER_DAY
-BASE_LOADOUT_SLOTS = 3
-LIGHT_CARD_BONUS_LOADOUT_SLOTS = 3
+BASE_LOADOUT_SLOTS = 2
+LIGHT_CARD_BONUS_LOADOUT_SLOTS = 2
 LIGHT_CARD_LOADOUT_SLOTS = BASE_LOADOUT_SLOTS + LIGHT_CARD_BONUS_LOADOUT_SLOTS
 _UINT32_MAX = 0xFFFFFFFF
 _UINT64_MAX = (1 << 64) - 1
@@ -54,7 +54,7 @@ def is_active(expires_at: int, now_unix_sec: int) -> bool:
 
 
 def unlocked_loadout_slots(active: bool) -> int:
-    """返回当前生效方案槽位数（免费 3 格，轻享卡 6 格）。"""
+    """返回当前生效方案槽位数（免费基础 2 格，轻享卡 +2 共 4 格，可另租扩至 7 格）。"""
     return LIGHT_CARD_LOADOUT_SLOTS if active else BASE_LOADOUT_SLOTS
 
 

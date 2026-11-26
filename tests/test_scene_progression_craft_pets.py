@@ -137,11 +137,11 @@ def test_season_state_equip_battle_progress_catchup_and_archive(tmp_path):
             assert not equipped.error_message.id
             assert equipped.state.equipped_seal_id == 103 and equipped.state.revision == 1
 
-            # 战斗进度累计（PVE 胜 +1、PVP 胜 +2、PVP 负 +1 => 共 4 点）与效果汇总。
+            # 战斗进度累计（PVE_SOLO=4 胜 +1、1V1=3 胜 +2、PVP_TEAM=7 负 +1 => 共 4 点）与效果汇总。
             data = scene.rows.assemble(player.snapshot)
-            assert season.record_battle_progress(data, match_mode=1, player_won=True) == 1
+            assert season.record_battle_progress(data, match_mode=4, player_won=True) == 1
             assert season.record_battle_progress(data, match_mode=3, player_won=True) == 2
-            assert season.record_battle_progress(data, match_mode=4, player_won=False) == 1
+            assert season.record_battle_progress(data, match_mode=7, player_won=False) == 1
             await scene.commit_player_data(player, data)
 
             effects = protocol.message("EquipmentEffects")
@@ -225,18 +225,18 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
             initial = await rpc("SceneTrialJournalClientPlayer", "GetTrialJournal")
             assert not initial.error_message.id
             snap = initial.snapshot
-            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 27
-            assert len(snap.chapters) == 3 and len(snap.chapters[0].entries) == 5
-            assert len(snap.milestones) == 11 and len(snap.redeemable_artifacts) == 8
+            assert snap.available and snap.total_permanent_lit_seals == 0 and snap.total_permanent_seals == 36
+            assert len(snap.chapters) == 4 and len(snap.chapters[0].entries) == 5
+            assert len(snap.milestones) == 13 and len(snap.redeemable_artifacts) == 8
             assert not snap.hard_boss_trial_unlocked
             # 困难条目 103/104 未过普通前不可进入。
             by_entry = {e.entry_id: e for e in snap.chapters[0].entries}
             assert by_entry[101].can_enter and not by_entry[103].can_enter
 
-            # 注入高位未知 bit（bit 40），验证有效计数不受影响且写回不截断高位。
+            # 注入高位未知 bit（bit 60），验证有效计数不受影响且写回不截断高位。
             player = scene.locations[1].players[1]
             data = scene.rows.assemble(player.snapshot)
-            data.trial_journal_component.lit_seal_bits = set_packed_bit(b"", 40)
+            data.trial_journal_component.lit_seal_bits = set_packed_bit(b"", 60)
 
             # 推进卷一普通·回春（单人 5 回合、无首领回春治疗 -> 点亮 1011/1012/1013 共 3 印）。
             delta1 = journal.record_trial_progress(
@@ -332,9 +332,9 @@ def test_trial_journal_progress_milestones_and_bound_artifact_voucher(tmp_path):
             opt_3301 = next(a for a in redeem.snapshot.redeemable_artifacts if a.item_config_id == 3301)
             assert opt_3301.owned_count == 1 and opt_3301.artifact_effect_id == 1
 
-            # 检查背包中的实体确实为绑定装备且保留了未知高位 bit 40。
+            # 检查背包中的实体确实为绑定装备且保留了未知高位 bit 60。
             saved = scene.rows.assemble(player.snapshot)
-            assert has_packed_bit(saved.trial_journal_component.lit_seal_bits, 40)
+            assert has_packed_bit(saved.trial_journal_component.lit_seal_bits, 60)
             bag_items = {item.item_id: item for _, item in assets.entries(saved.bag_component, 0)}
             created = bag_items[redeem.created_item_id]
             assert created.config_id == 3301 and created.bound is True and created.HasField("equip")

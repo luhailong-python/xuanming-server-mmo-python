@@ -10,6 +10,7 @@ from .gather import (
     MemoryPresenceProvider,
     StaticBattleNodeResolver,
 )
+from .jianghu import JianghuBattleGrudgeSummary, JianghuManager, JianghuRuleConfig, load_jianghu_rule
 from .match_service import MatchGrpcService, MatchServer
 from .model import MATCH_NODE_TYPE, TEAM_NODE_TYPE, BattleNodeEntry, CallerIdentity, PlayerPresence
 from .node import open_service, run
@@ -45,6 +46,7 @@ from .tournament import (
     TournamentRewardSpec,
     TournamentRuleSpec,
 )
+from .trial_cards import TrialChallengeCardManager, build_trial_battle_context, supports_trial_vows
 
 __all__ = [
     "BattleNodeEntry",
@@ -56,6 +58,9 @@ __all__ = [
     "EtcdBattleNodeResolver",
     "GatherPipeline",
     "GrpcEndpointPool",
+    "JianghuBattleGrudgeSummary",
+    "JianghuManager",
+    "JianghuRuleConfig",
     "KafkaTeamNotifier",
     "MATCH_NODE_TYPE",
     "MatchConfig",
@@ -91,10 +96,14 @@ __all__ = [
     "TournamentManager",
     "TournamentRewardSpec",
     "TournamentRuleSpec",
+    "TrialChallengeCardManager",
     "apply_battle_result",
+    "build_trial_battle_context",
     "compute_elo_delta",
+    "load_jianghu_rule",
     "open_pool",
     "open_service",
     "run",
+    "supports_trial_vows",
     "tier_for_rating",
 ]

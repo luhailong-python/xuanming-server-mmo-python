@@ -85,6 +85,8 @@ MATCH_MODE_POLARITY_5V5 = 8
 MATCH_MODE_GUILD_WAR_PVP = 9
 MATCH_MODE_GUILD_WAR_SIEGE = 10
 MATCH_MODE_SEASON_TOURNAMENT = 11
+MATCH_MODE_JIANGHU_DUEL = 12
+JIANGHU_DUEL_DEFAULT_MAX_ROUNDS = 30
 
 # 锦标赛 V2 & 五行幻境共享五行灵脉枚举（与 TournamentLeylineElement 逐项一致）
 TOURNAMENT_LEYLINE_UNSPECIFIED = 0
@@ -125,6 +127,9 @@ BOSS_TRIAL_KIND_BREAK_DUAL_GUARD = 8
 BOSS_TRIAL_KIND_PRACTICE_DUMMY = 9
 BOSS_TRIAL_KIND_TACTICAL_PUZZLE = 10
 BOSS_TRIAL_KIND_CHARACTER_TALE = 11
+BOSS_TRIAL_KIND_WILD_WIND = 12
+BOSS_TRIAL_KIND_WILD_BELL = 13
+BOSS_TRIAL_KIND_WILD_TIDE = 14
 
 BOSS_STANCE_NONE = 0
 BOSS_STANCE_PHYSICAL = 1
@@ -247,6 +252,7 @@ TELEGRAPH_KIND_GUARD_BIND = 6
 TELEGRAPH_KIND_BOSS_MAGIC_STRIKE = 7
 TELEGRAPH_KIND_BOSS_VENOM_AOE = 8
 TELEGRAPH_KIND_FESTIVAL_HEAVY_STRIKE = 9
+TELEGRAPH_KIND_WILD_WIND_GUST = 10
 
 TELEGRAPH_STATUS_UPCOMING = 1
 TELEGRAPH_STATUS_EXECUTING = 2
@@ -259,10 +265,59 @@ POLARITY_DAMAGE_NUM = 115
 POLARITY_DAMAGE_DEN = 100
 RANKED_DEFAULT_MAX_ROUNDS = 20
 
+# 五行试炼志 V3 自选试炼誓约位图（bit 0..3，对齐 trial_journal_rules.h）。
+VOW_NONE = 0
+VOW_BAN_CONTROL = 1 << 0
+VOW_SINGLE_ARTIFACT = 1 << 1
+VOW_NO_PET = 1 << 2
+VOW_TIGHT_ROUNDS = 1 << 3
+VOW_MASK_ALL = VOW_BAN_CONTROL | VOW_SINGLE_ARTIFACT | VOW_NO_PET | VOW_TIGHT_ROUNDS
+
+
+def is_valid_vow_mask(mask: int) -> bool:
+    """校验试炼誓约位掩码仅含合法位 0..3。"""
+    return (int(mask) & ~VOW_MASK_ALL) == 0
+
+
+def count_vows(mask: int) -> int:
+    """统计试炼誓约位掩码启用条数（0..4）。"""
+    return (int(mask) & VOW_MASK_ALL).bit_count()
+
+
+def tighten_round_limit(base_rounds: int) -> int:
+    """紧缩回合誓约：ceil(base_rounds * 0.7)，下限保护 6 回合。"""
+    if base_rounds <= 0:
+        return 0
+    if base_rounds <= 6:
+        return base_rounds
+    scaled = (base_rounds * 7 + 9) // 10
+    return max(6, scaled)
+
+
+def is_wild_boss_trial_kind(kind: int) -> bool:
+    """判断 boss_trial_kind 是否属于卷四·三境明雷野外首领试炼（12..14）。"""
+    return BOSS_TRIAL_KIND_WILD_WIND <= kind <= BOSS_TRIAL_KIND_WILD_TIDE
+
+
+def is_wild_bell_yang_round(round_index: int) -> bool:
+    """碧渊水宫阳钟（物理 +15%/法术 -12%）与阴鼓每 2 回合交替。"""
+    block = (round_index - 1 if round_index > 0 else 0) // 2
+    return (block % 2) == 0
+
+
+def is_wild_tide_ebb_round(round_index: int) -> bool:
+    """月汐湾涨潮（承伤 -25%）与退潮（承伤 +20%）每 2 回合交替。"""
+    block = (round_index - 1 if round_index > 0 else 0) // 2
+    return (block % 2) == 1
+
 
 def is_boss_trial_kind(kind: int) -> bool:
-    """判断 boss_trial_kind 是否属于首领试炼（1..4 或 8）。"""
-    return (BOSS_TRIAL_KIND_BREAK_REJUV <= kind <= BOSS_TRIAL_KIND_VENOM) or kind == BOSS_TRIAL_KIND_BREAK_DUAL_GUARD
+    """判断 boss_trial_kind 是否属于首领试炼（1..4、8 或 12..14）。"""
+    return (
+        (BOSS_TRIAL_KIND_BREAK_REJUV <= kind <= BOSS_TRIAL_KIND_VENOM)
+        or kind == BOSS_TRIAL_KIND_BREAK_DUAL_GUARD
+        or is_wild_boss_trial_kind(kind)
+    )
 
 
 def is_boss_trial_or_rescue_kind(kind: int) -> bool:
@@ -2610,6 +2665,7 @@ class TrialContext:
     season_id: int = 0
     guard_monster_table_id: int = 0
     guard_stance_buff_id: int = 0
+    challenge_vow_mask: int = 0
 
 
 def normalize_artifact_effect_ids(raw: Iterable[int]) -> list[int]:
@@ -2742,6 +2798,7 @@ class TrialFactTracker:
             season_id=int(getattr(ctx, "season_id", 0)),
             guard_monster_table_id=int(getattr(ctx, "guard_monster_table_id", 0)),
             guard_stance_buff_id=int(getattr(ctx, "guard_stance_buff_id", 0)),
+            challenge_vow_mask=int(getattr(ctx, "challenge_vow_mask", 0)),
         )
 
     @property
@@ -2768,10 +2825,11 @@ class TrialFactTracker:
     def initialize(self, request: Message) -> None:
         """在开局时冻结阵容人数、队友名、初始血线、出战宠、法宝与赛季印。"""
         players_by_team: dict[int, list[Message]] = {0: [], 1: []}
+        no_pet_vow = getattr(self.engine, "has_trial_vow", lambda _b: False)(VOW_NO_PET)
         for snapshot in request.players:
             players_by_team.setdefault(snapshot.team_index, []).append(snapshot)
             actor = self.engine.actors.get(snapshot.player_id)
-            if snapshot.pets:
+            if snapshot.pets and not (snapshot.team_index == 0 and no_pet_vow):
                 pet = snapshot.pets[0]
                 self._used_pet_table_id[snapshot.player_id] = pet.combat_pet_table_id or pet.pet_table_id
             else:
@@ -2829,13 +2887,28 @@ class TrialFactTracker:
             self.effective_contribution_players.add(owner_id)
 
     def record_direct_damage(self, source: Message, target: Message, damage_kind: int, dealt: int) -> None:
-        """记录敌我直接伤害（更新双系直伤标记、有效贡献与最低血线）。"""
+        """记录敌我直接伤害（更新双系直伤标记、卷四阳钟阴鼓、有效贡献与最低血线）。"""
         if dealt <= 0 or source.team_index == target.team_index or source.team_index >= 2:
             return
+        boss_kind = getattr(getattr(self.engine, "encounter", None), "boss_trial_kind", BOSS_TRIAL_KIND_NONE)
         if damage_kind == _DAMAGE_PHYSICAL:
             self.team_dealt_physical_direct_damage[source.team_index] = True
+            if (
+                source.team_index == 0
+                and target.team_index == 1
+                and boss_kind == BOSS_TRIAL_KIND_WILD_BELL
+                and is_wild_bell_yang_round(self.engine.round_index)
+            ):
+                self.dealt_yang_bell_physical_damage = True
         elif damage_kind == _DAMAGE_MAGIC:
             self.team_dealt_magic_direct_damage[source.team_index] = True
+            if (
+                source.team_index == 0
+                and target.team_index == 1
+                and boss_kind == BOSS_TRIAL_KIND_WILD_BELL
+                and not is_wild_bell_yang_round(self.engine.round_index)
+            ):
+                self.dealt_yin_drum_magic_damage = True
         self.record_effective_contribution(source)
         self._sample_hp(target)
 
@@ -2944,7 +3017,7 @@ class TrialFactTracker:
                 break
         if live_pet_table_id and not self.engine.uses_free_preset:
             facts.used_pet_table_id = live_pet_table_id
-        else:
+        elif not getattr(self.engine, "has_trial_vow", lambda _b: False)(VOW_NO_PET):
             facts.used_pet_table_id = self._used_pet_table_id.get(player_id, 0)
         facts.used_artifact_effect_ids.extend(self._used_artifact_effect_ids.get(player_id, ()))
         if actor.HasField("equipment_effects") and actor.equipment_effects.HasField("season_seal"):
@@ -2955,7 +3028,13 @@ class TrialFactTracker:
         facts.boss_wind_hit_unprotected_death = self.boss_wind_hit_unprotected_death
         facts.dealt_yang_bell_physical_damage = self.dealt_yang_bell_physical_damage
         facts.dealt_yin_drum_magic_damage = self.dealt_yin_drum_magic_damage
-        facts.finished_in_ebb_tide = self.finished_in_ebb_tide
+        boss_kind = getattr(getattr(self.engine, "encounter", None), "boss_trial_kind", BOSS_TRIAL_KIND_NONE)
+        facts.finished_in_ebb_tide = self.finished_in_ebb_tide or (
+            boss_kind == BOSS_TRIAL_KIND_WILD_TIDE
+            and self.engine.outcome == 1
+            and is_wild_tide_ebb_round(self.engine.round_index)
+        )
+        facts.challenge_vow_mask = int(getattr(self.engine, "trial_vow_mask", 0))
         facts.cleave_parry_count = self.cleave_parry_count
         facts.heal_interrupt_backlash_count = self.heal_interrupt_backlash_count
         facts.stance_break_count = self.stance_break_count
@@ -3215,6 +3294,29 @@ class EncounterV2Controller:
         # 1. 物法易势 5V5 同系直伤 ×1.15
         if is_direct_primary and self.active_polarity != 0 and self.active_polarity == damage_type:
             damage = (damage * POLARITY_DAMAGE_NUM) // POLARITY_DAMAGE_DEN
+        # 1.8 卷四·三境明雷野外首领机制（碧渊水宫·阳钟阴鼓 / 月汐湾·涨退潮，纯整数定点数倍率）。
+        if (
+            is_direct_primary
+            and self.boss_trial_kind == BOSS_TRIAL_KIND_WILD_BELL
+            and source.team_index == 0
+            and target.team_index == 1
+        ):
+            yang_bell = is_wild_bell_yang_round(self.engine.round_index)
+            if (yang_bell and damage_type == _DAMAGE_PHYSICAL) or (not yang_bell and damage_type == _DAMAGE_MAGIC):
+                damage = (damage * 115) // 100
+            elif damage_type in (_DAMAGE_PHYSICAL, _DAMAGE_MAGIC):
+                damage = (damage * 88) // 100
+        if (
+            self.boss_trial_kind == BOSS_TRIAL_KIND_WILD_TIDE
+            and source.team_index == 0
+            and target.team_index == 1
+            and target.is_boss
+        ):
+            damage = (
+                (damage * 120) // 100
+                if is_wild_tide_ebb_round(self.engine.round_index)
+                else (damage * 75) // 100
+            )
         # 2. 首领试炼 V2 多目标直伤副目标溅射保留 60%
         if (
             is_direct_primary
@@ -3723,6 +3825,21 @@ class EncounterV2Controller:
                         label="玄毒冲击：下回合慢速群体法术伤害，防御可减半、控场打断触发破绽",
                     )
                 )
+            elif self.boss_trial_kind == BOSS_TRIAL_KIND_WILD_WIND:
+                dual = self.initial_attacker_human_count >= 3
+                targets = pick_cleave_targets(boss, dual)
+                self.active_telegraphs.append(
+                    make_entry(
+                        source_actor_id=boss.actor_id,
+                        target_actor_id=targets[0] if targets else 0,
+                        target_actor_ids=targets,
+                        telegraph_round=round_idx,
+                        execute_round=round_idx + 1,
+                        intent_kind=TELEGRAPH_KIND_WILD_WIND_GUST,
+                        status=TELEGRAPH_STATUS_UPCOMING,
+                        label="风眼引风：下回合慢速风袭锁定目标，防御或护盾化解可免折损并触发首领破绽",
+                    )
+                )
             else:
                 dual = self.is_boss_trial and self.initial_attacker_human_count >= 3
                 targets = pick_cleave_targets(boss, dual)
@@ -3864,13 +3981,20 @@ class EncounterV2Controller:
                         TELEGRAPH_KIND_SLOW_CLEAVE,
                         TELEGRAPH_KIND_BOSS_MAGIC_STRIKE,
                         TELEGRAPH_KIND_BOSS_VENOM_AOE,
+                        TELEGRAPH_KIND_WILD_WIND_GUST,
                     ):
                         self.apply_boss_exposed(source.actor_id, BOSS_EXPOSED_FULL_PCT, self.engine.round_index + 1)
                         self.engine.trial_tracker.cleave_parry_count += 1
                         self.emit_boss_mechanic_event(
                             turn, grp, BOSS_MECHANIC_CLEAVE_PARRY_EXPOSE, source.actor_id, source.actor_id, BOSS_EXPOSED_FULL_PCT,
                         )
-                        record_resolved(entry, TELEGRAPH_STATUS_CANCELLED_BY_CONTROL, "重击受控取消，首领陷入破绽")
+                        record_resolved(
+                            entry,
+                            TELEGRAPH_STATUS_CANCELLED_BY_CONTROL,
+                            "风眼强袭受控取消，首领陷入破绽"
+                            if entry.intent_kind == TELEGRAPH_KIND_WILD_WIND_GUST
+                            else "重击受控取消，首领陷入破绽",
+                        )
                     elif entry.intent_kind == TELEGRAPH_KIND_GUARD_HEAL:
                         boss = self._find_alive_boss()
                         if boss is not None:
@@ -3919,13 +4043,18 @@ class EncounterV2Controller:
                 )
                 deal_boss_strike(source, target, _DAMAGE_PHYSICAL, scale, grp)
                 record_resolved(entry, TELEGRAPH_STATUS_EXECUTED, "春禧重击已发动")
-            elif kind in (TELEGRAPH_KIND_SLOW_CLEAVE, TELEGRAPH_KIND_BOSS_MAGIC_STRIKE):
+            elif kind in (TELEGRAPH_KIND_SLOW_CLEAVE, TELEGRAPH_KIND_BOSS_MAGIC_STRIKE, TELEGRAPH_KIND_WILD_WIND_GUST):
                 target_ids = list(entry.target_actor_ids) or ([entry.target_actor_id] if entry.target_actor_id else [])
                 if not target_ids:
                     continue
-                is_magic = kind == TELEGRAPH_KIND_BOSS_MAGIC_STRIKE
+                is_wind_gust = kind == TELEGRAPH_KIND_WILD_WIND_GUST
+                is_magic = kind == TELEGRAPH_KIND_BOSS_MAGIC_STRIKE or is_wind_gust
                 dmg_type = _DAMAGE_MAGIC if is_magic else _DAMAGE_PHYSICAL
-                scale = (2.0 if self.battle_difficulty >= 2 else 1.7) if is_magic else (2.1 if self.battle_difficulty >= 2 else 1.8)
+                scale = (
+                    1.75
+                    if is_wind_gust
+                    else ((2.0 if self.battle_difficulty >= 2 else 1.7) if is_magic else (2.1 if self.battle_difficulty >= 2 else 1.8))
+                )
                 if self.is_boss_trial:
                     if self.boss_momentum_stacks > 0:
                         scale *= 1.0 + (self.boss_momentum_stacks * BOSS_MOMENTUM_PER_STACK_PCT) / 100.0
@@ -3970,6 +4099,8 @@ class EncounterV2Controller:
                             self.engine.trial_tracker.self_cleaves_parried_by_player[owner_id] = (
                                 self.engine.trial_tracker.self_cleaves_parried_by_player.get(owner_id, 0) + 1
                             )
+                    elif is_wind_gust and target.attributes.health == 0:
+                        self.engine.trial_tracker.boss_wind_hit_unprotected_death = True
                 if self.is_boss_trial:
                     self.boss_momentum_stacks = 0
                     if valid_targets == 0:
@@ -4511,7 +4642,11 @@ class ConfiguredAbilitiesController:
             return 7004
         if self.engine.is_skill_banned(action.skill_table_id):
             return ERR_SKILL_BANNED_IN_BATTLE
-        if getattr(self.engine, "ban_control_skills", False) and self.engine.is_control_skill(rule):
+        control_banned_fn = getattr(self.engine, "is_control_banned_for_actor", None)
+        if (
+            (control_banned_fn(actor) if callable(control_banned_fn) else getattr(self.engine, "ban_control_skills", False))
+            and self.engine.is_control_skill(rule)
+        ):
             return 7004
         if (
             self.has_state(actor, BattleStateKind.SEAL_ACTIVE)
@@ -4924,7 +5059,8 @@ class ConfiguredAbilitiesController:
 
         # 持久化 Buff / 控制 / 蓄力 / 易伤 / 免控分支
         if hostile and op == BattleEffectOp.CONTROL and 1 <= row.state_kind <= 6:
-            if getattr(self.engine, "ban_control_skills", False):
+            control_banned_fn = getattr(self.engine, "is_control_banned_for_actor", None)
+            if control_banned_fn(caster) if callable(control_banned_fn) else getattr(self.engine, "ban_control_skills", False):
                 turn.events.add(
                     event_type=_EVENT_RESIST,
                     source_id=caster.actor_id,

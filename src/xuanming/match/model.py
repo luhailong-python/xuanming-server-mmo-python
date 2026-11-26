@@ -54,13 +54,17 @@ MODE_POLARITY_5V5 = 8
 MODE_GUILD_WAR_PVP = 9
 MODE_GUILD_WAR_SIEGE = 10
 MODE_SEASON_TOURNAMENT = 11
+MODE_JIANGHU_DUEL = 12
 BATTLE_ACTIVITY_KIND_GUILD_WAR = 3
 GUILD_WAR_MODES = frozenset((MODE_GUILD_WAR_PVP, MODE_GUILD_WAR_SIEGE))
 PVE_MODES = frozenset((MODE_PVE_SOLO, MODE_PVE_TEAM))
 PVP_MODES = frozenset((
     MODE_1V1, MODE_3V3, MODE_5V5, MODE_PVP_CHALLENGE, MODE_PVP_TEAM,
-    MODE_POLARITY_5V5, MODE_GUILD_WAR_PVP, MODE_SEASON_TOURNAMENT,
+    MODE_POLARITY_5V5, MODE_GUILD_WAR_PVP, MODE_SEASON_TOURNAMENT, MODE_JIANGHU_DUEL,
 ))
+
+# 五行试炼志 V3 全部四项自选誓约合法位掩码（bit0 禁控 / bit1 单宝 / bit2 无宠 / bit3 紧缩回合）
+TRIAL_VOW_MASK_ALL = 0x0F
 
 # QueueState 枚举值
 QUEUE_STATE_QUEUED = 1
@@ -536,8 +540,8 @@ def spectate_visibility_for(
     *,
     allow_public_spectate: bool = False,
 ) -> int:
-    """判定开局的观战可见性：帮战与锦标赛公开；自定义切磋按 allow_public_spectate 冻结；活动与单人 PVE 私密。"""
-    if mode in GUILD_WAR_MODES or mode == MODE_SEASON_TOURNAMENT:
+    """判定开局的观战可见性：帮战、锦标赛与天墉生死状公开；自定义切磋按 allow_public_spectate 冻结；活动与单人 PVE 私密。"""
+    if mode in GUILD_WAR_MODES or mode in (MODE_SEASON_TOURNAMENT, MODE_JIANGHU_DUEL):
         return SPECTATE_VISIBILITY_PUBLIC
     if mode == MODE_PVP_CHALLENGE:
         return SPECTATE_VISIBILITY_PUBLIC if allow_public_spectate else SPECTATE_VISIBILITY_PRIVATE
@@ -546,9 +550,24 @@ def spectate_visibility_for(
     return SPECTATE_VISIBILITY_PUBLIC
 
 
-def record_replay_for(mode: int) -> bool:
-    """PVP 对局默认开启战报回放录制。"""
-    return mode in PVP_MODES
+def record_replay_for(mode: int, *, trial_journal_entry_id: int = 0) -> bool:
+    """PVP（含天墉生死状）默认录制战报回放；试炼志 V3 有格 PVE 受控开放录制。"""
+    if mode in PVP_MODES:
+        return True
+    if mode in (MODE_PVE_SOLO, MODE_PVE_TEAM) and int(trial_journal_entry_id) > 0:
+        return True
+    return False
+
+
+def valid_trial_vow_mask(mask: int) -> bool:
+    """校验试炼誓约位掩码仅包含合法的 bit0..3（0..0x0F）。"""
+    return (int(mask) & ~TRIAL_VOW_MASK_ALL) == 0
+
+
+def is_permanent_boss_trial_kind(boss_trial_kind: int) -> bool:
+    """判定 Dungeon.boss_trial_kind 是否属于支持试炼誓约的常驻首领试炼（卷一/卷二/卷四）。"""
+    kind = int(boss_trial_kind)
+    return (1 <= kind <= 4) or kind == 8 or (12 <= kind <= 14)
 
 
 def formation_outcome_decided(formation: Message) -> bool:

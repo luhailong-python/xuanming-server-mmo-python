@@ -51,6 +51,7 @@ from .model import (
     spectate_visibility_for,
 )
 from .store import MatchStore
+from .trial_cards import build_trial_battle_context
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +237,7 @@ class GatherPipeline:
         *,
         on_tournament_profiles: Callable[[list[tuple[int, str, int, int, str]]], None] | None = None,
         on_tournament_captains: Callable[[int, int], set[int]] | None = None,
+        on_jianghu_duel_started: Callable[[int, Message], Awaitable[None]] | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
@@ -245,6 +247,7 @@ class GatherPipeline:
         self.battle_nodes = battle_nodes
         self.on_tournament_profiles = on_tournament_profiles
         self.on_tournament_captains = on_tournament_captains
+        self.on_jianghu_duel_started = on_jianghu_duel_started
 
     async def _cancel_prepared(self, battle_id: int, prepared: list[tuple[int, str]]) -> None:
         """发房前失败补偿：逐人向原备战端点发 CancelBattlePrepare（幂等）。"""
@@ -311,14 +314,17 @@ class GatherPipeline:
             await self.store.abort_formation_pre_persist(battle_id, culprit)
             return False
 
-        # 解码成局时冻结的可选上下文（锦标赛 V2/V3、自定义切磋规则、排位上下文）。
+        # 解码成局时冻结的可选上下文（锦标赛 V2/V3、自定义切磋规则、排位上下文、天墉生死状、试炼誓约）。
         raw_ranked = bytes(getattr(formation, "ranked_context", b""))
         raw_tournament = bytes(getattr(formation, "tournament_context", b""))
         raw_custom_duel = bytes(getattr(formation, "custom_duel_rules", b""))
+        raw_jianghu = bytes(getattr(formation, "jianghu_duel_context", b""))
         is_wuxing_tower = bool(getattr(formation, "is_wuxing_tower", False))
+        trial_vow_mask = int(getattr(formation, "trial_vow_mask", 0))
         ranked_ctx = None
         tournament_ctx = None
         custom_duel_rules = None
+        jianghu_ctx = None
         try:
             if raw_ranked:
                 ranked_ctx = self.protocol.parse("RankedMatchContext", raw_ranked)
@@ -326,6 +332,8 @@ class GatherPipeline:
                 tournament_ctx = self.protocol.parse("TournamentBattleContext", raw_tournament)
             if raw_custom_duel:
                 custom_duel_rules = self.protocol.parse("CustomDuelRules", raw_custom_duel)
+            if raw_jianghu:
+                jianghu_ctx = self.protocol.parse("JianghuDuelBattleContext", raw_jianghu)
         except Exception:
             logger.error("match gather invalid frozen context battle_id=%d", battle_id, exc_info=True)
             return await fail_pre_persist("invalid_frozen_context", 0)
@@ -339,8 +347,20 @@ class GatherPipeline:
             except Exception:
                 logger.warning("match gather tournament captain lookup failed battle_id=%d", battle_id, exc_info=True)
 
+        # 天墉生死状把发起方队长放到最后冻结收快照：其余任意成员掉线/拒绝时绝不触发发起方扣银两或金帖暂扣。
+        ordered_members = list(formation.members)
+        jianghu_rule = None
+        if jianghu_ctx is not None and int(jianghu_ctx.challenger_captain_id) > 0:
+            from .jianghu import load_jianghu_rule
+
+            jianghu_rule = load_jianghu_rule()
+            cap_id = int(jianghu_ctx.challenger_captain_id)
+            cap_idx = next((idx for idx, m in enumerate(ordered_members) if int(m.player_id) == cap_id), -1)
+            if 0 <= cap_idx < len(ordered_members) - 1:
+                ordered_members.append(ordered_members.pop(cap_idx))
+
         # 1. 逐参与者 PrepareBattle 收快照
-        for member in formation.members:
+        for member in ordered_members:
             pid = int(member.player_id)
             pres = await self.presence.get_presence(pid)
             if not pres.scene_grpc_endpoint:
@@ -366,6 +386,16 @@ class GatherPipeline:
                 req.ranked_context.CopyFrom(ranked_ctx)
             if custom_duel_rules is not None:
                 req.custom_duel_rules.CopyFrom(custom_duel_rules)
+            if jianghu_ctx is not None and pid == int(jianghu_ctx.challenger_captain_id):
+                req.jianghu_duel_fee.CopyFrom(
+                    self.protocol.message(
+                        "JianghuDuelPrepareFee",
+                        duel_invite_id=int(jianghu_ctx.duel_invite_id),
+                        writ_tier=int(jianghu_ctx.writ_tier),
+                        item_config_id=jianghu_rule.gold_writ_item_id if jianghu_rule is not None else 3415,
+                        silver_cost=jianghu_rule.silver_writ_cost if jianghu_rule is not None else 500,
+                    )
+                )
             try:
                 raw_resp = await self.rpc.call(
                     endpoint, PREPARE_BATTLE_PATH, req.SerializeToString(deterministic=True), timeout=3.0
@@ -443,6 +473,16 @@ class GatherPipeline:
         created_at_ms = max(now_ms, int(formation.created_ms))
         has_activity = bool(formation.activity_context)
         allow_public_spectate = bool(custom_duel_rules.allow_public_spectate) if custom_duel_rules is not None else False
+        trial_ctx = None
+        if not is_wuxing_tower:
+            trial_ctx = build_trial_battle_context(
+                self.protocol,
+                int(formation.mode),
+                int(formation.config_id),
+                vow_mask=trial_vow_mask,
+                has_activity_context=has_activity,
+            )
+        trial_entry_id = int(trial_ctx.journal_entry_id) if trial_ctx is not None else 0
         create_req = self.protocol.message(
             "CreateBattleRequest",
             battle_id=battle_id,
@@ -462,7 +502,7 @@ class GatherPipeline:
                 has_activity,
                 allow_public_spectate=allow_public_spectate,
             ),
-            record_replay=record_replay_for(int(formation.mode)),
+            record_replay=record_replay_for(int(formation.mode), trial_journal_entry_id=trial_entry_id),
         )
         if has_activity:
             create_req.activity_context.CopyFrom(
@@ -470,10 +510,14 @@ class GatherPipeline:
             )
         if ranked_ctx is not None:
             create_req.ranked_context.CopyFrom(ranked_ctx)
+        if trial_ctx is not None:
+            create_req.trial_context.CopyFrom(trial_ctx)
         if tournament_ctx is not None:
             create_req.tournament_context.CopyFrom(tournament_ctx)
         if custom_duel_rules is not None:
             create_req.custom_duel_rules.CopyFrom(custom_duel_rules)
+        if jianghu_ctx is not None:
+            create_req.jianghu_duel_context.CopyFrom(jianghu_ctx)
         effective_boss_affix = int(boss_weekly_affix_id) or int(getattr(formation, "boss_weekly_affix_id", 0))
         if effective_boss_affix:
             create_req.boss_weekly_affix_id = effective_boss_affix
@@ -530,6 +574,11 @@ class GatherPipeline:
 
         adopted = int(create_resp.adopted_outcome_protocol_version) or 1
         await self.store.mark_formation_created(battle_id, adopted)
+        if jianghu_ctx is not None and self.on_jianghu_duel_started is not None:
+            try:
+                await self.on_jianghu_duel_started(battle_id, jianghu_ctx)
+            except Exception:
+                logger.warning("match gather jianghu duel start notice failed battle_id=%d", battle_id, exc_info=True)
         logger.info(
             "match gather battle created battle_id=%d mode=%d node_id=%d room_count=%d",
             battle_id, int(formation.mode), int(formation.target_node_id), int(create_resp.room_count),

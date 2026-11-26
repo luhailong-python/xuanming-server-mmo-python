@@ -57,9 +57,9 @@ SEASON_UNAVAILABLE = 34011
 SEASON_HONOR_ALREADY_UNLOCKED = 34012
 SEASON_HONOR_TARGET_INVALID = 34013
 
-# MatchMode 枚举数值（保留既有 scene_season 映射以兼容旧单测；is_eligible_battle 严格按 proto MatchMode 判定）。
-_PVE_MODES = frozenset({1, 2})
-_PVP_MODES = frozenset({3, 4, 5})
+# 严格对齐 proto MatchMode 枚举值：PVE_SOLO=4, PVE_TEAM=5; PVP: 5V5=1, 1V1=3, PVP_TEAM=7。
+_PVE_MODES = frozenset({4, 5})
+_PVP_MODES = frozenset({1, 3, 7})
 
 # 正式排位败局/平局防挂机门槛（对齐 C++ PlayerEquipmentMaterialRewardSystem::kPvpMin*）。
 PVP_MIN_ROUNDS_FOR_LOSS = 3
@@ -642,9 +642,9 @@ class SceneSeason:
         if active is None:
             return empty
         rule, season_term, _cycle_idx, _pool_size, _term_start, _term_end = active
-        if match_mode in _PVE_MODES or match_mode in (4, 5):
+        if match_mode in _PVE_MODES:
             gain = rule.pve_win_points if player_won else 0
-        elif match_mode in _PVP_MODES or match_mode in (1, 3, 7):
+        elif match_mode in _PVP_MODES:
             gain = rule.pvp_win_points if player_won else rule.pvp_other_points
         else:
             gain = 0

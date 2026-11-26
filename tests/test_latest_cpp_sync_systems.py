@@ -121,9 +121,10 @@ def test_seven_new_config_tables_json_and_pb_parity():
         "SkillScrollCraft": 7,
         "TournamentReward": 9,
         "TournamentRule": 1,
-        "TrialJournalEntry": 12,
-        "TrialJournalMilestone": 11,
-        "TrialJournalSeal": 33,
+        "TrialJournalEntry": 15,
+        "TrialJournalMilestone": 13,
+        "TrialJournalSeal": 42,
+        "JianghuRule": 1,
     }
     for name, expected in expected_counts.items():
         jrows = json_tables[name].rows()
@@ -1091,6 +1092,198 @@ def test_support_control_fair_enhance_benefit_and_speed_never_scaled(tmp_path):
             bad_ctrl.ailment_hit_bps[1] = 1697
             with pytest.raises(BattleError):
                 TurnEngine(protocol, _make_battle_req(bad_ctrl), skills={}, items={}, max_rounds=10)
+        finally:
+            await scene.close()
+
+    asyncio.run(exercise())
+
+
+def test_offline_proxy_reputation_title_unlock_digest_ack_and_hot_rank_top3(tmp_path):
+    """验证离线/跨线名匠代打口碑异步回账、百炼宗师雅号解锁、落盘失败保留待回账、573 幂等确认与西市 Top 3 热榜。"""
+
+    async def exercise():
+        scene, _, _, rpc = await _make_multi_player_scene(
+            tmp_path,
+            [
+                {"player_id": 1, "name": "采购侠士", "level": 60, "gold": 50_000},
+                {"player_id": 2, "name": "离火名匠", "level": 60, "gold": 5_000},
+                {"player_id": 3, "name": "玄冰名匠", "level": 60, "gold": 5_000},
+                {"player_id": 4, "name": "青木名匠", "level": 60, "gold": 5_000},
+                {"player_id": 5, "name": "闲云名匠", "level": 60, "gold": 5_000},
+            ],
+        )
+        try:
+            # 1. 四位双料宗师开摊；离火名匠(2)已有 4 件极品（再出 1 件极品解锁 2 号雅号“百炼宗师”）。
+            for mid in (2, 3, 4, 5):
+                mp = scene.locations[mid].players[mid]
+                md = scene.rows.assemble(mp.snapshot)
+                md.craft_component.forge_mastery_exp = 60
+                md.craft_component.scroll_mastery_exp = 60
+                if mid == 2:
+                    md.craft_component.supreme_forged_count = 4
+                await scene.commit_player_data(mp, md)
+                opened = await rpc(
+                    mid, "SceneSkillClientPlayer", "SetCraftProxyStall",
+                    open=True, proxy_forge_fee_gold=100, proxy_scroll_fee_gold=80,
+                )
+                assert not opened.error_message.id
+
+            # 2. 离火名匠(2)下线离场，共享摊位继续 24 小时营业。
+            master2_world = scene.locations[2]
+            master2_player = master2_world.players[2]
+            await scene._remove(master2_world, master2_player, release_credential=True)
+            assert 2 not in scene.locations
+
+            # 3. 给采购侠士(1)发放打造与稀世制书材料并造 3 件白板装。
+            rules = await rpc(1, "SceneBagClientPlayer", "GetEquipmentCraftRules")
+            recipe = next(r for r in rules.recipes if r.product.equip_profile == 1)
+            affix = next(a for a in rules.affixes if a.pool == 1 and not a.polish_exempt)
+            state0 = await rpc(1, "SceneSkillClientPlayer", "GetSkillCraftingState")
+            rare_scroll = next(s for s in state0.state.scrolls if s.rarity_tier == 1)
+            rare_skill_id = rare_scroll.skill_table_ids[0]
+
+            buyer = scene.locations[1].players[1]
+            bd = scene.rows.assemble(buyer.snapshot)
+            add_err = await scene.assets.add_items(
+                bd,
+                {
+                    recipe.material_config_id: 200,
+                    affix.material_config_id: 200,
+                    rare_scroll.rare_scroll_item_id: 10,
+                    rare_scroll.rare_ink_item_id: 10,
+                },
+            )
+            assert add_err == 0
+            await scene.commit_player_data(buyer, bd)
+
+            equip_ids = []
+            forge_rev = rules.forge_revision
+            for idx in range(3):
+                created = await rpc(
+                    1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                    client_request_id=9101 + idx,
+                    rules_fingerprint=rules.rules_fingerprint,
+                    expected_forge_revision=forge_rev,
+                    choice=scene.protocol.message("EquipmentCraftChoice", operation=1, config_id=recipe.product.config_id),
+                )
+                assert not created.error_message.id
+                equip_ids.append(created.item_id)
+                forge_rev += 1
+
+            # 4. 离火名匠(2) 离线接单：1 笔极品装条(95 净银两) + 1 笔稀世制书(76 净银两) -> score=1*3+2=5。
+            scene.equip_craft._roll_fn = lambda _tier: 5
+            r1 = await rpc(
+                1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                client_request_id=9111,
+                rules_fingerprint=rules.rules_fingerprint,
+                expected_forge_revision=forge_rev,
+                choice=scene.protocol.message(
+                    "EquipmentCraftChoice",
+                    operation=2,
+                    item_id=equip_ids[0],
+                    affix_slot=1,
+                    affix_id=affix.affix_id,
+                    proxy_master_player_id=2,
+                ),
+            )
+            assert not r1.error_message.id and r1.result_quality_tier == 5
+            forge_rev += 1
+
+            r_rare = await rpc(
+                1, "SceneSkillClientPlayer", "CraftSkillBook",
+                mode=CRAFT_MODE_TARGETED_RARE,
+                scroll_id=rare_scroll.scroll_id,
+                target_skill_table_id=rare_skill_id,
+                expected_revision=0,
+                client_request_id=9112,
+                proxy_master_player_id=2,
+            )
+            assert not r_rare.error_message.id
+
+            # 5. 玄冰名匠(3) 在线极品单(score=4)；青木名匠(4) 在线凡品单(score=1)；闲云名匠(5) 无单(score=0)。
+            scene.equip_craft._roll_fn = lambda _tier: 5
+            r2 = await rpc(
+                1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                client_request_id=9113,
+                rules_fingerprint=rules.rules_fingerprint,
+                expected_forge_revision=forge_rev,
+                choice=scene.protocol.message(
+                    "EquipmentCraftChoice",
+                    operation=2,
+                    item_id=equip_ids[1],
+                    affix_slot=1,
+                    affix_id=affix.affix_id,
+                    proxy_master_player_id=3,
+                ),
+            )
+            assert not r2.error_message.id and r2.result_quality_tier == 5
+            forge_rev += 1
+
+            scene.equip_craft._roll_fn = lambda _tier: 1
+            r3 = await rpc(
+                1, "SceneBagClientPlayer", "CommitEquipmentCraft",
+                client_request_id=9114,
+                rules_fingerprint=rules.rules_fingerprint,
+                expected_forge_revision=forge_rev,
+                choice=scene.protocol.message(
+                    "EquipmentCraftChoice",
+                    operation=2,
+                    item_id=equip_ids[2],
+                    affix_slot=1,
+                    affix_id=affix.affix_id,
+                    proxy_master_player_id=4,
+                ),
+            )
+            assert not r3.error_message.id
+
+            # 6. 查询西市名匠摊位：离线名匠(2) 实时叠加待回账口碑与 Top 1 热榜，3=Top 2，4=Top 3，5=0。
+            stalls = await rpc(1, "SceneSkillClientPlayer", "ListCraftProxyStalls")
+            by_id = {s.master_player_id: s for s in stalls.stalls}
+            assert by_id[2].proxy_orders_completed == 2
+            assert by_id[2].supreme_forged_count == 5
+            assert by_id[2].rare_books_crafted_count == 1
+            assert by_id[2].recent_24h_orders == 2 and by_id[2].recent_24h_supreme == 1
+            assert by_id[2].hot_rank == 1
+            assert by_id[3].hot_rank == 2
+            assert by_id[4].hot_rank == 3
+            assert by_id[5].hot_rank == 0
+
+            # 7. 离火名匠(2) 重新上线：自动回账待结算口碑，解锁百炼宗师(2)，产出未读战报。
+            await scene.enter(
+                scene.protocol.message(
+                    "PlayerEnterGameNodeRequest",
+                    player_id=2, session_id=102, scene_id=1, owner_revision=2, login_generation=2,
+                ),
+                "gate",
+            )
+            st_back = await rpc(2, "SceneSkillClientPlayer", "GetSkillCraftingState")
+            assert not st_back.error_message.id
+            snap = st_back.state
+            assert snap.proxy_orders_completed == 2
+            assert snap.supreme_forged_count == 5
+            assert snap.rare_books_crafted_count == 1
+            assert 2 in snap.unlocked_craft_title_ids
+            assert snap.HasField("unread_proxy_digest")
+            assert snap.unread_proxy_digest.orders_completed == 2
+            assert snap.unread_proxy_digest.supreme_forged_count == 1
+            assert snap.unread_proxy_digest.rare_books_crafted_count == 1
+            assert snap.unread_proxy_digest.net_gold_earned == 171
+            assert snap.unread_proxy_digest.last_buyer_name == "采购侠士"
+            assert snap.unread_proxy_digest.newly_unlocked_title_mask & (1 << 1)
+
+            # 8. 573 AckCraftProxyDigest 幂等清空战报且保留口碑，佩戴百炼宗师(2)生效。
+            ack1 = await rpc(2, "SceneSkillClientPlayer", "AckCraftProxyDigest")
+            assert not ack1.error_message.id and not ack1.state.HasField("unread_proxy_digest")
+            assert ack1.state.proxy_orders_completed == 2
+            ack2 = await rpc(2, "SceneSkillClientPlayer", "AckCraftProxyDigest")
+            assert not ack2.error_message.id and not ack2.state.HasField("unread_proxy_digest")
+
+            equipped = await rpc(
+                2, "SceneSkillClientPlayer", "SetCraftProxyStall",
+                open=True, proxy_forge_fee_gold=100, proxy_scroll_fee_gold=80,
+                master_showcase_tag=1, equipped_craft_title_id=2,
+            )
+            assert not equipped.error_message.id and equipped.state.equipped_craft_title_id == 2
         finally:
             await scene.close()
 

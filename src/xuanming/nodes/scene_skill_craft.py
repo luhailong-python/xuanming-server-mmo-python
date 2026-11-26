@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import random
 from collections.abc import Callable
@@ -33,6 +34,11 @@ _CLIENT_REQUEST_KIND_LEARN_SKILL_BOOK = 15
 _CLIENT_REQUEST_KIND_DISMANTLE_SKILL_BOOK = 16
 _CLIENT_REQUEST_KIND_SEAL_SKILL_BOOK = 22
 _CLIENT_REQUEST_KIND_UNSEAL_SKILL_BOOK = 23
+_CLIENT_REQUEST_KIND_CLAIM_SCROLL_MILESTONE = 24
+_CLIENT_REQUEST_KIND_BATCH_DISMANTLE_SKILL_BOOKS = 25
+_CLIENT_REQUEST_KIND_POST_WANTED_ORDER = 26
+_CLIENT_REQUEST_KIND_CANCEL_WANTED_ORDER = 27
+_CLIENT_REQUEST_KIND_FULFILL_WANTED_ORDER = 28
 
 # 物品配置 ID（与 C++ equip_craft_quality_rules.h 对齐）。
 SCROLL_FRAGMENT_ITEM_ID = 3406
@@ -53,6 +59,35 @@ PROXY_FEE_MAX_GOLD = 100
 PROXY_TAX_BPS = 500  # 5% 银两税销毁
 SCROLL_BONUS_FRAGMENTS_COUNT = 2
 MAX_RARE_SKILL_RATIO_BPS = 1000  # 稀世绝学硬上限 <= 10%
+
+# V2 名匠口碑、招牌枚举与 6 档零属性雅号印款常量。
+MAX_MASTER_SHOWCASE_TAG = 4
+CRAFT_TITLE_MAX_ID = 6
+CRAFT_TITLE_BAILIAN_SUPREME_REQ = 5
+CRAFT_TITLE_TIANGONG_SUPREME_REQ = 20
+CRAFT_TITLE_WANJUAN_RARE_BOOKS_REQ = 3
+CRAFT_TITLE_WANJUAN_ORDERS_REQ = 15
+HOT_RANK_TOP_LIMIT = 3
+_CRAFT_TITLE_NAMES = {
+    1: "铸器宗师",
+    2: "百炼宗师",
+    3: "天工神匠",
+    4: "制卷宗师",
+    5: "万卷书圣",
+    6: "双绝天工",
+}
+
+# V4 典籍藏经阁卷宗收集里程碑位图与批量安全拆页常量。
+SCROLL_MILESTONE_HALF_TIER = 1
+SCROLL_MILESTONE_FULL_TIER = 2
+SCROLL_MILESTONE_HALF_REWARD_FRAGMENTS = 20
+SCROLL_MILESTONE_FULL_REWARD_FRAGMENTS = 40
+MAX_BATCH_DISMANTLE_COUNT = 20
+
+# V5 西市常规技能书悬赏求购板常量。
+WANTED_ORDER_MIN_GOLD = 100
+WANTED_ORDER_MAX_GOLD = 50_000
+MAX_ACTIVE_WANTED_ORDERS = 3
 
 # 制书模式（与 CraftSkillBookRequest.CraftMode 一致）。
 CRAFT_MODE_RANDOM_REGULAR = 1
@@ -153,12 +188,222 @@ def proxy_net_gold(gross_fee: int) -> int:
     return gross_fee - tax if gross_fee > tax else 0
 
 
+def _sat_add_u32(a: int, b: int) -> int:
+    return min(_MAX_UINT32, int(a) + int(b))
+
+
+def _sat_add_u64(a: int, b: int) -> int:
+    return min(_MAX_UINT64, int(a) + int(b))
+
+
+def craft_title_name(title_id: int) -> str:
+    return _CRAFT_TITLE_NAMES.get(int(title_id), "")
+
+
+def is_craft_title_unlocked(
+    title_id: int,
+    forge_exp: int,
+    scroll_exp: int,
+    supreme_forged_count: int,
+    rare_books_crafted_count: int,
+    proxy_orders_completed: int,
+) -> bool:
+    forge_master = mastery_tier_for_exp(forge_exp) >= MASTERY_MASTER
+    scroll_master = mastery_tier_for_exp(scroll_exp) >= MASTERY_MASTER
+    tid = int(title_id)
+    if tid == 1:
+        return forge_master
+    if tid == 2:
+        return forge_master and supreme_forged_count >= CRAFT_TITLE_BAILIAN_SUPREME_REQ
+    if tid == 3:
+        return forge_master and supreme_forged_count >= CRAFT_TITLE_TIANGONG_SUPREME_REQ
+    if tid == 4:
+        return scroll_master
+    if tid == 5:
+        return scroll_master and (
+            rare_books_crafted_count >= CRAFT_TITLE_WANJUAN_RARE_BOOKS_REQ
+            or proxy_orders_completed >= CRAFT_TITLE_WANJUAN_ORDERS_REQ
+        )
+    if tid == 6:
+        return forge_master and scroll_master
+    return False
+
+
+def unlocked_craft_title_ids(
+    forge_exp: int,
+    scroll_exp: int,
+    supreme_forged_count: int,
+    rare_books_crafted_count: int,
+    proxy_orders_completed: int,
+) -> list[int]:
+    return [
+        tid for tid in range(1, CRAFT_TITLE_MAX_ID + 1)
+        if is_craft_title_unlocked(
+            tid, forge_exp, scroll_exp, supreme_forged_count, rare_books_crafted_count, proxy_orders_completed,
+        )
+    ]
+
+
+def unlocked_craft_title_mask(
+    forge_exp: int,
+    scroll_exp: int,
+    supreme_forged_count: int,
+    rare_books_crafted_count: int,
+    proxy_orders_completed: int,
+) -> int:
+    mask = 0
+    for tid in unlocked_craft_title_ids(
+        forge_exp, scroll_exp, supreme_forged_count, rare_books_crafted_count, proxy_orders_completed,
+    ):
+        mask |= 1 << (tid - 1)
+    return mask
+
+
+def active_craft_title_id(craft) -> int:
+    tid = int(craft.equipped_craft_title_id)
+    if tid == 0:
+        return 0
+    return tid if is_craft_title_unlocked(
+        tid,
+        int(craft.forge_mastery_exp),
+        int(craft.scroll_mastery_exp),
+        int(craft.supreme_forged_count),
+        int(craft.rare_books_crafted_count),
+        int(craft.proxy_orders_completed),
+    ) else 0
+
+
+def format_master_signature(equipped_title_id: int, display_name: str) -> str:
+    title = craft_title_name(equipped_title_id)
+    return f"{title}·{display_name}" if title else display_name
+
+
+def hot_rank_score(recent_24h_orders: int, recent_24h_supreme: int) -> int:
+    return int(recent_24h_supreme) * 3 + int(recent_24h_orders)
+
+
+def scroll_half_threshold(total_skills: int) -> int:
+    return 0 if total_skills <= 0 else (int(total_skills) + 1) // 2
+
+
+def scroll_milestone_bit_index(scroll_id: int, tier: int) -> int:
+    if scroll_id <= 0 or tier not in (SCROLL_MILESTONE_HALF_TIER, SCROLL_MILESTONE_FULL_TIER):
+        return 0
+    return (int(scroll_id) - 1) * 2 + (int(tier) - 1)
+
+
+def scroll_milestone_reward_fragments(tier: int) -> int:
+    if tier == SCROLL_MILESTONE_HALF_TIER:
+        return SCROLL_MILESTONE_HALF_REWARD_FRAGMENTS
+    if tier == SCROLL_MILESTONE_FULL_TIER:
+        return SCROLL_MILESTONE_FULL_REWARD_FRAGMENTS
+    return 0
+
+
+def has_bit(bits: bytes, bit_index: int) -> bool:
+    byte_idx = bit_index // 8
+    if byte_idx >= len(bits):
+        return False
+    return bool(bits[byte_idx] & (1 << (bit_index % 8)))
+
+
+def set_bit(bits: bytes, bit_index: int) -> bytes:
+    """置位指定 bit，低位在前、保留未知高位 bit 并去尾 0（对齐 bit-storage-and-table-ids.md）。"""
+    byte_idx = bit_index // 8
+    buf = bytearray(bits)
+    if byte_idx >= len(buf):
+        buf.extend(b"\x00" * (byte_idx + 1 - len(buf)))
+    buf[byte_idx] |= 1 << (bit_index % 8)
+    while buf and buf[-1] == 0:
+        buf.pop()
+    return bytes(buf)
+
+
+def valid_wanted_order_gold(reward_gold: int) -> bool:
+    return WANTED_ORDER_MIN_GOLD <= int(reward_gold) <= WANTED_ORDER_MAX_GOLD
+
+
+def apply_reputation_to_craft(
+    craft,
+    orders_delta: int,
+    supreme_delta: int,
+    rare_delta: int,
+    net_gold_delta: int,
+    buyer_name: str,
+) -> None:
+    """将代打口碑与未读营业战报原子累积到 PlayerCraftComp。"""
+    before_mask = unlocked_craft_title_mask(
+        int(craft.forge_mastery_exp),
+        int(craft.scroll_mastery_exp),
+        int(craft.supreme_forged_count),
+        int(craft.rare_books_crafted_count),
+        int(craft.proxy_orders_completed),
+    )
+    craft.proxy_orders_completed = _sat_add_u32(craft.proxy_orders_completed, orders_delta)
+    craft.supreme_forged_count = _sat_add_u32(craft.supreme_forged_count, supreme_delta)
+    craft.rare_books_crafted_count = _sat_add_u32(craft.rare_books_crafted_count, rare_delta)
+    after_mask = unlocked_craft_title_mask(
+        int(craft.forge_mastery_exp),
+        int(craft.scroll_mastery_exp),
+        int(craft.supreme_forged_count),
+        int(craft.rare_books_crafted_count),
+        int(craft.proxy_orders_completed),
+    )
+    newly_unlocked = after_mask & ~before_mask
+
+    craft.unread_proxy_digest_orders = _sat_add_u32(craft.unread_proxy_digest_orders, orders_delta)
+    craft.unread_proxy_digest_supreme = _sat_add_u32(craft.unread_proxy_digest_supreme, supreme_delta)
+    craft.unread_proxy_digest_rare = _sat_add_u32(craft.unread_proxy_digest_rare, rare_delta)
+    craft.unread_proxy_digest_net_gold = _sat_add_u64(craft.unread_proxy_digest_net_gold, net_gold_delta)
+    craft.unread_proxy_digest_new_titles_mask = int(craft.unread_proxy_digest_new_titles_mask) | newly_unlocked
+    if buyer_name:
+        craft.unread_proxy_digest_last_buyer = buyer_name
+
+
+@dataclass(slots=True)
+class PendingProxyReputation:
+    orders: int = 0
+    supreme: int = 0
+    rare: int = 0
+    net_gold: int = 0
+    last_buyer: str = ""
+
+
+@dataclass(slots=True)
+class HotProxyCounters:
+    orders_24h: int = 0
+    supreme_24h: int = 0
+
+
+def _iter_online_players(scene):
+    """按 player_id 去重遍历场景中全部在线玩家（兼容 locations 按 player_id 或 world_id 索引）。"""
+    seen: set[int] = set()
+    for world in getattr(scene, "locations", {}).values():
+        for pid, target in world.players.items():
+            if pid and pid not in seen:
+                seen.add(pid)
+                yield pid, target
+
+
+def _share_active_team(scene, player_a_id: int, player_b_id: int) -> bool:
+    if not player_a_id or not player_b_id or player_a_id == player_b_id:
+        return False
+    team = getattr(scene, "team", None)
+    if team is not None and hasattr(team, "team_id"):
+        ta = int(team.team_id(player_a_id))
+        tb = int(team.team_id(player_b_id))
+        return ta != 0 and ta == tb
+    return False
+
+
 class CraftProxyStallDirectory:
-    """同区跨节点/离线名匠代打共享摊位目录（内存镜像 + 可选外部共享存储同步）。"""
+    """同区跨节点/离线名匠代打共享摊位目录与口碑/24h 热榜异步台账。"""
 
     def __init__(self, protocol) -> None:
         self.protocol = protocol
         self._stalls: dict[int, object] = {}
+        self._pending_reputation: dict[int, PendingProxyReputation] = {}
+        self._hot_counters: dict[int, HotProxyCounters] = {}
 
     @staticmethod
     def _display_name(data, player_id: int) -> str:
@@ -177,6 +422,7 @@ class CraftProxyStallDirectory:
         scroll_ready = s_tier >= MASTERY_MASTER and valid_proxy_fee(int(craft.proxy_scroll_fee_gold))
         if not forge_ready and not scroll_ready:
             return None
+        tag = int(craft.master_showcase_tag)
         return self.protocol.message(
             "CraftProxyStallInfo",
             master_player_id=player_id,
@@ -187,6 +433,13 @@ class CraftProxyStallDirectory:
             scroll_bonus_rate_bps=scroll_bonus_fragment_rate_bps(s_tier),
             proxy_forge_fee_gold=int(craft.proxy_forge_fee_gold) if forge_ready else 0,
             proxy_scroll_fee_gold=int(craft.proxy_scroll_fee_gold) if scroll_ready else 0,
+            proxy_orders_completed=int(craft.proxy_orders_completed),
+            supreme_forged_count=int(craft.supreme_forged_count),
+            rare_books_crafted_count=int(craft.rare_books_crafted_count),
+            master_showcase_tag=tag if tag <= MAX_MASTER_SHOWCASE_TAG else 0,
+            equipped_craft_title_id=active_craft_title_id(craft),
+            team_free_proxy=bool(craft.team_free_proxy),
+            viewer_gets_free_proxy=False,
         )
 
     @staticmethod
@@ -214,15 +467,124 @@ class CraftProxyStallDirectory:
 
     def remove(self, master_player_id: int) -> None:
         self._stalls.pop(master_player_id, None)
+        self._pending_reputation.pop(master_player_id, None)
+        self._hot_counters.pop(master_player_id, None)
+
+    def clear(self) -> None:
+        self._stalls.clear()
+        self._pending_reputation.clear()
+        self._hot_counters.clear()
 
     def find(self, master_player_id: int):
         info = self._stalls.get(master_player_id)
         return info if self.is_valid_stall(info) else None
 
-    def list_stalls(self) -> list:
-        valid = [info for info in self._stalls.values() if self.is_valid_stall(info)]
-        valid.sort(key=lambda info: int(info.master_player_id))
-        return valid
+    def record_pending_reputation(
+        self,
+        master_player_id: int,
+        supreme_delta: int,
+        rare_delta: int,
+        net_gold_earned: int,
+        buyer_name: str,
+        *,
+        already_applied_live: bool = False,
+    ) -> None:
+        """记录 24h 热榜计数，若宗师离线/跨线则同时累积到待回账口碑台账。"""
+        if not master_player_id:
+            return
+        hot = self._hot_counters.setdefault(master_player_id, HotProxyCounters())
+        hot.orders_24h = _sat_add_u32(hot.orders_24h, 1)
+        hot.supreme_24h = _sat_add_u32(hot.supreme_24h, supreme_delta)
+        if already_applied_live:
+            return
+        pending = self._pending_reputation.setdefault(master_player_id, PendingProxyReputation())
+        pending.orders = _sat_add_u32(pending.orders, 1)
+        pending.supreme = _sat_add_u32(pending.supreme, supreme_delta)
+        pending.rare = _sat_add_u32(pending.rare, rare_delta)
+        pending.net_gold = _sat_add_u64(pending.net_gold, net_gold_earned)
+        if buyer_name:
+            pending.last_buyer = buyer_name
+
+    def peek_pending_reputation(self, master_player_id: int) -> PendingProxyReputation | None:
+        pending = self._pending_reputation.get(master_player_id)
+        if pending is None or (
+            pending.orders == 0 and pending.supreme == 0 and pending.rare == 0 and pending.net_gold == 0
+        ):
+            self._pending_reputation.pop(master_player_id, None)
+            return None
+        return PendingProxyReputation(
+            orders=pending.orders,
+            supreme=pending.supreme,
+            rare=pending.rare,
+            net_gold=pending.net_gold,
+            last_buyer=pending.last_buyer,
+        )
+
+    def consume_pending_reputation(self, master_player_id: int, drained: PendingProxyReputation) -> None:
+        cur = self._pending_reputation.get(master_player_id)
+        if cur is None:
+            return
+        cur.orders = max(0, cur.orders - drained.orders)
+        cur.supreme = max(0, cur.supreme - drained.supreme)
+        cur.rare = max(0, cur.rare - drained.rare)
+        cur.net_gold = max(0, cur.net_gold - drained.net_gold)
+        if cur.orders == 0 and cur.supreme == 0 and cur.rare == 0 and cur.net_gold == 0:
+            self._pending_reputation.pop(master_player_id, None)
+
+    def list_stalls(self, *, scene=None, viewer_player_id: int = 0) -> list:
+        merged: dict[int, object] = {}
+        for pid, info in self._stalls.items():
+            if self.is_valid_stall(info):
+                merged[pid] = clone(info)
+        if scene is not None:
+            for pid, target in _iter_online_players(scene):
+                if not scene.mutable(target):
+                    merged.pop(pid, None)
+                    continue
+                data = scene.rows.assemble(target.snapshot)
+                live = self.build_stall_info(pid, data)
+                if live is not None:
+                    merged[pid] = live
+                else:
+                    merged.pop(pid, None)
+        rows = []
+        for pid in sorted(merged):
+            stall = merged[pid]
+            if not self.is_valid_stall(stall):
+                continue
+            pending = self._pending_reputation.get(pid)
+            if pending is not None:
+                stall.proxy_orders_completed = _sat_add_u32(stall.proxy_orders_completed, pending.orders)
+                stall.supreme_forged_count = _sat_add_u32(stall.supreme_forged_count, pending.supreme)
+                stall.rare_books_crafted_count = _sat_add_u32(stall.rare_books_crafted_count, pending.rare)
+            hot = self._hot_counters.get(pid)
+            stall.recent_24h_orders = hot.orders_24h if hot is not None else 0
+            stall.recent_24h_supreme = hot.supreme_24h if hot is not None else 0
+            stall.hot_rank = 0
+            stall.viewer_gets_free_proxy = bool(
+                scene is not None
+                and stall.team_free_proxy
+                and _share_active_team(scene, viewer_player_id, pid)
+            )
+            rows.append(stall)
+
+        # 全区西市「极品热榜」Top 3 评选（与 C++ ListProxyStalls 完全一致）。
+        eligible = [
+            idx for idx, s in enumerate(rows)
+            if s.recent_24h_orders > 0 or s.proxy_orders_completed > 0 or s.supreme_forged_count > 0
+        ]
+        eligible.sort(
+            key=lambda idx: (
+                -hot_rank_score(rows[idx].recent_24h_orders, rows[idx].recent_24h_supreme),
+                -int(rows[idx].recent_24h_supreme),
+                -int(rows[idx].supreme_forged_count),
+                -int(rows[idx].proxy_orders_completed),
+                int(rows[idx].master_player_id),
+            )
+        )
+        for rank, idx in enumerate(eligible[:HOT_RANK_TOP_LIMIT], start=1):
+            rows[idx].hot_rank = rank
+        return rows
 
 
 def get_proxy_stall_directory(scene) -> CraftProxyStallDirectory:
@@ -232,6 +594,89 @@ def get_proxy_stall_directory(scene) -> CraftProxyStallDirectory:
         directory = CraftProxyStallDirectory(scene.protocol)
         scene.craft_proxy_directory = directory
     return directory
+
+
+def _find_online_player_in_scene(scene, player_id: int):
+    for location in getattr(scene, "locations", {}).values():
+        target = location.players.get(player_id)
+        if target is not None:
+            return target
+    return None
+
+
+async def record_proxy_order_reputation(
+    scene,
+    master_player_id: int,
+    supreme_delta: int = 0,
+    rare_delta: int = 0,
+    net_gold_earned: int = 0,
+    buyer_name: str = "",
+) -> None:
+    """统一记录名匠代打/代制订单口碑与 24h 热榜计数（在线直落盘，失败或离线入待回账台账）。"""
+    if not master_player_id:
+        return
+    directory = get_proxy_stall_directory(scene)
+    master_player = _find_online_player_in_scene(scene, master_player_id)
+    if master_player is not None and scene.mutable(master_player):
+        master_data = scene.rows.assemble(master_player.snapshot)
+        staged = clone(master_data)
+        apply_reputation_to_craft(
+            staged.craft_component, 1, supreme_delta, rare_delta, net_gold_earned, buyer_name,
+        )
+        try:
+            await scene.commit_player_data(master_player, staged)
+            directory.sync_player(master_player_id, staged)
+            directory.record_pending_reputation(
+                master_player_id, supreme_delta, rare_delta, net_gold_earned, buyer_name,
+                already_applied_live=True,
+            )
+            return
+        except (StoreRejected, StoreUnavailable, OSError):
+            logger.warning(
+                "Failed to commit live proxy reputation, buffering pending delta master_id=%s",
+                master_player_id,
+            )
+    directory.record_pending_reputation(
+        master_player_id, supreme_delta, rare_delta, net_gold_earned, buyer_name,
+        already_applied_live=False,
+    )
+
+
+async def drain_pending_proxy_reputation(scene, player) -> bool:
+    """将离线/跨线期间累积的代打口碑与未读战报原子落盘到宗师存档（先落盘再核销）。"""
+    if player is None or not player.player_id or not scene.mutable(player):
+        return False
+    directory = getattr(scene, "craft_proxy_directory", None)
+    if directory is None:
+        return False
+    delta = directory.peek_pending_reputation(player.player_id)
+    if delta is None:
+        return False
+    data = scene.rows.assemble(player.snapshot)
+    staged = clone(data)
+    apply_reputation_to_craft(
+        staged.craft_component,
+        delta.orders,
+        delta.supreme,
+        delta.rare,
+        delta.net_gold,
+        delta.last_buyer,
+    )
+    try:
+        await scene.commit_player_data(player, staged)
+    except (StoreRejected, StoreUnavailable, OSError):
+        logger.warning(
+            "Failed to persist drained proxy reputation, retaining pending delta master_id=%s orders=%s",
+            player.player_id, delta.orders,
+        )
+        return False
+    directory.consume_pending_reputation(player.player_id, delta)
+    directory.sync_player(player.player_id, staged)
+    logger.info(
+        "Drained offline proxy reputation master_id=%s orders=%s supreme=%s rare=%s net_gold=%s",
+        player.player_id, delta.orders, delta.supreme, delta.rare, delta.net_gold,
+    )
+    return True
 
 
 class SceneSkillCraft:
@@ -261,7 +706,7 @@ class SceneSkillCraft:
         )
 
     def register(self) -> None:
-        """向 SceneNode 注册 8 条技能制书、封卷/开卷与代打摊位客户端 RPC。"""
+        """向 SceneNode 注册全部 15 条技能制书、封卷、里程碑、批量拆页、悬赏求书与代打摊位 RPC。"""
         self.scene.register(_SERVICE, "GetSkillCraftingState", self.get_state)
         self.scene.register(_SERVICE, "CraftSkillBook", self.craft_skill_book, mutating=True)
         self.scene.register(_SERVICE, "LearnSkillBook", self.learn_skill_book, mutating=True)
@@ -270,6 +715,13 @@ class SceneSkillCraft:
         self.scene.register(_SERVICE, "UnsealSkillBook", self.unseal_skill_book, mutating=True)
         self.scene.register(_SERVICE, "SetCraftProxyStall", self.set_proxy_stall, mutating=True)
         self.scene.register(_SERVICE, "ListCraftProxyStalls", self.list_proxy_stalls)
+        self.scene.register(_SERVICE, "ClaimScrollCollectionMilestone", self.claim_scroll_collection_milestone, mutating=True)
+        self.scene.register(_SERVICE, "BatchDismantleSkillBooks", self.batch_dismantle_skill_books, mutating=True)
+        self.scene.register(_SERVICE, "PostSkillBookWantedOrder", self.post_wanted_order, mutating=True)
+        self.scene.register(_SERVICE, "CancelSkillBookWantedOrder", self.cancel_wanted_order, mutating=True)
+        self.scene.register(_SERVICE, "ListSkillBookWantedOrders", self.list_wanted_orders)
+        self.scene.register(_SERVICE, "FulfillSkillBookWantedOrder", self.fulfill_wanted_order, mutating=True)
+        self.scene.register(_SERVICE, "AckCraftProxyDigest", self.ack_proxy_digest, mutating=True)
 
     # ── 配置与校验辅助 ──
 
@@ -373,6 +825,70 @@ class SceneSkillCraft:
     def _display_name(data, player_id: int) -> str:
         name = getattr(data.profile_component, "name", "") if data.HasField("profile_component") else ""
         return name or f"宗师#{player_id}"
+
+    @staticmethod
+    def _buyer_display_name(data, player_id: int) -> str:
+        name = getattr(data.profile_component, "name", "") if data.HasField("profile_component") else ""
+        return name or f"侠士#{player_id}"
+
+    def _can_credit_gold(self, data, amount: int) -> bool:
+        if amount <= 0:
+            return True
+        if self.assets is not None and hasattr(self.assets, "currency_globally_blocked"):
+            if self.assets.currency_globally_blocked(CURRENCY_GOLD):
+                return False
+        if self.assets is not None and hasattr(self.assets, "currency_gain_blocked"):
+            if self.assets.currency_gain_blocked(data, CURRENCY_GOLD):
+                return False
+        return self._gold_balance(data) <= _MAX_UINT64 - amount
+
+    def _skill_scroll_id(self, skill_id: int) -> int:
+        if self._skill_has_scroll:
+            row = self.tables["Skill"].get(skill_id)
+            return int(getattr(row, "scroll_id", 0)) if row is not None else 0
+        for scroll_id, entries in _DEFAULT_SCROLL_SKILLS.items():
+            for sid, _ in entries:
+                if sid == skill_id:
+                    return scroll_id
+        return 0
+
+    def _fill_wanted_order_info(self, order, out) -> None:
+        out.Clear()
+        out.order_id = int(order.order_id)
+        out.poster_player_id = int(order.poster_player_id)
+        out.poster_name = order.poster_name
+        out.skill_table_id = int(order.skill_table_id)
+        skill = self.tables["Skill"].get(int(order.skill_table_id))
+        if skill is not None:
+            out.skill_name = skill.name
+        out.scroll_id = int(order.scroll_id)
+        scroll = self._scroll_by_id(int(order.scroll_id))
+        if scroll is not None:
+            out.scroll_name = scroll.name
+        out.require_master_signature = bool(order.require_master_signature)
+        out.reward_gold = int(order.reward_gold)
+        out.seller_net_gold = proxy_net_gold(int(order.reward_gold))
+        out.created_at_sec = int(order.created_at_sec)
+
+    async def _record_proxy_order_reputation(
+        self,
+        master_player_id: int,
+        supreme_delta: int,
+        rare_delta: int,
+        net_gold_earned: int,
+        buyer_name: str,
+    ) -> None:
+        await record_proxy_order_reputation(
+            self.scene,
+            master_player_id,
+            supreme_delta=supreme_delta,
+            rare_delta=rare_delta,
+            net_gold_earned=net_gold_earned,
+            buyer_name=buyer_name,
+        )
+
+    async def _drain_pending_proxy_reputation(self, player) -> bool:
+        return await drain_pending_proxy_reputation(self.scene, player)
 
     # ── 背包材料与货币辅助（兼容 Item 表未含 3406/3407/3408 时走同口径原子逻辑） ──
 
@@ -562,6 +1078,36 @@ class SceneSkillCraft:
         out.proxy_forge_fee_gold = craft.proxy_forge_fee_gold
         out.proxy_scroll_fee_gold = craft.proxy_scroll_fee_gold
         out.craft_unlock_gate_enabled = self._craft_unlock_gate
+        out.proxy_orders_completed = int(craft.proxy_orders_completed)
+        out.supreme_forged_count = int(craft.supreme_forged_count)
+        out.rare_books_crafted_count = int(craft.rare_books_crafted_count)
+        out.master_showcase_tag = int(craft.master_showcase_tag)
+        out.equipped_craft_title_id = active_craft_title_id(craft)
+        out.unlocked_craft_title_ids.extend(
+            unlocked_craft_title_ids(
+                int(craft.forge_mastery_exp),
+                int(craft.scroll_mastery_exp),
+                int(craft.supreme_forged_count),
+                int(craft.rare_books_crafted_count),
+                int(craft.proxy_orders_completed),
+            )
+        )
+        out.team_free_proxy = bool(craft.team_free_proxy)
+        out.claimed_scroll_milestone_bits = bytes(craft.claimed_scroll_milestone_bits)
+        for order in sorted(craft.wanted_orders, key=lambda o: int(o.order_id)):
+            self._fill_wanted_order_info(order, out.my_wanted_orders.add())
+        if (
+            int(craft.unread_proxy_digest_orders) > 0
+            or int(craft.unread_proxy_digest_net_gold) > 0
+            or int(craft.unread_proxy_digest_new_titles_mask) != 0
+        ):
+            digest = out.unread_proxy_digest
+            digest.orders_completed = int(craft.unread_proxy_digest_orders)
+            digest.supreme_forged_count = int(craft.unread_proxy_digest_supreme)
+            digest.rare_books_crafted_count = int(craft.unread_proxy_digest_rare)
+            digest.net_gold_earned = int(craft.unread_proxy_digest_net_gold)
+            digest.last_buyer_name = craft.unread_proxy_digest_last_buyer
+            digest.newly_unlocked_title_mask = int(craft.unread_proxy_digest_new_titles_mask)
 
     def _finish(self, response, data, error: int = 0):
         if error:
@@ -569,14 +1115,15 @@ class SceneSkillCraft:
         self._fill_state(data, response.state)
         return response
 
-    # ── 6 条客户端 RPC ──
+    # ── 客户端 RPC ──
 
-    def get_state(self, _world, player, _route, _request):
-        """查询技能制书卷宗目录、未学技能书架、熟练度与代打摊位状态。"""
+    async def get_state(self, _world, player, _route, _request):
+        """查询技能制书卷宗目录、未学技能书架、熟练度、悬赏求书与代打摊位状态。"""
         response = self.protocol.message("GetSkillCraftingStateResponse")
         if self.assets is None:
             response.error_message.id = UNAVAILABLE
             return response
+        await self._drain_pending_proxy_reputation(player)
         data = self.scene.rows.assemble(player.snapshot)
         return self._finish(response, data)
 
@@ -664,7 +1211,8 @@ class SceneSkillCraft:
                 or not valid_proxy_fee(int(stall.proxy_scroll_fee_gold))
             ):
                 return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            proxy_fee_gold = int(stall.proxy_scroll_fee_gold)
+            team_free = bool(stall.team_free_proxy) and _share_active_team(self.scene, player.player_id, proxy_master_id)
+            proxy_fee_gold = 0 if team_free else int(stall.proxy_scroll_fee_gold)
             proxy_net_fee = proxy_net_gold(proxy_fee_gold)
             if proxy_net_fee > 0 and (
                 outbox is None
@@ -672,7 +1220,8 @@ class SceneSkillCraft:
                 or (hasattr(self.assets, "currency_globally_blocked") and self.assets.currency_globally_blocked(CURRENCY_GOLD))
             ):
                 return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            proxy_master_name = stall.master_name or f"宗师#{proxy_master_id}"
+            base_master_name = stall.master_name or f"宗师#{proxy_master_id}"
+            proxy_master_name = format_master_signature(int(stall.equipped_craft_title_id), base_master_name)
             effective_tier = MASTERY_MASTER
 
         # 防洗白硬隔离：代工费(proxy_fee_gold)永远只扣流通银两；仅稀世绝学定向制书的系统手续费允许优先抵扣绑定银两。
@@ -728,13 +1277,18 @@ class SceneSkillCraft:
             signer_id = proxy_master_id if proxy_master_id else player.player_id
             new_book.crafter_player_id = signer_id
             new_book.crafter_name = (
-                proxy_master_name if proxy_master_id else self._display_name(staged, signer_id)
+                proxy_master_name
+                if proxy_master_id
+                else format_master_signature(active_craft_title_id(sc), self._display_name(staged, signer_id))
             )
         sc.next_book_seq = book_id + 1
         next_rev = sc.scroll_craft_revision + 1
         sc.scroll_craft_revision = next_rev
-        if proxy_master_id == 0 and sc.scroll_mastery_exp < _MAX_UINT32:
-            sc.scroll_mastery_exp += 1
+        if proxy_master_id == 0:
+            if sc.scroll_mastery_exp < _MAX_UINT32:
+                sc.scroll_mastery_exp += 1
+            if mode == CRAFT_MODE_TARGETED_RARE and sc.rare_books_crafted_count < _MAX_UINT32:
+                sc.rare_books_crafted_count += 1
 
         if proxy_master_id != 0 and proxy_net_fee > 0:
             prepared_outbox = await outbox.prepare_proxy_fee(
@@ -762,6 +1316,15 @@ class SceneSkillCraft:
             await self.scene.commit_player_data(player, staged)
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        if proxy_master_id != 0:
+            await self._record_proxy_order_reputation(
+                proxy_master_id,
+                0,
+                1 if mode == CRAFT_MODE_TARGETED_RARE else 0,
+                proxy_net_fee,
+                self._buyer_display_name(staged, player.player_id),
+            )
 
         logger.info(
             "Skill book crafted player_id=%s book_id=%s skill_id=%s scroll_id=%s bound=%s bonus=%s",
@@ -1144,7 +1707,7 @@ class SceneSkillCraft:
         return self._finish(response, staged)
 
     async def set_proxy_stall(self, _world, player, _route, request):
-        """宗师开启或关闭主城原子代打/代制摊位并设置固定银两手工费（50..100）。"""
+        """宗师开启或关闭主城原子代打/代制摊位，配置固定手工费（50..100）、招牌、雅号与同队免费。"""
         response = self.protocol.message("SetCraftProxyStallResponse")
         if self.assets is None:
             response.error_message.id = UNAVAILABLE
@@ -1153,10 +1716,32 @@ class SceneSkillCraft:
         if busy := self._writable_error(player):
             return self._finish(response, data, busy)
 
+        await self._drain_pending_proxy_reputation(player)
+        data = self.scene.rows.assemble(player.snapshot)
+        craft = data.craft_component
+        if int(request.master_showcase_tag) > MAX_MASTER_SHOWCASE_TAG:
+            return self._finish(response, data, INVALID)
+        if int(request.equipped_craft_title_id) != 0 and not is_craft_title_unlocked(
+            int(request.equipped_craft_title_id),
+            int(craft.forge_mastery_exp),
+            int(craft.scroll_mastery_exp),
+            int(craft.supreme_forged_count),
+            int(craft.rare_books_crafted_count),
+            int(craft.proxy_orders_completed),
+        ):
+            return self._finish(response, data, INVALID)
+
+        forge_master = mastery_tier_for_exp(int(craft.forge_mastery_exp)) >= MASTERY_MASTER
+        scroll_master = mastery_tier_for_exp(int(craft.scroll_mastery_exp)) >= MASTERY_MASTER
+
         staged = clone(data)
         sc = staged.craft_component
         if not request.open:
             sc.proxy_stall_open = False
+            if forge_master or scroll_master:
+                sc.master_showcase_tag = int(request.master_showcase_tag)
+                sc.equipped_craft_title_id = int(request.equipped_craft_title_id)
+                sc.team_free_proxy = bool(request.team_free_proxy)
             try:
                 await self.scene.commit_player_data(player, staged)
             except (StoreRejected, StoreUnavailable, OSError):
@@ -1164,8 +1749,6 @@ class SceneSkillCraft:
             get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
             return self._finish(response, staged)
 
-        forge_master = mastery_tier_for_exp(int(sc.forge_mastery_exp)) >= MASTERY_MASTER
-        scroll_master = mastery_tier_for_exp(int(sc.scroll_mastery_exp)) >= MASTERY_MASTER
         if not forge_master and not scroll_master:
             return self._finish(response, data, SKILL_PROXY_STALL_REQUIRES_MASTER)
 
@@ -1183,6 +1766,9 @@ class SceneSkillCraft:
         sc.proxy_stall_open = True
         sc.proxy_forge_fee_gold = forge_fee if forge_master else 0
         sc.proxy_scroll_fee_gold = scroll_fee if scroll_master else 0
+        sc.master_showcase_tag = int(request.master_showcase_tag)
+        sc.equipped_craft_title_id = int(request.equipped_craft_title_id)
+        sc.team_free_proxy = bool(request.team_free_proxy)
         try:
             await self.scene.commit_player_data(player, staged)
         except (StoreRejected, StoreUnavailable, OSError):
@@ -1190,9 +1776,617 @@ class SceneSkillCraft:
         get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
         return self._finish(response, staged)
 
-    def list_proxy_stalls(self, _world, _player, _route, _request):
-        """列出同区跨节点/离线营业中的宗师原子代打/代制摊位（按 player_id 升序）。"""
+    def list_proxy_stalls(self, _world, player, _route, _request):
+        """列出同区跨节点/离线营业中的宗师代打摊位（含口碑、同队免费标记与 24h 极品热榜 Top 3）。"""
         response = self.protocol.message("ListCraftProxyStallsResponse")
-        for info in get_proxy_stall_directory(self.scene).list_stalls():
+        viewer_id = player.player_id if player is not None else 0
+        for info in get_proxy_stall_directory(self.scene).list_stalls(scene=self.scene, viewer_player_id=viewer_id):
             response.stalls.add().CopyFrom(info)
         return response
+
+    async def claim_scroll_collection_milestone(self, _world, player, _route, request):
+        """558 ClaimScrollCollectionMilestone：领取典籍藏经阁卷宗收集里程碑绑定残页（小成 20 / 圆满 40）。"""
+        response = self.protocol.message(
+            "ClaimScrollCollectionMilestoneResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if (
+            not request.client_request_id
+            or not request.scroll_id
+            or request.milestone_tier not in (SCROLL_MILESTONE_HALF_TIER, SCROLL_MILESTONE_FULL_TIER)
+        ):
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(
+            ledger, request, _CLIENT_REQUEST_KIND_CLAIM_SCROLL_MILESTONE,
+        )
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            response.rewarded_fragments = int(prior.scroll_bonus_fragments)
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+
+        scroll = self._scroll_by_id(int(request.scroll_id))
+        if scroll is None:
+            return self._finish(response, data, SKILL_SCROLL_INVALID)
+        pool = self._collect_scroll_skills(scroll.id)
+        if not pool:
+            return self._finish(response, data, SKILL_SCROLL_INVALID)
+
+        unlocked = set(craft.book_unlocked_skill_ids)
+        unlocked_in_scroll = sum(1 for sid in pool if sid in unlocked)
+        required = (
+            scroll_half_threshold(len(pool))
+            if request.milestone_tier == SCROLL_MILESTONE_HALF_TIER
+            else len(pool)
+        )
+        if unlocked_in_scroll < required:
+            return self._finish(response, data, INVALID)
+
+        bit_idx = scroll_milestone_bit_index(scroll.id, int(request.milestone_tier))
+        if has_bit(bytes(craft.claimed_scroll_milestone_bits), bit_idx):
+            return self._finish(response, data, INVALID)
+
+        reward_count = scroll_milestone_reward_fragments(int(request.milestone_tier))
+        frag_item_id = int(scroll.fragment_item_id) if scroll.fragment_item_id else SCROLL_FRAGMENT_ITEM_ID
+
+        staged = clone(data)
+        grant_err = await self._grant_stack(staged, frag_item_id, reward_count, bound=True)
+        if grant_err:
+            return self._finish(response, data, grant_err)
+
+        sc = staged.craft_component
+        sc.claimed_scroll_milestone_bits = set_bit(bytes(sc.claimed_scroll_milestone_bits), bit_idx)
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_CLAIM_SCROLL_MILESTONE,
+            fingerprint,
+            scroll_craft_revision=next_rev,
+            scroll_bonus_fragments=reward_count,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Scroll collection milestone claimed player_id=%s scroll_id=%s tier=%s fragments=%s",
+            player.player_id, scroll.id, request.milestone_tier, reward_count,
+        )
+        response.rewarded_fragments = reward_count
+        return self._finish(response, staged)
+
+    async def batch_dismantle_skill_books(self, _world, player, _route, request):
+        """559 BatchDismantleSkillBooks：一次拆解 1..20 本未学常规书（严禁稀世绝学），返还绑定残页。"""
+        response = self.protocol.message(
+            "BatchDismantleSkillBooksResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if (
+            not request.client_request_id
+            or not request.book_ids
+            or len(request.book_ids) > MAX_BATCH_DISMANTLE_COUNT
+        ):
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(
+            ledger, request, _CLIENT_REQUEST_KIND_BATCH_DISMANTLE_SKILL_BOOKS,
+        )
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            response.dismantled_count = int(prior.crafted_skill_table_id)
+            response.refunded_fragments = int(prior.scroll_bonus_fragments)
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+
+        by_book_id = {int(b.book_id): b for b in craft.skill_books}
+        unique_book_ids: set[int] = set()
+        refund_by_item: dict[int, int] = {}
+        total_refund = 0
+        for raw_id in request.book_ids:
+            book_id = int(raw_id)
+            if not book_id or book_id in unique_book_ids:
+                return self._finish(response, data, INVALID)
+            unique_book_ids.add(book_id)
+            book = by_book_id.get(book_id)
+            if book is None:
+                return self._finish(response, data, SKILL_BOOK_NOT_FOUND)
+            if book.rarity_tier != 0:
+                return self._finish(response, data, SKILL_BOOK_NOT_DISMANTLABLE)
+            scroll = self._scroll_by_id(int(book.scroll_id))
+            if scroll is None or not scroll.dismantle_fragment_count:
+                return self._finish(response, data, SKILL_BOOK_NOT_DISMANTLABLE)
+            frag_id = int(scroll.fragment_item_id) if scroll.fragment_item_id else SCROLL_FRAGMENT_ITEM_ID
+            refund_by_item[frag_id] = refund_by_item.get(frag_id, 0) + int(scroll.dismantle_fragment_count)
+            total_refund += int(scroll.dismantle_fragment_count)
+
+        staged = clone(data)
+        for item_id, count in sorted(refund_by_item.items()):
+            grant_err = await self._grant_stack(staged, item_id, count, bound=True)
+            if grant_err:
+                return self._finish(response, data, grant_err)
+
+        sc = staged.craft_component
+        kept = [b for b in sc.skill_books if int(b.book_id) not in unique_book_ids]
+        del sc.skill_books[:]
+        for b in kept:
+            sc.skill_books.add().CopyFrom(b)
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        dismantled_count = len(unique_book_ids)
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_BATCH_DISMANTLE_SKILL_BOOKS,
+            fingerprint,
+            crafted_skill_table_id=dismantled_count,
+            scroll_craft_revision=next_rev,
+            scroll_bonus_fragments=total_refund,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill books batch dismantled player_id=%s count=%s refunded=%s",
+            player.player_id, dismantled_count, total_refund,
+        )
+        response.dismantled_count = dismantled_count
+        response.refunded_fragments = total_refund
+        return self._finish(response, staged)
+
+    async def post_wanted_order(self, _world, player, _route, request):
+        """560 PostSkillBookWantedOrder：发榜托管非绑定银两求购常规永久技能书（最多 3 条）。"""
+        response = self.protocol.message(
+            "PostSkillBookWantedOrderResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if (
+            not request.client_request_id
+            or not request.skill_table_id
+            or not valid_wanted_order_gold(int(request.reward_gold))
+        ):
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(
+            ledger, request, _CLIENT_REQUEST_KIND_POST_WANTED_ORDER,
+        )
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            found = next(
+                (o for o in data.craft_component.wanted_orders if int(o.order_id) == int(prior.wanted_order_id)),
+                None,
+            )
+            if found is not None:
+                self._fill_wanted_order_info(found, response.order)
+            else:
+                response.order.order_id = int(prior.wanted_order_id)
+                response.order.reward_gold = int(prior.wanted_order_gold)
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64 or craft.next_wanted_order_seq == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+        if len(craft.wanted_orders) >= MAX_ACTIVE_WANTED_ORDERS:
+            return self._finish(response, data, INVALID)
+
+        skill = self.tables["Skill"].get(int(request.skill_table_id))
+        if (
+            skill is None
+            or getattr(skill, "season_id", 0) != 0
+            or getattr(skill, "battle_model", 0) != 1
+            or getattr(skill, "rarity_tier", 0) != 0
+        ):
+            return self._finish(response, data, SKILL_SCROLL_INVALID)
+        scroll = self._scroll_by_id(self._skill_scroll_id(int(skill.id)))
+        if scroll is None or scroll.rarity_tier != 0:
+            return self._finish(response, data, SKILL_SCROLL_INVALID)
+
+        reward_gold = int(request.reward_gold)
+        # 防洗白硬隔离：悬赏求书严格仅允许托管流通银两（禁止用绑定银两发榜撤单或小号揭榜套现）。
+        if hasattr(self.assets, "can_afford_split_gold"):
+            if not self.assets.can_afford_split_gold(data, reward_gold, 0):
+                return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+        elif self._gold_balance(data) < reward_gold:
+            return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+
+        staged = clone(data)
+        if hasattr(self.assets, "deduct_split_gold"):
+            if self.assets.deduct_split_gold(staged, reward_gold, 0):
+                return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+        elif not self._deduct_gold(staged, reward_gold):
+            return self._finish(response, data, SKILL_GOLD_NOT_ENOUGH)
+
+        sc = staged.craft_component
+        order_id = sc.next_wanted_order_seq or 1
+        order = sc.wanted_orders.add(
+            order_id=order_id,
+            poster_player_id=player.player_id,
+            poster_name=self._display_name(staged, player.player_id),
+            skill_table_id=int(skill.id),
+            scroll_id=int(scroll.id),
+            require_master_signature=bool(request.require_master_signature),
+            reward_gold=reward_gold,
+            created_at_sec=int(self.clock()) // 1000,
+        )
+        sc.next_wanted_order_seq = order_id + 1
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_POST_WANTED_ORDER,
+            fingerprint,
+            wanted_order_id=order_id,
+            wanted_order_gold=reward_gold,
+            scroll_craft_revision=next_rev,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill book wanted order posted player_id=%s order_id=%s skill_id=%s reward_gold=%s",
+            player.player_id, order_id, skill.id, reward_gold,
+        )
+        self._fill_wanted_order_info(order, response.order)
+        return self._finish(response, staged)
+
+    async def cancel_wanted_order(self, _world, player, _route, request):
+        """561 CancelSkillBookWantedOrder：撤单全额退还托管非绑定银两。"""
+        response = self.protocol.message(
+            "CancelSkillBookWantedOrderResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if not request.client_request_id or not request.order_id:
+            return self._finish(response, data, INVALID)
+
+        ledger = data.client_request_ledger
+        err, fingerprint, prior = client_request.check(
+            ledger, request, _CLIENT_REQUEST_KIND_CANCEL_WANTED_ORDER,
+        )
+        if err:
+            return self._finish(response, data, err)
+        if prior is not None:
+            response.replayed = True
+            response.refunded_gold = int(prior.wanted_order_gold)
+            return self._finish(response, data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        craft = data.craft_component
+        if craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, data, UNAVAILABLE)
+        if request.expected_revision != craft.scroll_craft_revision:
+            return self._finish(response, data, SKILL_CRAFT_REVISION_CHANGED)
+
+        order_idx = next(
+            (i for i, o in enumerate(craft.wanted_orders) if int(o.order_id) == int(request.order_id)), -1,
+        )
+        if order_idx < 0:
+            return self._finish(response, data, SKILL_BOOK_NOT_FOUND)
+        refund_gold = int(craft.wanted_orders[order_idx].reward_gold)
+        if not self._can_credit_gold(data, refund_gold):
+            return self._finish(response, data, UNAVAILABLE)
+
+        staged = clone(data)
+        sc = staged.craft_component
+        del sc.wanted_orders[order_idx]
+        if not self._add_gold(staged, refund_gold):
+            return self._finish(response, data, UNAVAILABLE)
+        next_rev = sc.scroll_craft_revision + 1
+        sc.scroll_craft_revision = next_rev
+
+        client_request.remember(
+            staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_CANCEL_WANTED_ORDER,
+            fingerprint,
+            wanted_order_id=int(request.order_id),
+            wanted_order_gold=refund_gold,
+            scroll_craft_revision=next_rev,
+        )
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill book wanted order canceled player_id=%s order_id=%s refunded_gold=%s",
+            player.player_id, request.order_id, refund_gold,
+        )
+        response.refunded_gold = refund_gold
+        return self._finish(response, staged)
+
+    def list_wanted_orders(self, _world, player, _route, request):
+        """562 ListSkillBookWantedOrders：列出在线玩家挂出的悬赏求购单（按悬赏降序、发榜时间升序）。"""
+        response = self.protocol.message("ListSkillBookWantedOrdersResponse")
+        self_id = player.player_id if player is not None else 0
+        filter_skill = int(request.filter_skill_table_id)
+        only_mine = bool(request.only_mine)
+        collected = []
+        for pid, target in _iter_online_players(self.scene):
+            if not self.scene.mutable(target):
+                continue
+            if only_mine and pid != self_id:
+                continue
+            tdata = self.scene.rows.assemble(target.snapshot)
+            if not tdata.HasField("craft_component"):
+                continue
+            for order in tdata.craft_component.wanted_orders:
+                if filter_skill and int(order.skill_table_id) != filter_skill:
+                    continue
+                collected.append(order)
+        collected.sort(key=lambda o: (-int(o.reward_gold), int(o.created_at_sec), int(o.order_id)))
+        for order in collected:
+            self._fill_wanted_order_info(order, response.orders.add())
+        return response
+
+    async def fulfill_wanted_order(self, _world, player, _route, request):
+        """563 FulfillSkillBookWantedOrder：卖家交出未绑定封卷道籍或书架常规书，原子结算 95% 净银两。"""
+        response = self.protocol.message(
+            "FulfillSkillBookWantedOrderResponse", client_request_id=request.client_request_id,
+        )
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        seller_data = self.scene.rows.assemble(player.snapshot)
+        from_sealed_bag = int(request.sealed_item_id) != 0
+        from_bookshelf = int(request.bookshelf_book_id) != 0
+        if (
+            not request.client_request_id
+            or not request.poster_player_id
+            or not request.order_id
+            or from_sealed_bag == from_bookshelf
+        ):
+            return self._finish(response, seller_data, INVALID)
+
+        ledger = seller_data.client_request_ledger
+        err, fingerprint, prior = client_request.check(
+            ledger, request, _CLIENT_REQUEST_KIND_FULFILL_WANTED_ORDER,
+        )
+        if err:
+            return self._finish(response, seller_data, err)
+        if prior is not None:
+            response.replayed = True
+            response.order_id = int(prior.wanted_order_id)
+            response.seller_net_gold = int(prior.wanted_order_gold)
+            return self._finish(response, seller_data)
+
+        if busy := self._writable_error(player):
+            return self._finish(response, seller_data, busy)
+        if int(request.poster_player_id) == player.player_id:
+            return self._finish(response, seller_data, INVALID)
+
+        seller_craft = seller_data.craft_component
+        if seller_craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, seller_data, UNAVAILABLE)
+        if request.expected_revision != seller_craft.scroll_craft_revision:
+            return self._finish(response, seller_data, SKILL_CRAFT_REVISION_CHANGED)
+
+        poster = self._find_online_player(int(request.poster_player_id))
+        if poster is None or not self.scene.mutable(poster):
+            return self._finish(response, seller_data, SKILL_BOOK_NOT_FOUND)
+        poster_data = self.scene.rows.assemble(poster.snapshot)
+        poster_craft = poster_data.craft_component
+        if poster_craft.next_book_seq == _MAX_UINT64 or poster_craft.scroll_craft_revision == _MAX_UINT64:
+            return self._finish(response, seller_data, UNAVAILABLE)
+        order_idx = next(
+            (i for i, o in enumerate(poster_craft.wanted_orders) if int(o.order_id) == int(request.order_id)), -1,
+        )
+        if order_idx < 0:
+            return self._finish(response, seller_data, SKILL_BOOK_NOT_FOUND)
+        order = poster_craft.wanted_orders[order_idx]
+
+        delivered_crafter_name = ""
+        delivered_crafter_id = 0
+        delivered_scroll_id = int(order.scroll_id)
+        seller_entry_idx = -1
+        seller_book_idx = -1
+
+        if from_sealed_bag:
+            target_item = None
+            for idx, entry in enumerate(seller_data.bag_component.items):
+                if entry.bag_type != 0:
+                    continue
+                inst = self.assets.item(entry)
+                if int(inst.item_id) == int(request.sealed_item_id):
+                    seller_entry_idx = idx
+                    target_item = inst
+                    break
+            if target_item is None:
+                return self._finish(response, seller_data, SKILL_BOOK_NOT_FOUND)
+            if (
+                target_item.config_id != SEALED_SKILL_BOOK_ITEM_ID
+                or target_item.size != 1
+                or target_item.bound
+                or not target_item.HasField("sealed_skill_book")
+            ):
+                return self._finish(response, seller_data, INVALID)
+            sealed = target_item.sealed_skill_book
+            if int(sealed.rarity_tier) != 0 or int(sealed.skill_table_id) != int(order.skill_table_id):
+                return self._finish(response, seller_data, INVALID)
+            if order.require_master_signature and (not sealed.crafter_name or not sealed.crafter_player_id):
+                return self._finish(response, seller_data, INVALID)
+            if not self.assets.countable(target_item) or held_item_count(seller_data, SEALED_SKILL_BOOK_ITEM_ID):
+                return self._finish(response, seller_data, FEATURE_UNAVAILABLE)
+            delivered_crafter_name = sealed.crafter_name
+            delivered_crafter_id = int(sealed.crafter_player_id)
+            if sealed.scroll_id:
+                delivered_scroll_id = int(sealed.scroll_id)
+        else:
+            seller_book_idx = next(
+                (i for i, b in enumerate(seller_craft.skill_books) if int(b.book_id) == int(request.bookshelf_book_id)),
+                -1,
+            )
+            if seller_book_idx < 0:
+                return self._finish(response, seller_data, SKILL_BOOK_NOT_FOUND)
+            book = seller_craft.skill_books[seller_book_idx]
+            if book.bound or book.rarity_tier != 0 or int(book.skill_table_id) != int(order.skill_table_id):
+                return self._finish(response, seller_data, INVALID)
+            if order.require_master_signature and (not book.crafter_name or not book.crafter_player_id):
+                return self._finish(response, seller_data, INVALID)
+            delivered_crafter_name = book.crafter_name
+            delivered_crafter_id = int(book.crafter_player_id)
+            if book.scroll_id:
+                delivered_scroll_id = int(book.scroll_id)
+
+        net_gold = proxy_net_gold(int(order.reward_gold))
+        if not self._can_credit_gold(seller_data, net_gold):
+            return self._finish(response, seller_data, UNAVAILABLE)
+
+        poster_before = clone(poster_data)
+        poster_staged = clone(poster_data)
+        seller_staged = clone(seller_data)
+
+        if from_sealed_bag:
+            del seller_staged.bag_component.items[seller_entry_idx]
+        else:
+            del seller_staged.craft_component.skill_books[seller_book_idx]
+
+        pc = poster_staged.craft_component
+        poster_book_id = pc.next_book_seq or 1
+        del pc.wanted_orders[order_idx]
+        delivered = pc.skill_books.add(
+            book_id=poster_book_id,
+            skill_table_id=int(order.skill_table_id),
+            scroll_id=delivered_scroll_id,
+            rarity_tier=0,
+            bound=False,
+        )
+        if delivered_crafter_name:
+            delivered.crafter_name = delivered_crafter_name
+        if delivered_crafter_id:
+            delivered.crafter_player_id = delivered_crafter_id
+        pc.next_book_seq = poster_book_id + 1
+        pc.scroll_craft_revision = pc.scroll_craft_revision + 1
+
+        if net_gold > 0 and not self._add_gold(seller_staged, net_gold):
+            return self._finish(response, seller_data, UNAVAILABLE)
+        next_seller_rev = seller_staged.craft_component.scroll_craft_revision + 1
+        seller_staged.craft_component.scroll_craft_revision = next_seller_rev
+
+        client_request.remember(
+            seller_staged.client_request_ledger,
+            request.client_request_id,
+            _CLIENT_REQUEST_KIND_FULFILL_WANTED_ORDER,
+            fingerprint,
+            wanted_order_id=int(order.order_id),
+            wanted_order_gold=net_gold,
+            scroll_craft_revision=next_seller_rev,
+        )
+
+        try:
+            await self.scene.commit_player_data(poster, poster_staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        try:
+            await self.scene.commit_player_data(player, seller_staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            try:
+                await self.scene.commit_player_data(poster, poster_before)
+            except (StoreRejected, StoreUnavailable, OSError):
+                logger.error(
+                    "Failed to rollback poster after seller commit error poster_id=%s seller_id=%s order_id=%s",
+                    poster.player_id, player.player_id, order.order_id,
+                )
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+
+        logger.info(
+            "Skill book wanted order fulfilled seller_id=%s poster_id=%s order_id=%s net_gold=%s from_sealed=%s",
+            player.player_id, poster.player_id, order.order_id, net_gold, from_sealed_bag,
+        )
+        response.order_id = int(order.order_id)
+        response.seller_net_gold = net_gold
+        return self._finish(response, seller_staged)
+
+    async def ack_proxy_digest(self, _world, player, _route, _request):
+        """573 AckCraftProxyDigest：先回账离线代打口碑，再幂等清零未读营业战报。"""
+        response = self.protocol.message("AckCraftProxyDigestResponse")
+        if self.assets is None:
+            response.error_message.id = UNAVAILABLE
+            return response
+        data = self.scene.rows.assemble(player.snapshot)
+        if busy := self._writable_error(player):
+            return self._finish(response, data, busy)
+
+        await self._drain_pending_proxy_reputation(player)
+        data = self.scene.rows.assemble(player.snapshot)
+        craft = data.craft_component
+        had_digest = (
+            int(craft.unread_proxy_digest_orders) > 0
+            or int(craft.unread_proxy_digest_supreme) > 0
+            or int(craft.unread_proxy_digest_rare) > 0
+            or int(craft.unread_proxy_digest_net_gold) > 0
+            or bool(craft.unread_proxy_digest_last_buyer)
+            or int(craft.unread_proxy_digest_new_titles_mask) != 0
+        )
+        if not had_digest:
+            return self._finish(response, data)
+
+        staged = clone(data)
+        sc = staged.craft_component
+        sc.unread_proxy_digest_orders = 0
+        sc.unread_proxy_digest_supreme = 0
+        sc.unread_proxy_digest_rare = 0
+        sc.unread_proxy_digest_net_gold = 0
+        sc.unread_proxy_digest_last_buyer = ""
+        sc.unread_proxy_digest_new_titles_mask = 0
+        try:
+            await self.scene.commit_player_data(player, staged)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
+        logger.info("Craft proxy digest acked player_id=%s", player.player_id)
+        return self._finish(response, staged)

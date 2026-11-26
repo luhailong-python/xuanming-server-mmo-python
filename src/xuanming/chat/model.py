@@ -32,6 +32,8 @@ MAX_WORLD_CHANNEL_COOLDOWN_MS = 600_000
 
 # 协议字段与扫描上限
 MAX_REQUEST_ID_BYTES = 64
+MAX_SYSTEM_NOTICE_ID_BYTES = 64
+MAX_SYSTEM_NOTICE_NAME_BYTES = 64
 MAX_ACCOUNT_BYTES = 191
 MAX_RETRACT_REASON_BYTES = 128
 MAX_REPORT_DETAIL_BYTES = 200
@@ -40,6 +42,16 @@ MAX_REPEAT_SCAN_ROWS = 64
 MIN_SPAM_NORMALIZED_RUNES = 4
 ACCEPTED_STATE = 1
 INT64_MAX = (1 << 63) - 1
+
+# 系统全服模板播报枚举（chatpb.SystemWorldNoticeTemplate）
+SYSTEM_WORLD_NOTICE_TEMPLATE_UNSPECIFIED = 0
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_START_SILVER = 1
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_START_GOLD = 2
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_WIN_SILVER = 3
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_WIN_GOLD = 4
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_DRAW = 5
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_STREAK_MILESTONE = 6
+SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_STREAK_BROKEN = 7
 
 # 世界频道 Kafka 推送协议号（与 proto/message_id.txt 对齐）
 WORLD_BROADCAST_MSG_ID = 383  # ClientPlayerChatNotifyWorldChat
@@ -246,7 +258,7 @@ def validate_receipt(row: ReceiptRow) -> ReceiptRow:
         raise StoreUnavailableError("corrupt chat receipt account encoding") from exc
     if (
         not valid_account(account_str)
-        or row.revision == 0
+        or (row.revision == 0 and account_str != "system")
         or len(row.digest) != 32
         or len(row.request) == 0
         or row.state != ACCEPTED_STATE
@@ -258,6 +270,78 @@ def validate_receipt(row: ReceiptRow) -> ReceiptRow:
     ):
         raise StoreUnavailableError("corrupt chat authority receipt")
     return row
+
+
+def sanitize_notice_actor_name(raw: str) -> tuple[str, bool]:
+    """清理系统播报参与方展示名：剥离控制字符与换行，要求非空且不超过 64 字节。"""
+    if not isinstance(raw, str):
+        return "", False
+    cleaned = "".join(
+        ch for ch in raw if ch not in ("\n", "\r", "\t") and unicodedata.category(ch)[0] != "C"
+    ).strip()
+    if not cleaned:
+        return "", False
+    try:
+        raw_bytes = cleaned.encode("utf-8")
+    except UnicodeEncodeError:
+        return "", False
+    if len(raw_bytes) > MAX_SYSTEM_NOTICE_NAME_BYTES:
+        return "", False
+    return cleaned, True
+
+
+def render_system_world_notice(request: Any) -> tuple[str, bool]:
+    """严格按白名单模板渲染全服系统播报正文（绝不接收客户端自由文本）。"""
+    if request is None:
+        return "", False
+    notice_id = str(getattr(request, "notice_id", "") or "").strip()
+    if not notice_id:
+        return "", False
+    try:
+        notice_bytes = notice_id.encode("utf-8")
+    except UnicodeEncodeError:
+        return "", False
+    if len(notice_bytes) > MAX_SYSTEM_NOTICE_ID_BYTES:
+        return "", False
+
+    actor_a, ok_a = sanitize_notice_actor_name(str(getattr(request, "actor_a_name", "") or ""))
+    actor_b, ok_b = sanitize_notice_actor_name(str(getattr(request, "actor_b_name", "") or ""))
+    if not ok_a or not ok_b:
+        return "", False
+
+    team_size = int(getattr(request, "team_size", 0) or 0) or 1
+    if team_size > 5:
+        return "", False
+    rounds = int(getattr(request, "total_rounds", 0) or 0)
+    streak = int(getattr(request, "streak_count", 0) or 0)
+    template_id = int(getattr(request, "template_id", 0) or 0)
+
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_START_SILVER:
+        if team_size <= 1:
+            return f"【天墉生死擂】{actor_a} 向 {actor_b} 下达江湖战书，点击观战！", True
+        return f"【天墉生死擂】{actor_a} 向 {actor_b} 下达江湖战书（{team_size}V{team_size}），点击观战！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_START_GOLD:
+        if team_size <= 1:
+            return f"【金帖生死状】{actor_a} 向 {actor_b} 掷出金帖生死状，名动天墉，点击观战！", True
+        return f"【金帖生死状】{actor_a} 向 {actor_b} 掷出金帖生死状（{team_size}V{team_size}），名动天墉，点击观战！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_WIN_SILVER:
+        rounds = rounds or 1
+        return f"【天墉生死擂】{actor_a} 历经 {rounds} 回合击败 {actor_b}，略胜一筹！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_WIN_GOLD:
+        rounds = rounds or 1
+        return f"【金帖生死状】{actor_a} 历经 {rounds} 回合大破 {actor_b}，快意恩仇！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_DRAW:
+        rounds = rounds or 1
+        return f"【天墉生死擂】{actor_a} 与 {actor_b} 大战 {rounds} 回合难分胜负，各自收剑！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_STREAK_MILESTONE:
+        if streak < 3:
+            return "", False
+        return f"【宿敌连胜】{actor_a} 再度力克宿敌 {actor_b}，豪取 {streak} 连胜！", True
+    if template_id == SYSTEM_WORLD_NOTICE_JIANGHU_DUEL_STREAK_BROKEN:
+        if streak < 3:
+            return "", False
+        return f"【快意雪耻】{actor_a} 终结了宿敌 {actor_b} 的 {streak} 连胜，扬眉吐气！", True
+    return "", False
 
 
 def _is_skip_spam_char(ch: str) -> bool:

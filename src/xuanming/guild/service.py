@@ -299,6 +299,9 @@ class GuildService:
                 "GetGuildWarBattleResult": self.get_guild_war_battle_result,
                 "NotifyGuildWarAlert": self.notify_guild_war_alert,
                 "InspectFieldWarTargets": self.inspect_field_war_targets,
+                "IssueGuildWarFeud": self.issue_guild_war_feud,
+                "RespondGuildWarFeud": self.respond_guild_war_feud,
+                "GetGuildJianghuGrudgeWall": self.get_guild_jianghu_grudge_wall,
             },
             SERVICE_GUILD_INTERNAL: {
                 "ListAppliedAssetOpsSince": self.list_applied_asset_ops_since,
@@ -2121,8 +2124,26 @@ class GuildService:
         actor = await self._admit_client(context, path)
         return await self._with_budget(self.war.inspect_field_targets(actor, request))
 
+    async def issue_guild_war_feud(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.issue_feud(actor, request))
+
+    async def respond_guild_war_feud(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.respond_feud(actor, request))
+
+    async def get_guild_jianghu_grudge_wall(self, request: Message, context, path: str) -> Message:
+        actor = await self._admit_client(context, path)
+        return await self._with_budget(self.war.get_jianghu_grudge_wall(actor))
+
+    async def record_jianghu_duel_result(self, event: Message) -> bool:
+        """消费 match-results 中的天墉生死状终局事件，幂等记入双方帮派恩怨墙。"""
+        return await self.war.record_jianghu_duel_result(event)
+
     async def handle_battle_result_event(self, event: Message):
-        """消费战斗结果事件：按 activity_context.kind 分派至全天帮战或同道历练结算。"""
+        """消费战斗结果事件：按 match_mode / activity_context.kind 分派至生死状恩怨墙、全天帮战或同道历练结算。"""
+        if int(getattr(event, "match_mode", 0)) == 12:
+            return await self.war.record_jianghu_duel_result(event)
         if event.HasField("activity_context") and int(event.activity_context.kind) == 3:
             return await self.war.settle_battle(
                 int(event.battle_id),

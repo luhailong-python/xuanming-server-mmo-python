@@ -27,11 +27,16 @@ from .errors import (
     ERR_GUILD_FUNDS_INSUFFICIENT,
     ERR_GUILD_NOT_IN_GUILD,
     ERR_GUILD_NO_PERMISSION,
+    ERR_GUILD_RANK_TOO_LOW,
     ERR_GUILD_WAR_BOUNTY_ALREADY_ACTIVE,
     ERR_GUILD_WAR_BOUNTY_INVALID_TARGET,
     ERR_GUILD_WAR_BOUNTY_LIMIT,
     ERR_GUILD_WAR_BOUNTY_NOT_FOUND,
     ERR_GUILD_WAR_DIVIDEND_EMPTY,
+    ERR_GUILD_WAR_FEUD_ALREADY_ACTIVE,
+    ERR_GUILD_WAR_FEUD_COOLDOWN,
+    ERR_GUILD_WAR_FEUD_INVALID_TARGET,
+    ERR_GUILD_WAR_FEUD_NOT_FOUND,
     ERR_GUILD_WAR_GARRISON_COOLDOWN,
     ERR_GUILD_WAR_GARRISON_FULL,
     ERR_GUILD_WAR_LEYLINE_NOT_FOUND,
@@ -56,6 +61,7 @@ from .model import (
     GuildData,
     MATCH_MODE_GUILD_WAR_PVP,
     MATCH_MODE_GUILD_WAR_SIEGE,
+    MATCH_MODE_JIANGHU_DUEL,
     MS_PER_DAY,
     MS_PER_HOUR,
     ORDER_STATUS_APPLIED,
@@ -99,6 +105,24 @@ ALERT_LEYLINE_CAPTURED = 2
 ALERT_PURSUER_ENTERED_MAP = 3
 ALERT_BOUNTY_RESOLVED = 4
 ALERT_STREAK_BOUNTY = 5
+ALERT_FEUD_CHALLENGE = 6
+ALERT_FEUD_STARTED = 7
+ALERT_FEUD_ENDED = 8
+
+# 宿敌约战战书状态（GuildWarFeudStatus）与规则常量（对齐 Go war/rules.go）
+FEUD_STATUS_PENDING = 1
+FEUD_STATUS_ACTIVE = 2
+FEUD_STATUS_FINISHED = 3
+FEUD_STATUS_DECLINED = 4
+FEUD_STATUS_EXPIRED = 5
+
+FEUD_BONUS_BPS = 2500
+FEUD_ACCEPT_WINDOW_SEC = 900
+FEUD_DURATION_SEC = 7200
+FEUD_COOLDOWN_SEC = 86400
+FEUD_FREE_DIMINISH_FIGHTS = 3
+STREAK_BROADCAST_MIN = 5
+MAX_GUILD_JIANGHU_WALL_RECORDS = 20
 
 BOUNTY_TAG_NONE = 0
 BOUNTY_TAG_STREAK_END = 1
@@ -381,6 +405,7 @@ class _WarBattleState:
     gold_leyline_bonus: bool
     rivalry_bonus: bool
     started_at_ms: int
+    feud_bonus: bool = False
     settled: bool = False
     outcome: int = 0
     rounds: int = 0
@@ -406,8 +431,59 @@ class _EnemyRecord:
     occurred_at_ms: int
 
 
-def _diminish_percent_for_count(prior_count: int, *, threshold: int = 0) -> int:
-    """30 分钟窗口内同对手/同守旗阵防互刷递减：100% -> 50% -> 20% -> 0%。"""
+@dataclass(slots=True)
+class _FeudState:
+    feud_id: int
+    zone_id: int
+    issuer_guild_id: int
+    issuer_guild_name: str
+    target_guild_id: int
+    target_guild_name: str
+    status: int = FEUD_STATUS_PENDING
+    issuer_wins: int = 0
+    target_wins: int = 0
+    issuer_merit: int = 0
+    target_merit: int = 0
+    created_at_ms: int = 0
+    accept_deadline_ms: int = 0
+    started_at_ms: int = 0
+    ends_at_ms: int = 0
+    winner_guild_id: int = 0
+    updated_ms: int = 0
+
+
+@dataclass(slots=True)
+class _GuildJianghuRivalSummary:
+    rival_guild_id: int
+    rival_guild_name: str = ""
+    wins: int = 0
+    losses: int = 0
+    draws: int = 0
+    last_battle_ms: int = 0
+
+
+@dataclass(slots=True)
+class _GuildJianghuGrudgeRec:
+    battle_id: int
+    rival_guild_id: int
+    rival_guild_name: str
+    outcome_for_guild: int
+    writ_tier: int
+    team_size: int
+    total_rounds: int
+    our_captain_name: str
+    rival_captain_name: str
+    finished_ms: int
+
+
+def _diminish_percent_for_count(prior_count: int, *, threshold: int = 0, feud_active: bool = False) -> int:
+    """30 分钟窗口内同对手/同守旗阵防互刷递减；2 小时宿敌约战期间前 3 场免递减、第 4 场 20%、第 5 场起 0%。"""
+    if feud_active:
+        if prior_count < FEUD_FREE_DIMINISH_FIGHTS:
+            return 100
+        if prior_count == FEUD_FREE_DIMINISH_FIGHTS:
+            return 20
+        return 0
     over = prior_count - threshold
     if over <= 0:
         return 100
@@ -416,6 +492,42 @@ def _diminish_percent_for_count(prior_count: int, *, threshold: int = 0) -> int:
     if over == 2:
         return 20
     return 0
+
+
+def resolve_feud_winner(
+    issuer_guild_id: int,
+    target_guild_id: int,
+    issuer_wins: int,
+    target_wins: int,
+    issuer_merit: int,
+    target_merit: int,
+) -> int:
+    """约战收官胜负判定：先比胜场，同胜场比约战战功，仍平局返回 0。"""
+    if issuer_wins > target_wins:
+        return issuer_guild_id
+    if target_wins > issuer_wins:
+        return target_guild_id
+    if issuer_merit > target_merit:
+        return issuer_guild_id
+    if target_merit > issuer_merit:
+        return target_guild_id
+    return 0
+
+
+def format_feud_summary(rec: _FeudState | None) -> str:
+    """生成约战收官战报碑摘要（纯服务端拼接，零玩家自由文本）。"""
+    if rec is None or rec.status != FEUD_STATUS_FINISHED:
+        return ""
+    if rec.winner_guild_id == rec.issuer_guild_id and rec.winner_guild_id != 0:
+        return f"约战大捷：{rec.issuer_guild_name} {rec.issuer_wins}:{rec.target_wins} 胜 {rec.target_guild_name}"
+    if rec.winner_guild_id == rec.target_guild_id and rec.winner_guild_id != 0:
+        return f"约战大捷：{rec.target_guild_name} {rec.target_wins}:{rec.issuer_wins} 胜 {rec.issuer_guild_name}"
+    return f"势均力敌：{rec.issuer_guild_name} {rec.issuer_wins}:{rec.target_wins} 平 {rec.target_guild_name}"
+
+
+def should_broadcast_streak_alert(new_streak: int, ended_loser_streak: int) -> bool:
+    """达成 5/8 连胜或终结 >=5 连胜时推送非阻断捷报。"""
+    return new_streak in (5, 8) or ended_loser_streak >= STREAK_BROADCAST_MIN
 
 
 def _streak_jackpot(streak: int) -> tuple[int, int]:
@@ -462,6 +574,7 @@ class GuildWarManager:
         self._lock = asyncio.Lock()
         self._next_battle_id = 700_000
         self._next_bounty_id = 900_000
+        self._next_feud_id = 950_000
         self._leylines: dict[tuple[int, int], _LeylineState] = {}
         self._garrisons: dict[int, list[_GarrisonSlot]] = {}
         self._weekly: dict[tuple[int, int], _GuildWeeklyState] = {}
@@ -475,6 +588,10 @@ class GuildWarManager:
         self._enemies: dict[int, list[_EnemyRecord]] = {}
         self._pair_clashes: dict[tuple[int, int], deque[int]] = {}
         self._siege_clashes: dict[tuple[int, int], deque[int]] = {}
+        self._feuds: dict[int, _FeudState] = {}
+        self._jianghu_rivals: dict[int, dict[int, _GuildJianghuRivalSummary]] = {}
+        self._jianghu_records: dict[int, list[_GuildJianghuGrudgeRec]] = {}
+        self._jianghu_seen: set[tuple[int, int]] = set()
         self._idempotency: dict[tuple[str, int, int], Message] = {}
         self.alerts: list[Message] = []  # 记录已触发警报，便于推送/观测
 
@@ -872,6 +989,18 @@ class GuildWarManager:
                 self._milestone_view(self.milestones[mid], weekly.guild_merit, me)
                 for mid in sorted(self.milestones)
             ]
+            active_feud, just_finished = self._active_or_pending_feud_locked(guild.guild_id, now_ms)
+            if just_finished is not None:
+                self._emit_feud_alert_locked(ALERT_FEUD_ENDED, just_finished)
+            active_feud_view = self._feud_view(active_feud) if active_feud is not None else None
+            last_feud = self._last_finished_feud_locked(guild.guild_id)
+            last_feud_summary = format_feud_summary(last_feud)
+            last_issued_at = self._last_feud_issued_at_locked(guild.guild_id)
+            next_feud_at = 0
+            if last_issued_at > 0:
+                cand = last_issued_at + FEUD_COOLDOWN_SEC * 1000
+                if cand > now_ms:
+                    next_feud_at = cand
 
         # 在锁外批量查询帮会名、玩家名与帮贡余额
         guild_ids_needed = {ll.owner_guild_id for ll in leylines_snap if ll.owner_guild_id}
@@ -921,7 +1050,11 @@ class GuildWarManager:
             contribution_balance=contrib_balance,
             public_bounty_used_today=public_used,
             public_bounty_daily_limit=self.rule.bounty_public_daily_limit,
+            last_feud_summary=last_feud_summary,
+            next_feud_issue_at_ms=next_feud_at,
         )
+        if active_feud_view is not None:
+            resp.active_feud.CopyFrom(active_feud_view)
         resp.banner_honor.occupied_leyline_id = occupied_lid
         resp.banner_honor.weekly_mvps.extend(name_map.get(pid, f"player-{pid}") for pid in mvp_ids)
         resp.banner_honor.first_win_names.extend(first_win_names)
@@ -1686,6 +1819,11 @@ class GuildWarManager:
                 if attacker_win:
                     st.protect_until_ms = now_ms + self.rule.post_battle_protect_sec * 1000
 
+            # 检查两帮是否正处于 2 小时宿敌约战窗口内（前 3 场免递减 + 收益 +25% + 计入比分）
+            active_feud = self._active_feud_between_locked(btl.attacker_guild_id, btl.defender_guild_id, now_ms)
+            feud_active = active_feud is not None
+            btl.feud_bonus = feud_active
+
             # 30 分钟窗口递减计算
             window_ms = self.rule.diminish_window_sec * 1000
             cutoff = now_ms - window_ms
@@ -1699,7 +1837,7 @@ class GuildWarManager:
                     hist.popleft()
                 prior_cnt = len(hist)
                 hist.append(now_ms)
-                dim_pct = _diminish_percent_for_count(prior_cnt, threshold=0)
+                dim_pct = _diminish_percent_for_count(prior_cnt, threshold=0, feud_active=feud_active)
             elif not is_pvp and btl.attacker_ids and btl.defender_guild_id > 0:
                 skey = (btl.attacker_ids[0], btl.defender_guild_id)
                 hist = self._siege_clashes.setdefault(skey, deque())
@@ -1707,7 +1845,7 @@ class GuildWarManager:
                     hist.popleft()
                 prior_cnt = len(hist)
                 hist.append(now_ms)
-                dim_pct = _diminish_percent_for_count(prior_cnt, threshold=6)
+                dim_pct = _diminish_percent_for_count(prior_cnt, threshold=6, feud_active=feud_active)
             else:
                 dim_pct = 100
 
@@ -1722,8 +1860,9 @@ class GuildWarManager:
                     return v
                 if btl.gold_leyline_bonus:
                     v = (v * self.rule.gold_leyline_multiplier_bps) // 10000
-                if btl.rivalry_bonus:
-                    v = (v * (10000 + self.rule.rivalry_bonus_bps)) // 10000
+                if btl.rivalry_bonus or feud_active:
+                    bonus_bps = max(self.rule.rivalry_bonus_bps, FEUD_BONUS_BPS) if feud_active else self.rule.rivalry_bonus_bps
+                    v = (v * (10000 + bonus_bps)) // 10000
                 return v
 
             # 基础第 1/2 层战利品
@@ -1990,6 +2129,21 @@ class GuildWarManager:
                     funds_to_apply.append((gid, rew.funds))
                 logs = self._guild_logs.setdefault(gid, deque(maxlen=_RECENT_LOG_LIMIT))
                 logs.append(battle_id)
+
+            # 计入 2 小时宿敌约战比分与双方战功（到点自动收官并播报战果）
+            if feud_active and active_feud is not None:
+                finished = self._record_feud_battle_locked(
+                    active_feud,
+                    btl.attacker_guild_id,
+                    btl.defender_guild_id,
+                    attacker_win,
+                    defender_win,
+                    atk_r.merit * len(btl.attacker_ids),
+                    def_r.merit * len(btl.defender_ids),
+                    now_ms,
+                )
+                if finished:
+                    self._emit_feud_alert_locked(ALERT_FEUD_ENDED, active_feud)
 
             btl.settled = True
 
@@ -2342,6 +2496,7 @@ class GuildWarManager:
                 bounty_candidate_name=cand_name,
                 gold_leyline_bonus=btl.gold_leyline_bonus,
                 rivalry_bonus=btl.rivalry_bonus,
+                feud_bonus=btl.feud_bonus,
             )
 
     async def inspect_field_targets(self, actor: RoleOriginal, request: Message) -> Message:
@@ -2404,4 +2559,387 @@ class GuildWarManager:
                     active_bounty_tier=ab.tier if ab is not None else 0,
                     can_attack_now=can_attack,
                 )
+        return resp
+
+    # -- 帮战 V2.5 · 宿敌约战战书（567 IssueGuildWarFeud / 568 RespondGuildWarFeud）-----------------
+
+    def _feud_view(self, rec: _FeudState) -> Message:
+        return self.protocol.message(
+            "guildpb.GuildWarFeudView",
+            feud_id=rec.feud_id,
+            issuer_guild_id=rec.issuer_guild_id,
+            issuer_guild_name=rec.issuer_guild_name,
+            target_guild_id=rec.target_guild_id,
+            target_guild_name=rec.target_guild_name,
+            status=rec.status,
+            issuer_wins=rec.issuer_wins,
+            target_wins=rec.target_wins,
+            issuer_merit=rec.issuer_merit,
+            target_merit=rec.target_merit,
+            created_at_ms=rec.created_at_ms,
+            accept_deadline_ms=rec.accept_deadline_ms,
+            started_at_ms=rec.started_at_ms,
+            ends_at_ms=rec.ends_at_ms,
+            winner_guild_id=rec.winner_guild_id,
+        )
+
+    def _emit_feud_alert_locked(self, kind: int, rec: _FeudState) -> None:
+        self._emit_alert(
+            kind,
+            attacker_guild_name=rec.issuer_guild_name,
+            defender_guild_name=rec.target_guild_name,
+            feud_id=rec.feud_id,
+            issuer_wins=rec.issuer_wins,
+            target_wins=rec.target_wins,
+        )
+
+    def _active_or_pending_feud_locked(
+        self, guild_id: int, now_ms: int
+    ) -> tuple[_FeudState | None, _FeudState | None]:
+        """返回 (生效中或待应答约战, 本次惰性收官的约战)；同步收口超时战书。"""
+        candidates = [
+            f
+            for f in self._feuds.values()
+            if (f.issuer_guild_id == guild_id or f.target_guild_id == guild_id)
+            and f.status in (FEUD_STATUS_PENDING, FEUD_STATUS_ACTIVE)
+        ]
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda f: (f.created_at_ms, f.feud_id), reverse=True)
+        rec = candidates[0]
+        if rec.status == FEUD_STATUS_PENDING and rec.accept_deadline_ms > 0 and now_ms >= rec.accept_deadline_ms:
+            rec.status = FEUD_STATUS_EXPIRED
+            rec.updated_ms = now_ms
+            return None, None
+        if rec.status == FEUD_STATUS_ACTIVE and rec.ends_at_ms > 0 and now_ms >= rec.ends_at_ms:
+            rec.status = FEUD_STATUS_FINISHED
+            rec.winner_guild_id = resolve_feud_winner(
+                rec.issuer_guild_id,
+                rec.target_guild_id,
+                rec.issuer_wins,
+                rec.target_wins,
+                rec.issuer_merit,
+                rec.target_merit,
+            )
+            rec.updated_ms = now_ms
+            return None, rec
+        return rec, None
+
+    def _last_finished_feud_locked(self, guild_id: int) -> _FeudState | None:
+        finished = [
+            f
+            for f in self._feuds.values()
+            if (f.issuer_guild_id == guild_id or f.target_guild_id == guild_id)
+            and f.status == FEUD_STATUS_FINISHED
+        ]
+        if not finished:
+            return None
+        finished.sort(key=lambda f: (f.ends_at_ms, f.feud_id), reverse=True)
+        return finished[0]
+
+    def _last_feud_issued_at_locked(self, issuer_guild_id: int) -> int:
+        times = [
+            f.created_at_ms
+            for f in self._feuds.values()
+            if f.issuer_guild_id == issuer_guild_id
+            and f.status in (FEUD_STATUS_PENDING, FEUD_STATUS_ACTIVE, FEUD_STATUS_FINISHED)
+        ]
+        return max(times) if times else 0
+
+    def _active_feud_between_locked(self, g1: int, g2: int, now_ms: int) -> _FeudState | None:
+        if g1 <= 0 or g2 <= 0 or g1 == g2:
+            return None
+        for rec in self._feuds.values():
+            if rec.status != FEUD_STATUS_ACTIVE:
+                continue
+            if {rec.issuer_guild_id, rec.target_guild_id} == {g1, g2}:
+                if rec.ends_at_ms > 0 and now_ms >= rec.ends_at_ms:
+                    return None
+                return rec
+        return None
+
+    def _record_feud_battle_locked(
+        self,
+        rec: _FeudState,
+        atk_guild_id: int,
+        def_guild_id: int,
+        atk_won: bool,
+        def_won: bool,
+        atk_merit: int,
+        def_merit: int,
+        now_ms: int,
+    ) -> bool:
+        if rec.status != FEUD_STATUS_ACTIVE:
+            return False
+        if atk_guild_id == rec.issuer_guild_id and def_guild_id == rec.target_guild_id:
+            if atk_won:
+                rec.issuer_wins += 1
+            elif def_won:
+                rec.target_wins += 1
+            rec.issuer_merit += atk_merit
+            rec.target_merit += def_merit
+        elif atk_guild_id == rec.target_guild_id and def_guild_id == rec.issuer_guild_id:
+            if atk_won:
+                rec.target_wins += 1
+            elif def_won:
+                rec.issuer_wins += 1
+            rec.target_merit += atk_merit
+            rec.issuer_merit += def_merit
+        finished = rec.ends_at_ms > 0 and now_ms >= rec.ends_at_ms
+        if finished:
+            rec.status = FEUD_STATUS_FINISHED
+            rec.winner_guild_id = resolve_feud_winner(
+                rec.issuer_guild_id,
+                rec.target_guild_id,
+                rec.issuer_wins,
+                rec.target_wins,
+                rec.issuer_merit,
+                rec.target_merit,
+            )
+        rec.updated_ms = now_ms
+        return finished
+
+    @staticmethod
+    def _is_officer_or_leader(guild: GuildData, player_id: int) -> bool:
+        if guild.leader_id == player_id:
+            return True
+        member = guild.member(player_id)
+        return member is not None and role_rank(member.role) >= RANK_OFFICER
+
+    async def issue_feud(self, actor: RoleOriginal, request: Message) -> Message:
+        """567 IssueGuildWarFeud：帮主/长老向异帮下发 2 小时宿敌约战战书（15 分钟应战窗，24h 冷却）。"""
+        now_ms = self._now()
+        guild = await self.store.get_player_guild(actor.player_id)
+        if guild is None or guild.member(actor.player_id) is None:
+            return self.protocol.message(
+                "guildpb.IssueGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not in any guild"),
+            )
+        if not self._is_officer_or_leader(guild, actor.player_id):
+            return self.protocol.message(
+                "guildpb.IssueGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_RANK_TOO_LOW, "officer or leader required"),
+            )
+        target_guild_id = int(request.target_guild_id)
+        if target_guild_id <= 0 or target_guild_id == guild.guild_id:
+            return self.protocol.message(
+                "guildpb.IssueGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_WAR_FEUD_INVALID_TARGET, "invalid target guild"),
+            )
+        target_guild = await self.store.get_guild(target_guild_id)
+        if target_guild is None:
+            return self.protocol.message(
+                "guildpb.IssueGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_WAR_FEUD_INVALID_TARGET, "target guild not found"),
+            )
+        zone_id = self._guild_zone(guild)
+        async with self._lock:
+            a_live, a_fin = self._active_or_pending_feud_locked(guild.guild_id, now_ms)
+            if a_fin is not None:
+                self._emit_feud_alert_locked(ALERT_FEUD_ENDED, a_fin)
+            b_live, b_fin = self._active_or_pending_feud_locked(target_guild_id, now_ms)
+            if b_fin is not None:
+                self._emit_feud_alert_locked(ALERT_FEUD_ENDED, b_fin)
+            if a_live is not None or b_live is not None:
+                return self.protocol.message(
+                    "guildpb.IssueGuildWarFeudResponse",
+                    error_message=self._tip(ERR_GUILD_WAR_FEUD_ALREADY_ACTIVE, "guild already has pending or active feud"),
+                )
+            last_issued = self._last_feud_issued_at_locked(guild.guild_id)
+            if last_issued > 0 and now_ms < last_issued + FEUD_COOLDOWN_SEC * 1000:
+                return self.protocol.message(
+                    "guildpb.IssueGuildWarFeudResponse",
+                    error_message=self._tip(ERR_GUILD_WAR_FEUD_COOLDOWN, "feud issue cooldown active"),
+                )
+            self._next_feud_id += 1
+            rec = _FeudState(
+                feud_id=self._next_feud_id,
+                zone_id=zone_id,
+                issuer_guild_id=guild.guild_id,
+                issuer_guild_name=guild.name,
+                target_guild_id=target_guild.guild_id,
+                target_guild_name=target_guild.name,
+                status=FEUD_STATUS_PENDING,
+                created_at_ms=now_ms,
+                accept_deadline_ms=now_ms + FEUD_ACCEPT_WINDOW_SEC * 1000,
+                updated_ms=now_ms,
+            )
+            self._feuds[rec.feud_id] = rec
+            self._emit_feud_alert_locked(ALERT_FEUD_CHALLENGE, rec)
+            view = self._feud_view(rec)
+        return self.protocol.message(
+            "guildpb.IssueGuildWarFeudResponse",
+            feud=view,
+            next_issue_at_ms=now_ms + FEUD_COOLDOWN_SEC * 1000,
+        )
+
+    async def respond_feud(self, actor: RoleOriginal, request: Message) -> Message:
+        """568 RespondGuildWarFeud：目标帮会管理应战/拒战，或发起方管理撤回待应答战书。"""
+        now_ms = self._now()
+        guild = await self.store.get_player_guild(actor.player_id)
+        if guild is None or guild.member(actor.player_id) is None:
+            return self.protocol.message(
+                "guildpb.RespondGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not in any guild"),
+            )
+        if not self._is_officer_or_leader(guild, actor.player_id):
+            return self.protocol.message(
+                "guildpb.RespondGuildWarFeudResponse",
+                error_message=self._tip(ERR_GUILD_RANK_TOO_LOW, "officer or leader required"),
+            )
+        feud_id = int(request.feud_id)
+        accept = bool(request.accept)
+        async with self._lock:
+            rec = self._feuds.get(feud_id)
+            if rec is None or rec.status != FEUD_STATUS_PENDING:
+                return self.protocol.message(
+                    "guildpb.RespondGuildWarFeudResponse",
+                    error_message=self._tip(ERR_GUILD_WAR_FEUD_NOT_FOUND, "feud not found or resolved"),
+                )
+            if rec.accept_deadline_ms > 0 and now_ms >= rec.accept_deadline_ms:
+                rec.status = FEUD_STATUS_EXPIRED
+                rec.updated_ms = now_ms
+                return self.protocol.message(
+                    "guildpb.RespondGuildWarFeudResponse",
+                    error_message=self._tip(ERR_GUILD_WAR_FEUD_NOT_FOUND, "feud expired"),
+                )
+            if accept:
+                if guild.guild_id != rec.target_guild_id:
+                    return self.protocol.message(
+                        "guildpb.RespondGuildWarFeudResponse",
+                        error_message=self._tip(ERR_GUILD_WAR_FEUD_NOT_FOUND, "only target guild can accept"),
+                    )
+                rec.status = FEUD_STATUS_ACTIVE
+                rec.started_at_ms = now_ms
+                rec.ends_at_ms = now_ms + FEUD_DURATION_SEC * 1000
+                rec.updated_ms = now_ms
+                self._emit_feud_alert_locked(ALERT_FEUD_STARTED, rec)
+            else:
+                if guild.guild_id not in (rec.target_guild_id, rec.issuer_guild_id):
+                    return self.protocol.message(
+                        "guildpb.RespondGuildWarFeudResponse",
+                        error_message=self._tip(ERR_GUILD_WAR_FEUD_NOT_FOUND, "not feud participant guild"),
+                    )
+                rec.status = FEUD_STATUS_DECLINED
+                rec.updated_ms = now_ms
+            view = self._feud_view(rec)
+        return self.protocol.message("guildpb.RespondGuildWarFeudResponse", feud=view)
+
+    # -- 江湖恩怨·帮派生死状恩怨墙（547 GetGuildJianghuGrudgeWall）----------------------------------
+
+    async def record_jianghu_duel_result(self, event: Message) -> bool:
+        """幂等记入两帮纯同帮小队天墉生死状的帮派恩怨汇总与近 20 场恩怨战绩。"""
+        if event is None or int(getattr(event, "battle_id", 0)) == 0:
+            return False
+        if int(getattr(event, "match_mode", 0)) != MATCH_MODE_JIANGHU_DUEL:
+            return False
+        total_rounds = int(getattr(event, "total_rounds", 0))
+        outcome = int(getattr(event, "outcome", 0))
+        if total_rounds == 0 or outcome not in (BATTLE_OUTCOME_SIDE_A_WIN, BATTLE_OUTCOME_SIDE_B_WIN, BATTLE_OUTCOME_DRAW):
+            return False
+        if not event.HasField("jianghu_duel_context"):
+            return False
+        duel = event.jianghu_duel_context
+        gid_a = int(duel.side_a_guild_id)
+        gid_b = int(duel.side_b_guild_id)
+        if gid_a <= 0 or gid_b <= 0 or gid_a == gid_b:
+            return False
+
+        if outcome == BATTLE_OUTCOME_SIDE_A_WIN:
+            out_a, out_b = 1, 2
+        elif outcome == BATTLE_OUTCOME_SIDE_B_WIN:
+            out_a, out_b = 2, 1
+        else:
+            out_a, out_b = 3, 3
+
+        battle_id = int(event.battle_id)
+        finished_ms = int(getattr(event, "finished_at_ms", 0)) or battle_id
+        writ_tier = int(duel.writ_tier)
+        team_size = int(duel.team_size)
+
+        sides = (
+            (gid_a, gid_b, str(duel.side_b_guild_name), out_a, str(duel.challenger_captain_name), str(duel.target_captain_name)),
+            (gid_b, gid_a, str(duel.side_a_guild_name), out_b, str(duel.target_captain_name), str(duel.challenger_captain_name)),
+        )
+        async with self._lock:
+            for gid, _, _, _, _, _ in sides:
+                if (gid, battle_id) in self._jianghu_seen:
+                    return False
+            for gid, rival_id, rival_name, out_for_guild, our_cap, rival_cap in sides:
+                self._jianghu_seen.add((gid, battle_id))
+                rivals_map = self._jianghu_rivals.setdefault(gid, {})
+                summary = rivals_map.get(rival_id)
+                if summary is None:
+                    summary = _GuildJianghuRivalSummary(rival_guild_id=rival_id, rival_guild_name=rival_name)
+                    rivals_map[rival_id] = summary
+                else:
+                    summary.rival_guild_name = rival_name
+                if out_for_guild == 1:
+                    summary.wins += 1
+                elif out_for_guild == 2:
+                    summary.losses += 1
+                else:
+                    summary.draws += 1
+                summary.last_battle_ms = max(summary.last_battle_ms, finished_ms)
+
+                recs = self._jianghu_records.setdefault(gid, [])
+                recs.append(
+                    _GuildJianghuGrudgeRec(
+                        battle_id=battle_id,
+                        rival_guild_id=rival_id,
+                        rival_guild_name=rival_name,
+                        outcome_for_guild=out_for_guild,
+                        writ_tier=writ_tier,
+                        team_size=team_size,
+                        total_rounds=total_rounds,
+                        our_captain_name=our_cap,
+                        rival_captain_name=rival_cap,
+                        finished_ms=finished_ms,
+                    )
+                )
+                recs.sort(key=lambda r: (r.finished_ms, r.battle_id), reverse=True)
+                if len(recs) > MAX_GUILD_JIANGHU_WALL_RECORDS:
+                    del recs[MAX_GUILD_JIANGHU_WALL_RECORDS:]
+        return True
+
+    async def get_jianghu_grudge_wall(self, actor: RoleOriginal) -> Message:
+        """547 GetGuildJianghuGrudgeWall：返回本帮生死状宿敌帮会汇总与最近 20 场战绩（仅本帮在册成员可读）。"""
+        guild = await self.store.get_player_guild(actor.player_id)
+        if guild is None or guild.member(actor.player_id) is None:
+            return self.protocol.message(
+                "guildpb.GetGuildJianghuGrudgeWallResponse",
+                error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not in any guild"),
+            )
+        gid = guild.guild_id
+        async with self._lock:
+            rivals = sorted(
+                self._jianghu_rivals.get(gid, {}).values(),
+                key=lambda s: (s.last_battle_ms, s.rival_guild_id),
+                reverse=True,
+            )[:MAX_GUILD_JIANGHU_WALL_RECORDS]
+            records = list(self._jianghu_records.get(gid, ()))[:MAX_GUILD_JIANGHU_WALL_RECORDS]
+
+        resp = self.protocol.message("guildpb.GetGuildJianghuGrudgeWallResponse", guild_id=gid)
+        for s in rivals:
+            resp.rivals.add(
+                rival_guild_id=s.rival_guild_id,
+                rival_guild_name=s.rival_guild_name,
+                wins=s.wins,
+                losses=s.losses,
+                draws=s.draws,
+                last_battle_ms=s.last_battle_ms,
+            )
+        for r in records:
+            resp.recent_records.add(
+                battle_id=r.battle_id,
+                rival_guild_id=r.rival_guild_id,
+                rival_guild_name=r.rival_guild_name,
+                outcome_for_guild=r.outcome_for_guild,
+                writ_tier=r.writ_tier,
+                team_size=r.team_size,
+                total_rounds=r.total_rounds,
+                our_captain_name=r.our_captain_name,
+                rival_captain_name=r.rival_captain_name,
+                finished_ms=r.finished_ms,
+            )
         return resp
