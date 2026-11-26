@@ -2,7 +2,7 @@
   "schema_version": 2,
   "schema_digest": "e8408ff7f70f67cc",
   "version": 73,
-  "content_digest": "da0292c3febf31c0ef807ee26a65ebab760cfc1953f016c5e64336f39593fc67",
+  "content_digest": "2d7a6d300f7db9c65edeb906feb9b2984baa401e74f74377abd4f47740c087b0",
   "generated_at": "2026-11-25T15:19:34Z",
   "source_rev": {
     "commit": "0f9bc81d68f0af285497d6ffc5cea8a87c5c5fc9",
@@ -1617,21 +1617,21 @@
       "rows": 3,
       "source": {
         "file": "SkillVfxCosmetic.xlsx",
-        "size": 6331,
-        "sha256": "13393d4532729c6a1d1a35f9e75ecd75b16ae016207053c6866a976f13a640fd"
+        "size": 6288,
+        "sha256": "49c6fbdc51d26c3ae133ffa7d79f0dc8ce2ac974be29c013d69b62dca3d2494b"
       },
       "artifacts": [
         {
           "kind": "json",
           "file": "skillvfxcosmetic.json",
-          "size": 1702,
-          "sha256": "6e0fd86d00774a6f0f9b6250a5eafcd4b19f00f2a0fa60b6859d031845d504b6"
+          "size": 1646,
+          "sha256": "30c491520f66c8921dc15bdb05857620230e7477696d8ac51f8e53f77d87c878"
         },
         {
           "kind": "binary",
           "file": "skillvfxcosmetic.pb",
-          "size": 825,
-          "sha256": "3597736a6397ff56a5d9d76f001235917bccd7e42b90db174a124f246c2fd6f1"
+          "size": 820,
+          "sha256": "d01561ef7859e824702b2e519fbce2664172e9015e6f21cc8605222b3db3ae89"
         }
       ]
     },
