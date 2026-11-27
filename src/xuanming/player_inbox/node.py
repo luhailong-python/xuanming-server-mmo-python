@@ -98,6 +98,7 @@ async def open_service(
         match_secret=config.match_secret,
         admin_token=config.admin_token,
         request_budget_sec=config.request_budget_sec,
+        allow_unapproved=config.admin_allow_unapproved,
     )
 
 

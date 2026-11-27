@@ -19,13 +19,24 @@ from .model import (
 
 ROLE_FENCE_SECRET_ENV = "MMORPG_ROLE_FENCE_SECRET_CHAT"
 MYSQL_PASSWORD_ENV = "CHAT_MYSQL_PASSWORD"
+ADMIN_TOKEN_ENV = "MMORPG_CHAT_ADMIN_TOKEN"
+ADMIN_TOKEN_METADATA_KEY = "x-admin-token"
 
 DEFAULT_GRPC_PORT = 50700
 DEFAULT_LEASE_TTL_SEC = 60
 MAX_RPC_TIMEOUT_SEC = 4.0  # 与 Go MaxRpcTimeoutMs=4000ms 对齐
 MIN_HMAC_SECRET_BYTES = 32
+MIN_ADMIN_TOKEN_BYTES = 16
 
-_TOML_FORBIDDEN_FIELDS = frozenset(("mysql_password", "role_fence_secret"))
+_TOML_FORBIDDEN_FIELDS = frozenset(("mysql_password", "role_fence_secret", "admin_token"))
+
+
+def resolve_admin_token(environ) -> str:
+    """解析运维撤回口令（未配置返回空串停用运维面；非空但不足 16 字节则拒启）。"""
+    token = environ.get(ADMIN_TOKEN_ENV, "")
+    if token and len(token.encode("utf-8")) < MIN_ADMIN_TOKEN_BYTES:
+        raise ValueError(f"{ADMIN_TOKEN_ENV} is shorter than {MIN_ADMIN_TOKEN_BYTES} bytes")
+    return token
 
 
 def load_required_secret(environ, env_name: str = ROLE_FENCE_SECRET_ENV) -> bytes:
@@ -65,6 +76,7 @@ class ChatConfig:
     kafka_partitions: int = 256
     bootstrap_schema: bool = False
     role_fence_secret: bytes = b""
+    admin_token: str = ""
 
     # 聊天业务规则参数（默认值与 Go config.go 一致）
     max_content_bytes: int = 512
@@ -106,6 +118,7 @@ class ChatConfig:
             **raw,
             mysql_password=environ.get(MYSQL_PASSWORD_ENV, ""),
             role_fence_secret=load_required_secret(environ, ROLE_FENCE_SECRET_ENV),
+            admin_token=resolve_admin_token(environ),
         )
         config.validate(settings=settings)
         return config

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import random
+import time
 import uuid
+from collections.abc import Callable
 
 from google.protobuf.message import DecodeError, Message
 
@@ -61,6 +63,38 @@ def _is_public_watchable(protocol: Protocol, formation: Message) -> tuple[bool, 
     return int(create_req.spectate_visibility) == SPECTATE_VISIBILITY_PUBLIC, create_req
 
 
+class SpectateLobbyCache:
+    """进程内短时观战列表缓存（对齐 Go SpectateLobby，支持按 battle_id 立即摘除失效项）。"""
+
+    def __init__(self, *, ttl_sec: float = 1.0, clock: Callable[[], float] | None = None) -> None:
+        self._ttl_sec = max(0.0, float(ttl_sec))
+        self._clock = clock or time.monotonic
+        self._entries: dict[tuple[str, bool], tuple[float, list[bytes]]] = {}
+
+    def get(self, release_track: str, ranked_only: bool) -> list[bytes] | None:
+        if self._ttl_sec <= 0:
+            return None
+        entry = self._entries.get((release_track, ranked_only))
+        if entry is None:
+            return None
+        fetched_at, raw_items = entry
+        if self._clock() - fetched_at >= self._ttl_sec:
+            self._entries.pop((release_track, ranked_only), None)
+            return None
+        return list(raw_items)
+
+    def put(self, release_track: str, ranked_only: bool, items: list[bytes]) -> None:
+        if self._ttl_sec <= 0:
+            return
+        self._entries[(release_track, ranked_only)] = (self._clock(), list(items))
+
+    def forget(self, battle_id: int) -> None:
+        """终局或懒剔除时立即忘掉指定对局，避免缓存窗口内反复回源。"""
+        if not battle_id:
+            return
+        self._entries.clear()
+
+
 class SpectateManager:
     """管理活跃公开对局列表、直连/大厅观战准入、赛事广播与战斗票据补签。"""
 
@@ -71,20 +105,48 @@ class SpectateManager:
         config: MatchConfig,
         rpc: EndpointCaller,
         presence: PresenceProvider,
+        *,
+        lobby_cache_ttl_sec: float = 0.0,
     ) -> None:
         self.protocol = protocol
         self.store = store
         self.config = config
         self.rpc = rpc
         self.presence = presence
+        self.lobby_cache = SpectateLobbyCache(ttl_sec=lobby_cache_ttl_sec)
 
-    async def list_watchable_battles(self, caller: CallerIdentity, limit: int) -> Message:
+    def forget_battle(self, battle_id: int) -> None:
+        """通知观战列表缓存摘除已结束或不再公开的对局。"""
+        self.lobby_cache.forget(int(battle_id))
+
+    async def list_watchable_battles(
+        self, caller: CallerIdentity, limit: int, *, ranked_only: bool = False
+    ) -> Message:
         capped = min(max(limit or 20, 1), 100)
-        active = await self.store.list_active_formations(release_track=caller.release_track, limit=capped)
         resp = self.protocol.message("match.ListWatchableBattlesResponse")
+        cached = self.lobby_cache.get(caller.release_track, ranked_only)
+        if cached is not None:
+            for raw in cached[:capped]:
+                resp.battles.add().ParseFromString(raw)
+            return resp
+
+        active = await self.store.list_active_formations(release_track=caller.release_track, limit=capped)
+        raw_items: list[bytes] = []
         for formation, featured in active:
             public, create_req = _is_public_watchable(self.protocol, formation)
             if not public or create_req is None:
+                continue
+            ranked_team_size = 0
+            ranked_peak_rating = 0
+            if (
+                "ranked_context" in create_req.DESCRIPTOR.fields_by_name
+                and create_req.HasField("ranked_context")
+            ):
+                rc = create_req.ranked_context
+                if not bool(getattr(rc, "use_free_preset", False)) and int(getattr(rc, "season_id", 0)) != 0:
+                    ranked_team_size = int(getattr(rc, "team_size", 0))
+                    ranked_peak_rating = int(getattr(rc, "peak_rating_centi", 0))
+            if ranked_only and ranked_team_size == 0:
                 continue
             summary = resp.battles.add(
                 battle_id=int(formation.battle_id),
@@ -93,8 +155,14 @@ class SpectateManager:
                 created_at_ms=int(formation.created_ms),
                 featured=featured,
             )
+            if "ranked_team_size" in summary.DESCRIPTOR.fields_by_name and ranked_team_size:
+                summary.ranked_team_size = ranked_team_size
+            if "ranked_peak_rating_centi" in summary.DESCRIPTOR.fields_by_name and ranked_peak_rating:
+                summary.ranked_peak_rating_centi = ranked_peak_rating
             for p in create_req.players:
                 summary.player_names.append(p.player_name)
+            raw_items.append(summary.SerializeToString(deterministic=True))
+        self.lobby_cache.put(caller.release_track, ranked_only, raw_items)
         return resp
 
     async def watch_battle(self, caller: CallerIdentity, req: Message, *, force_lobby: bool = False) -> Message:
@@ -161,6 +229,8 @@ class SpectateManager:
         add_req.routing.gate_node_id = caller.gate_node_id
         add_req.routing.gate_instance_id = caller.gate_instance_id
         add_req.routing.zone_id = pres.zone_id
+        if "minor_play_deadline_ms" in add_req.DESCRIPTOR.fields_by_name:
+            add_req.minor_play_deadline_ms = int(getattr(pres, "minor_play_deadline_ms", 0))
 
         add_bytes = add_req.SerializeToString(deterministic=True)
         try:

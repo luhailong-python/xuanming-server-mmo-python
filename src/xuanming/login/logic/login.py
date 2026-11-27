@@ -6,6 +6,7 @@ from .. import keys, login_session, session_fence, tips
 from ..directory import DirectoryError, Missing
 from ..locker import RedisLock
 from ..password_auth import DevPasswordProvider
+from ..queue import ticket_issued_to
 from ..tokens import AccessRejected
 from . import tip
 
@@ -63,6 +64,11 @@ async def run(ctx, request, details):
         unavailable = isinstance(error, AuthProviderUnavailable)
         response.error_message.CopyFrom(tip(protocol, tips.AUTH_PROVIDER_UNAVAILABLE if unavailable
                                             else tips.ACCOUNT_NOT_FOUND))
+        return response
+    if not http and not ticket_issued_to(bytes(getattr(details, "ticket_account_digest", b"")), account):
+        logger.error("Login rejected: gate ticket issued to another account account=%s session_id=%d",
+                     account, int(details.session_id))
+        response.error_message.CopyFrom(tip(protocol, tips.UNKNOWN_ERROR))
         return response
     lock = RedisLock(ctx.login_redis, keys.account_login_lock_key(account), config.account_lock_ttl_ms)
     try:

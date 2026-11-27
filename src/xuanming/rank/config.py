@@ -67,6 +67,7 @@ class RankConfig:
     bootstrap_schema: bool = False
     mail_secret_env: str = DEFAULT_MAIL_SECRET_ENV
     mail_max_personal_mail_ttl_days: int = DEFAULT_MAIL_MAX_PERSONAL_TTL_DAYS
+    admin_allow_unapproved: bool = False
     producers: tuple[tuple[str, str], ...] = DEFAULT_PRODUCER_SECRET_ENVS
     producer_secrets: tuple[tuple[str, bytes], ...] = ()
     mail_secret: bytes = b""

@@ -80,6 +80,7 @@ from .recall import (
     VALID_REVIEW_REASONS,
     RecallFilter,
     RecallPlanTooLarge,
+    approval_trail,
     build_recall_plan,
     distinct_gains,
     format_recall_evidence,
@@ -90,6 +91,8 @@ from .recall import (
     status_label,
     valid_recall_asset,
     valid_recall_text,
+    validate_admin_approval,
+    with_approval_trail,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,22 +159,39 @@ class DataService:
         zone_refresh: float = 5.0,
         clock_ms=lambda: time.time_ns() // 1_000_000,
         admin_token: str = "",
+        # shortcut: direct DataService() defaults admin_allow_unapproved=True for pre-dual-control test fixtures;
+        # DataServiceConfig & node.py always default False (strict fail-closed).
+        admin_allow_unapproved: bool = True,
         deletion_cooling_off_ms: int = DEFAULT_DELETION_COOLING_OFF_MS,
         recall_enabled: bool = True,
+        merged_zone_source=None,
     ) -> None:
         self.protocol, self.store, self.secrets = protocol, store, secrets
         self.id_tags, self.zone_refresh, self.clock_ms = frozenset(id_tags), zone_refresh, clock_ms
         self.admin_token = admin_token
+        self.admin_allow_unapproved = bool(admin_allow_unapproved)
+        self.unapproved_admin_commands: dict[str, int] = {
+            "BatchRecallItems": 0,
+            "CancelRecallBatch": 0,
+            "ResolveRecallOp": 0,
+            "RegisterRecallReviewHandled": 0,
+        }
         self.deletion_cooling_off_ms = deletion_cooling_off_ms
         self.recall_enabled = recall_enabled
+        self._merged_zone_source = merged_zone_source
         self._known_currencies = _known_currencies(protocol)
         self.zones: MergedZones | None = None
         self._refresher: asyncio.Task | None = None
 
     # -- lifecycle -----------------------------------------------------------------------------------
+    async def _read_merged_zones(self) -> dict[int, int]:
+        if self._merged_zone_source is not None:
+            return await self._merged_zone_source.read()
+        return await self.store.merged_zones()
+
     async def start(self) -> None:
         """首次合服映射读取失败直接拒启；后续刷新失败保留旧快照。"""
-        self.zones = MergedZones(await self.store.merged_zones())
+        self.zones = MergedZones(await self._read_merged_zones())
         self._refresher = asyncio.create_task(self._refresh_zones(), name="merged-zones")
 
     async def close(self) -> None:
@@ -183,7 +203,7 @@ class DataService:
         while True:
             await asyncio.sleep(self.zone_refresh)
             try:
-                self.zones = MergedZones(await self.store.merged_zones())
+                self.zones = MergedZones(await self._read_merged_zones())
             except Exception:
                 logger.warning("merged zone refresh failed, keeping previous snapshot", exc_info=True)
 
@@ -280,6 +300,33 @@ class DataService:
                 CODE.PERMISSION_DENIED,
                 f"error_code={ERR_ADMIN_AUTH}: {rpc_name} requires a valid {ADMIN_TOKEN_KEY}",
             )
+
+    async def _admit_approval(
+        self,
+        context,
+        method: str,
+        approval,
+        operator: str,
+        *,
+        request_id: int | None = None,
+    ) -> None:
+        """甲级回收入口双人复核准入（对齐 Go dataserviceserver.go admitApproval）：排在口令后、所有读库写库前。"""
+        kind, detail = validate_admin_approval(approval, operator, request_id=request_id)
+        if kind is None:
+            return
+        if kind == "missing" and self.admin_allow_unapproved:
+            self.unapproved_admin_commands[method] = self.unapproved_admin_commands.get(method, 0) + 1
+            logger.error(
+                "[admin] %s accepted without a dual-control approval record request_operator=%r "
+                "(admin_allow_unapproved is on) peer=%s",
+                method, operator, self._peer_addr(context),
+            )
+            return
+        logger.error("[admin] Rejecting %s: %s peer=%s", method, detail, self._peer_addr(context))
+        await context.abort(
+            CODE.PERMISSION_DENIED,
+            f"error_code={ERR_ADMIN_AUTH}: {method}: {detail}",
+        )
 
     @staticmethod
     def _peer_addr(context) -> str:
@@ -785,6 +832,13 @@ class DataService:
 
     async def batch_recall_items(self, request, context, path):
         await self._authorize_admin(context, "BatchRecallItems")
+        approval = request.approval if request.HasField("approval") else None
+        if not request.dry_run:
+            await self._admit_approval(
+                context, "BatchRecallItems", approval, request.operator, request_id=int(request.request_id),
+            )
+        elif approval is not None:
+            await self._admit_approval(context, "BatchRecallItems", approval, request.operator)
         player_ids = tuple(int(p) for p in request.player_ids)
         tx_types = tuple(int(t) for t in request.tx_types)
         if (not request.time_start or not request.time_end or request.time_start > request.time_end
@@ -828,7 +882,8 @@ class DataService:
                 return await self._format_recall_batch_resp(existing)
             if not self.recall_enabled:
                 await self.store.insert_recall_audit(
-                    request.time_start, 0, 0, f"batch_recall REJECTED (DISABLED): {request.reason}",
+                    request.time_start, 0, 0,
+                    f"batch_recall REJECTED (DISABLED): {request.reason} ({approval_trail(approval)})",
                     request.operator, now_ms,
                 )
                 return self.protocol.message(
@@ -975,7 +1030,7 @@ class DataService:
             "time_start": int(request.time_start),
             "time_end": int(request.time_end),
             "operator": request.operator,
-            "reason": request.reason,
+            "reason": with_approval_trail(request.reason, approval),
             "peer_addr": self._peer_addr(context),
             "player_count": plan.player_count,
             "op_count": len(op_plans),
@@ -1022,11 +1077,15 @@ class DataService:
 
     async def cancel_recall_batch(self, request, context, path):
         await self._authorize_admin(context, "CancelRecallBatch")
+        approval = request.approval if request.HasField("approval") else None
+        await self._admit_approval(context, "CancelRecallBatch", approval, request.operator)
         if (not request.request_id or not valid_recall_text(request.operator, RECALL_OPERATOR_MAX_RUNES)
                 or not valid_recall_text(request.reason, RECALL_REASON_MAX_RUNES)):
             return self.protocol.message("data_service.BatchRecallItemsResponse", error_code=ERR_INVALID_REQUEST)
         try:
-            await self.store.cancel_recall_batch(request.request_id, request.operator, request.reason, self.clock_ms())
+            await self.store.cancel_recall_batch(
+                request.request_id, request.operator, with_approval_trail(request.reason, approval), self.clock_ms(),
+            )
             batch = await self.store.read_recall_batch(request.request_id)
             return await self._format_recall_batch_resp(batch)
         except RecallBatchNotFound:
@@ -1040,6 +1099,8 @@ class DataService:
 
     async def resolve_recall_op(self, request, context, path):
         await self._authorize_admin(context, "ResolveRecallOp")
+        approval = request.approval if request.HasField("approval") else None
+        await self._admit_approval(context, "ResolveRecallOp", approval, request.operator)
         if (not request.op_id or request.final_status not in MANUAL_FINAL_STATUSES
                 or not valid_recall_text(request.operator, RECALL_OPERATOR_MAX_RUNES)
                 or not valid_recall_text(request.reason, RECALL_REASON_MAX_RUNES)):
@@ -1093,6 +1154,13 @@ class DataService:
 
     async def register_recall_review_handled(self, request, context, path):
         await self._authorize_admin(context, "RegisterRecallReviewHandled")
+        approval = request.approval if request.HasField("approval") else None
+        await self._admit_approval(context, "RegisterRecallReviewHandled", approval, request.operator)
+        if approval is not None:
+            logger.info(
+                "[BatchRecall] RegisterRecallReviewHandled approved player_id=%d correlation_id=%d %s",
+                request.player_id, request.correlation_id, approval_trail(approval),
+            )
         tx_ids = [int(t) for t in request.tx_ids]
         if (not request.player_id or not request.correlation_id or not tx_ids or len(tx_ids) > MAX_RECALL_SOURCE_ROWS
                 or any(t == 0 for t in tx_ids) or len(set(tx_ids)) != len(tx_ids)

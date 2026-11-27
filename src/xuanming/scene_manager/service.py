@@ -431,13 +431,24 @@ def valid_session(session_id: int) -> bool:
     return session_id != 0 and session_id != _UNBOUND_SESSION_ID
 
 
+def same_gate_instance(a: str, b: str) -> bool:
+    """两个会话的 gate 实例是否相容（任一方为空表示未知，按会话号认；两侧均非空须逐字节相等，§14.8）。"""
+    return not a or not b or a == b
+
+
 @dataclass(frozen=True, slots=True)
 class PlacementIdentity:
     session_id: int = 0
     login_generation: int = 0
+    gate_instance_id: str = ""
 
     def absent(self) -> bool:
         return self.session_id == 0 and self.login_generation == 0
+
+
+def identity_is_hosted_login(loc: PlacementIdentity, req: PlacementIdentity) -> bool:
+    """托管归位是否指向 location 记录的那次登录：比对非 0 代次与会话号，不比对 gate 实例（托管归位不带 gate）。"""
+    return loc.login_generation != 0 and loc.session_id == req.session_id and loc.login_generation == req.login_generation
 
 
 class PlacementVerdict(str, Enum):
@@ -456,23 +467,28 @@ class PlacementVerdict(str, Enum):
 def decide_placement_identity(
     cur: PlacementIdentity, cur_exists: bool, req: PlacementIdentity,
 ) -> tuple[PlacementVerdict, PlacementIdentity]:
-    """EnterScene 入口落点会话身份裁决（与 Go decidePlacementIdentity 逐行一致）。"""
+    """EnterScene 入口落点会话身份裁决（与 Go decidePlacementIdentity 含 §14.8 gate_instance_id 逐行一致）。"""
     if not cur_exists or cur.absent():
         return PlacementVerdict.FRESH, req
-    if valid_session(req.session_id) and req.session_id == cur.session_id:
+    if (
+        valid_session(req.session_id)
+        and req.session_id == cur.session_id
+        and same_gate_instance(cur.gate_instance_id, req.gate_instance_id)
+    ):
         gen = max(cur.login_generation, req.login_generation)
-        return PlacementVerdict.SAME_SESSION, PlacementIdentity(cur.session_id, gen)
+        inst = req.gate_instance_id or cur.gate_instance_id
+        return PlacementVerdict.SAME_SESSION, PlacementIdentity(cur.session_id, gen, inst)
     if req.login_generation == 0:
         if cur.login_generation != 0:
             return PlacementVerdict.LEGACY, cur
-        return PlacementVerdict.LEGACY, PlacementIdentity(req.session_id, 0)
+        return PlacementVerdict.LEGACY, PlacementIdentity(req.session_id, 0, req.gate_instance_id)
     if cur.login_generation == 0 or req.login_generation > cur.login_generation:
         return PlacementVerdict.NEWER, req
     if req.login_generation < cur.login_generation:
         return PlacementVerdict.STALE, PlacementIdentity()
     if valid_session(cur.session_id):
         return PlacementVerdict.CONFLICT, PlacementIdentity()
-    return PlacementVerdict.SAME_SESSION, PlacementIdentity(req.session_id, req.login_generation)
+    return PlacementVerdict.SAME_SESSION, req
 
 
 class LeaveIdentityVerdict(str, Enum):
@@ -1637,6 +1653,7 @@ class SceneManagerService:
             pending_scene_conf_id=pending_scene_conf_id,
             session_id=identity.session_id,
             login_generation=identity.login_generation,
+            gate_instance_id=identity.gate_instance_id,
         )
         raw = loc.SerializeToString()
         new_tag = keys.location_revision_tag(owner_revision, raw)
@@ -1809,7 +1826,15 @@ class SceneManagerService:
         await self.publisher.publish_gate_command(target_gate_id, int(request.player_id), cmd)
 
     async def _push_hosted_placement(
-        self, request, *, node_id: str, instance_id: str, scene_id: int, home_zone_id: int, owner_epoch: int,
+        self,
+        request,
+        *,
+        node_id: str,
+        instance_id: str,
+        scene_id: int,
+        home_zone_id: int,
+        owner_epoch: int,
+        login_gate_instance: str = "",
     ) -> None:
         if self.publisher is None:
             raise RuntimeError("Kafka command publisher is unavailable")
@@ -1825,6 +1850,7 @@ class SceneManagerService:
             session_id=int(request.session_id),
             login_generation=int(request.login_generation),
             owner_revision=int(request.owner_revision),
+            gate_instance_id=login_gate_instance,
         )
         cmd = self.protocol.message(
             "contracts.kafka.SceneCommand",
@@ -2010,11 +2036,19 @@ class SceneManagerService:
 
             observed_loc_raw = current_loc_raw
             cur_identity = (
-                PlacementIdentity(int(current_loc.session_id), int(current_loc.login_generation))
+                PlacementIdentity(
+                    int(current_loc.session_id),
+                    int(current_loc.login_generation),
+                    str(getattr(current_loc, "gate_instance_id", "")),
+                )
                 if current_loc is not None
                 else PlacementIdentity()
             )
-            req_identity = PlacementIdentity(int(request.session_id), int(request.login_generation))
+            req_identity = PlacementIdentity(
+                int(request.session_id),
+                int(request.login_generation),
+                str(getattr(request, "gate_instance_id", "")),
+            )
             identity_verdict, identity_record = decide_placement_identity(cur_identity, current_loc is not None, req_identity)
             if not identity_verdict.admits:
                 response = self._err_resp(
@@ -2236,6 +2270,7 @@ class SceneManagerService:
                     cloned.CopyFrom(current_loc)
                     cloned.session_id = identity_record.session_id
                     cloned.login_generation = identity_record.login_generation
+                    cloned.gate_instance_id = identity_record.gate_instance_id
                     updated_raw = cloned.SerializeToString()
                     updated_tag = keys.location_revision_tag(owner_revision, updated_raw)
                     ok = await self.player_store.set_location_if_epoch(
@@ -2274,6 +2309,7 @@ class SceneManagerService:
                             scene_id=scene_id,
                             home_zone_id=home_zone_id,
                             owner_epoch=routed_epoch,
+                            login_gate_instance=identity_record.gate_instance_id,
                         )
                     except Exception as exc:
                         logger.error("same-placement hosted route failed player=%d error=%s", player_id, exc)
@@ -2369,6 +2405,7 @@ class SceneManagerService:
                             scene_id=scene_id,
                             home_zone_id=home_zone_id,
                             owner_epoch=placed.epoch,
+                            login_gate_instance=identity_record.gate_instance_id,
                         )
                     else:
                         await self._push_route_player(

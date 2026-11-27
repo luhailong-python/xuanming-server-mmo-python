@@ -45,12 +45,17 @@ from .model import (
     ASSET_OP_MAX_PENDING,
     ASSET_OP_MAX_SPAN,
     ASSET_STREAM_TRADE_DEBIT,
+    COMMERCE_CANCELLED,
     COMMERCE_ESCROWING,
     COMMERCE_KIND_MARKET_MATCH,
+    COMMERCE_KIND_SKILL_BOOK_WANTED,
     COMMERCE_MANUAL,
     COMMERCE_SETTLED,
+    COMMERCE_WAITING,
     DUE_STATUSES,
     FRESH_ATTEMPT_LIMIT,
+    MAX_ACTIVE_WANTED_ORDERS,
+    SEALED_SKILL_BOOK_CONFIG_ID,
     UINT64_MAX,
     LISTING_SORT_DEFAULT,
     LISTING_SORT_LEVEL_DESC,
@@ -75,6 +80,7 @@ from .model import (
     ListingQuery,
     PendingAssetOp,
     RoleFenceRow,
+    WantedBoardCursor,
     on_book,
 )
 from .store import (
@@ -639,6 +645,16 @@ class _SqlTx:
         row = await self._cur.fetchone()
         return int(row[0] or 0)
 
+    async def count_active_wanted_orders(self, buyer_player_id: int, limit: int = MAX_ACTIVE_WANTED_ORDERS) -> int:
+        await self._cur.execute(
+            "SELECT `commerce_id` FROM `trade_commerce` "
+            "WHERE `buyer_player_id`=%s AND `kind`=%s AND `status` NOT IN (%s,%s) "
+            "ORDER BY `commerce_id` LIMIT %s FOR UPDATE",
+            (int(buyer_player_id), COMMERCE_KIND_SKILL_BOOK_WANTED, COMMERCE_CANCELLED, COMMERCE_SETTLED, int(limit)),
+        )
+        rows = await self._cur.fetchall()
+        return len(rows)
+
     async def allocate_seqs(
         self, now_ms: int, keys: Sequence[tuple[int, int]]
     ) -> dict[tuple[int, int], tuple[int, int]]:
@@ -1014,6 +1030,55 @@ class SqlTradeStore(TradeStoreBase):
             "AND `kind`<>1 AND (`seller_player_id`=%s OR `buyer_player_id`=%s) "
             "ORDER BY `created_ms`,`commerce_id` LIMIT %s",
             (after.created_ms, after.created_ms, after.commerce_id, pid, pid, int(limit)),
+        )
+        return [_scan_commerce(self.protocol, r) for r in rows]
+
+    async def list_open_wanted_skill_book_orders(
+        self, after: WantedBoardCursor | None, limit: int
+    ) -> list[Message]:
+        where = (
+            " FROM `trade_commerce` WHERE `kind`=%s AND `market_id`=0 AND `item_config_id`=%s "
+            "AND `side`=0 AND `status`=%s AND `on_book`=0"
+        )
+        if after is None:
+            rows = await self._query(
+                f"SELECT {_COMMERCE_COLUMNS}{where} ORDER BY `unit_price` DESC,`commerce_id` DESC LIMIT %s",
+                (COMMERCE_KIND_SKILL_BOOK_WANTED, SEALED_SKILL_BOOK_CONFIG_ID, COMMERCE_WAITING, int(limit)),
+            )
+        else:
+            rows = await self._query(
+                f"SELECT {_COMMERCE_COLUMNS}{where} AND (`unit_price`<%s OR (`unit_price`=%s AND `commerce_id`<%s)) "
+                "ORDER BY `unit_price` DESC,`commerce_id` DESC LIMIT %s",
+                (
+                    COMMERCE_KIND_SKILL_BOOK_WANTED,
+                    SEALED_SKILL_BOOK_CONFIG_ID,
+                    COMMERCE_WAITING,
+                    int(after.reward_gold),
+                    int(after.reward_gold),
+                    int(after.commerce_id),
+                    int(limit),
+                ),
+            )
+        return [_scan_commerce(self.protocol, r) for r in rows]
+
+    async def list_my_wanted_skill_book_orders(
+        self, poster_player_id: int, after: CommerceCursor, limit: int
+    ) -> list[Message]:
+        rows = await self._query(
+            f"SELECT {_COMMERCE_COLUMNS} FROM `trade_commerce` "
+            "WHERE `buyer_player_id`=%s AND `kind`=%s AND `status` NOT IN (%s,%s) "
+            "AND (`created_ms`>%s OR (`created_ms`=%s AND `commerce_id`>%s)) "
+            "ORDER BY `created_ms`,`commerce_id` LIMIT %s",
+            (
+                int(poster_player_id),
+                COMMERCE_KIND_SKILL_BOOK_WANTED,
+                COMMERCE_CANCELLED,
+                COMMERCE_SETTLED,
+                after.created_ms,
+                after.created_ms,
+                after.commerce_id,
+                int(limit),
+            ),
         )
         return [_scan_commerce(self.protocol, r) for r in rows]
 

@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 import grpc
 from google.protobuf.message import Message
 
+from ..dualcontrol import ApprovalMissingError, DualControlError, extract_approval, validate_admin_approval
 from ..grpc_runtime import verify_service_call
 from ..login.caller_auth import AuthError, CallerVerifier, SESSION_DETAIL, parse_details
 from ..protocol import Protocol
@@ -81,6 +82,7 @@ from .model import (
     COMMERCE_KIND_CONSIGNMENT,
     COMMERCE_KIND_OFFICIAL,
     COMMERCE_KIND_RMB_CONSIGNMENT,
+    COMMERCE_KIND_SKILL_BOOK_WANTED,
     LISTING_SECTION_AUCTION,
     LISTING_STATUS_LISTED,
     MANUAL_LIST_PAGE_MAX,
@@ -94,6 +96,7 @@ from .model import (
     MarketLimits,
     MergedZones,
     RoleOriginal,
+    WantedBoardCursor,
     clamp_page_size,
     clamp_uint32,
     escape_like,
@@ -109,6 +112,7 @@ from .model import (
     valid_sort,
     valid_tab,
     visible_to_buyer,
+    wanted_phase,
 )
 from .rmb import RmbConsignments, local_rmb_view
 from .role_trade import ContentGuardChecker, RmbIdentity, RmbIdentityResolver
@@ -173,6 +177,7 @@ class TradeService:
         daily_outflow: DailyPlayerTradeTracker | None | object = _AUTO,
         manual_resolution_secret: bytes = b"",
         manual_resolution_environment: str = "",
+        manual_resolution_allow_unapproved: bool = True,
         request_budget_sec: float = 3.5,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
@@ -217,6 +222,7 @@ class TradeService:
             self._daily_outflow = daily_outflow  # type: ignore[assignment]
         self._manual_secret = manual_resolution_secret
         self._manual_target = manual_resolution_environment
+        self._manual_allow_unapproved = bool(manual_resolution_allow_unapproved)
         self._replica = socket.gethostname() or "unknown"
         self._budget_sec = request_budget_sec
         self._clock_ms = clock_ms
@@ -268,6 +274,10 @@ class TradeService:
                 "SubmitSellerReview": self.submit_seller_review,
                 "GetMarketReferencePrice": self.get_market_reference_price,
                 "GetPlayerTradeQuota": self.get_player_trade_quota,
+                # Wanted Skill Book Orders (3: 582..584)
+                "CreateWantedSkillBookOrder": self.create_wanted_skill_book_order,
+                "FulfillWantedSkillBookOrder": self.fulfill_wanted_skill_book_order,
+                "ListWantedSkillBookOrders": self.list_wanted_skill_book_orders,
             },
             SERVICE_ADMIN: {
                 "SeedListing": self.seed_listing,
@@ -1509,7 +1519,150 @@ class TradeService:
             resp.daily_currency_remaining = int(resp.daily_currency_limit) - int(used)
         return resp
 
-    # -- TradeAdmin (3 RPCs) ------------------------------------------------------------------------
+    # -- Wanted Skill Book Orders (3 RPCs: 582..584) ------------------------------------------------
+
+    def _wanted_order_view(self, rec: Message | None, me: int) -> Message | None:
+        if rec is None or int(rec.kind) != COMMERCE_KIND_SKILL_BOOK_WANTED:
+            return None
+        try:
+            w = decode_workflow(self.protocol, rec)
+        except Exception:
+            return None
+        if not w.HasField("wanted_skill_book"):
+            return None
+        terms = w.wanted_skill_book
+        skill_name = ""
+        scroll_name = ""
+        if self.commerce is not None and self.commerce.wanted_skills is not None:
+            info, _ = self.commerce.wanted_skills.wanted_skill(int(terms.skill_table_id))
+            skill_name = info.skill_name
+            scroll_name = info.scroll_name
+        return self.protocol.message(
+            "trade.WantedSkillBookOrderView",
+            order_id=str(rec.commerce_id),
+            poster_player_id=int(rec.buyer_player_id),
+            poster_name=str(terms.poster_name),
+            skill_table_id=int(terms.skill_table_id),
+            skill_name=skill_name,
+            scroll_id=int(terms.scroll_id),
+            scroll_name=scroll_name,
+            require_master_signature=bool(terms.require_master_signature),
+            reward_gold=int(terms.reward_gold),
+            seller_net_gold=int(terms.seller_net_gold),
+            phase=wanted_phase(rec, w),
+            fulfiller_player_id=int(rec.seller_player_id),
+            created_ms=int(rec.created_ms),
+            version=int(rec.version),
+            is_mine=(me != 0 and int(rec.buyer_player_id) == me),
+        )
+
+    def _wanted_response(
+        self, rec: Message | None, me: int, *, error: BaseException | None = None, tip: int = 0
+    ) -> Message:
+        now = self._now_ms()
+        resp = self.protocol.message("trade.WantedSkillBookOrderResponse", server_now_ms=now)
+        code = tip if tip != 0 else commerce_tip_id(error)
+        if code != 0:
+            resp.error_message.id = code
+            return resp
+        if rec is None:
+            return resp
+        view = self._wanted_order_view(rec, me)
+        if view is None:
+            resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+            return resp
+        resp.order.CopyFrom(view)
+        return resp
+
+    async def create_wanted_skill_book_order(self, request: Message, context, path: str) -> Message:
+        """582 发榜悬赏求书求购单（仅流通银两，严禁绑定银两）。"""
+        original = await self._admit_client(context, path)
+        if self.commerce is None:
+            return self._wanted_response(None, original.player_id, tip=ERR_TRADE_FEATURE_DISABLED)
+        try:
+            rec = await self._with_budget(self.commerce.create_wanted_skill_book_order(original, request))
+            return self._wanted_response(rec, original.player_id)
+        except Exception as exc:
+            return self._wanted_response(None, original.player_id, error=exc)
+
+    async def fulfill_wanted_skill_book_order(self, request: Message, context, path: str) -> Message:
+        """583 揭榜悬赏求书求购单：交出背包未绑定封卷道籍(3414)，同请求号重发可查询该次揭榜结果。"""
+        original = await self._admit_client(context, path)
+        if self.commerce is None:
+            return self._wanted_response(None, original.player_id, tip=ERR_TRADE_FEATURE_DISABLED)
+        raw_id = str(request.order_id)
+        if not raw_id.isdigit() or int(raw_id) == 0:
+            return self._wanted_response(None, original.player_id, tip=ERR_INVALID_PARAMETER)
+        try:
+            rec = await self._with_budget(
+                self.commerce.fulfill_wanted_skill_book_order(
+                    original,
+                    int(raw_id),
+                    str(request.client_request_id),
+                    int(request.sealed_item_id),
+                )
+            )
+            return self._wanted_response(rec, original.player_id)
+        except Exception as exc:
+            return self._wanted_response(None, original.player_id, error=exc)
+
+    async def list_wanted_skill_book_orders(self, request: Message, context, path: str) -> Message:
+        """584 悬赏求书榜查询：公开榜按悬赏额降序列挂榜中订单；only_mine 列本人未结案订单。"""
+        original = await self._admit_client(context, path)
+        now = self._now_ms()
+        resp = self.protocol.message("trade.ListWantedSkillBookOrdersResponse", server_now_ms=now)
+        only_mine = bool(request.only_mine)
+        if self.commerce is None or (not only_mine and self.commerce.wanted_skills is None):
+            resp.error_message.id = ERR_TRADE_FEATURE_DISABLED
+            return resp
+        limit = int(request.limit) or 20
+        limit = min(max(limit, 1), 50)
+        try:
+            if only_mine:
+                after = CommerceCursor.parse(str(request.cursor))
+                rows = await self._with_budget(
+                    self.store.list_my_wanted_skill_book_orders(original.player_id, after, limit)
+                )
+            else:
+                after_board = WantedBoardCursor.parse(str(request.cursor))
+                rows = await self._with_budget(
+                    self.store.list_open_wanted_skill_book_orders(after_board, limit)
+                )
+        except Exception as exc:
+            logger.error("trade ListWantedSkillBookOrders failed only_mine=%s err=%s", only_mine, exc)
+            resp.error_message.id = commerce_tip_id(exc)
+            return resp
+
+        if len(rows) == limit:
+            last = rows[-1]
+            if only_mine:
+                resp.next_cursor = CommerceCursor(int(last.created_ms), int(last.commerce_id)).format()
+            else:
+                resp.next_cursor = WantedBoardCursor(int(last.unit_price), int(last.commerce_id)).format()
+
+        filter_skill = int(request.filter_skill_table_id)
+        for rec in rows:
+            if only_mine:
+                try:
+                    w = decode_workflow(self.protocol, rec)
+                except Exception:
+                    continue
+                if not owns_record(original, rec, w):
+                    continue
+            view = self._wanted_order_view(rec, original.player_id)
+            if view is None:
+                if only_mine:
+                    continue
+                resp.error_message.id = ERR_SERVICE_UNAVAILABLE
+                del resp.orders[:]
+                resp.next_cursor = ""
+                return resp
+            if filter_skill != 0 and int(view.skill_table_id) != filter_skill:
+                continue
+            resp.orders.add().CopyFrom(view)
+        return resp
+
+    # -- TradeAdmin (5 RPCs) ------------------------------------------------------------------------
 
     async def seed_listing(self, request: Message, context, path: str) -> Message:
         await self._reject_client_session(context, SERVICE_ADMIN)
@@ -1644,6 +1797,15 @@ class TradeService:
             out.refusal = "target_mismatch"
             self._write_manual_audit(request, out, executed=False)
             return out
+        approval = extract_approval(request)
+        approval_refusal = self._admit_manual_approval(request, approval, execute=execute)
+        if approval_refusal:
+            out.verdict = _VERDICT_REFUSED
+            out.refusal = approval_refusal
+            self._write_manual_audit(request, out, executed=False)
+            return out
+        approval_id = str(approval.approval_id) if approval is not None else ""
+        approver = str(approval.approver) if approval is not None else ""
         try:
             parts = tuple(parse_partial_part(str(raw)) for raw in request.parts)
             mreq = ManualRequest(
@@ -1657,11 +1819,14 @@ class TradeService:
                 to_player_id=int(request.to_player_id),
                 linked_commerce_id=int(request.linked_commerce_id),
                 linked_version=int(request.linked_version),
+                approval_id=approval_id,
+                approver=approver,
             )
             res = await self._with_budget(self.commerce.resolve_manual(mreq, execute=execute))
             out.verdict = _VERDICT_OK
             out.stage = res.stage
             out.status = res.status
+            out.already_executed = bool(res.already_executed)
             if res.audit is not None:
                 out.plan.CopyFrom(res.audit)
             if res.linked is not None and res.linked.audit is not None:
@@ -1678,15 +1843,47 @@ class TradeService:
             logger.error("trade ResolveManualContract failed cid=%d err=%s", cid, exc)
             out.verdict = _VERDICT_RETRY
             out.refusal = str(exc)
-        self._write_manual_audit(request, out, executed=(execute and int(out.verdict) == _VERDICT_OK))
+        executed = execute and int(out.verdict) == _VERDICT_OK and not bool(out.already_executed)
+        self._write_manual_audit(request, out, executed=executed)
         return out
 
+    def _admit_manual_approval(self, req: Message, approval: object | None, *, execute: bool) -> str:
+        """核对人工处置双人复核批准记录；返回非空串为带内拒绝原因。"""
+        if approval is None:
+            if not execute:
+                return ""
+            if not self._manual_allow_unapproved:
+                return "dual_control_approval_required"
+            logger.error(
+                "[CommerceManual] EXECUTE accepted without a dual-control approval record commerce_id=%d operator=%r (Commerce.ManualResolutionAllowUnapproved is on)",
+                int(req.commerce_id),
+                str(req.operator),
+            )
+            return ""
+        try:
+            validate_admin_approval(
+                approval,
+                operator=str(req.operator),
+                allow_unapproved=False,
+                require_operator=True,
+            )
+        except ApprovalMissingError:
+            return "dual_control_approval_required"
+        except DualControlError as exc:
+            return f"dual_control_approval_invalid: {exc}"
+        return ""
+
     def _write_manual_audit(self, req: Message, out: Message, *, executed: bool) -> None:
+        approval = extract_approval(req)
+        approval_id = str(approval.approval_id) if approval is not None else ""
+        approver = str(approval.approver) if approval is not None else ""
         line = (
             f"[CommerceManual] operator={str(req.operator)!r} commerce_id={int(req.commerce_id)} "
             f"action={str(req.action)!r} mode={int(req.mode)} verdict={int(out.verdict)} "
             f"refusal={str(out.refusal)!r} stage={str(out.stage)} status={int(out.status)} "
-            f"target={self._manual_target} replica={self._replica} reason={str(req.reason)!r} executed={executed}"
+            f"target={self._manual_target} replica={self._replica} reason={str(req.reason)!r} "
+            f"approval_id={approval_id!r} approver={approver!r} "
+            f"already_executed={bool(out.already_executed)} executed={executed}"
         )
         out.audit_line = line
         if executed:

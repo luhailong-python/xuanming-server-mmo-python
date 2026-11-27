@@ -1190,6 +1190,20 @@ class SceneSeason:
         logger.info("Equipped wuxing formation player_id=%s formation_id=%s", player.player_id, fid)
         return self._finish(response, player, data, stamp)
 
+    def try_equip_linked_formation(self, player, data, formation_id: int) -> int:
+        """装备流派方案切换时联动装配免费五行阵法（1..5，对齐 C++ TryEquipLinkedFormation）。"""
+        fid = int(formation_id)
+        if fid == 0 or not is_valid_formation_id(fid):
+            return INVALID
+        if writable_err := self._writable_error(player):
+            return writable_err
+        if not data.HasField("level_component"):
+            return SEASON_UNAVAILABLE
+        if int(data.season_component.equipped_formation_id) == fid:
+            return 0
+        data.season_component.equipped_formation_id = fid
+        return 0
+
     def _fill_tower_state(self, data, stamp: int, out) -> None:
         out.Clear()
         wk = wuxing_week_key(stamp)

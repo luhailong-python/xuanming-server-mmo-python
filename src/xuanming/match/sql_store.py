@@ -1880,6 +1880,7 @@ class SqlMatchStore:
         ranked_season_id: int = 0,
         jianghu_duel_context: bytes = b"",
         trial_vow_mask: int = 0,
+        tactical_puzzle_context: bytes = b"",
         skip_ticket_check: bool = False,
     ) -> Message:
         battle_id = await self.next_id()
@@ -1908,6 +1909,7 @@ class SqlMatchStore:
                 is_wuxing_tower=is_wuxing_tower,
                 jianghu_duel_context=jianghu_duel_context,
                 trial_vow_mask=int(trial_vow_mask),
+                tactical_puzzle_context=tactical_puzzle_context,
             )
             for pid, tk_id, side, captain in members:
                 formation.members.add(player_id=pid, ticket=tk_id, team_index=side, captain=captain)
@@ -2235,6 +2237,63 @@ class SqlMatchStore:
                 config_id=battle_config_id, team_size=1, state=TICKET_STATE_FORMING,
                 enqueued_ms=now, formation_id=battle_id_alloc, expires_ms=now + battle_deadline_ms,
                 selected_region=b_region, owner_account=f"acct:{owner_id}", owner_revision=1,
+            )
+            await self._insert_ticket_tx(cur, tk)
+            await self._insert_formation_tx(cur, formation)
+            return formation, True
+
+        return await self._run_tx(work)
+
+    async def start_tactical_puzzle_battle(
+        self,
+        *,
+        caller: CallerIdentity,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        ranked_context_bytes: bytes,
+        tactical_puzzle_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        """万象残局坊单人开局（SQL 权威实现，与 MemoryMatchStore 语义一致）。"""
+        battle_id_alloc = await self.next_id()
+
+        async def work(cur):
+            await self._check_fence_tx(cur, caller.player_id, caller.account, caller.owner_revision)
+            now = await self._db_now(cur)
+            await cur.execute(
+                "SELECT `state`,`expires_ms` FROM `match_authority_ticket` WHERE `player_id`=%s FOR UPDATE",
+                (caller.player_id,),
+            )
+            trow = await cur.fetchone()
+            if trow:
+                st = int(trow[0])
+                if st == TICKET_STATE_QUEUED and int(trow[1]) > now:
+                    raise MatchBusinessError(ERR_MATCH_ALREADY_QUEUED)
+                if st in (TICKET_STATE_FORMING, TICKET_STATE_READY):
+                    raise MatchBusinessError(ERR_MATCH_IN_BATTLE)
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id_alloc, operation_id=op_id, state=FORMATION_STATE_PREPARING,
+                physical_region=b_region, target_node_id=b_node_id, target_instance_id=b_uuid,
+                target_endpoint=b_endpoint, mode=MODE_PVE_SOLO, config_id=battle_config_id,
+                created_ms=now, deadline_ms=now + battle_deadline_ms, retry_at_ms=now + 60_000,
+                requeue_on_failure=False, release_track=b_track,
+                ranked_context=ranked_context_bytes,
+                tactical_puzzle_context=tactical_puzzle_context_bytes,
+            )
+            tk_id = f"pz-{battle_id_alloc}-{caller.player_id}"
+            formation.members.add(player_id=caller.player_id, ticket=tk_id, team_index=0, captain=True)
+            tk = self.protocol.message(
+                "match.MatchAuthorityTicketRecord",
+                player_id=caller.player_id, ticket=tk_id, request_id=op_id, mode=MODE_PVE_SOLO,
+                config_id=battle_config_id, team_size=1, state=TICKET_STATE_FORMING,
+                enqueued_ms=now, formation_id=battle_id_alloc, expires_ms=now + battle_deadline_ms,
+                selected_region=b_region, owner_account=caller.account, owner_revision=caller.owner_revision,
             )
             await self._insert_ticket_tx(cur, tk)
             await self._insert_formation_tx(cur, formation)

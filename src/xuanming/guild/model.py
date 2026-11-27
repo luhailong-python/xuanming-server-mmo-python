@@ -91,6 +91,9 @@ OP_KIND_UNSPECIFIED = 0
 OP_KIND_DONATE = 1
 OP_KIND_SHOP = 2
 OP_KIND_ACTIVITY_REWARD = 3
+OP_KIND_WAR_REWARD = 5
+OP_KIND_BOUNTY_ESCROW = 6
+OP_KIND_BOUNTY_PAYOUT = 7
 
 COUNTER_KIND_UNSPECIFIED = 0
 COUNTER_KIND_DONATE = 1
@@ -187,6 +190,7 @@ ROLE_BLOCKER_ASSET_OP = "guild_asset_op"
 ROLE_BLOCKER_TRIAL_REWARD_OWED = "guild_trial_reward_owed"
 ROLE_BLOCKER_TRIAL_LAUNCH_ROLE = "guild_trial_launch_role"
 ROLE_BLOCKER_TRIAL_LOBBY_SLOT = "guild_trial_lobby_slot"
+ROLE_BLOCKER_WAR_CREDIT_OWED = "guild_war_credit_owed"
 
 # 内容安全场景常量（对应 content_guard.TextScene）
 TEXT_SCENE_GUILD_NAME = 2
@@ -630,6 +634,78 @@ class TrialOwedRewardRecord:
     payload: bytes
     attempts: int
     created_ms: int
+
+
+class CreditFenceVerdict(int):
+    """帮战入账目标此刻的角色护栏结论（对齐 Go war_credit_owed.go creditFenceVerdict）。"""
+
+    OPEN = 0
+    FROZEN = 1
+    REMOVED = 2
+
+
+class WarOwedConvertStatus(int):
+    """ConvertWarCreditOwed 转换状态（对齐 Go war_credit_owed.go WarOwedConvertStatus）。"""
+
+    CONVERTED = 1
+    STILL_FULL = 2
+    FROZEN = 3
+    ABANDONED = 4
+    GONE = 5
+
+
+def classify_credit_fence(
+    fence: RoleFenceRow | None,
+    *,
+    healed: bool = False,
+    fence_enabled: bool = True,
+) -> tuple[int, bool]:
+    """判定入账目标的护栏副本结论，返回 `(verdict, need_heal)`（对齐 Go classifyCreditFence）。
+
+    - 未装配护栏（独立仓储夹具）直接放行；
+    - 缺失副本或首次遇到冻结：返回 `need_heal=True` 供外层向权威目录自愈后重试；
+    - 墓碑（`account == ""`）：永久放弃，不再自愈也不写入任何业务行；
+    - 自愈后仍冻结：返回 `CreditFenceVerdict.FROZEN`，转入 `guild_war_credit_owed` 队列。
+    """
+    if not fence_enabled:
+        return CreditFenceVerdict.OPEN, False
+    if fence is None:
+        return CreditFenceVerdict.OPEN, True
+    if fence.account == "":
+        return CreditFenceVerdict.REMOVED, False
+    if fence.freeze_token != 0 and not healed:
+        return CreditFenceVerdict.OPEN, True
+    if fence.freeze_token != 0:
+        return CreditFenceVerdict.FROZEN, False
+    return CreditFenceVerdict.OPEN, False
+
+
+@dataclass(frozen=True, slots=True)
+class WarCreditOwedCursor:
+    """guild_war_credit_owed 键集翻页游标（created_ms, player_id, op_id）。"""
+
+    created_ms: int = 0
+    player_id: int = 0
+    op_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class WarCreditOwed:
+    """帮战待入账行 guild_war_credit_owed（r2-gw#5 / #6，对齐 Go WarCreditOwed）。"""
+
+    player_id: int
+    op_id: int
+    guild_id: int
+    kind: int
+    tx_type: int
+    ref_id: int = 0
+    period_key: int = 0
+    payload: bytes = b""
+    source_id: int = 0
+    created_ms: int = 0
+
+    def cursor(self) -> WarCreditOwedCursor:
+        return WarCreditOwedCursor(created_ms=self.created_ms, player_id=self.player_id, op_id=self.op_id)
 
 
 @dataclass(frozen=True, slots=True)

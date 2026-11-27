@@ -239,6 +239,41 @@ end
 return #tokens
 """
 
+RETIRE_ISSUED_BEFORE = """
+local kind = redis.call("TYPE", KEYS[1]).ok
+if kind == "none" then return 0 end
+if kind ~= "zset" then return redis.error_reply("invalid account refresh index") end
+local cutoff = tonumber(ARGV[4])
+local tokens, families = {}, {}
+for _, token in ipairs(redis.call("ZRANGE", KEYS[1], 0, -1)) do
+    local raw = redis.call("GET", ARGV[2] .. token)
+    if raw then
+        local ok, data = pcall(cjson.decode, raw)
+        if not ok or type(data) ~= "table" or data.account ~= ARGV[1] then
+            return redis.error_reply("invalid refresh ownership")
+        end
+        if (tonumber(data.identity_issued_at) or 0) <= cutoff then
+            local family = data.family_id
+            if type(family) ~= "string" or #family ~= 22 or not string.match(family, "^[%w_-]+$") then
+                return redis.error_reply("invalid refresh family identity")
+            end
+            tokens[#tokens + 1] = token
+            local key = ARGV[3] .. family
+            if redis.call("TYPE", key).ok == "hash" and redis.call("HGET", key, "account") == ARGV[1] and
+               redis.call("HGET", key, "head") == token then
+                families[#tokens] = key
+            end
+        end
+    end
+end
+for i, token in ipairs(tokens) do
+    redis.call("DEL", ARGV[2] .. token)
+    if families[i] then redis.call("DEL", families[i]) end
+    redis.call("ZREM", KEYS[1], token)
+end
+return #tokens
+"""
+
 
 class AccessRejected(Exception):
     """The access token cannot authenticate (as opposed to a store failure)."""
@@ -255,6 +290,7 @@ class TokenData:
     family_id: str
     device_id: str = ""
     created_at: int = 0
+    identity_issued_at: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,11 +342,20 @@ def _go_json(data: dict) -> bytes:
     return text.encode()
 
 
-def _payload(account: str, auth_type: str, device_id: str, created_at: int, family_id: str) -> bytes:
+def _payload(
+    account: str,
+    auth_type: str,
+    device_id: str,
+    created_at: int,
+    family_id: str,
+    identity_issued_at: int = 0,
+) -> bytes:
     data = {"account": account, "auth_type": auth_type}
     if device_id:
         data["device_id"] = device_id
     data |= {"created_at": created_at, "family_id": family_id}
+    if identity_issued_at > 0:
+        data["identity_issued_at"] = int(identity_issued_at)
     return _go_json(data)
 
 
@@ -332,7 +377,14 @@ class TokenManager:
     async def _eval(self, script: str, keys_: list[str], *args):
         return await self.redis.eval(script, len(keys_), *keys_, *args)
 
-    async def issue(self, account: str, auth_type: str, device_id: str = "") -> TokenPair:
+    async def issue(
+        self,
+        account: str,
+        auth_type: str,
+        device_id: str = "",
+        *,
+        identity_issued_at: int = 0,
+    ) -> TokenPair:
         if not account or not auth_type:
             raise ValueError("token 账号与认证类型不能为空")
         now = int(time.time())
@@ -345,7 +397,7 @@ class TokenManager:
             ISSUE_FAMILY,
             [keys.access_token_key(tag, access), keys.refresh_token_key(tag, refresh),
              keys.account_refresh_key(account), keys.refresh_family_key(tag, family_id)],
-            _payload(account, auth_type, device_id, now, family_id), account, now,
+            _payload(account, auth_type, device_id, now, family_id, identity_issued_at), account, now,
             self.access_ttl_ms, self.refresh_ttl_ms, now - 1, refresh_expire, refresh,
         )
         await self._trim(account, refresh)
@@ -366,6 +418,17 @@ class TokenManager:
             raise AccessRejected("token family 已失效或不匹配")
         return data
 
+    async def read_refresh_payload(self, token: str) -> TokenData | None:
+        """只读解析仍有效的 refresh token 载荷，不修改 Redis；格式无效或已不存在返回 ``None``。"""
+        parsed = _parse(token)
+        if parsed is None or parsed.access:
+            return None
+        try:
+            _, data = await self._load(parsed, keys.refresh_token_key(parsed.tag, parsed.secret), None)
+        except LookupError:
+            return None
+        return data
+
     async def refresh(self, token: str) -> TokenPair:
         parsed = _parse(token)
         if parsed is None or parsed.access:
@@ -383,7 +446,8 @@ class TokenManager:
             [keys.refresh_token_key(parsed.tag, parsed.secret), keys.account_refresh_key(data.account),
              keys.access_token_key(parsed.tag, access), keys.refresh_token_key(parsed.tag, refresh),
              keys.refresh_family_key(parsed.tag, parsed.family_id), keys.refresh_rotated_key(parsed.tag, parsed.secret)],
-            raw, parsed.secret, _payload(data.account, data.auth_type, data.device_id, now, parsed.family_id),
+            raw, parsed.secret,
+            _payload(data.account, data.auth_type, data.device_id, now, parsed.family_id, data.identity_issued_at),
             self.access_ttl_ms, self.refresh_ttl_ms, now - 1, refresh_expire, refresh, data.account, now,
             self.reuse_grace_ms, access, access_expire,
         ))
@@ -447,6 +511,21 @@ class TokenManager:
         logger.info("Revoked refresh token families account=%s count=%d", account, count)
         return count
 
+    async def revoke_issued_before(self, account: str, cutoff: int) -> int:
+        """原子吊销账号下 ``identity_issued_at <= cutoff`` 的全部令牌家族，保留改密后的新登录（Go ``RevokeIssuedBefore``）。"""
+        tag = keys.account_tag(account)
+        count = int(await self._eval(
+            RETIRE_ISSUED_BEFORE,
+            [keys.account_refresh_key(account)],
+            account,
+            keys.refresh_token_key_prefix(tag),
+            keys.refresh_family_key_prefix(tag),
+            int(cutoff),
+        ))
+        if count > 0:
+            logger.info("Revoked refresh families issued before %d account=%s count=%d", int(cutoff), account, count)
+        return count
+
     async def _trim(self, account: str, protect: str) -> None:
         tag = keys.account_tag(account)
         try:
@@ -463,8 +542,14 @@ class TokenManager:
             raise rejected("token not found or expired")
         try:
             data = json.loads(raw)
-            token = TokenData(account=data["account"], auth_type=data["auth_type"], family_id=data["family_id"],
-                              device_id=data.get("device_id", ""), created_at=data["created_at"])
+            token = TokenData(
+                account=data["account"],
+                auth_type=data["auth_type"],
+                family_id=data["family_id"],
+                device_id=data.get("device_id", ""),
+                created_at=data["created_at"],
+                identity_issued_at=int(data.get("identity_issued_at", 0) or 0),
+            )
             ok = (isinstance(token.account, str) and token.account and isinstance(token.auth_type, str)
                   and token.auth_type and isinstance(token.created_at, int) and token.created_at > 0
                   and token.family_id == parsed.family_id and keys.account_tag(token.account) == parsed.tag)

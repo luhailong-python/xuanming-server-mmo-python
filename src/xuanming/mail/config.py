@@ -110,6 +110,8 @@ class MailConfig:
     asset_loop_interval_sec: float = 2.0
     asset_loop_batch: int = 100
     asset_loop_workers: int = 8
+    admin_allow_unapproved: bool = False
+    approval_required_callers: tuple[str, ...] = ("admin",)
     producer_secrets: tuple[tuple[str, bytes], ...] = ()
     asset_op_secret: bytes = b""
     coordinator_secret: bytes = b""
@@ -138,6 +140,8 @@ class MailConfig:
             raise ValueError(f"[mail_node] missing or has invalid fields: {sorted(unknown)}")
         if "limits" in raw and isinstance(raw["limits"], dict):
             raw["limits"] = MailLimits(**raw["limits"])
+        if "approval_required_callers" in raw:
+            raw["approval_required_callers"] = tuple(str(c) for c in raw["approval_required_callers"])
         raw.setdefault("zone_id", settings.zone_id)
         raw.setdefault("physical_region", settings.physical_region)
         raw.setdefault("release_track", settings.release_track)

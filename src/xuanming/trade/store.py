@@ -50,12 +50,15 @@ from .model import (
     COMMERCE_KIND_OFFICIAL,
     COMMERCE_KIND_PLAYER_TRADE,
     COMMERCE_KIND_RMB_CONSIGNMENT,
+    COMMERCE_KIND_SKILL_BOOK_WANTED,
     COMMERCE_MANUAL,
     COMMERCE_REFUND_PENDING,
     COMMERCE_SETTLED,
     COMMERCE_WAITING,
     DUE_STATUSES,
     FRESH_ATTEMPT_LIMIT,
+    MAX_ACTIVE_WANTED_ORDERS,
+    SEALED_SKILL_BOOK_CONFIG_ID,
     UINT64_MAX,
     LISTING_SORT_DEFAULT,
     LISTING_SORT_LEVEL_DESC,
@@ -85,6 +88,7 @@ from .model import (
     RoleFenceExpect,
     RoleFenceRow,
     RoleOriginal,
+    WantedBoardCursor,
     check_role_fence,
     on_book,
     valid_role_fence_state,
@@ -278,6 +282,7 @@ class TradeTx(TypingProtocol):
     async def reschedule_commerce(self, commerce_id: int, version: int, due_ms: int) -> None: ...
     async def find_market_counterparty(self, taker: Message) -> int | None: ...
     async def count_pending_market_fills(self, parent_id: int) -> int: ...
+    async def count_active_wanted_orders(self, buyer_player_id: int, limit: int = MAX_ACTIVE_WANTED_ORDERS) -> int: ...
     async def allocate_seqs(
         self, now_ms: int, keys: Sequence[tuple[int, int]]
     ) -> dict[tuple[int, int], tuple[int, int]]: ...
@@ -675,6 +680,20 @@ class _MemoryTx:
             and int(rec.status) not in (COMMERCE_CANCELLED, COMMERCE_SETTLED)
         )
 
+    async def count_active_wanted_orders(self, buyer_player_id: int, limit: int = MAX_ACTIVE_WANTED_ORDERS) -> int:
+        pid = int(buyer_player_id)
+        count = 0
+        for rec in self._state.commerce.values():
+            if (
+                int(rec.buyer_player_id) == pid
+                and int(rec.kind) == COMMERCE_KIND_SKILL_BOOK_WANTED
+                and int(rec.status) not in (COMMERCE_CANCELLED, COMMERCE_SETTLED)
+            ):
+                count += 1
+                if count >= limit:
+                    break
+        return count
+
     async def allocate_seqs(
         self, now_ms: int, keys: Sequence[tuple[int, int]]
     ) -> dict[tuple[int, int], tuple[int, int]]:
@@ -1008,6 +1027,45 @@ class MemoryTradeStore(TradeStoreBase):
             )
         ]
         rows.sort(key=lambda r: (int(r.updated_ms), int(r.commerce_id)))
+        return [_clone_msg(self.protocol, "trade.TradeCommerceRecord", r) for r in rows[:limit]]
+
+    async def list_open_wanted_skill_book_orders(
+        self, after: WantedBoardCursor | None, limit: int
+    ) -> list[Message]:
+        rows = [
+            rec
+            for rec in self._state.commerce.values()
+            if int(rec.kind) == COMMERCE_KIND_SKILL_BOOK_WANTED
+            and int(rec.market_id) == 0
+            and int(rec.item_config_id) == SEALED_SKILL_BOOK_CONFIG_ID
+            and int(rec.side) == 0
+            and int(rec.status) == COMMERCE_WAITING
+            and not bool(rec.on_book)
+            and (
+                after is None
+                or int(rec.unit_price) < after.reward_gold
+                or (int(rec.unit_price) == after.reward_gold and int(rec.commerce_id) < after.commerce_id)
+            )
+        ]
+        rows.sort(key=lambda r: (-int(r.unit_price), -int(r.commerce_id)))
+        return [_clone_msg(self.protocol, "trade.TradeCommerceRecord", r) for r in rows[:limit]]
+
+    async def list_my_wanted_skill_book_orders(
+        self, poster_player_id: int, after: CommerceCursor, limit: int
+    ) -> list[Message]:
+        pid = int(poster_player_id)
+        rows = [
+            rec
+            for rec in self._state.commerce.values()
+            if int(rec.buyer_player_id) == pid
+            and int(rec.kind) == COMMERCE_KIND_SKILL_BOOK_WANTED
+            and int(rec.status) not in (COMMERCE_CANCELLED, COMMERCE_SETTLED)
+            and (
+                int(rec.created_ms) > after.created_ms
+                or (int(rec.created_ms) == after.created_ms and int(rec.commerce_id) > after.commerce_id)
+            )
+        ]
+        rows.sort(key=lambda r: (int(r.created_ms), int(r.commerce_id)))
         return [_clone_msg(self.protocol, "trade.TradeCommerceRecord", r) for r in rows[:limit]]
 
     async def defer_commerce(self, commerce_id: int, version: int, until_ms: int) -> bool:

@@ -35,6 +35,7 @@ class DataServiceConfig:
     mysql_database: str = "mmorpg_global"
     mysql_password: str = ""
     admin_token: str = ""
+    admin_allow_unapproved: bool = False
     deletion_cooling_off_sec: int = 7 * 86400
     recall_enabled: bool = False
     logical_shards: int = 1

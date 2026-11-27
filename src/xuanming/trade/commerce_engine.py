@@ -23,12 +23,16 @@ from .economy_credit import (
 )
 from .errors import (
     ERR_INVALID_PARAMETER,
+    ERR_TRADE_ASSET_NOT_TRADABLE,
     ERR_TRADE_AUCTION_ENDED,
     ERR_TRADE_BID_TOO_LOW,
     ERR_TRADE_CANNOT_TRADE_SELF,
+    ERR_TRADE_FEATURE_DISABLED,
     ERR_TRADE_ORDER_NOT_FOUND,
     ERR_TRADE_ORDER_STATE_CONFLICT,
     ERR_TRADE_REQUEST_CONFLICT,
+    ERR_TRADE_WANTED_BOOK_MISMATCH,
+    ERR_TRADE_WANTED_ORDER_LIMIT_REACHED,
     ManualNotAllowedError,
     ManualNotFoundError,
     ManualVersionChangedError,
@@ -54,13 +58,17 @@ from .model import (
     COMMERCE_KIND_OFFICIAL,
     COMMERCE_KIND_PLAYER_TRADE,
     COMMERCE_KIND_RMB_CONSIGNMENT,
+    COMMERCE_KIND_SKILL_BOOK_WANTED,
     COMMERCE_MANUAL,
     COMMERCE_SETTLED,
     COMMERCE_WAITING,
+    CURRENCY_GOLD,
     INT64_MAX,
     MANUAL_OPERATOR_MAX_BYTES,
     MANUAL_REASON_MAX_BYTES,
+    MAX_ACTIVE_WANTED_ORDERS,
     MAX_NEW_LEGS_PER_STEP,
+    MAX_WANTED_FULFILL_ATTEMPTS,
     OP_KIND_DELIVER_CREDIT,
     OP_KIND_ESCROW_DEBIT,
     OP_REF_KIND_ORDER,
@@ -68,12 +76,22 @@ from .model import (
     OP_STATUS_APPLIED_PARTIAL,
     OP_STATUS_PENDING,
     QUARANTINE_DETAIL_MAX_BYTES,
+    SEALED_SKILL_BOOK_CONFIG_ID,
     STAGE_OFFICIAL_DELIVER,
+    STAGE_WANTED_ESCROW,
+    STAGE_WANTED_FILL,
+    STAGE_WANTED_OPEN,
+    WANTED_DEBIT_PREFIX,
+    WANTED_FULFILL_SCOPE,
+    WANTED_RETURN_PREFIX,
+    WANTED_REWARD_MAX_GOLD,
+    WANTED_REWARD_MIN_GOLD,
     LegOutcome,
     RoleFenceExpect,
     RoleFenceRow,
     RoleOriginal,
     TradePolicy,
+    WantedSkillCatalog,
     build_asset_bundle,
     empty_bundle,
     is_official_reverse_leg,
@@ -84,6 +102,7 @@ from .model import (
     transfer_bundle,
     truncate_utf8,
     valid_account,
+    wanted_seller_net_gold,
 )
 from .mall_adapter import MANUAL_REASON_PAYMENT_REVERSAL, plan_official
 from .rmb import plan_rmb
@@ -245,15 +264,23 @@ def settle_buyer_first_delivery(protocol: Protocol, rec: Message, w: Message, no
         return
     if find_leg(w, "seller_return") is not None or find_leg(w, "buyer_return") is not None:
         raise ValueError("auto-unwind requested but return legs already exist")
-    buyer.superseded_by = _UNWOUND_BY
-    seller.superseded_by = _UNWOUND_BY
     buyer_bundle = protocol.message("AssetBundle")
     buyer_bundle.CopyFrom(buyer.bundle)
+    if int(rec.kind) == COMMERCE_KIND_SKILL_BOOK_WANTED:
+        # 求购单卖家所得仅为税后 95%，整单退回须按发榜人托管的原件全额退还，绝不让发榜人白损 5% 税。
+        escrow = find_leg(w, "buyer_debit")
+        if not leg_applied(escrow):
+            raise ValueError("wanted skill book unwind missing applied buyer_debit")
+        snap = escrow.snapshot if escrow.HasField("snapshot") else None
+        refund_bundle = transfer_bundle(protocol, escrow.bundle, snap)
+    else:
+        refund_bundle = protocol.message("AssetBundle")
+        refund_bundle.CopyFrom(seller.bundle)
+    buyer.superseded_by = _UNWOUND_BY
+    seller.superseded_by = _UNWOUND_BY
     add_escrow_leg(w, "seller_return", int(seller.player_id), int(buyer.escrow_owner_id), buyer_bundle)
     if int(rec.kind) != COMMERCE_KIND_AUCTION_LOT:
-        seller_bundle = protocol.message("AssetBundle")
-        seller_bundle.CopyFrom(seller.bundle)
-        add_escrow_leg(w, "buyer_return", int(buyer.player_id), int(seller.escrow_owner_id), seller_bundle)
+        add_escrow_leg(w, "buyer_return", int(buyer.player_id), int(seller.escrow_owner_id), refund_bundle)
     w.stage = "return"
     rec.status = COMMERCE_CANCEL_PENDING
 
@@ -312,7 +339,7 @@ def _next_due_ms(rec: Message, w: Message, now_ms: int) -> int:
     if in_flight:
         return now_ms + _IN_FLIGHT_RECHECK_MS
     waits_time = (
-        w.stage in ("open", "lot_open", "official_refund")
+        w.stage in ("open", "lot_open", "official_refund", STAGE_WANTED_OPEN)
         or (w.stage == "confirm" and int(rec.kind) == COMMERCE_KIND_PLAYER_TRADE)
         or (w.stage == "market_open" and int(rec.side) != 0 and int(rec.filled_quantity) < int(rec.quantity))
     )
@@ -390,6 +417,8 @@ class ManualRequest:
     to_player_id: int = 0
     linked_commerce_id: int = 0
     linked_version: int = 0
+    approval_id: str = ""
+    approver: str = ""
 
 
 @dataclass
@@ -410,6 +439,7 @@ class ManualResult:
     linked_id: int = 0
     linked: "ManualResult | None" = None
     audit: Message | None = None
+    already_executed: bool = False
 
 
 @dataclass(slots=True)
@@ -476,6 +506,8 @@ def _validate_manual_request(req: ManualRequest) -> None:
             raise ManualNotAllowedError(f"{name} must be non-empty and <= {limit} bytes")
         if any(unicodedata.category(ch).startswith("C") for ch in value):
             raise ManualNotAllowedError(f"{name} must not contain control characters")
+    if bool(req.approval_id) != bool(req.approver):
+        raise ManualNotAllowedError("approval_id and approver must both be provided or both be empty")
     if req.action == "partial":
         if not 1 <= len(req.parts) <= MAX_NEW_LEGS_PER_STEP:
             raise ManualNotAllowedError(f"partial requires 1..{MAX_NEW_LEGS_PER_STEP} parts")
@@ -604,6 +636,182 @@ def _credit_shortfall(protocol: Protocol, bundle: Message, missing: PartialMissi
     return out
 
 
+def _wanted_reward_bundle(protocol: Protocol, amount: int) -> Message:
+    """构造流通银两(CURRENCY_GOLD=0)资产包，严禁绑定银两(CURRENCY_BIND_GOLD=3)进入求购单。"""
+    bundle = protocol.message("AssetBundle")
+    cur = bundle.currencies.add()
+    cur.currency_type = CURRENCY_GOLD
+    cur.amount = int(amount)
+    return bundle
+
+
+def _wanted_debit_role(attempt: int, key: str) -> str:
+    return f"{WANTED_DEBIT_PREFIX}{int(attempt)}_{key}"
+
+
+def _wanted_return_role(attempt: int) -> str:
+    return f"{WANTED_RETURN_PREFIX}{int(attempt)}"
+
+
+def _wanted_attempt_debit(w: Message, attempt: int) -> Message | None:
+    prefix = f"{WANTED_DEBIT_PREFIX}{int(attempt)}_"
+    for item in w.legs:
+        if str(item.role).startswith(prefix):
+            return item
+    return None
+
+
+def _wanted_attempt_by_key(w: Message, key: str) -> tuple[int, Message | None]:
+    suffix = f"_{key}"
+    for item in w.legs:
+        role = str(item.role)
+        if not role.startswith(WANTED_DEBIT_PREFIX) or not role.endswith(suffix):
+            continue
+        mid = role[len(WANTED_DEBIT_PREFIX) : -len(suffix)]
+        if mid.isdigit():
+            return int(mid), item
+    return 0, None
+
+
+def _reopen_wanted(rec: Message, w: Message) -> None:
+    """让一次未成的揭榜作废、单子回到挂榜：揭榜人清零，旧腿保留在 workflow 中作证据。"""
+    rec.seller_player_id = 0
+    w.ClearField("seller_identity")
+    w.stage = STAGE_WANTED_OPEN
+    rec.status = COMMERCE_WAITING
+
+
+def wanted_book_matches(protocol: Protocol, book: Message, terms: Message) -> bool:
+    """按 scene 扣出时交回的完整物品快照核对封卷道籍条款（纵深防御：拒收绑定书、稀世书、错技能与缺署名）。"""
+    if (
+        len(book.item_instances) != 1
+        or len(book.items) != 0
+        or len(book.currencies) != 0
+        or (book.HasField("pet_instance") and int(book.pet_instance.pet_id) != 0)
+    ):
+        return False
+    inst = book.item_instances[0]
+    if int(inst.config_id) != SEALED_SKILL_BOOK_CONFIG_ID or int(inst.stack_size) != 1:
+        return False
+    item = protocol.message("ItemComp")
+    try:
+        item.ParseFromString(bytes(inst.instance_proto))
+    except DecodeError:
+        return False
+    if (
+        int(item.item_id) != int(inst.item_uuid)
+        or int(item.config_id) != SEALED_SKILL_BOOK_CONFIG_ID
+        or int(item.size) != 1
+        or bool(item.bound)
+        or not item.HasField("sealed_skill_book")
+    ):
+        return False
+    sealed = item.sealed_skill_book
+    if int(sealed.rarity_tier) != 0 or int(sealed.skill_table_id) != int(terms.skill_table_id):
+        return False
+    if bool(terms.require_master_signature):
+        return bool(str(sealed.crafter_name)) and int(sealed.crafter_player_id) != 0
+    return True
+
+
+def _plan_wanted_skill_book(protocol: Protocol, rec: Message, w: Message, now_ms: int) -> None:
+    """推进悬赏求书求购单(kind 7)的三个专属阶段；进入 deliver/return 后由通用收尾接管。"""
+    if not w.HasField("wanted_skill_book"):
+        raise ValueError("wanted skill book order missing terms")
+    terms = w.wanted_skill_book
+    if w.stage == STAGE_WANTED_ESCROW:
+        add_leg(
+            w,
+            "buyer_debit",
+            int(rec.buyer_player_id),
+            ASSET_STREAM_TRADE_DEBIT,
+            _wanted_reward_bundle(protocol, int(terms.reward_gold)),
+        )
+        escrow = find_leg(w, "buyer_debit")
+        if not leg_done(escrow):
+            return
+        if not leg_applied(escrow):
+            w.stage = "done"
+            rec.status = COMMERCE_CANCELLED
+            return
+        w.stage = STAGE_WANTED_OPEN
+        rec.status = COMMERCE_WAITING
+    if w.stage == STAGE_WANTED_OPEN and w.cancel_requested:
+        w.stage = "return"
+        rec.status = COMMERCE_CANCEL_PENDING
+        transfer_leg(protocol, w, "buyer_return", int(rec.buyer_player_id), find_leg(w, "buyer_debit"))
+        return
+    if w.stage == STAGE_WANTED_FILL:
+        attempt = int(w.quantity_reserved)
+        debit = _wanted_attempt_debit(w, attempt)
+        if debit is None:
+            raise ValueError(f"wanted skill book attempt {attempt} missing debit leg")
+        if not leg_done(debit):
+            return
+        if not leg_applied(debit):
+            _reopen_wanted(rec, w)
+            return
+        snap = debit.snapshot if debit.HasField("snapshot") else None
+        book = transfer_bundle(protocol, debit.bundle, snap)
+        if not wanted_book_matches(protocol, book, terms):
+            ret_role = _wanted_return_role(attempt)
+            add_escrow_leg(w, ret_role, int(debit.player_id), int(debit.player_id), book)
+            returned = current_leg(w, ret_role)
+            if not leg_done(returned):
+                return
+            if not leg_applied(returned):
+                mark_manual(
+                    rec,
+                    w,
+                    MANUAL_REASON_FINAL_CREDIT,
+                    f"wanted attempt {attempt} mismatch return leg {returned.role} failed",
+                    now_ms,
+                )
+                return
+            _reopen_wanted(rec, w)
+            return
+        escrow = find_leg(w, "buyer_debit")
+        if not leg_applied(escrow):
+            raise ValueError("wanted skill book entered fill without applied buyer_debit")
+        w.stage = "deliver"
+        rec.status = COMMERCE_DELIVERING
+        add_escrow_leg(w, "buyer_receive", int(rec.buyer_player_id), int(debit.player_id), book)
+        add_escrow_leg(
+            w,
+            "seller_receive",
+            int(rec.seller_player_id),
+            int(escrow.player_id),
+            _wanted_reward_bundle(protocol, int(terms.seller_net_gold)),
+        )
+
+
+def _already_executed_manual(protocol: Protocol, rec: Message, approval_id: str) -> ManualResult | None:
+    """在合同 manual_actions 留痕中查找相同 approval_id：命中则幂等返回原结果，不重复改动。"""
+    if not approval_id:
+        return None
+    try:
+        w = decode_workflow(protocol, rec)
+    except TradeCorruptContractError:
+        return None
+    for action in w.manual_actions:
+        if str(action.approval_id) == approval_id:
+            audit_copy = protocol.message("trade.TradeCommerceManualAction")
+            audit_copy.CopyFrom(action)
+            q_copy = None
+            if action.HasField("quarantine"):
+                q_copy = protocol.message("trade.TradeCommerceQuarantine")
+                q_copy.CopyFrom(action.quarantine)
+            return ManualResult(
+                already_executed=True,
+                version_before=int(action.version_before),
+                quarantine=q_copy,
+                stage=str(w.stage),
+                status=int(rec.status),
+                audit=audit_copy,
+            )
+    return None
+
+
 # -- CommerceEngine -------------------------------------------------------------------------------------
 
 class CommerceEngine:
@@ -622,6 +830,7 @@ class CommerceEngine:
         rmb=None,
         credits: SellerCreditService | None = None,
         player_trade_guard: PlayerTradeGuard | None = None,
+        wanted_skills: WantedSkillCatalog | None = None,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -634,6 +843,7 @@ class CommerceEngine:
         self.rmb = rmb
         self.credits = credits
         self.player_trade_guard = player_trade_guard
+        self.wanted_skills = wanted_skills
         self._clock_ms = clock_ms
         self._ack_after_op_id = 0
 
@@ -758,6 +968,8 @@ class CommerceEngine:
         input_msg: Message,
         rec: Message,
         w: Message,
+        *,
+        in_role_lock: Callable[[TradeTx], Awaitable[None]] | None = None,
     ) -> Message:
         prior = await self._prior_request(original, player_id, client_req_id, input_msg)
         if prior is not None:
@@ -775,6 +987,8 @@ class CommerceEngine:
 
         async def _tx(tx: TradeTx) -> None:
             await self._lock_roles(tx, original, 0, int(rec.seller_player_id), int(rec.buyer_player_id))
+            if in_role_lock is not None:
+                await in_role_lock(tx)
             if int(rec.kind) == COMMERCE_KIND_RMB_CONSIGNMENT:
                 if not w.HasField("rmb"):
                     raise TradeRejection(ERR_INVALID_PARAMETER, "rmb contract missing terms")
@@ -973,7 +1187,85 @@ class CommerceEngine:
         bw.seller_assets.currency_amount = amount
         return await self._create(original, me, str(req.client_request_id), req, rec, bw)
 
-    async def mutate(self, original: RoleOriginal, commerce_id: int, action: str, client_request_id: str = "") -> Message:
+    async def create_wanted_skill_book_order(
+        self,
+        original: RoleOriginal,
+        req: Message,
+        *,
+        poster_name: str = "",
+    ) -> Message:
+        """发榜悬赏求书求购单(kind 7)：仅接受常规永久技能与流通银两(100..50000)，单人同时最多 3 张未结案单。"""
+        if self.wanted_skills is None:
+            raise TradeRejection(ERR_TRADE_FEATURE_DISABLED, "wanted skill book orders disabled")
+        reward_gold = int(req.reward_gold)
+        if reward_gold < WANTED_REWARD_MIN_GOLD or reward_gold > WANTED_REWARD_MAX_GOLD:
+            raise TradeRejection(ERR_INVALID_PARAMETER, "wanted reward_gold out of bounds")
+        skill_id = int(req.skill_table_id)
+        skill_info, eligible = self.wanted_skills.wanted_skill(skill_id)
+        if not eligible:
+            raise TradeRejection(ERR_INVALID_PARAMETER, "skill not eligible for wanted order")
+        me = original.player_id
+        rec = self.protocol.message(
+            "trade.TradeCommerceRecord",
+            kind=COMMERCE_KIND_SKILL_BOOK_WANTED,
+            status=COMMERCE_ESCROWING,
+            buyer_player_id=me,
+            unit_price=reward_gold,
+            currency_type=CURRENCY_GOLD,
+            item_config_id=SEALED_SKILL_BOOK_CONFIG_ID,
+        )
+        w = self.protocol.message("trade.TradeCommerceWorkflow", stage=STAGE_WANTED_ESCROW)
+        w.wanted_skill_book.skill_table_id = skill_id
+        w.wanted_skill_book.scroll_id = int(skill_info.scroll_id)
+        w.wanted_skill_book.require_master_signature = bool(req.require_master_signature)
+        w.wanted_skill_book.reward_gold = reward_gold
+        w.wanted_skill_book.seller_net_gold = wanted_seller_net_gold(reward_gold)
+        w.wanted_skill_book.poster_name = str(poster_name)
+
+        async def _check_limit(tx: TradeTx) -> None:
+            active = await tx.count_active_wanted_orders(me, MAX_ACTIVE_WANTED_ORDERS)
+            if active >= MAX_ACTIVE_WANTED_ORDERS:
+                raise TradeRejection(ERR_TRADE_WANTED_ORDER_LIMIT_REACHED, "active wanted order limit reached")
+
+        return await self._create(
+            original,
+            me,
+            str(req.client_request_id),
+            req,
+            rec,
+            w,
+            in_role_lock=_check_limit,
+        )
+
+    async def fulfill_wanted_skill_book_order(
+        self,
+        original: RoleOriginal,
+        commerce_id: int,
+        client_request_id: str,
+        sealed_item_id: int,
+    ) -> Message:
+        """揭榜悬赏求书求购单(kind 7)：按同一请求号重发可查询该次揭榜结果（幂等）。"""
+        if self.wanted_skills is None:
+            raise TradeRejection(ERR_TRADE_FEATURE_DISABLED, "wanted skill book orders disabled")
+        if not 8 <= len(client_request_id) <= 80 or int(sealed_item_id) == 0:
+            raise TradeRejection(ERR_INVALID_PARAMETER, "invalid fulfill wanted parameters")
+        return await self.mutate(
+            original,
+            commerce_id,
+            "fulfill",
+            client_request_id=client_request_id,
+            sealed_item_id=int(sealed_item_id),
+        )
+
+    async def mutate(
+        self,
+        original: RoleOriginal,
+        commerce_id: int,
+        action: str,
+        client_request_id: str = "",
+        *,
+        sealed_item_id: int = 0,
+    ) -> Message:
         me = original.player_id
         before = await self.store.get_commerce(commerce_id)
         if before is None:
@@ -1060,12 +1352,62 @@ class CommerceEngine:
                 w.stage = "pay"
                 rec.status = COMMERCE_ESCROWING
 
+            elif action == "fulfill":
+                if int(rec.kind) != COMMERCE_KIND_SKILL_BOOK_WANTED or not w.HasField("wanted_skill_book"):
+                    raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "not a wanted skill book order")
+                if not 8 <= len(client_request_id) <= 80 or int(sealed_item_id) == 0:
+                    raise TradeRejection(ERR_INVALID_PARAMETER, "invalid fulfill parameters")
+                fkey = request_key(WANTED_FULFILL_SCOPE, me, client_request_id)
+                attempt, prior_debit = _wanted_attempt_by_key(w, fkey)
+                if prior_debit is not None:
+                    uuids = [int(u) for u in prior_debit.bundle.item_uuids]
+                    if len(uuids) != 1 or uuids[0] != int(sealed_item_id):
+                        raise TradeRejection(ERR_TRADE_REQUEST_CONFLICT, "fulfill replay sealed_item_id mismatch")
+                    if attempt == int(w.quantity_reserved) and int(rec.seller_player_id) == me:
+                        return rec
+                    if leg_applied(prior_debit):
+                        raise TradeRejection(ERR_TRADE_WANTED_BOOK_MISMATCH, "wanted book mismatched and returned")
+                    raise TradeRejection(ERR_TRADE_ASSET_NOT_TRADABLE, "sealed book debit failed")
+                if (
+                    w.stage != STAGE_WANTED_OPEN
+                    or int(rec.status) != COMMERCE_WAITING
+                    or int(rec.seller_player_id) != 0
+                    or w.cancel_requested
+                ):
+                    raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "wanted order is not open")
+                if me == int(rec.buyer_player_id):
+                    raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot fulfill own wanted order")
+                if int(w.quantity_reserved) >= MAX_WANTED_FULFILL_ATTEMPTS:
+                    raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "wanted fulfill attempt limit reached")
+                seller_fence = await self.store.read_ownership(tx, me)
+                rec.seller_player_id = me
+                w.seller_identity.account = seller_fence.account
+                w.seller_identity.owner_revision = seller_fence.owner_revision
+                w.quantity_reserved = int(w.quantity_reserved) + 1
+                book_bundle = self.protocol.message("AssetBundle", item_uuids=[int(sealed_item_id)])
+                add_leg(
+                    w,
+                    _wanted_debit_role(int(w.quantity_reserved), fkey),
+                    me,
+                    ASSET_STREAM_TRADE_DEBIT,
+                    book_bundle,
+                )
+                w.stage = STAGE_WANTED_FILL
+                rec.status = COMMERCE_ESCROWING
+
             elif action == "cancel":
                 if me != int(rec.seller_player_id) and me != int(rec.buyer_player_id):
                     raise TradeRejection(ERR_TRADE_ORDER_NOT_FOUND, "not a party to order")
                 if int(rec.status) == COMMERCE_CANCELLED:
                     return rec
                 if int(rec.kind) == COMMERCE_KIND_PLAYER_TRADE and w.stage in ("confirm", "offer_escrow", "buyer_escrow"):
+                    w.cancel_requested = True
+                    rec.status = COMMERCE_CANCEL_PENDING
+                elif (
+                    int(rec.kind) == COMMERCE_KIND_SKILL_BOOK_WANTED
+                    and me == int(rec.buyer_player_id)
+                    and w.stage in (STAGE_WANTED_ESCROW, STAGE_WANTED_OPEN)
+                ):
                     w.cancel_requested = True
                     rec.status = COMMERCE_CANCEL_PENDING
                 elif me == int(rec.seller_player_id) and (
@@ -1094,7 +1436,11 @@ class CommerceEngine:
         if rec is None:
             raise TradeRejection(ERR_TRADE_ORDER_NOT_FOUND, "commerce order not found")
         me = original.player_id if original is not None else 0
-        is_public = int(rec.kind) in (COMMERCE_KIND_CONSIGNMENT, COMMERCE_KIND_AUCTION_LOT)
+        is_public = int(rec.kind) in (
+            COMMERCE_KIND_CONSIGNMENT,
+            COMMERCE_KIND_AUCTION_LOT,
+            COMMERCE_KIND_SKILL_BOOK_WANTED,
+        )
         if not is_public and int(rec.seller_player_id) != me and int(rec.buyer_player_id) != me:
             raise TradeRejection(ERR_TRADE_ORDER_NOT_FOUND, "order not visible to caller")
         if original is not None and not is_public:
@@ -1110,6 +1456,8 @@ class CommerceEngine:
         if kind == COMMERCE_KIND_RMB_CONSIGNMENT:
             plan_rmb(self.protocol, self.policy, rec, w, now_ms)
             return
+        if kind == COMMERCE_KIND_SKILL_BOOK_WANTED:
+            _plan_wanted_skill_book(self.protocol, rec, w, now_ms)
         if w.stage == STAGE_OFFICIAL_DELIVER:
             plan_official(rec, w, now_ms)
             return
@@ -1849,6 +2197,9 @@ class CommerceEngine:
         pre = await self.store.get_commerce(req.commerce_id)
         if pre is None:
             raise ManualNotFoundError(f"commerce {req.commerce_id} not found")
+        already = _already_executed_manual(self.protocol, pre, req.approval_id)
+        if already is not None:
+            return already
         if int(pre.version) != req.expect_version:
             raise ManualVersionChangedError(f"commerce {req.commerce_id} version={pre.version} expected={req.expect_version}")
 
@@ -1901,6 +2252,9 @@ class CommerceEngine:
             rec = lot if lot_id == req.commerce_id else await tx.lock_commerce(req.commerce_id)
             if rec is None:
                 raise ManualNotFoundError(f"commerce {req.commerce_id} not found")
+            already_locked = _already_executed_manual(self.protocol, rec, req.approval_id)
+            if already_locked is not None:
+                return already_locked
             if int(rec.version) != req.expect_version:
                 raise ManualVersionChangedError(f"commerce version={rec.version} expected={req.expect_version}")
             try:
@@ -1943,6 +2297,8 @@ class CommerceEngine:
                     at_ms=now_ms,
                     version_before=req.linked_version,
                     linked_commerce_id=int(rec.commerce_id),
+                    approval_id=req.approval_id,
+                    approver=req.approver,
                 )
                 if res.linked.quarantine is not None:
                     res.linked.audit.quarantine.CopyFrom(res.linked.quarantine)
@@ -2235,6 +2591,8 @@ class CommerceEngine:
             to_player_id=res.to_player,
             retargeted_legs=res.retargeted_legs,
             linked_commerce_id=res.linked_id,
+            approval_id=req.approval_id,
+            approver=req.approver,
         )
         if res.quarantine is not None:
             audit.quarantine.CopyFrom(res.quarantine)

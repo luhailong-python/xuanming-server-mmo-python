@@ -6,6 +6,7 @@ import hashlib
 import math
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Protocol as TypingProtocol
 
 from google.protobuf.message import Message
 
@@ -93,7 +94,33 @@ COMMERCE_KIND_CONSIGNMENT = 3
 COMMERCE_KIND_MARKET_MATCH = 4
 COMMERCE_KIND_AUCTION_LOT = 5
 COMMERCE_KIND_RMB_CONSIGNMENT = 6
+COMMERCE_KIND_SKILL_BOOK_WANTED = 7
 COMMERCE_KIND_BID = 100
+
+# 悬赏求书求购单常量（kind 7，与 Go commerce/wanted_skill_book.go 及 C++ equip_craft_quality_rules.h 对齐）
+WANTED_REWARD_MIN_GOLD = 100
+WANTED_REWARD_MAX_GOLD = 50_000
+MAX_ACTIVE_WANTED_ORDERS = 3
+WANTED_TAX_BPS = 500
+SEALED_SKILL_BOOK_CONFIG_ID = 3414
+MAX_WANTED_FULFILL_ATTEMPTS = 32
+STAGE_WANTED_ESCROW = "wanted_escrow"
+STAGE_WANTED_OPEN = "wanted_open"
+STAGE_WANTED_FILL = "wanted_fill"
+WANTED_FULFILL_SCOPE = "wanted_fulfill"
+WANTED_DEBIT_PREFIX = "seller_debit_"
+WANTED_RETURN_PREFIX = "seller_return_"
+
+# WantedSkillBookOrderPhase 枚举值（与 proto/trade/commerce.proto 对齐）
+WANTED_PHASE_UNSPECIFIED = 0
+WANTED_PHASE_ESCROWING = 1
+WANTED_PHASE_OPEN = 2
+WANTED_PHASE_FULFILLING = 3
+WANTED_PHASE_DELIVERING = 4
+WANTED_PHASE_SETTLED = 5
+WANTED_PHASE_CANCELLING = 6
+WANTED_PHASE_CANCELLED = 7
+WANTED_PHASE_MANUAL = 8
 
 # 合同状态（CommerceOrderState）
 COMMERCE_WAITING = 1
@@ -743,7 +770,7 @@ def is_return_leg(role: str) -> bool:
     base = role.split("#", 1)[0]
     if base in ("seller_return", "buyer_return", "bid_return", "buyer_surplus"):
         return True
-    return base.endswith("/refund")
+    return base.endswith("/refund") or base.startswith(WANTED_RETURN_PREFIX)
 
 
 def leg_tx_type(leg: Message) -> int:
@@ -829,3 +856,115 @@ def market_remainder(protocol: Protocol, rec: Message) -> Message:
         grant.config_id = int(rec.item_config_id)
         grant.count = remaining
     return out
+
+
+# -- 悬赏求书求购单纯计算、配表目录与游标（与 Go commerce/wanted_skill_book.go 对齐） -------------------
+
+def wanted_tax_gold(reward_gold: int) -> int:
+    """计算悬赏求书集市税：悬赏额 × 5% 向上取整（销毁，不发给任何人）。"""
+    reward = int(reward_gold)
+    if reward <= 0:
+        return 0
+    return (reward * WANTED_TAX_BPS + 9999) // 10000
+
+
+def wanted_seller_net_gold(reward_gold: int) -> int:
+    """计算揭榜人税后实得流通银两。"""
+    reward = int(reward_gold)
+    tax = wanted_tax_gold(reward)
+    if reward <= tax:
+        return 0
+    return reward - tax
+
+
+def wanted_phase(rec: Message, w: Message) -> int:
+    """根据合同状态与工作流阶段推导客户端展示用的 WantedSkillBookOrderPhase。"""
+    status = int(rec.status)
+    if status == COMMERCE_MANUAL:
+        return WANTED_PHASE_MANUAL
+    if status == COMMERCE_SETTLED:
+        return WANTED_PHASE_SETTLED
+    if status == COMMERCE_CANCELLED:
+        return WANTED_PHASE_CANCELLED
+    if status == COMMERCE_CANCEL_PENDING:
+        return WANTED_PHASE_CANCELLING
+    stage = str(w.stage)
+    if stage == STAGE_WANTED_ESCROW:
+        return WANTED_PHASE_ESCROWING
+    if stage == STAGE_WANTED_OPEN:
+        return WANTED_PHASE_OPEN
+    if stage == STAGE_WANTED_FILL:
+        return WANTED_PHASE_FULFILLING
+    if stage == "deliver":
+        return WANTED_PHASE_DELIVERING
+    if stage == "return":
+        return WANTED_PHASE_CANCELLING
+    return WANTED_PHASE_UNSPECIFIED
+
+
+@dataclass(frozen=True, slots=True)
+class WantedSkillInfo:
+    """技能在配表中的展示信息（卷宗号、技能名、卷宗名）。"""
+
+    scroll_id: int = 0
+    skill_name: str = ""
+    scroll_name: str = ""
+
+
+class WantedSkillCatalog(TypingProtocol):
+    """查询某门技能是否允许发榜求购及其配表展示信息。"""
+
+    def wanted_skill(self, skill_table_id: int) -> tuple[WantedSkillInfo, bool]: ...
+
+
+class TableWantedSkillCatalog:
+    """从配置表 ``Skill`` 与 ``SkillScrollCraft`` 现查可悬赏求购的常规永久技能。"""
+
+    def __init__(self, tables=None) -> None:
+        if tables is None:
+            from ..data import ConfigTables
+
+            tables = ConfigTables()
+        self._skills = tables["Skill"]
+        self._scrolls = tables["SkillScrollCraft"]
+
+    def wanted_skill(self, skill_table_id: int) -> tuple[WantedSkillInfo, bool]:
+        skill = self._skills.get(int(skill_table_id))
+        if skill is None:
+            return WantedSkillInfo(), False
+        scroll_id = int(getattr(skill, "scroll_id", 0))
+        skill_name = str(getattr(skill, "name", "") or "")
+        scroll = self._scrolls.get(scroll_id)
+        if scroll is None:
+            return WantedSkillInfo(scroll_id=scroll_id, skill_name=skill_name), False
+        scroll_name = str(getattr(scroll, "name", "") or "")
+        info = WantedSkillInfo(scroll_id=scroll_id, skill_name=skill_name, scroll_name=scroll_name)
+        eligible = (
+            int(getattr(skill, "season_id", 0)) == 0
+            and int(getattr(skill, "battle_model", 0)) == 1
+            and int(getattr(skill, "rarity_tier", 0)) == 0
+            and int(getattr(scroll, "enabled", 0)) != 0
+            and int(getattr(scroll, "rarity_tier", 0)) == 0
+        )
+        return info, eligible
+
+
+@dataclass(frozen=True, slots=True)
+class WantedBoardCursor:
+    """公开悬赏榜按 (reward_gold DESC, commerce_id DESC) 翻页的不透明游标。"""
+
+    reward_gold: int
+    commerce_id: int
+
+    def format(self) -> str:
+        return f"{int(self.reward_gold)}:{int(self.commerce_id)}"
+
+    @classmethod
+    def parse(cls, raw: str) -> "WantedBoardCursor | None":
+        if ":" not in raw:
+            return None
+        left, right = raw.split(":", 1)
+        if not left.isdigit() or not right.isdigit():
+            return None
+        return cls(reward_gold=int(left), commerce_id=int(right))
+

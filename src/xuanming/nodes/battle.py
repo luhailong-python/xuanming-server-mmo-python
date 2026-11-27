@@ -32,6 +32,7 @@ from .battle_dropin_effects import (
     BOSS_TRIAL_KIND_NONE,
     BOSS_TRIAL_KIND_POLARITY_5V5,
     BOSS_TRIAL_KIND_PRACTICE_DUMMY,
+    BOSS_TRIAL_KIND_TACTICAL_PUZZLE,
     CLUTCH_COMEBACK_LOW_HP_DENOMINATOR,
     CLUTCH_COMEBACK_MIN_ESCALATION_STACKS,
     ERR_RATE_LIMIT_EXCEEDED,
@@ -73,6 +74,9 @@ from .battle_dropin_effects import (
     TACTICAL_PREP_TIMEOUT_MS,
     TACTICAL_PREP_WITH_BAN_DURATION_SECONDS,
     TACTICAL_PREP_WITH_BAN_TIMEOUT_MS,
+    TACTICAL_PUZZLE_POISON_MAX_HP_PCT,
+    TACTICAL_PUZZLE_SHIELD_BUFF_ID,
+    TACTICAL_PUZZLE_WORKSHOP_DUNGEON_ID,
     TOURNAMENT_LEYLINE_EARTH,
     TOURNAMENT_LEYLINE_FIRE,
     TOURNAMENT_LEYLINE_METAL,
@@ -114,9 +118,16 @@ from .battle_dropin_effects import (
     is_valid_boss_affix_override,
     is_valid_custom_duel_round_limit,
     is_valid_formation_id,
+    is_valid_tactical_puzzle_context,
     is_valid_tower_sigil_id,
     is_valid_vow_mask,
+    minor_play_deadline_reached,
+    minor_ticket_expire_at_ms,
     mix_seed_u64,
+    tactical_puzzle_apply_speed_delta,
+    tactical_puzzle_enemy_buff_table_id,
+    tactical_puzzle_player_debuff_table_id,
+    tactical_puzzle_scale_pct,
     tighten_round_limit,
     tower_monster_attack_pct,
     tower_monster_health_pct,
@@ -178,8 +189,16 @@ class _Connection:
 
 @dataclass(slots=True)
 class _Observer:
-    operation_id: str
+    operation_id: int | str
     expires_ms: int
+
+
+@dataclass(slots=True)
+class _MinorPlayLimit:
+    """未成年人单场直连服务截止状态（与 C++ BattleRoom::MinorPlayLimit 对齐）。"""
+
+    deadline_ms: int
+    ended: bool = False
 
 
 @dataclass(slots=True)
@@ -304,6 +323,29 @@ class TurnEngine:
             if max_rounds == _MAX_ROUNDS:
                 max_rounds = POLARITY_DEFAULT_MAX_ROUNDS
 
+        # 万象残局坊（Dungeon 314）开局门禁：必须携带合法 TacticalPuzzleBattleContext 且为单人免费公平预设局。
+        self.tactical_puzzle_context: Message | None = None
+        has_puzzle_ctx_field = (
+            "tactical_puzzle_context" in request.DESCRIPTOR.fields_by_name
+            and request.HasField("tactical_puzzle_context")
+        )
+        is_workshop_dungeon = int(request.battle_config_id) == TACTICAL_PUZZLE_WORKSHOP_DUNGEON_ID
+        if has_puzzle_ctx_field or is_workshop_dungeon:
+            if (
+                not has_puzzle_ctx_field
+                or not is_workshop_dungeon
+                or int(request.match_mode) != MATCH_MODE_PVE_SOLO
+                or len(request.players) != 1
+                or boss_trial_kind != BOSS_TRIAL_KIND_TACTICAL_PUZZLE
+                or not self.uses_free_preset
+                or self.tower_context is not None
+                or self.custom_duel_rules is not None
+                or not is_valid_tactical_puzzle_context(request.tactical_puzzle_context)
+            ):
+                raise BattleError("invalid tactical puzzle battle context")
+            self.tactical_puzzle_context = request.tactical_puzzle_context
+            max_rounds = int(self.tactical_puzzle_context.spec.round_limit)
+
         effective_trial_ctx = trial_context
         if effective_trial_ctx is None and hasattr(request, "trial_context") and request.HasField("trial_context"):
             effective_trial_ctx = request.trial_context
@@ -414,6 +456,7 @@ class TurnEngine:
         if (
             self.tower_context is None
             and self.custom_duel_rules is None
+            and self.tactical_puzzle_context is None
             and self.active_leyline == TOURNAMENT_LEYLINE_UNSPECIFIED
             and boss_trial_kind != BOSS_TRIAL_KIND_FESTIVAL_BEAST
             and not has_festival_activity
@@ -558,6 +601,19 @@ class TurnEngine:
                     actor.physical_attack = max(1, (actor.physical_attack * atk_pct) // 100)
                 if actor.magic_attack > 0:
                     actor.magic_attack = max(1, (actor.magic_attack * atk_pct) // 100)
+            if self.tactical_puzzle_context is not None:
+                enemies = self.tactical_puzzle_context.spec.enemies
+                if index < len(enemies):
+                    enemy_spec = enemies[index]
+                    base_max_hp = int(actor.max_health)
+                    init_hp = tactical_puzzle_scale_pct(base_max_hp, int(enemy_spec.initial_hp_pct))
+                    if init_hp > base_max_hp:
+                        actor.max_health = init_hp
+                    actor.attributes.health = init_hp
+                    actor.attributes.speed = tactical_puzzle_apply_speed_delta(
+                        int(actor.attributes.speed), int(enemy_spec.speed_delta_pct),
+                    )
+                    actor.capture_pet_table_id = 0
             self.actors[actor.actor_id] = actor
         if {actor.team_index for actor in self.actors.values()} != {0, 1}:
             raise BattleError("both sides need a unit")
@@ -570,6 +626,8 @@ class TurnEngine:
             self.configured.initialize_abilities()
         self.trial_tracker.initialize(request)
         self.encounter.init_special_encounter_state()
+        if self.tactical_puzzle_context is not None:
+            self._apply_tactical_puzzle_setup()
         self._init_opening_shields()
 
     @property
@@ -1256,7 +1314,11 @@ class TurnEngine:
 
     @property
     def active_leyline(self) -> int:
-        """返回本场生效的五行灵脉（锦标赛 BO3 灵脉优先，其次五行幻境层灵脉）。"""
+        """返回本场生效的五行灵脉（残局坊 V1.5 灵脉优先，其次锦标赛 BO3 灵脉，最后五行幻境层灵脉）。"""
+        if self.tactical_puzzle_context is not None:
+            puzzle_leyline = int(getattr(self.tactical_puzzle_context.spec, "leyline_element", 0))
+            if puzzle_leyline:
+                return puzzle_leyline
         if self.tournament_context is not None and self.tournament_context.leyline_element:
             return int(self.tournament_context.leyline_element)
         if self.tower_context is not None and self.tower_context.leyline_element:
@@ -1280,6 +1342,96 @@ class TurnEngine:
     @property
     def is_jianghu_duel_battle(self) -> bool:
         return self.match_mode == MATCH_MODE_JIANGHU_DUEL
+
+    @property
+    def is_tactical_puzzle_battle(self) -> bool:
+        return self.tactical_puzzle_context is not None
+
+    def _attach_tactical_puzzle_initial_buff(
+        self,
+        target: Message,
+        buff_table_id: int,
+        caster_id: int,
+        shield_capacity: int = 0,
+        periodic_damage: int = 0,
+    ) -> None:
+        """为残局坊参战双方挂载开局护盾/减益/增益（与 C++ AttachTacticalPuzzleInitialBuff 同源）。"""
+        if not buff_table_id:
+            return
+        rule = self.effects.rules.get(buff_table_id)
+        if rule is None:
+            return
+        added = target.buffs.add()
+        added.buff_id = self.effects.next_buff_id()
+        added.buff_table_id = buff_table_id
+        added.caster_id = caster_id
+        added.layer = 1
+        op = int(rule.battle_op)
+        if op == int(BattleEffectOp.SHIELD):
+            added.remaining_capacity = max(0, int(shield_capacity))
+            added.remain_rounds = self.max_rounds
+        elif op == int(BattleEffectOp.PERIODIC_DAMAGE):
+            added.snapshot_value = max(0, int(periodic_damage))
+            ticks = int(rule.interval_count) if int(rule.interval_count) > 0 else self.max_rounds
+            added.remaining_ticks = ticks
+            added.remain_rounds = ticks
+        else:
+            dur = int(rule.config_duration_rounds) if int(rule.config_duration_rounds) > 0 else self.max_rounds
+            added.remain_rounds = dur
+        added.remaining_hits = int(rule.hit_limit)
+        added.applied_round = 1
+        added.tick_round = 2
+
+    def _apply_tactical_puzzle_setup(self) -> None:
+        """落地残局开局气血/法力百分比、护盾、玩家减益、敌方增益与阵法配置。"""
+        if self.tactical_puzzle_context is None:
+            return
+        spec = self.tactical_puzzle_context.spec
+        self.team_formation_ids[0] = int(spec.formation_id)
+        self.team_formation_ids[1] = 0
+        banned_skill_id = int(getattr(spec, "banned_skill_id", 0))
+        if banned_skill_id:
+            if banned_skill_id not in self.banned_skill_set:
+                self.banned_skill_ids.append(banned_skill_id)
+                self.banned_skill_set.add(banned_skill_id)
+
+        first_enemy_id = next(
+            (a.actor_id for a in self.actors.values() if a.team_index == 1 and a.actor_type == _MONSTER),
+            0,
+        )
+        enemy_idx = 0
+        for actor in self.actors.values():
+            if actor.team_index == 0 and actor.actor_type in (_PLAYER, _PET):
+                actor.attributes.health = tactical_puzzle_scale_pct(actor.max_health, int(spec.player_initial_hp_pct))
+                if actor.max_mana > 0:
+                    actor.attributes.mana = tactical_puzzle_scale_pct(actor.max_mana, int(spec.player_initial_mp_pct))
+                if actor.actor_type == _PLAYER:
+                    if int(spec.player_initial_shield_pct) > 0:
+                        cap = tactical_puzzle_scale_pct(actor.max_health, int(spec.player_initial_shield_pct))
+                        self._attach_tactical_puzzle_initial_buff(
+                            actor, TACTICAL_PUZZLE_SHIELD_BUFF_ID, actor.actor_id, shield_capacity=cap,
+                        )
+                    debuff_id = tactical_puzzle_player_debuff_table_id(int(spec.player_initial_debuff_kind))
+                    if debuff_id:
+                        dot = tactical_puzzle_scale_pct(actor.max_health, TACTICAL_PUZZLE_POISON_MAX_HP_PCT)
+                        self._attach_tactical_puzzle_initial_buff(
+                            actor,
+                            debuff_id,
+                            first_enemy_id if first_enemy_id else actor.actor_id,
+                            periodic_damage=dot,
+                        )
+            elif actor.team_index == 1 and actor.actor_type == _MONSTER:
+                if enemy_idx < len(spec.enemies):
+                    enemy_spec = spec.enemies[enemy_idx]
+                    if int(enemy_spec.initial_shield_pct) > 0:
+                        cap = tactical_puzzle_scale_pct(actor.max_health, int(enemy_spec.initial_shield_pct))
+                        self._attach_tactical_puzzle_initial_buff(
+                            actor, TACTICAL_PUZZLE_SHIELD_BUFF_ID, actor.actor_id, shield_capacity=cap,
+                        )
+                    buff_id = tactical_puzzle_enemy_buff_table_id(int(enemy_spec.initial_buff_kind))
+                    if buff_id:
+                        self._attach_tactical_puzzle_initial_buff(actor, buff_id, actor.actor_id)
+                enemy_idx += 1
 
     @property
     def custom_duel_polarity_enabled(self) -> bool:
@@ -1743,6 +1895,8 @@ class TurnEngine:
             state.season_weekly_affix_id = self.active_season_weekly_affix_id
         if self.trial_vow_mask:
             state.trial_vow_mask = self.trial_vow_mask
+        if self.tactical_puzzle_context is not None and "tactical_puzzle_context" in state.DESCRIPTOR.fields_by_name:
+            state.tactical_puzzle_context.CopyFrom(self.tactical_puzzle_context)
         if self.banned_skill_ids:
             state.banned_skill_ids.extend(self.banned_skill_ids)
         if self.team_a_banned_skill_ids:
@@ -1885,7 +2039,9 @@ class TurnEngine:
         elif not side_b:
             self.outcome = 1
         elif self.round_index >= self.max_rounds:
-            if (
+            if self.tactical_puzzle_context is not None:
+                self.outcome = 2
+            elif (
                 self.is_ranked_battle
                 or self.encounter.boss_trial_kind == BOSS_TRIAL_KIND_POLARITY_5V5
                 or self.match_mode == MATCH_MODE_POLARITY_5V5
@@ -2623,6 +2779,7 @@ class _Room:
     replay: BattleReplayRecorder | None = None
     outcome_replay: Message | None = None
     spectate: SpectateChannels = field(default_factory=SpectateChannels)
+    minor_play_limits: dict[int, _MinorPlayLimit] = field(default_factory=dict)
 
 
 class BattleNode:
@@ -2746,7 +2903,14 @@ class BattleNode:
         try:
             reward_profile = (self.tables.reward_profile(request.battle_config_id)
                               if self.tables and request.match_mode in _PVE_MODES else None)
-            monsters = self.monster_factory(request) if self.monster_factory and request.match_mode in _PVE_MODES else ()
+            has_puzzle_ctx = (
+                "tactical_puzzle_context" in request.DESCRIPTOR.fields_by_name
+                and request.HasField("tactical_puzzle_context")
+            )
+            if has_puzzle_ctx and self.tables is not None:
+                monsters = self._build_tactical_puzzle_monsters(request)
+            else:
+                monsters = self.monster_factory(request) if self.monster_factory and request.match_mode in _PVE_MODES else ()
             max_rounds = self.tables.max_rounds(request, self.max_rounds) if self.tables else self.max_rounds
             boss_trial_kind, battle_difficulty, explicit_round_limit = (
                 self.tables.dungeon_meta(request.battle_config_id)
@@ -2781,9 +2945,17 @@ class BattleNode:
             if player.routing.gate_instance_id and player.routing.scene_instance_id
         }
         in_prep_phase = engine.is_in_prep_phase
+        minor_play_limits: dict[int, _MinorPlayLimit] = {}
+        for player in original.players:
+            if bool(getattr(player, "ai_controlled", False)):
+                continue
+            dl = int(getattr(player, "minor_play_deadline_ms", 0))
+            if dl > 0:
+                minor_play_limits[int(player.player_id)] = _MinorPlayLimit(deadline_ms=dl)
         room = _Room(engine, original, deadline, 0 if in_prep_phase else (now + manual_window_ms), routing,
                      reward_profile=reward_profile,
-                     confirm_until_ms=now + 180_000)
+                     confirm_until_ms=now + 180_000,
+                     minor_play_limits=minor_play_limits)
         # 战前明牌变阵期延迟录制回放起点至 _finalize_battle_prep 亮牌后再录。
         if request.record_replay and not in_prep_phase:
             fingerprint = self.tables.fingerprint if self.tables else ""
@@ -2825,6 +2997,33 @@ class BattleNode:
                 self._publish(self.on_confirm, route, player, request.battle_id, deadline)
         room.confirm_retry_steady_ms = self._steady_ms() + 10_000
         return self._create_success(response)
+
+    def _build_tactical_puzzle_monsters(self, request: Message) -> list[Message]:
+        """按残局规格 enemies 列表从 Monster 表逐项构造敌方单位（与 C++ InitMonsters 同源）。"""
+        assert self.tables is not None
+        level = max(1, max((int(p.level) for p in request.players), default=1))
+        out: list[Message] = []
+        for enemy in request.tactical_puzzle_context.spec.enemies:
+            monster_id = int(enemy.monster_table_id)
+            row = self.tables.tables["Monster"].get(monster_id)
+            attributes = self.protocol.message("BaseAttributesComp", health=300, strength=5, armor=24, speed=60)
+            is_boss = False
+            if row is not None and row.health:
+                for field_name in ("health", "strength", "armor", "resistance", "critchance"):
+                    setattr(attributes, field_name, getattr(row, field_name))
+                attributes.speed = row.speed or 60
+                is_boss = bool(getattr(row, "is_boss", 0))
+            actor = self.protocol.message(
+                "BattleActorState",
+                level=level,
+                monster_table_id=monster_id,
+                is_boss=is_boss,
+                attributes=attributes,
+                max_health=attributes.health,
+            )
+            actor.name = getattr(row, "name", "") or "残局敌将"
+            out.append(actor)
+        return out
 
     def _fingerprint_mismatches(self, request: Message) -> list[str]:
         if self.tables is None or self.fingerprint_mode == "off":
@@ -2877,15 +3076,19 @@ class BattleNode:
         return self.protocol.message("Empty")
 
     def _assignment(self, room: _Room, player: int, role: int, operation: str = "") -> Message:
+        minor_limit = room.minor_play_limits.get(player)
+        expire_at_ms = minor_ticket_expire_at_ms(
+            room.deadline_ms, minor_limit.deadline_ms if minor_limit is not None else 0,
+        )
         payload = self.protocol.message(
             "BattleTicketPayload", battle_id=room.engine.battle_id, player_id=player,
-            battle_node_id=self.node_id, battle_instance_id=self.instance_id, expire_at_ms=room.deadline_ms,
+            battle_node_id=self.node_id, battle_instance_id=self.instance_id, expire_at_ms=expire_at_ms,
             role=role, spectator_operation_id=operation,
         ).SerializeToString(deterministic=True)
         signature = hmac.new(self.ticket_secret, payload, "sha256").hexdigest().encode("ascii")
         return self.protocol.message(
             "BattleAssignedS2C", battle_id=room.engine.battle_id, host=self.host, port=self.port,
-            token_payload=payload, token_signature=signature, expire_at_ms=room.deadline_ms, role=role,
+            token_payload=payload, token_signature=signature, expire_at_ms=expire_at_ms, role=role,
         )
 
     def issue_ticket(self, request: Message) -> Message:
@@ -2946,8 +3149,16 @@ class BattleNode:
         *, is_live: Callable[[], bool] | None = None,
     ) -> None:
         room = self._member(ticket)
-        if self._draining or room is None or ticket.expires_ms <= self.now_ms():
+        now = self.now_ms()
+        if self._draining or room is None or ticket.expires_ms <= now:
             raise BattleError("battle not found or player not in this battle")
+        minor_limit = room.minor_play_limits.get(ticket.player_id)
+        if minor_limit is not None and (minor_limit.ended or minor_play_deadline_reached(minor_limit.deadline_ms, now)):
+            _LOG.info(
+                "battle direct connection attachment rejected: minor play deadline reached battle_id=%d player_id=%d play_deadline_ms=%d",
+                ticket.battle_id, ticket.player_id, minor_limit.deadline_ms,
+            )
+            raise BattleError("minor play deadline reached")
         old = room.connections.get(ticket.player_id)
         room.connections[ticket.player_id] = _Connection(emit, close, is_live)
         if ticket.role == _OBSERVER:
@@ -3020,6 +3231,10 @@ class BattleNode:
             elif not self.ticket_secret or not self.port:
                 receipt.error = _UNAVAILABLE
             else:
+                room.minor_play_limits.pop(player, None)
+                obs_dl = int(getattr(request, "minor_play_deadline_ms", 0))
+                if obs_dl > 0:
+                    room.minor_play_limits[player] = _MinorPlayLimit(deadline_ms=obs_dl)
                 room.observers[player] = _Observer(operation, self._steady_ms() + _OBSERVER_GRACE_MS)
                 receipt.error = 0
             if receipt.error:
@@ -3081,6 +3296,7 @@ class BattleNode:
 
     def _drop_observer(self, room: _Room, player: int, *, notify: bool = True) -> None:
         observer = room.observers.pop(player)
+        room.minor_play_limits.pop(player, None)
         key = room.engine.battle_id, player, observer.operation_id
         receipt = self.observer_receipts.get(key)
         if receipt is not None:
@@ -3533,6 +3749,11 @@ class BattleNode:
                 settlement.ranked_rule_version = engine.ranked_context.rule_version
             if engine.jianghu_duel_context is not None:
                 settlement.jianghu_duel.CopyFrom(engine.jianghu_duel_context)
+            if (
+                engine.tactical_puzzle_context is not None
+                and "tactical_puzzle_context" in settlement.DESCRIPTOR.fields_by_name
+            ):
+                settlement.tactical_puzzle_context.CopyFrom(engine.tactical_puzzle_context)
             if actor.fled:
                 event.fled_player_ids.append(player)
             if actor.is_dead:
@@ -3543,7 +3764,7 @@ class BattleNode:
                 if pet.actor_type == _PET and pet.owner_player_id == player and not pet.competitive_temporary:
                     settlement.pets.add(pet_id=pet.pet_id, health=pet.attributes.health,
                                         mana=pet.attributes.mana, is_dead=pet.is_dead)
-            if (engine.pve and not engine.is_festival_beast_battle
+            if (engine.pve and not engine.is_festival_beast_battle and not engine.is_tactical_puzzle_battle
                     and engine.outcome == 1 and actor.team_index == 0 and _active(actor)):
                 for monster_id in engine.defeated_monsters:
                     settlement.defeated_monsters.add(monster_config_id=monster_id, count=1)
@@ -3596,6 +3817,31 @@ class BattleNode:
             self._publish(self.on_rooms_changed, len(self.rooms))
         return True
 
+    def enforce_minor_play_deadlines(self, now: int | None = None) -> int:
+        """强制断开所有已达未成年人防沉迷直连截止时刻的玩家直连，同时保持战斗照常按超时推进。"""
+        now_ms = self.now_ms() if now is None else int(now)
+        closed_count = 0
+        for room in tuple(self.rooms.values()):
+            for player_id, limit in tuple(room.minor_play_limits.items()):
+                if limit.ended or not minor_play_deadline_reached(limit.deadline_ms, now_ms):
+                    continue
+                limit.ended = True
+                conn = room.connections.pop(player_id, None)
+                closing = conn is not None and (conn.is_live is None or conn.is_live())
+                if conn is not None:
+                    self._publish(conn.close)
+                if closing:
+                    closed_count += 1
+                _LOG.info(
+                    "metric=battle_minor_play_deadline_reached battle_id=%d player_id=%d role=%s play_deadline_ms=%d direct_connection_closed=%d",
+                    room.engine.battle_id,
+                    player_id,
+                    "participant" if player_id in room.routing else "observer",
+                    limit.deadline_ms,
+                    1 if closing else 0,
+                )
+        return closed_count
+
     def tick(self) -> None:
         if self._draining:
             return
@@ -3603,6 +3849,7 @@ class BattleNode:
         steady = self._steady_ms()
         self._prune_creation_receipts(now)
         self._prune_observer_receipts(now)
+        self.enforce_minor_play_deadlines(now)
         for room in tuple(self.rooms.values()):
             for player, observer in tuple(room.observers.items()):
                 if 0 < observer.expires_ms <= steady:

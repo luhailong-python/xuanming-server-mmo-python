@@ -121,6 +121,57 @@ class SceneMerchant:
         rules = self.tables["MysteryMerchantRule"].rows()
         return min(100, rules[0].interact_range or 8) if rules else 8
 
+    def validate_tables(self) -> bool:
+        """校验神秘商人规则与商品表可售性（对齐 C++ PlayerMysteryMerchantSystem::ValidateTables）。"""
+        all_valid = True
+        rules = self.tables["MysteryMerchantRule"].rows() if "MysteryMerchantRule" in self.tables.tables else ()
+        if not rules:
+            logger.error("MysteryMerchantRule table is empty; purchase range falls back to 8")
+            all_valid = False
+        else:
+            interact_range = int(rules[0].interact_range)
+            if not 1 <= interact_range <= 100:
+                logger.error(
+                    "MysteryMerchantRule.interact_range=%d is not in 1..100, effective value %d",
+                    interact_range, self._range(),
+                )
+                all_valid = False
+
+        sellable = 0
+        goods_rows = self.tables["MysteryMerchantGoods"].rows() if "MysteryMerchantGoods" in self.tables.tables else ()
+        for row in goods_rows:
+            reason = self._goods_row_invalid_reason(row)
+            if reason is not None:
+                logger.error(
+                    "MysteryMerchantGoods row is not sellable: id=%d reason=%s",
+                    int(row.id), reason,
+                )
+                all_valid = False
+                continue
+            sellable += 1
+        spots = len(self.tables["MysteryMerchantSpot"].rows()) if "MysteryMerchantSpot" in self.tables.tables else 0
+        logger.info(
+            "MysteryMerchant table check finished: sellable_goods=%d spots=%d interact_range=%d",
+            sellable, spots, self._range(),
+        )
+        return all_valid
+
+    def _goods_row_invalid_reason(self, row) -> str | None:
+        if int(row.weight) <= 0:
+            return "weight<=0"
+        if not 1 <= int(row.price) <= 1_000_000_000:
+            return "price_out_of_range"
+        if not 1 <= int(row.limit_count) <= 99:
+            return "limit_count_out_of_range"
+        if int(row.currency_type) not in self.assets.currency_types:
+            return "invalid_currency_type"
+        item = self.tables["Item"].get(int(row.item_id))
+        if item is None:
+            return "item_not_found"
+        if not 1 <= int(row.item_count) <= int(item.max_stack_size):
+            return "item_count_out_of_range"
+        return None
+
     def _goods(self, entry):
         goods = self.tables["MysteryMerchantGoods"].get(entry.goods_id)
         if goods is None or not goods.weight or not 1 <= entry.discount_percent <= 100:

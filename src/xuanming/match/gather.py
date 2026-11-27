@@ -35,6 +35,7 @@ from .errors import (
     UnterminableOriginalError,
 )
 from .model import (
+    BATTLE_ACTIVITY_KIND_GUILD_WAR,
     BATTLE_NOT_ALLOCATABLE_MESSAGE,
     BATTLE_NODE_TYPE,
     MAX_TEAM_SIZE,
@@ -51,6 +52,7 @@ from .model import (
     spectate_visibility_for,
 )
 from .store import MatchStore
+from .tactical_puzzle import deterministic_puzzle_seed
 from .trial_cards import build_trial_battle_context
 
 logger = logging.getLogger(__name__)
@@ -314,17 +316,19 @@ class GatherPipeline:
             await self.store.abort_formation_pre_persist(battle_id, culprit)
             return False
 
-        # 解码成局时冻结的可选上下文（锦标赛 V2/V3、自定义切磋规则、排位上下文、天墉生死状、试炼誓约）。
+        # 解码成局时冻结的可选上下文（锦标赛 V2/V3、自定义切磋规则、排位上下文、天墉生死状、残局坊、试炼誓约）。
         raw_ranked = bytes(getattr(formation, "ranked_context", b""))
         raw_tournament = bytes(getattr(formation, "tournament_context", b""))
         raw_custom_duel = bytes(getattr(formation, "custom_duel_rules", b""))
         raw_jianghu = bytes(getattr(formation, "jianghu_duel_context", b""))
+        raw_tactical_puzzle = bytes(getattr(formation, "tactical_puzzle_context", b""))
         is_wuxing_tower = bool(getattr(formation, "is_wuxing_tower", False))
         trial_vow_mask = int(getattr(formation, "trial_vow_mask", 0))
         ranked_ctx = None
         tournament_ctx = None
         custom_duel_rules = None
         jianghu_ctx = None
+        tactical_puzzle_ctx = None
         try:
             if raw_ranked:
                 ranked_ctx = self.protocol.parse("RankedMatchContext", raw_ranked)
@@ -334,6 +338,8 @@ class GatherPipeline:
                 custom_duel_rules = self.protocol.parse("CustomDuelRules", raw_custom_duel)
             if raw_jianghu:
                 jianghu_ctx = self.protocol.parse("JianghuDuelBattleContext", raw_jianghu)
+            if raw_tactical_puzzle:
+                tactical_puzzle_ctx = self.protocol.parse("TacticalPuzzleBattleContext", raw_tactical_puzzle)
         except Exception:
             logger.error("match gather invalid frozen context battle_id=%d", battle_id, exc_info=True)
             return await fail_pre_persist("invalid_frozen_context", 0)
@@ -416,6 +422,9 @@ class GatherPipeline:
             snap.team_index = int(member.team_index)
             if pid in tournament_captains:
                 snap.is_team_captain = True
+            # 无条件按会话目录覆盖未成年人截止时刻（0 = 成年人不限），防止 scene 快照越权伪造。
+            if "minor_play_deadline_ms" in snap.DESCRIPTOR.fields_by_name:
+                snap.minor_play_deadline_ms = int(getattr(pres, "minor_play_deadline_ms", 0))
             prepared_members.append((pid, endpoint, snap, resp.table_fingerprint or snap.table_fingerprint))
 
         # 锦标赛 V3 模块 F：建房阶段顺手回填参战成员真实角色外观快照（最佳努力，不阻塞建房）。
@@ -472,9 +481,22 @@ class GatherPipeline:
         now_ms = await self.store.now_ms()
         created_at_ms = max(now_ms, int(formation.created_ms))
         has_activity = bool(formation.activity_context)
+        activity_msg = (
+            self.protocol.parse("BattleActivityContext", bytes(formation.activity_context))
+            if has_activity
+            else None
+        )
+        is_guild_war_activity = (
+            activity_msg is not None and int(getattr(activity_msg, "kind", 0)) == BATTLE_ACTIVITY_KIND_GUILD_WAR
+        )
         allow_public_spectate = bool(custom_duel_rules.allow_public_spectate) if custom_duel_rules is not None else False
+        ranked_public_spectate = (
+            ranked_ctx is not None
+            and not bool(getattr(ranked_ctx, "use_free_preset", False))
+            and bool(getattr(ranked_ctx, "allow_public_spectate", False))
+        )
         trial_ctx = None
-        if not is_wuxing_tower:
+        if not is_wuxing_tower and tactical_puzzle_ctx is None:
             trial_ctx = build_trial_battle_context(
                 self.protocol,
                 int(formation.mode),
@@ -485,11 +507,17 @@ class GatherPipeline:
                 now_ms=created_at_ms,
             )
         trial_entry_id = int(trial_ctx.journal_entry_id) if trial_ctx is not None else 0
+        battle_seed = (
+            deterministic_puzzle_seed(int(tactical_puzzle_ctx.puzzle_id), int(tactical_puzzle_ctx.spec_revision))
+            if tactical_puzzle_ctx is not None
+            else (secrets.randbits(64) or 1)
+        )
+        puzzle_author_verify = bool(tactical_puzzle_ctx.is_author_verify) if tactical_puzzle_ctx is not None else False
         create_req = self.protocol.message(
             "CreateBattleRequest",
             battle_id=battle_id,
             battle_config_id=int(formation.config_id),
-            seed=secrets.randbits(64) or 1,
+            seed=battle_seed,
             match_mode=int(formation.mode),
             created_at_ms=created_at_ms,
             deadline_ms=deadline_ms,
@@ -503,13 +531,17 @@ class GatherPipeline:
                 int(formation.mode),
                 has_activity,
                 allow_public_spectate=allow_public_spectate,
+                ranked_public_spectate=ranked_public_spectate,
+                is_guild_war_activity=is_guild_war_activity,
             ),
-            record_replay=record_replay_for(int(formation.mode), trial_journal_entry_id=trial_entry_id),
+            record_replay=record_replay_for(
+                int(formation.mode),
+                trial_journal_entry_id=trial_entry_id,
+                tactical_puzzle_author_verify=puzzle_author_verify,
+            ),
         )
-        if has_activity:
-            create_req.activity_context.CopyFrom(
-                self.protocol.parse("BattleActivityContext", bytes(formation.activity_context))
-            )
+        if activity_msg is not None:
+            create_req.activity_context.CopyFrom(activity_msg)
         if ranked_ctx is not None:
             create_req.ranked_context.CopyFrom(ranked_ctx)
         if trial_ctx is not None:
@@ -520,6 +552,8 @@ class GatherPipeline:
             create_req.custom_duel_rules.CopyFrom(custom_duel_rules)
         if jianghu_ctx is not None:
             create_req.jianghu_duel_context.CopyFrom(jianghu_ctx)
+        if tactical_puzzle_ctx is not None:
+            create_req.tactical_puzzle_context.CopyFrom(tactical_puzzle_ctx)
         effective_boss_affix = int(boss_weekly_affix_id) or int(getattr(formation, "boss_weekly_affix_id", 0))
         if effective_boss_affix:
             create_req.boss_weekly_affix_id = effective_boss_affix

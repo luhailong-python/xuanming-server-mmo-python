@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 import hashlib
+import re
 
 from .model import (
     MAX_UINT64,
@@ -58,6 +59,58 @@ _STATUS_LABELS = {
     RECALL_OP_ROLE_GONE: "ROLE_GONE",
 }
 MANUAL_FINAL_STATUSES = frozenset((RECALL_OP_REJECTED, RECALL_OP_ABORTED, RECALL_OP_PARTIAL))
+
+# 双人复核批准记录校验（对齐 Go shared/dualcontrol/dualcontrol.go）。
+APPROVAL_SUBJECT_PATTERN = re.compile(r"^[A-Za-z0-9._@-]{1,64}$")
+APPROVAL_ID_PATTERN = re.compile(r"^[1-9][0-9]{0,18}$")
+
+
+def validate_admin_approval(
+    approval,
+    operator: str,
+    *,
+    request_id: int | None = None,
+) -> tuple[str | None, str | None]:
+    """核对高风险管理请求的 AdminApproval 双人复核批准记录（对齐 Go dualcontrol.Require/RequireForRequest）。
+
+    返回 `(kind, detail)`：
+    - `(None, None)`：批准记录合格；
+    - `("missing", ...)`：未携带批准记录（仅在 admin_allow_unapproved=True 时可放行并告警）；
+    - `("invalid", ...)`：批准记录格式错误、发起人与批准人相同、发起人与操作人不符或批准号与 request_id 不符（一律拒审）。
+    """
+    if approval is None or (hasattr(approval, "ByteSize") and approval.ByteSize() == 0):
+        return "missing", "dual-control approval record is missing"
+    approval_id = str(getattr(approval, "approval_id", "") or "")
+    proposer = str(getattr(approval, "proposer", "") or "")
+    approver = str(getattr(approval, "approver", "") or "")
+    approved_at_ms = int(getattr(approval, "approved_at_ms", 0) or 0)
+    if not APPROVAL_ID_PATTERN.match(approval_id):
+        return "invalid", "dual-control approval record is invalid: approval_id must be a positive decimal number"
+    if not APPROVAL_SUBJECT_PATTERN.match(proposer):
+        return "invalid", "dual-control approval record is invalid: proposer is not a valid operator identifier"
+    if not APPROVAL_SUBJECT_PATTERN.match(approver):
+        return "invalid", "dual-control approval record is invalid: approver is not a valid operator identifier"
+    if approved_at_ms <= 0:
+        return "invalid", "dual-control approval record is invalid: approved_at_ms is missing"
+    if proposer == approver:
+        return "invalid", "dual-control approval record is invalid: proposer and approver are the same person"
+    if proposer != operator:
+        return "invalid", "dual-control approval record is invalid: proposer differs from the request operator"
+    if request_id is not None and approval_id != str(int(request_id)):
+        return "invalid", "dual-control approval record is invalid: request_id must be the approval id"
+    return None, None
+
+
+def approval_trail(approval) -> str:
+    """格式化双人复核留痕片段（对齐 Go recall_logic.go approvalTrail）。"""
+    aid = str(getattr(approval, "approval_id", "") or "") if approval is not None else ""
+    approver = str(getattr(approval, "approver", "") or "") if approval is not None else ""
+    return f'approval_id="{aid}" approver="{approver}"'
+
+
+def with_approval_trail(reason: str, approval) -> str:
+    """将双人复核批准记录拼接到落库理由文本末尾（不改变入参长度校验）。"""
+    return f"{reason} [{approval_trail(approval)}]"
 
 
 class RecallPlanTooLarge(ValueError):

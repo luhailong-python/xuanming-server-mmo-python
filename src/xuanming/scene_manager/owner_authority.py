@@ -332,6 +332,13 @@ class OwnerAuthorityConfig:
             return ""
         if self.mode not in ("", "shadow", "enforce"):
             raise ValueError(f"OwnerAuthority.mode must be empty, shadow, or enforce, got {self.mode!r}")
+        # r2-oa#1：在实例租约续期与准入屏障做实之前拒绝 enforce 启服，防止产生无时间保护的额外否决点。
+        if self.mode == "enforce":
+            raise ValueError(
+                "OwnerAuthority.Mode=enforce is refused until the admit barrier is implemented: "
+                "no process renews owner_instance_lease and the scene target identity is a reusable "
+                "node id with a constant instance epoch, so admit_not_before is always now; use shadow"
+            )
         parse_sql_backend(self.backend)
         if self.skew_margin_ms < 0:
             raise ValueError(f"OwnerAuthority.skew_margin_ms must be >= 0, got {self.skew_margin_ms}")

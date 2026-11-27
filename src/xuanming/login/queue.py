@@ -8,9 +8,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import random
+import secrets
 import time
 import uuid
 from dataclasses import dataclass
@@ -97,31 +99,32 @@ return {code, redis.call('ZRANK', KEYS[1], ARGV[1]), redis.call('ZCARD', KEYS[1]
 
 LOOKUP_SCRIPT = """
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then
-\treturn {1, 0, 0, ''}
+\treturn {1, 0, 0, '', ''}
 end
 local slot = redis.call('GETDEL', KEYS[4])
 if slot then
-\tif redis.call('TYPE', KEYS[1]).ok == 'hash' then
-\t\tredis.call('HSET', KEYS[1], ARGV[7], slot, ARGV[8], ARGV[10])
+\tif redis.call('TYPE', KEYS[1]).ok ~= 'hash' then
+\t\treturn {1, 0, 0, '', ''}
 \tend
-\treturn {2, 0, 0, slot}
+\tredis.call('HSET', KEYS[1], ARGV[7], slot, ARGV[8], ARGV[10])
+\treturn {2, 0, 0, slot, redis.call('HGET', KEYS[1], 'account') or ''}
 end
 if redis.call('TYPE', KEYS[1]).ok ~= 'hash' then
-\treturn {1, 0, 0, ''}
+\treturn {1, 0, 0, '', ''}
 end
-local f = redis.call('HMGET', KEYS[1], ARGV[3], ARGV[4], ARGV[7], ARGV[8])
+local f = redis.call('HMGET', KEYS[1], ARGV[3], ARGV[4], ARGV[7], ARGV[8], 'account')
 if f[1] ~= ARGV[2] then
-\treturn {1, 0, 0, ''}
+\treturn {1, 0, 0, '', ''}
 end
 if f[2] then
 \tif f[3] and tonumber(ARGV[9]) < (tonumber(f[4]) or 0) then
-\t\treturn {6, 0, 0, f[3]}
+\t\treturn {6, 0, 0, f[3], f[5] or ''}
 \tend
-\treturn {5, 0, 0, ''}
+\treturn {5, 0, 0, '', ''}
 end
 local rank = redis.call('ZRANK', KEYS[2], ARGV[1])
 if not rank then
-\treturn {4, 0, 0, ''}
+\treturn {4, 0, 0, '', ''}
 end
 local idle = tonumber(ARGV[5])
 for i = 1, 3 do
@@ -130,7 +133,7 @@ for i = 1, 3 do
 \t\tredis.call('PEXPIRE', KEYS[i], ARGV[6])
 \tend
 end
-return {3, rank, redis.call('ZCARD', KEYS[2]), ''}
+return {3, rank, redis.call('ZCARD', KEYS[2]), '', ''}
 """
 
 ADMIT_ENTRY_SCRIPT = """
@@ -176,7 +179,7 @@ return redis.call('ZCARD', KEYS[1])
 
 RESERVE_FAST_PATH_SCRIPT = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
+if not redis.call('ZSCORE', KEYS[1], ARGV[3]) and redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then return 0 end
 redis.call('ZADD', KEYS[1], ARGV[4], ARGV[3])
 if redis.call('PTTL', KEYS[1]) < tonumber(ARGV[5]) then
 \tredis.call('PEXPIRE', KEYS[1], ARGV[5])
@@ -389,8 +392,51 @@ def pick_gate(candidates: list[GateCandidate], *, rng=None) -> GateCandidate | N
     return two_choices(eligible_gates(candidates), rng=rng)
 
 
-def sign_gate_token(protocol, gate: GateCandidate, secret: bytes, ttl_s: int, *, player_id: int = 0) -> AdmitToken:
-    """为指定 gate 签发 ``GateTokenPayload`` 与 HMAC-SHA256 签名。"""
+def ticket_account_digest(account: str) -> bytes:
+    """计算 gate 票据绑定账号的 16 字节 SHA-256 摘要（空串返回空字节，表示不绑定账号）。"""
+    if not account:
+        return b""
+    return hashlib.sha256(f"gate-ticket-account|{account}".encode("utf-8")).digest()[:16]
+
+
+def ticket_issued_to(digest: bytes | bytearray, account: str) -> bool:
+    """判断 gate 票据是否允许该账号使用：未绑摘要的票放行，绑了摘要则须常数时间比对一致。"""
+    if not digest:
+        return True
+    want = ticket_account_digest(account)
+    return bool(want) and hmac.compare_digest(bytes(digest), want)
+
+
+def sign_gate_token(
+    protocol,
+    gate: GateCandidate,
+    secret: bytes,
+    ttl_s: int,
+    *,
+    player_id: int = 0,
+    account: str = "",
+) -> AdmitToken:
+    """为指定 gate 签发 ``GateTokenPayload`` 与 HMAC-SHA256 签名（非空 ``account`` 时绑定持票账号摘要）。"""
+    if account:
+        deadline = int(time.time()) + int(ttl_s)
+        payload = protocol.message(
+            "GateTokenPayload",
+            gate_node_id=gate.node_id,
+            zone_id=gate.zone_id,
+            expire_timestamp=deadline,
+            player_id=player_id,
+            hmac_session_key=secrets.token_bytes(32),
+            account_digest=ticket_account_digest(account),
+        ).SerializeToString()
+        signature = hmac.new(secret, payload, "sha256").hexdigest().encode()
+        return AdmitToken(
+            ip=gate.ip,
+            port=gate.port,
+            ws_url=gate.ws_url,
+            token_payload=payload,
+            token_signature=signature,
+            token_deadline=deadline,
+        )
     ticket = issue_gate_ticket(protocol, gate.node_id, gate.zone_id, secret, ttl=ttl_s, player_id=player_id)
     deadline = protocol.parse("GateTokenPayload", ticket.payload).expire_timestamp
     return AdmitToken(
@@ -534,12 +580,12 @@ class LoginQueue:
     async def admitted_count(self, zone_id: int) -> int:
         return int(await self._eval(ADMITTED_COUNT_SCRIPT, [keys.admitted_zset_key(zone_id)], self.clock_ms()))
 
-    async def try_reserve_fast_path_slot(self, zone_id: int, budget: int) -> bool:
-        """快速通道原子占位：未到期占位小于 ``budget`` 时占一枚，防并发洪峰击穿容量。"""
+    async def try_reserve_fast_path_slot(self, zone_id: int, budget: int, account: str = "") -> bool:
+        """快速通道原子占位：同账号在途仅占一枚确定性名额（防单账号耗尽全区名额），匿名回落 ``fast:<uuid>``。"""
         if budget <= 0:
             return False
         now_ms = self.clock_ms()
-        member = f"fast:{uuid.uuid4()}"
+        member = queue_id_for_account(self.hmac_secret, zone_id, account) if account else f"fast:{uuid.uuid4()}"
         result = int(await self._eval(
             RESERVE_FAST_PATH_SCRIPT,
             [keys.admitted_zset_key(zone_id)],
@@ -612,7 +658,11 @@ class LoginQueue:
         code = int(reply[0])
         if code in (LOOKUP_ADMIT_TAKEN, LOOKUP_ADMIT_RETAKEN):
             slot = AdmitSlot.from_json(_text(reply[3]))
-            admit = await sign_fn(slot)
+            account = _text(reply[4]) if len(reply) > 4 else ""
+            if len(inspect.signature(sign_fn).parameters) >= 2:
+                admit = await sign_fn(slot, account)
+            else:
+                admit = await sign_fn(slot)
             # 票交出后延长在途占位至 handoff_grace，避免在 gate 上报人数前被重复放行
             try:
                 await self._eval(

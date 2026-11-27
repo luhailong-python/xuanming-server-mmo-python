@@ -40,6 +40,7 @@ async def open_service(config: DataServiceConfig, protocol: Protocol, stack: Asy
         protocol, store, config.secrets, id_tags=config.id_tags,
         zone_refresh=config.merged_zone_refresh_sec,
         admin_token=config.admin_token,
+        admin_allow_unapproved=config.admin_allow_unapproved,
         deletion_cooling_off_ms=config.deletion_cooling_off_sec * 1000,
         recall_enabled=config.recall_enabled,
     )

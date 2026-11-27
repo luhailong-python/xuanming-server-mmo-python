@@ -146,6 +146,8 @@ async def open_service(
         coordinator_secret=config.coordinator_secret,
         notifier=notifier,
         request_budget_sec=config.request_budget_sec,
+        approval_required_callers=config.approval_required_callers,
+        allow_unapproved=config.admin_allow_unapproved,
     )
 
     asset_loop: AssetDeliveryLoop | None = None

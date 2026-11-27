@@ -58,11 +58,19 @@ from .model import (
     BATTLE_OUTCOME_DRAW,
     BATTLE_OUTCOME_SIDE_A_WIN,
     BATTLE_OUTCOME_SIDE_B_WIN,
+    CreditFenceVerdict,
     GuildData,
     MATCH_MODE_GUILD_WAR_PVP,
     MATCH_MODE_GUILD_WAR_SIEGE,
     MATCH_MODE_JIANGHU_DUEL,
     MS_PER_DAY,
+    OP_KIND_BOUNTY_PAYOUT,
+    OP_KIND_WAR_REWARD,
+    TX_GUILD_BOUNTY_PAYOUT,
+    TX_GUILD_WAR_REWARD,
+    WarCreditOwed,
+    WarCreditOwedCursor,
+    WarOwedConvertStatus,
     MS_PER_HOUR,
     ORDER_STATUS_APPLIED,
     RANK_OFFICER,
@@ -362,6 +370,7 @@ class _BountyState:
     escrow_silver: int
     public_board: bool
     status: int = BOUNTY_STATUS_ACTIVE
+    escrow_guild_funds: int = 0
     counter_kills: int = 0
     last_counter_attacker_id: int = 0
     hunter_player_id: int = 0
@@ -370,6 +379,107 @@ class _BountyState:
     resolved_at_ms: int = 0
     last_scene_config_id: int = 0
     last_channel_no: int = 0
+
+
+_TERMINAL_BOUNTY_STATUSES = frozenset({
+    BOUNTY_STATUS_COMPLETED,
+    BOUNTY_STATUS_TORN_BY_TARGET,
+    BOUNTY_STATUS_EXPIRED,
+    6,  # GUILD_WAR_BOUNTY_STATUS_ESCROW_FAILED
+})
+WAR_BOUNTY_TERMINAL_RETENTION_MS = 30 * MS_PER_DAY
+
+
+@dataclass(frozen=True, slots=True)
+class BannerDelta:
+    """灵脉旗势变化与事务内快照一致性比对基线（r2-gw#3，对齐 Go war.BannerDelta）。"""
+
+    hp_before: int = 0
+    owner_before: int = 0
+    shield_until_before: int = 0
+    attacker_owns_other: bool = False
+    hp_after: int = 0
+    owner_after: int = 0
+    shield_until_after: int = 0
+    broke_banner: bool = False
+    captured_by_winner: bool = False
+    break_bonus_funds: int = 0
+    break_bonus_silver: int = 0
+
+    def basis_holds(self, cur: _LeylineState | None, attacker_owns_other: bool) -> bool:
+        """校验锁内当前灵脉行是否仍与事务外计算时一致（防并发结算错扣旗势或兼并第 2 座）。"""
+        return (
+            cur is not None
+            and cur.owner_guild_id == self.owner_before
+            and cur.banner_hp == self.hp_before
+            and cur.shield_until_ms == self.shield_until_before
+            and bool(attacker_owns_other) == self.attacker_owns_other
+        )
+
+
+def find_leyline_basis(
+    rows: Sequence[_LeylineState],
+    leyline_id: int,
+    attacker_guild_id: int,
+) -> tuple[_LeylineState | None, bool]:
+    """从同区灵脉行中取出目标灵脉并判攻方是否已占领其余灵脉（r2-gw#3）。"""
+    cur = None
+    owns_other = False
+    for lr in rows:
+        if lr.leyline_id == leyline_id:
+            cur = lr
+        elif attacker_guild_id > 0 and lr.owner_guild_id == attacker_guild_id:
+            owns_other = True
+    return cur, owns_other
+
+
+def client_war_target_hints(target_kind: int, req_leyline_id: int, req_bounty_id: int) -> tuple[int, int]:
+    """按目标种类收窄允许采信的客户端字段（r2-gw#1）：仅守旗阵采信 leyline_id，仅追杀榜采信 bounty_id。"""
+    if target_kind == TARGET_KIND_LEYLINE_GARRISON:
+        return req_leyline_id, 0
+    if target_kind == TARGET_KIND_BOUNTY:
+        return 0, req_bounty_id
+    return 0, 0
+
+
+def bounty_huntable(b: _BountyState | None, zone_id: int, hunter_guild_id: int, now_ms: int) -> bool:
+    """判定追杀令此刻能否由 hunter_guild_id 在 zone_id 接单/结单/展示（r2-gw#1 / #8）。"""
+    return (
+        b is not None
+        and b.zone_id == zone_id
+        and b.status == BOUNTY_STATUS_ACTIVE
+        and b.expires_at_ms > now_ms
+        and (bool(b.public_board) or b.issuer_guild_id == hunter_guild_id)
+    )
+
+
+def field_target_bounty(
+    b: _BountyState | None, zone_id: int, viewer_guild_id: int, now_ms: int
+) -> tuple[int, int, int]:
+    """野外点选面板可见追杀令（r2-gw#8）：仅发单帮可见的单对别帮返回 (0, 0, 0)。"""
+    if not bounty_huntable(b, zone_id, viewer_guild_id, now_ms) or b is None:
+        return 0, 0, 0
+    return b.bounty_id, b.escrow_silver, b.tier
+
+
+def bounty_expiry_refund(b: _BountyState) -> tuple[int, int]:
+    """ACTIVE 追杀令到期原路退回本金（r2-gw#2）：公费档退预扣帮会资金，银两档退扣税后托管银两。"""
+    if b.tier == BOUNTY_TIER_GUILD_PUBLIC:
+        return 0, b.escrow_guild_funds
+    return b.escrow_silver, 0
+
+
+@dataclass(slots=True)
+class WarCreditOwedStats:
+    """一轮 guild_war_credit_owed 后台转换统计（r2-gw#5 / #6）。"""
+
+    scanned: int = 0
+    converted: int = 0
+    still_full: int = 0
+    frozen: int = 0
+    abandoned: int = 0
+    gone: int = 0
+    failed: int = 0
 
 
 @dataclass(slots=True)
@@ -1457,13 +1567,16 @@ class GuildWarManager:
                 defender_ids = [req_target_pid]
                 defender_guild_id = explicit_target_guild.guild_id
                 defender_guild_name = explicit_target_guild.name
-                leyline_id = req_leyline_id if req_leyline_id in LEYLINE_BY_ID else 0
                 if target_kind == TARGET_KIND_LIVE_PLAYER:
+                    # r2-gw#1：直打活人不采信客户端 leyline_id。
+                    leyline_id = 0
                     war_battle_kind = BATTLE_KIND_PANEL_PVP
-                elif leyline_id != 0:
-                    war_battle_kind = BATTLE_KIND_LEYLINE_PVP
                 else:
-                    war_battle_kind = BATTLE_KIND_FIELD_ROAD
+                    leyline_id = req_leyline_id if req_leyline_id in LEYLINE_BY_ID else 0
+                    if leyline_id != 0:
+                        war_battle_kind = BATTLE_KIND_LEYLINE_PVP
+                    else:
+                        war_battle_kind = BATTLE_KIND_FIELD_ROAD
 
             elif target_kind == TARGET_KIND_LEYLINE_GARRISON:
                 if req_leyline_id not in LEYLINE_BY_ID:
@@ -1529,7 +1642,8 @@ class GuildWarManager:
                     defender_ids = [tgt.player_id]
                     defender_guild_id = tg.guild_id
                     defender_guild_name = tg.name
-                    leyline_id = req_leyline_id if req_leyline_id in LEYLINE_BY_ID else 0
+                    # r2-gw#1：一键开战命中活人时不采信客户端 leyline_id。
+                    leyline_id = 0
                 else:
                     candidate_lids = []
                     if req_leyline_id in LEYLINE_BY_ID:
@@ -2012,10 +2126,11 @@ class GuildWarManager:
                 btl.banner_hp_after = ll.banner_hp
                 ll.updated_ms = now_ms
 
-            # 追杀令销单 / 反杀 / 反杀 2 人撕单
+            # 追杀令销单 / 反杀 / 反杀 2 人撕单（r2-gw#1 / #2：行锁内复核同区 + 接单资格 + 未过期）
+            bounty_silver_refunds: list[tuple[int, int, int, int]] = []  # (player_id, guild_id, tier, silver, bounty_id)
             if btl.bounty_id != 0 and btl.bounty_id in self._bounties:
                 b = self._bounties[btl.bounty_id]
-                if b.status == BOUNTY_STATUS_ACTIVE:
+                if bounty_huntable(b, btl.zone_id, btl.attacker_guild_id, now_ms):
                     if attacker_win and btl.attacker_ids:
                         hunter = self._ensure_player(btl.attacker_ids[0], btl.zone_id, now_ms)
                         target_st = self._ensure_player(b.target_player_id, btl.zone_id, now_ms)
@@ -2053,8 +2168,20 @@ class GuildWarManager:
                         if b.counter_kills >= self.rule.bounty_counter_kill_tear:
                             b.status = BOUNTY_STATUS_TORN_BY_TARGET
                             b.resolved_at_ms = now_ms
-                            silver_bonus += b.escrow_silver // 2
+                            target_half = b.escrow_silver // 2
+                            silver_bonus += target_half
                             btl.bounty_outcome_tag = BOUNTY_TAG_COUNTER_TEAR
+                            # r2-gw#2：撕单退发布者另一半（公费档退一半实付帮会资金，银两档退另一半托管银两）。
+                            if b.tier == BOUNTY_TIER_GUILD_PUBLIC:
+                                issuer_funds = b.escrow_guild_funds - (b.escrow_guild_funds // 2)
+                                if issuer_funds > 0:
+                                    funds_to_apply.append((b.issuer_guild_id, issuer_funds))
+                            else:
+                                issuer_silver = b.escrow_silver - target_half
+                                if issuer_silver > 0:
+                                    bounty_silver_refunds.append(
+                                        (b.issuer_player_id, b.issuer_guild_id, b.tier, issuer_silver)
+                                    )
                         else:
                             btl.bounty_outcome_tag = BOUNTY_TAG_COUNTER_KILL
                         if target_st.bounty_payouts_today < self.rule.bounty_daily_payout_limit:
@@ -2147,11 +2274,22 @@ class GuildWarManager:
 
             btl.settled = True
 
-        # 在锁外写回帮会资金与个人帮贡（帮会已解散则静默跳过）
+        # 在锁外写回帮会资金与个人帮贡（帮会已解散则静默跳过），并经分流通道处理撕单银两退本
         for gid, f_delta in funds_to_apply:
             await self._credit_guild_funds(gid, f_delta)
         for gid, pid, c_delta in credits_to_apply:
             await self._credit_member_contribution(gid, pid, c_delta)
+        for issuer_pid, issuer_gid, b_tier, refund_silver in bounty_silver_refunds:
+            await self.credit_war_asset(
+                player_id=issuer_pid,
+                guild_id=issuer_gid,
+                silver=refund_silver,
+                kind=OP_KIND_BOUNTY_PAYOUT,
+                tx_type=TX_GUILD_BOUNTY_PAYOUT,
+                ref_id=b_tier,
+                source_id=btl.bounty_id or battle_id,
+                now_ms=now_ms,
+            )
         return btl
 
     def _record_enemy_locked(self, victim_guild_id: int, rec: _EnemyRecord) -> None:
@@ -2341,6 +2479,7 @@ class GuildWarManager:
                 escrow_silver=escrow,
                 public_board=public_board,
                 status=BOUNTY_STATUS_ACTIVE,
+                escrow_guild_funds=self.rule.bounty_public_funds if tier == BOUNTY_TIER_GUILD_PUBLIC else 0,
                 created_at_ms=now_ms,
                 expires_at_ms=now_ms + self.rule.bounty_ttl_sec * 1000,
             )
@@ -2532,6 +2671,7 @@ class GuildWarManager:
                 streak = st.streak_count if st is not None else 0
                 bid = st.in_battle_id if st is not None else 0
                 ab = self._active_bounty_for_target(pid, now_ms)
+                b_id, b_silver, b_tier = field_target_bounty(ab, caller_zone, caller_gid, now_ms)
                 can_attack = (
                     caller_gid > 0
                     and tg_id > 0
@@ -2554,9 +2694,9 @@ class GuildWarManager:
                     in_battle=bid != 0,
                     battle_id=bid,
                     is_rival_guild=self._is_rival(caller_gid, tg_id, wk),
-                    active_bounty_id=ab.bounty_id if ab is not None else 0,
-                    active_bounty_reward_silver=ab.escrow_silver if ab is not None else 0,
-                    active_bounty_tier=ab.tier if ab is not None else 0,
+                    active_bounty_id=b_id,
+                    active_bounty_reward_silver=b_silver,
+                    active_bounty_tier=b_tier,
                     can_attack_now=can_attack,
                 )
         return resp
@@ -2943,3 +3083,181 @@ class GuildWarManager:
                 finished_ms=r.finished_ms,
             )
         return resp
+
+    # -- 帮战入账分流、追杀令到期退本、终态清理与待入账转换（r2-gw#2 / #5 / #6 / #7）-----------
+
+    def _encode_silver_bundle(self, silver: int) -> bytes:
+        bundle = self.protocol.message("AssetBundle")
+        bundle.currencies.add(currency_type=0, amount=int(silver))
+        return bundle.SerializeToString()
+
+    async def credit_war_asset(
+        self,
+        *,
+        player_id: int,
+        guild_id: int,
+        silver: int,
+        kind: int = OP_KIND_WAR_REWARD,
+        tx_type: int = TX_GUILD_WAR_REWARD,
+        ref_id: int = 0,
+        period_key: int = 0,
+        source_id: int = 0,
+        now_ms: int | None = None,
+        op_id: int | None = None,
+    ) -> tuple[object | None, WarCreditOwed | None, int]:
+        """将单笔帮战银两奖励/退本经 GUILD_CREDIT 分流落库（满窗或护栏冻结转入 guild_war_credit_owed，墓碑放弃）。"""
+        if player_id <= 0 or silver <= 0:
+            return None, None, CreditFenceVerdict.OPEN
+        credit_fn = getattr(self.store, "credit_or_owe_war_op", None)
+        if not callable(credit_fn):
+            return None, None, CreditFenceVerdict.OPEN
+        ts = self._now() if now_ms is None else int(now_ms)
+        minted_op_id = int(op_id) if op_id else int(await self.store._op_ids())
+        rec = WarCreditOwed(
+            player_id=player_id,
+            op_id=minted_op_id,
+            guild_id=guild_id,
+            kind=kind,
+            tx_type=tx_type,
+            ref_id=ref_id,
+            period_key=period_key,
+            payload=self._encode_silver_bundle(silver),
+            source_id=source_id,
+            created_ms=ts,
+        )
+        op_row, owed_row, verdict = await credit_fn(rec, ts)
+        if owed_row is not None:
+            logger.info(
+                "Guild war credit op %d of player %d deferred to guild_war_credit_owed (source=%d verdict=%d)",
+                owed_row.op_id, owed_row.player_id, source_id, verdict,
+            )
+        elif verdict == CreditFenceVerdict.REMOVED:
+            logger.error(
+                "Guild war credit for removed player %d abandoned (source=%d op_id=%d)",
+                player_id, source_id, minted_op_id,
+            )
+        return op_row, owed_row, verdict
+
+    async def expire_due_bounties(self, now_ms: int | None = None, *, limit: int = 200) -> dict[str, int]:
+        """r2-gw#2：到期 ACTIVE 追杀令原路退本（公费退帮会资金；银两档经 GUILD_CREDIT 分流退发布者）。"""
+        ts = self._now() if now_ms is None else int(now_ms)
+        due: list[_BountyState] = []
+        async with self._lock:
+            candidates = [
+                b for b in self._bounties.values()
+                if b.status == BOUNTY_STATUS_ACTIVE and b.expires_at_ms <= ts
+            ]
+            candidates.sort(key=lambda b: (b.expires_at_ms, b.bounty_id))
+            for b in candidates[:max(0, limit)]:
+                b.status = BOUNTY_STATUS_EXPIRED
+                b.resolved_at_ms = ts
+                due.append(b)
+
+        stats = {
+            "expired": 0,
+            "funds_refunded": 0,
+            "ops_created": 0,
+            "owed_count": 0,
+            "abandoned_count": 0,
+        }
+        for b in due:
+            stats["expired"] += 1
+            silver, funds = bounty_expiry_refund(b)
+            if funds > 0:
+                await self._credit_guild_funds(b.issuer_guild_id, funds)
+                stats["funds_refunded"] += funds
+            if silver > 0:
+                op_row, owed_row, verdict = await self.credit_war_asset(
+                    player_id=b.issuer_player_id,
+                    guild_id=b.issuer_guild_id,
+                    silver=silver,
+                    kind=OP_KIND_BOUNTY_PAYOUT,
+                    tx_type=TX_GUILD_BOUNTY_PAYOUT,
+                    ref_id=b.tier,
+                    source_id=b.bounty_id,
+                    now_ms=ts,
+                )
+                if op_row is not None:
+                    stats["ops_created"] += 1
+                elif owed_row is not None:
+                    stats["owed_count"] += 1
+                elif verdict == CreditFenceVerdict.REMOVED:
+                    stats["abandoned_count"] += 1
+        return stats
+
+    async def purge_terminal_bounties(
+        self,
+        now_ms: int | None = None,
+        *,
+        retention_ms: int = WAR_BOUNTY_TERMINAL_RETENTION_MS,
+        limit: int = 200,
+    ) -> int:
+        """r2-gw#7：按保留期批量清理终态追杀令（永不删除 ESCROW_PENDING / ACTIVE）。"""
+        ts = self._now() if now_ms is None else int(now_ms)
+        if limit <= 0 or ts <= retention_ms:
+            return 0
+        cutoff = ts - retention_ms
+        async with self._lock:
+            victim_ids = [
+                b.bounty_id
+                for b in self._bounties.values()
+                if b.status in _TERMINAL_BOUNTY_STATUSES and b.expires_at_ms < cutoff
+            ][:limit]
+            for bid in victim_ids:
+                self._bounties.pop(bid, None)
+        if victim_ids:
+            logger.info("Purged %d terminal bounties expired before %d", len(victim_ids), cutoff)
+        return len(victim_ids)
+
+    async def convert_war_credit_owed_round(
+        self,
+        after: WarCreditOwedCursor = WarCreditOwedCursor(),
+        now_ms: int | None = None,
+        *,
+        page_size: int = 64,
+        max_rows: int = 256,
+    ) -> tuple[WarCreditOwedCursor, WarCreditOwedStats]:
+        """r2-gw#5 / #6：按游标翻页将 guild_war_credit_owed 转换为 GUILD_CREDIT 资产指令。"""
+        next_cursor = after
+        stats = WarCreditOwedStats()
+        list_fn = getattr(self.store, "list_war_credit_owed", None)
+        convert_fn = getattr(self.store, "convert_war_credit_owed", None)
+        if not callable(list_fn) or not callable(convert_fn):
+            return next_cursor, stats
+        ts = self._now() if now_ms is None else int(now_ms)
+        waiting: set[int] = set()
+        while stats.scanned < max_rows:
+            page = await list_fn(next_cursor, page_size)
+            for owed in page:
+                stats.scanned += 1
+                if owed.player_id not in waiting:
+                    try:
+                        status, _ = await convert_fn(owed, ts)
+                    except Exception:
+                        stats.failed += 1
+                        logger.error(
+                            "Convert owed war credit failed op_id=%d player_id=%d",
+                            owed.op_id, owed.player_id, exc_info=True,
+                        )
+                    else:
+                        if status == WarOwedConvertStatus.CONVERTED:
+                            stats.converted += 1
+                        elif status == WarOwedConvertStatus.STILL_FULL:
+                            stats.still_full += 1
+                            waiting.add(owed.player_id)
+                        elif status == WarOwedConvertStatus.FROZEN:
+                            stats.frozen += 1
+                            waiting.add(owed.player_id)
+                        elif status == WarOwedConvertStatus.ABANDONED:
+                            stats.abandoned += 1
+                            logger.error(
+                                "Owed war credit op_id=%d source=%d abandoned: player %d removed",
+                                owed.op_id, owed.source_id, owed.player_id,
+                            )
+                        elif status == WarOwedConvertStatus.GONE:
+                            stats.gone += 1
+                next_cursor = owed.cursor()
+            if len(page) < page_size:
+                next_cursor = WarCreditOwedCursor()
+                break
+        return next_cursor, stats

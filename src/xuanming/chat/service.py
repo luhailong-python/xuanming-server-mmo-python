@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import logging
 
 import grpc
@@ -11,6 +12,7 @@ from google.protobuf.message import Message
 
 from ..login.caller_auth import AuthError, CallerVerifier, SESSION_DETAIL, parse_details
 from ..protocol import Protocol
+from .config import ADMIN_TOKEN_ENV, ADMIN_TOKEN_METADATA_KEY, MIN_ADMIN_TOKEN_BYTES
 from .errors import (
     ERR_INVALID_PARAMETER,
     ERR_MESSAGE_TOO_LONG,
@@ -35,7 +37,15 @@ from .model import (
     render_system_world_notice,
     valid_account,
 )
-from .store import ChatStoreCore, ContentReviewer, WorldPusher
+from .store import (
+    ChatStoreCore,
+    ContentReviewer,
+    PlatformRecheckTask,
+    RECHECK_GAVE_UP,
+    RECHECK_PASSED,
+    RECHECK_RETRACTED,
+    WorldPusher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +65,16 @@ class ChatService:
         *,
         world_pusher: WorldPusher | None = None,
         platform_reviewer: ContentReviewer | None = None,
+        admin_token: str | None = None,
     ) -> None:
+        if admin_token and len(admin_token.encode("utf-8")) < MIN_ADMIN_TOKEN_BYTES:
+            raise ValueError(f"{ADMIN_TOKEN_ENV} is shorter than {MIN_ADMIN_TOKEN_BYTES} bytes")
         self._protocol = protocol
         self._store = store
         self._verifier = verifier
         self._world_pusher = world_pusher
         self._platform_reviewer = platform_reviewer if platform_reviewer is not None else store.reviewer
+        self._admin_token = admin_token
         self._bg_tasks: set[asyncio.Task] = set()
 
     def services(self) -> dict[str, dict]:
@@ -127,6 +141,28 @@ class ChatService:
                 logger.error("chat rejected client session on server-only method=%s", path)
                 await context.abort(grpc.StatusCode.PERMISSION_DENIED, f"{path} is not callable by clients")
 
+    async def _authorize_ops(self, context, path: str) -> None:
+        """核对运维口令（常数时间比对，口令值绝不进日志；显式空串表示停用运维撤回面）。"""
+        if self._admin_token is None:
+            return
+        if not self._admin_token:
+            logger.error("[chat] %s refused: %s is not set, the ops surface is disabled", path, ADMIN_TOKEN_ENV)
+            await context.abort(
+                grpc.StatusCode.PERMISSION_DENIED,
+                f"{path} is disabled because {ADMIN_TOKEN_ENV} is not set",
+            )
+        got = ""
+        for key, value in context.invocation_metadata() or ():
+            if str(key).lower() == ADMIN_TOKEN_METADATA_KEY:
+                got = value.decode("utf-8", errors="ignore") if isinstance(value, bytes) else str(value)
+                break
+        if not got or not hmac.compare_digest(got.encode("utf-8"), self._admin_token.encode("utf-8")):
+            logger.error("[chat] %s refused: bad or missing %s (present=%s)", path, ADMIN_TOKEN_METADATA_KEY, bool(got))
+            await context.abort(
+                grpc.StatusCode.PERMISSION_DENIED,
+                f"{path} requires a valid {ADMIN_TOKEN_METADATA_KEY}",
+            )
+
     async def _publish_world(self, message: Message | None) -> None:
         if self._world_pusher is None or message is None or int(message.channel) != CHANNEL_WORLD:
             return
@@ -157,6 +193,88 @@ class ChatService:
                 exc,
             )
 
+    async def _retract_platform_rejected(self, sender_id: int, send_time_ms: int) -> int:
+        """撤回平台判违规的世界消息并广播撤回通知；返回结局码（0 表示需下一轮重试）。"""
+        try:
+            retracted, tip = await self._store.retract_world(sender_id, send_time_ms, _PLATFORM_REJECT_REASON)
+        except Exception as exc:
+            logger.error(
+                "[chat] world platform reject not retracted sender=%d send_time_ms=%d err=%s",
+                sender_id,
+                send_time_ms,
+                exc,
+            )
+            return 0
+        if tip != 0:
+            logger.error(
+                "[chat] world platform reject could not be retracted sender=%d send_time_ms=%d tip=%d",
+                sender_id,
+                send_time_ms,
+                tip,
+            )
+            return RECHECK_GAVE_UP
+        if retracted:
+            notify = self._protocol.message(
+                "chatpb.ChatRetractedNotify",
+                channel=CHANNEL_WORLD,
+                sender_player_id=sender_id,
+                send_time_ms=send_time_ms,
+                reason=_PLATFORM_REJECT_REASON,
+            )
+            await self._publish_world_retract(notify)
+        return RECHECK_RETRACTED
+
+    async def _decide_platform_recheck(self, task: PlatformRecheckTask) -> int:
+        if task.exhausted or task.missing:
+            logger.error(
+                "[chat] world platform recheck gave_up sender=%d send_time_ms=%d attempts=%d missing=%s",
+                task.sender_player_id,
+                task.accepted_ms,
+                task.attempt,
+                task.missing,
+            )
+            return RECHECK_GAVE_UP
+        if task.already_retracted:
+            return RECHECK_RETRACTED
+        reviewer = self._platform_reviewer
+        if reviewer is None:
+            return 0
+        try:
+            async with asyncio.timeout(_ASYNC_RECHECK_TIMEOUT_SEC):
+                res = await reviewer.check_platform_text(
+                    TEXT_SCENE_CHAT_WORLD, task.sender_player_id, task.content
+                )
+        except Exception as exc:
+            logger.error(
+                "[chat] world platform recheck call failed sender=%d send_time_ms=%d err=%s",
+                task.sender_player_id,
+                task.accepted_ms,
+                exc,
+            )
+            return 0
+        if res.verdict == REVIEW_REJECT:
+            return await self._retract_platform_rejected(task.sender_player_id, task.accepted_ms)
+        if res.verdict == REVIEW_UNAVAILABLE:
+            logger.error(
+                "[chat] world platform recheck unavailable sender=%d send_time_ms=%d attempt=%d",
+                task.sender_player_id,
+                task.accepted_ms,
+                task.attempt + 1,
+            )
+            return 0
+        return RECHECK_PASSED
+
+    async def run_platform_recheck_once(self, limit: int = 16) -> list[tuple[int, int, int]]:
+        """认领并执行一批持久化的世界频道平台补审待办（对应 Go ``svc/platform_recheck.go``）。"""
+        tasks = await self._store.claim_platform_rechecks(limit)
+        results: list[tuple[int, int, int]] = []
+        for task in tasks:
+            outcome = await self._decide_platform_recheck(task)
+            if outcome != 0:
+                await self._store.finish_platform_recheck(task.sender_player_id, task.accepted_ms, outcome)
+            results.append((task.sender_player_id, task.accepted_ms, outcome))
+        return results
+
     def _schedule_async_world_platform_recheck(self, message: Message, account: str, raw_content: str) -> None:
         reviewer = self._platform_reviewer
         if reviewer is None or not raw_content:
@@ -170,24 +288,19 @@ class ChatService:
                     res = await reviewer.check_platform_text(
                         TEXT_SCENE_CHAT_WORLD, sender_id, raw_content, account=account
                     )
-                    if res.verdict != REVIEW_REJECT:
-                        if res.verdict == REVIEW_UNAVAILABLE:
-                            logger.error(
-                                "async platform moderation unavailable sender=%d send_time_ms=%d",
-                                sender_id,
-                                send_time_ms,
-                            )
-                        return
-                    retracted, _ = await self._store.retract_world(sender_id, send_time_ms, _PLATFORM_REJECT_REASON)
-                    if retracted:
-                        notify = self._protocol.message(
-                            "chatpb.ChatRetractedNotify",
-                            channel=CHANNEL_WORLD,
-                            sender_player_id=sender_id,
-                            send_time_ms=send_time_ms,
-                            reason=_PLATFORM_REJECT_REASON,
+                    if res.verdict == REVIEW_UNAVAILABLE:
+                        logger.error(
+                            "async platform moderation unavailable sender=%d send_time_ms=%d",
+                            sender_id,
+                            send_time_ms,
                         )
-                        await self._publish_world_retract(notify)
+                        return
+                    if res.verdict != REVIEW_REJECT:
+                        await self._store.finish_platform_recheck(sender_id, send_time_ms, RECHECK_PASSED)
+                        return
+                    outcome = await self._retract_platform_rejected(sender_id, send_time_ms)
+                    if outcome != 0:
+                        await self._store.finish_platform_recheck(sender_id, send_time_ms, outcome)
             except Exception as exc:
                 logger.error(
                     "async world chat platform recheck failed sender=%d send_time_ms=%d error=%s",
@@ -304,8 +417,9 @@ class ChatService:
         return self._protocol.message("chatpb.ReportChatResponse")
 
     async def retract_world_chat(self, request, context, path: str):
-        """内部撤回世界频道消息并向全服在线玩家广播撤回通知（拒绝客户端会话调用）。"""
+        """内部撤回世界频道消息并向全服在线玩家广播撤回通知（拒绝客户端会话调用并核对运维口令）。"""
         await self._reject_client_session(context, path)
+        await self._authorize_ops(context, path)
 
         def fail(tip_code: int):
             return self._protocol.message("chatpb.RetractWorldChatResponse", error_message=self._tip(tip_code))

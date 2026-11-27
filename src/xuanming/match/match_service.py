@@ -82,6 +82,7 @@ from .model import (
     session_binding,
     sign_internal_reply,
     sign_probe_message,
+    uuid_to_pair,
     valid_operator_text,
     valid_trial_vow_mask,
     validate_custom_duel_rules,
@@ -94,6 +95,7 @@ from .ranked import RankedManager, _default_config_tables
 from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
 from .store import MatchStore, StrandedFormationEntry
+from .tactical_puzzle import WORKSHOP_DUNGEON_ID, TacticalPuzzleManager
 from .team_service import TeamGrpcService
 from .tournament import TournamentManager
 from .trial_cards import TrialChallengeCardManager, supports_trial_vows
@@ -125,6 +127,7 @@ class MatchGrpcService:
         tournament: TournamentManager | None = None,
         jianghu: JianghuManager | None = None,
         trial_cards: TrialChallengeCardManager | None = None,
+        tactical_puzzles: TacticalPuzzleManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -153,6 +156,18 @@ class MatchGrpcService:
             if trial_cards is not None
             else TrialChallengeCardManager(protocol, store, clock_ms=self._clock_ms)
         )
+        self.tactical_puzzles = (
+            tactical_puzzles
+            if tactical_puzzles is not None
+            else TacticalPuzzleManager(
+                protocol,
+                store,
+                author_name_lookup=self._lookup_player_display_name,
+                clock_ms=self._clock_ms,
+            )
+        )
+        if self.tactical_puzzles.battle_launcher is None:
+            self.tactical_puzzles.battle_launcher = self._launch_tactical_puzzle_formation
         if self.gather.on_tournament_profiles is None:
             self.gather.on_tournament_profiles = self.tournament.sync_member_profiles
         if getattr(self.gather, "on_tournament_captains", None) is None:
@@ -215,6 +230,13 @@ class MatchGrpcService:
                 "CreateTrialChallengeCard": self.create_trial_challenge_card,
                 "GetTrialChallengeCard": self.get_trial_challenge_card,
                 "GetSharedTrialReplay": self.get_shared_trial_replay,
+                "ListTacticalPuzzles": self.list_tactical_puzzles,
+                "GetTacticalPuzzle": self.get_tactical_puzzle,
+                "SaveTacticalPuzzleDraft": self.save_tactical_puzzle_draft,
+                "DeleteTacticalPuzzle": self.delete_tactical_puzzle,
+                "StartTacticalPuzzleBattle": self.start_tactical_puzzle_battle,
+                "LikeTacticalPuzzle": self.like_tactical_puzzle,
+                "GetTacticalPuzzleSolutionReplay": self.get_tactical_puzzle_solution_replay,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -590,7 +612,11 @@ class MatchGrpcService:
 
     async def list_watchable_battles(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
-        return await self.spectate.list_watchable_battles(caller, int(request.limit))
+        return await self.spectate.list_watchable_battles(
+            caller,
+            int(request.limit),
+            ranked_only=bool(getattr(request, "ranked_only", False)),
+        )
 
     async def request_battle_ticket(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_client(context, path)
@@ -811,6 +837,113 @@ class MatchGrpcService:
         caller = await self._admit_client(context, path)
         return await self.trial_cards.get_shared_replay(caller, request)
 
+    # -- 万象残局坊 V1 客户端 RPCs（575..581）--------------------------------------------------------
+
+    async def _lookup_player_display_name(self, player_id: int) -> str:
+        pres = await self.presence.get_presence(player_id)
+        return str(pres.name or "")
+
+    async def _launch_tactical_puzzle_formation(
+        self,
+        caller: CallerIdentity,
+        pctx: Message,
+        request_id: str,
+    ) -> int:
+        """校验玩家在线/不在战后以 Kind=7 幂等建房并驱动 GatherPipeline 开战（副本 314）。"""
+        pres = await self.presence.get_presence(caller.player_id)
+        if not pres.online or not pres.scene_grpc_endpoint:
+            raise MatchBusinessError(ERR_MATCH_NOT_IN_SCENE)
+        if pres.in_battle:
+            raise MatchBusinessError(ERR_MATCH_IN_BATTLE)
+
+        nodes = await self.battle_nodes.list_nodes(release_track=caller.release_track)
+        node = select_battle_node(nodes, release_track=caller.release_track)
+        if node is None:
+            raise MatchBusinessError(ERR_MATCH_INTERNAL)
+
+        req_high, req_low = uuid_to_pair(request_id)
+        payload_bytes = pctx.SerializeToString(deterministic=True)
+        ranked_ctx = self.protocol.message(
+            "RankedMatchContext",
+            season_id=0,
+            rule_version=int(self.ranked.rule.rule_version),
+            team_size=1,
+            use_free_preset=True,
+        )
+        member_loadout = ranked_ctx.members.add(player_id=caller.player_id)
+        member_loadout.presets.character_preset_id = int(pctx.spec.character_preset_id)
+        member_loadout.presets.pet_preset_id = int(pctx.spec.pet_preset_id)
+
+        formation, created = await self.store.start_tactical_puzzle_battle(
+            caller=caller,
+            request_high=req_high,
+            request_low=req_low,
+            payload_bytes=payload_bytes,
+            battle_config_id=WORKSHOP_DUNGEON_ID,
+            ranked_context_bytes=ranked_ctx.SerializeToString(deterministic=True),
+            tactical_puzzle_context_bytes=payload_bytes,
+            battle_node=(
+                node.node_id,
+                node.node_uuid,
+                node.grpc_endpoint,
+                node.physical_region,
+                node.release_track or caller.release_track,
+            ),
+            battle_deadline_ms=self.config.battle_deadline_sec * 1000,
+        )
+        if created and int(formation.state) < 4:
+            if self._inline_gather:
+                await self.gather.run_formation(formation)
+            else:
+                self._spawn(self.gather.run_formation(formation), name=f"puzzle-gather-{formation.battle_id}")
+        return int(formation.battle_id)
+
+    async def list_tactical_puzzles(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.list_puzzles(caller, request)
+
+    async def get_tactical_puzzle(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.get_puzzle(caller, request)
+
+    async def save_tactical_puzzle_draft(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.save_draft(caller, request)
+
+    async def delete_tactical_puzzle(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.delete_puzzle(caller, request)
+
+    async def start_tactical_puzzle_battle(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.start_battle(caller, request)
+
+    async def like_tactical_puzzle(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.like_puzzle(caller, request)
+
+    async def get_tactical_puzzle_solution_replay(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.tactical_puzzles.get_solution_replay(caller, request)
+
+    async def _on_tactical_puzzle_outcome_committed(self, request: Message) -> None:
+        battle_id = int(request.battle_id)
+        formation = await self.store.get_formation(battle_id)
+        if formation is None or not getattr(formation, "tactical_puzzle_context", b""):
+            return
+        try:
+            event = self.protocol.parse("contracts.kafka.BattleResultEvent", bytes(request.raw_result_payload))
+        except Exception:
+            return
+        has_replay = request.HasField("replay") and bool(request.replay.payload)
+        await self.tactical_puzzles.on_battle_completed(
+            battle_id,
+            formation,
+            event,
+            has_replay=has_replay,
+            now_ms=int(self._clock_ms()),
+        )
+
     # -- MatchInternal RPCs ---------------------------------------------------------------------------
 
     async def commit_battle_outcome(self, request: Message, context, path: str) -> Message:
@@ -823,6 +956,11 @@ class MatchGrpcService:
         except Exception:
             logger.error("match CommitBattleOutcome failed battle_id=%d", int(request.battle_id), exc_info=True)
             await context.abort(CODE.UNAVAILABLE, "battle outcome commit unavailable")
+
+        if decision == OUTCOME_DECISION_COMPLETE:
+            await self._on_tactical_puzzle_outcome_committed(request)
+        if decision in (OUTCOME_DECISION_COMPLETE, OUTCOME_DECISION_ABORT):
+            self.spectate.forget_battle(int(request.battle_id))
 
         reply = self.protocol.message("match.CommitBattleOutcomeResponse", decision=decision)
         sign_internal_reply(path, request, reply, "match", self.config.battle_outcome_secret, int(self._clock_ms()))
@@ -1174,6 +1312,8 @@ class MatchGrpcService:
             resp.reject = 4  # SPECTATE_FEATURED_REJECT_DENIED
             return resp
         reject, tier = await self.spectate.set_spectate_featured(int(request.battle_id), bool(request.featured))
+        if reject == 0:
+            self.spectate.forget_battle(int(request.battle_id))
         resp.reject = reject
         resp.tier = tier
         return resp
@@ -1414,7 +1554,9 @@ class MatchGrpcService:
     async def purge_removed_role(self, request: Message, context, path: str) -> Message:
         await self._admit_internal(context, request, path, "coordinator", self.config.coordinator_secret)
         try:
-            return await self.store.purge_removed_role(request.state)
+            resp = await self.store.purge_removed_role(request.state)
+            await self.tactical_puzzles.purge_player(int(request.state.player_id))
+            return resp
         except InvalidRoleFenceStateError as exc:
             await context.abort(CODE.INVALID_ARGUMENT, str(exc))
         except Exception:

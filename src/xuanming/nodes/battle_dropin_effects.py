@@ -5853,3 +5853,180 @@ def roll_tower_sigil_offer(
 def is_valid_custom_duel_round_limit(round_limit_override: int) -> bool:
     """自定义切磋回合上限白名单：0=默认；仅允许 8/12/20 回合。"""
     return round_limit_override in (0, 8, 12, 20)
+
+
+# -- 万象残局坊 V1 引擎侧共享规则与白名单（与 C++ tactical_puzzle_rules.h 逐项同源）----------------
+
+TACTICAL_PUZZLE_WORKSHOP_DUNGEON_ID = 314
+
+TACTICAL_PUZZLE_MIN_ROUND_LIMIT = 1
+TACTICAL_PUZZLE_MAX_ROUND_LIMIT = 6
+
+TACTICAL_PUZZLE_MIN_CHAR_PRESET_ID = 101
+TACTICAL_PUZZLE_MAX_CHAR_PRESET_ID = 103
+TACTICAL_PUZZLE_MIN_PET_PRESET_ID = 201
+TACTICAL_PUZZLE_MAX_PET_PRESET_ID = 203
+
+TACTICAL_PUZZLE_MIN_MONSTER_ID = 311
+TACTICAL_PUZZLE_MAX_MONSTER_ID = 316
+TACTICAL_PUZZLE_MIN_ENEMIES = 1
+TACTICAL_PUZZLE_MAX_ENEMIES = 3
+
+TACTICAL_PUZZLE_MAX_FORMATION_ID = 5
+
+TACTICAL_PUZZLE_PLAYER_MIN_HP_PCT = 15
+TACTICAL_PUZZLE_PLAYER_MAX_HP_PCT = 100
+TACTICAL_PUZZLE_PLAYER_MIN_MP_PCT = 20
+TACTICAL_PUZZLE_PLAYER_MAX_MP_PCT = 100
+TACTICAL_PUZZLE_PLAYER_MAX_SHIELD_PCT = 50
+TACTICAL_PUZZLE_MAX_PLAYER_DEBUFF_KIND = 3
+
+TACTICAL_PUZZLE_ENEMY_MIN_HP_PCT = 10
+TACTICAL_PUZZLE_ENEMY_MAX_HP_PCT = 150
+TACTICAL_PUZZLE_ENEMY_MAX_SHIELD_PCT = 60
+TACTICAL_PUZZLE_MIN_SPEED_DELTA_PCT = -30
+TACTICAL_PUZZLE_MAX_SPEED_DELTA_PCT = 30
+TACTICAL_PUZZLE_MAX_ENEMY_BUFF_KIND = 4
+
+TACTICAL_PUZZLE_SHIELD_BUFF_ID = 100400
+TACTICAL_PUZZLE_DEBUFF_ATK_DOWN_BUFF_ID = 100031
+TACTICAL_PUZZLE_DEBUFF_DEF_DOWN_BUFF_ID = 130051
+TACTICAL_PUZZLE_DEBUFF_POISON_BUFF_ID = 100190
+TACTICAL_PUZZLE_BUFF_DEF_UP_BUFF_ID = 100140
+TACTICAL_PUZZLE_BUFF_SPD_UP_BUFF_ID = 100160
+TACTICAL_PUZZLE_BUFF_DMG_UP_BUFF_ID = 100250
+TACTICAL_PUZZLE_BUFF_REFLECT_BUFF_ID = 110070
+TACTICAL_PUZZLE_POISON_MAX_HP_PCT = 8
+TACTICAL_PUZZLE_MAX_LEYLINE_ELEMENT = 5
+
+_TACTICAL_PUZZLE_PRESET_SKILLS: dict[int, frozenset[int]] = {
+    101: frozenset((10002, 10039, 10025, 10035)),
+    102: frozenset((10006, 10020, 10034, 10041)),
+    103: frozenset((10010, 10033, 10040, 10026)),
+    201: frozenset((10002, 10018, 10016, 13005)),
+    202: frozenset((10006, 10019, 10034, 13006)),
+    203: frozenset((10014, 10010, 11006, 11005)),
+}
+
+_PLAYER_DEBUFF_MAP = {
+    1: TACTICAL_PUZZLE_DEBUFF_ATK_DOWN_BUFF_ID,
+    2: TACTICAL_PUZZLE_DEBUFF_DEF_DOWN_BUFF_ID,
+    3: TACTICAL_PUZZLE_DEBUFF_POISON_BUFF_ID,
+}
+
+_ENEMY_BUFF_MAP = {
+    1: TACTICAL_PUZZLE_BUFF_DEF_UP_BUFF_ID,
+    2: TACTICAL_PUZZLE_BUFF_SPD_UP_BUFF_ID,
+    3: TACTICAL_PUZZLE_BUFF_DMG_UP_BUFF_ID,
+    4: TACTICAL_PUZZLE_BUFF_REFLECT_BUFF_ID,
+}
+
+
+def tactical_puzzle_player_debuff_table_id(kind: int) -> int:
+    """将残局玩家开局减益档位（1..3）映射为既有 Buff 表 ID。"""
+    return _PLAYER_DEBUFF_MAP.get(int(kind), 0)
+
+
+def tactical_puzzle_enemy_buff_table_id(kind: int) -> int:
+    """将残局敌方开局增益档位（1..4）映射为既有 Buff 表 ID。"""
+    return _ENEMY_BUFF_MAP.get(int(kind), 0)
+
+
+def tactical_puzzle_scale_pct(base_value: int, pct: int) -> int:
+    """按整数百分比缩放残局气血/法力/护盾基值，下限保底为 1。"""
+    return max(1, (int(base_value) * int(pct)) // 100)
+
+
+def tactical_puzzle_apply_speed_delta(base_speed: int, delta_pct: int) -> int:
+    """按 [-30%, +30%] 调整残局敌方速度，下限保底为 1。"""
+    clamped = max(TACTICAL_PUZZLE_MIN_SPEED_DELTA_PCT, min(TACTICAL_PUZZLE_MAX_SPEED_DELTA_PCT, int(delta_pct)))
+    return max(1, (int(base_speed) * (100 + clamped)) // 100)
+
+
+def is_tactical_puzzle_preset_skill(char_preset_id: int, pet_preset_id: int, skill_id: int) -> bool:
+    """判定 skill_id 是否属于残局所选公平人物/灵宠预设的技能池。"""
+    sid = int(skill_id)
+    if sid <= 0:
+        return False
+    if sid in _TACTICAL_PUZZLE_PRESET_SKILLS.get(int(char_preset_id), ()):
+        return True
+    pet = int(pet_preset_id)
+    return pet != 0 and sid in _TACTICAL_PUZZLE_PRESET_SKILLS.get(pet, ())
+
+
+def is_valid_tactical_puzzle_spec(spec: Message | None) -> bool:
+    """强校验残局题面规格，与 C++ IsValidTacticalPuzzleSpec 逐项同源。"""
+    if spec is None:
+        return False
+    if not (TACTICAL_PUZZLE_MIN_ROUND_LIMIT <= int(spec.round_limit) <= TACTICAL_PUZZLE_MAX_ROUND_LIMIT):
+        return False
+    if not (TACTICAL_PUZZLE_MIN_CHAR_PRESET_ID <= int(spec.character_preset_id) <= TACTICAL_PUZZLE_MAX_CHAR_PRESET_ID):
+        return False
+    pet = int(spec.pet_preset_id)
+    if pet != 0 and not (TACTICAL_PUZZLE_MIN_PET_PRESET_ID <= pet <= TACTICAL_PUZZLE_MAX_PET_PRESET_ID):
+        return False
+    if int(spec.formation_id) > TACTICAL_PUZZLE_MAX_FORMATION_ID:
+        return False
+    if not (TACTICAL_PUZZLE_PLAYER_MIN_HP_PCT <= int(spec.player_initial_hp_pct) <= TACTICAL_PUZZLE_PLAYER_MAX_HP_PCT):
+        return False
+    if not (TACTICAL_PUZZLE_PLAYER_MIN_MP_PCT <= int(spec.player_initial_mp_pct) <= TACTICAL_PUZZLE_PLAYER_MAX_MP_PCT):
+        return False
+    if int(spec.player_initial_shield_pct) > TACTICAL_PUZZLE_PLAYER_MAX_SHIELD_PCT:
+        return False
+    if int(spec.player_initial_debuff_kind) > TACTICAL_PUZZLE_MAX_PLAYER_DEBUFF_KIND:
+        return False
+    leyline = int(getattr(spec, "leyline_element", 0))
+    if not (0 <= leyline <= TACTICAL_PUZZLE_MAX_LEYLINE_ELEMENT):
+        return False
+    banned_skill_id = int(getattr(spec, "banned_skill_id", 0))
+    if banned_skill_id != 0 and not is_tactical_puzzle_preset_skill(int(spec.character_preset_id), pet, banned_skill_id):
+        return False
+    enemies = list(spec.enemies)
+    if not (TACTICAL_PUZZLE_MIN_ENEMIES <= len(enemies) <= TACTICAL_PUZZLE_MAX_ENEMIES):
+        return False
+    for enemy in enemies:
+        if not (TACTICAL_PUZZLE_MIN_MONSTER_ID <= int(enemy.monster_table_id) <= TACTICAL_PUZZLE_MAX_MONSTER_ID):
+            return False
+        if not (TACTICAL_PUZZLE_ENEMY_MIN_HP_PCT <= int(enemy.initial_hp_pct) <= TACTICAL_PUZZLE_ENEMY_MAX_HP_PCT):
+            return False
+        if int(enemy.initial_shield_pct) > TACTICAL_PUZZLE_ENEMY_MAX_SHIELD_PCT:
+            return False
+        if not (TACTICAL_PUZZLE_MIN_SPEED_DELTA_PCT <= int(enemy.speed_delta_pct) <= TACTICAL_PUZZLE_MAX_SPEED_DELTA_PCT):
+            return False
+        if int(enemy.initial_buff_kind) > TACTICAL_PUZZLE_MAX_ENEMY_BUFF_KIND:
+            return False
+    return True
+
+
+def is_valid_tactical_puzzle_context(ctx: Message | None) -> bool:
+    """校验残局开战上下文非空、含有效 puzzle_id/spec_revision 且题面规格合法。"""
+    return (
+        ctx is not None
+        and int(ctx.puzzle_id) != 0
+        and int(ctx.spec_revision) != 0
+        and ctx.HasField("spec")
+        and is_valid_tactical_puzzle_spec(ctx.spec)
+    )
+
+
+# -- 未成年人防沉迷战斗直连截止时刻（与 C++ battle_minor_play_deadline.h 逐项同源）------------------
+
+MINOR_PLAY_CLOSE_LEAD_MS = 5000
+
+
+def minor_direct_close_at_ms(play_deadline_ms: int) -> int:
+    """未成年人战斗直连截止时刻 = 截止时刻 - 提前量（不足提前量时归 0）。"""
+    deadline = int(play_deadline_ms)
+    return deadline - MINOR_PLAY_CLOSE_LEAD_MS if deadline > MINOR_PLAY_CLOSE_LEAD_MS else 0
+
+
+def minor_play_deadline_reached(play_deadline_ms: int, now_ms: int) -> bool:
+    """判定未成年人直连服务是否已到点；0 表示成年人不限，永远不到点。"""
+    deadline = int(play_deadline_ms)
+    return deadline != 0 and int(now_ms) >= minor_direct_close_at_ms(deadline)
+
+
+def minor_ticket_expire_at_ms(room_deadline_ms: int, play_deadline_ms: int) -> int:
+    """票据截止时刻：成年人取房间截止时刻；未成年人按直连截止时刻封顶取较早者。"""
+    deadline = int(play_deadline_ms)
+    return int(room_deadline_ms) if deadline == 0 else min(int(room_deadline_ms), minor_direct_close_at_ms(deadline))

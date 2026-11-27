@@ -46,27 +46,56 @@ CHANNEL_CUES: tuple[str, ...] = (
 
 _LOOKAHEAD = 28
 
-_URL_SCHEME_RE = re.compile(r"(?:https?://|www\.)[a-z0-9.-]+", re.IGNORECASE | re.ASCII)
-_DOMAIN_SUFFIX_RE = re.compile(
-    r"(?:^|[^a-z0-9])([a-z0-9-]{2,}\.(?:com|cn|net|org|xyz|top|vip|cc|tv|me|gg|io|club|shop|work|site))(?:$|[^a-z0-9])",
-    re.IGNORECASE | re.ASCII,
+# 两条正则均在折叠后的字符串上匹配（已转小写且折叠全角/带圈/同形字符，避免全角输入绕过）。
+_DOMAIN_RE = re.compile(
+    r"[a-z0-9-]{2,}\.(?:com|cn|net|org|xyz|top|vip|cc|tv|me|gg|io|club|shop|work|site)",
+    re.ASCII,
 )
+_URL_RE = re.compile(r"(?:https?://(?:www\.)?|www\.)([a-z0-9.-]+)", re.ASCII)
 
 # 渠道线索词后的中文数字与语音谐音字集合
 _CN_DIGITS: frozenset[str] = frozenset("〇零洞一壹幺妖二贰两三叁四肆五伍六陆七柒拐八捌九玖")
 
 
-def _has_unallowed_regex_match(
-    pattern: re.Pattern[str],
-    orig: str,
+def _allowed_folded(
+    elems: Sequence[Elem],
+    start: int,
+    end: int,
     allow_check: Callable[[int, int], bool] | None,
 ) -> bool:
-    for match in pattern.finditer(orig):
-        if allow_check is None:
+    """判断折叠序列闭开区间 ``[start, end)`` 对应的原文区间是否整段落在白名单内。"""
+    if allow_check is None:
+        return False
+    return allow_check(elems[start].orig, elems[end - 1].orig)
+
+
+def _has_unallowed_url(
+    folded: str,
+    elems: Sequence[Elem],
+    allow_check: Callable[[int, int], bool] | None,
+) -> bool:
+    """检测主机名不在白名单里的网址；去除末尾句子标点（避免将 ``www...`` 误判为网址）。"""
+    for match in _URL_RE.finditer(folded):
+        start, end = match.span(1)
+        while end > start and folded[end - 1] in (".", "-"):
+            end -= 1
+        if end > start and not _allowed_folded(elems, start, end, allow_check):
             return True
-        start_rune = match.start()
-        end_rune = match.end() - 1
-        if not allow_check(start_rune, end_rune):
+    return False
+
+
+def _has_unallowed_domain(
+    folded: str,
+    elems: Sequence[Elem],
+    allow_check: Callable[[int, int], bool] | None,
+) -> bool:
+    """检测不在白名单里的域名；显式检查右边界非 ASCII 字母数字，避免吃掉相邻域名或误伤 ``abc.community``。"""
+    total = len(folded)
+    for match in _DOMAIN_RE.finditer(folded):
+        start, end = match.span()
+        if end < total and is_ascii_alnum(folded[end]):
+            continue
+        if not _allowed_folded(elems, start, end, allow_check):
             return True
     return False
 
@@ -166,12 +195,12 @@ def contains_ad(
     elems: Sequence[Elem],
     allow_check: Callable[[int, int], bool] | None = None,
 ) -> bool:
-    """判断文本是否包含未豁免的外链广告或变体联系方式。"""
-    if not text or not elems:
+    """判断文本是否包含未豁免的外链广告或变体联系方式（URL/域名在折叠后字符序列上匹配防全角/同形绕过）。"""
+    del text
+    if not elems:
         return False
-    if _has_unallowed_regex_match(_URL_SCHEME_RE, text, allow_check):
-        return True
-    if _has_unallowed_regex_match(_DOMAIN_SUFFIX_RE, text, allow_check):
+    folded = "".join(elem.r for elem in elems)
+    if _has_unallowed_url(folded, elems, allow_check) or _has_unallowed_domain(folded, elems, allow_check):
         return True
 
     dense = [elem for elem in elems if not elem.skip]

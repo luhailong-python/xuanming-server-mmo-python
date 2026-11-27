@@ -109,6 +109,8 @@ class TradeConfig:
     content_guard: str = ""
     manual_resolution_secret_env: str = ""
     manual_resolution_environment: str = ""
+    manual_resolution_allow_unapproved: bool = False
+    wanted_skill_book_enabled: bool = True
     asset_op_secret: bytes = b""
     coordinator_secret: bytes = b""
     role_fence_secret: bytes = b""

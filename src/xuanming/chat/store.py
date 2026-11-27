@@ -8,6 +8,7 @@ import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Protocol as TypingProtocol, TypeVar
 
 from google.protobuf.message import DecodeError, Message
@@ -74,6 +75,28 @@ from .model import (
 from .world_window import WorldSnapshot, WorldWindow
 
 logger = logging.getLogger(__name__)
+
+# 平台补审待办常量（与 Go chat/internal/authority/platform_recheck.go 对齐）
+PLATFORM_RECHECK_WINDOW_MS = 15 * 60 * 1000
+PLATFORM_RECHECK_LEASE_MS = 20 * 1000
+PLATFORM_RECHECK_MAX_ATTEMPTS = 3
+
+RECHECK_PASSED = 1
+RECHECK_RETRACTED = 2
+RECHECK_GAVE_UP = 3
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformRecheckTask:
+    """认领到的一条世界频道平台补审待办（对应 Go ``authority.PlatformRecheckTask``）。"""
+
+    sender_player_id: int
+    accepted_ms: int
+    attempt: int = 0
+    content: str = ""
+    already_retracted: bool = False
+    exhausted: bool = False
+    missing: bool = False
 
 _DATA_SERVICE_PREFIX = "/data_service.DataService/"
 _CONTENT_GUARD_PREFIX = "/content_guard.ContentGuard/"
@@ -786,6 +809,11 @@ class ChatStoreCore:
                     raise StoreUnavailableError("duplicate key without visible winning receipt")
                 raise _TxRollbackReturn(replay(winner))
 
+            if peer == 0 and pending_platform:
+                enqueue = getattr(tx, "enqueue_platform_recheck", None)
+                if callable(enqueue):
+                    await enqueue(actor, now_ms, accepted_at_utc(now_ms))
+
             return SendResult(
                 message=canonical_msg,
                 pending_platform_review=(peer == 0 and pending_platform),
@@ -979,6 +1007,23 @@ class ChatStoreCore:
 
         return await self._driver.run_tx(tx_work)
 
+    async def claim_platform_rechecks(self, limit: int) -> list[PlatformRecheckTask]:
+        """认领至多 ``limit`` 条回看窗口内未结案且租期已过的世界频道平台补审待办。"""
+        if limit <= 0:
+            raise InvalidChatError("platform recheck claim limit must be positive")
+        claimer = getattr(self._driver, "claim_platform_rechecks", None)
+        if not callable(claimer):
+            return []
+        return await claimer(self._protocol, int(limit))
+
+    async def finish_platform_recheck(self, sender_player_id: int, accepted_ms: int, outcome: int) -> None:
+        """幂等记录一条世界频道平台补审待办的终态结局（1=通过，2=已撤回，3=放弃）。"""
+        if sender_player_id <= 0 or accepted_ms <= 0 or outcome not in (RECHECK_PASSED, RECHECK_RETRACTED, RECHECK_GAVE_UP):
+            raise InvalidChatError("invalid platform recheck outcome")
+        finisher = getattr(self._driver, "finish_platform_recheck", None)
+        if callable(finisher):
+            await finisher(int(sender_player_id), int(accepted_ms), int(outcome))
+
 
 # ---------------------------------------------------------------------------
 # 确定性内存双胞胎（MemoryChatStore）
@@ -1112,6 +1157,10 @@ class _MemoryTx:
         if key not in self._d.reports:
             self._d.reports[key] = (reason, detail, reported_ms)
 
+    async def enqueue_platform_recheck(self, sender_player_id: int, accepted_ms: int, accepted_at: str) -> None:
+        del accepted_at
+        self._d.recheck_queue[(int(sender_player_id), int(accepted_ms))] = int(accepted_ms)
+
 
 class _MemoryDriver:
     """确定性内存事务驱动：通过快照/回滚与 SqlChatStore 保持一致的原子语义。"""
@@ -1124,6 +1173,9 @@ class _MemoryDriver:
         self.reports: dict[tuple[int, int, int, int], tuple[int, bytes, int]] = {}
         self.repeat_events: set[tuple[bytes, int, int]] = set()
         self.private_targets: set[tuple[int, int, int]] = set()
+        self.recheck_queue: dict[tuple[int, int], int] = {}
+        self.recheck_claims: dict[tuple[int, int], list[int]] = {}
+        self.recheck_done: dict[tuple[int, int], tuple[int, int]] = {}
         self.policy_digest: bytes | None = None
 
     async def run_tx(self, work: Callable[[ChatTx], Awaitable[T]]) -> T:
@@ -1133,6 +1185,7 @@ class _MemoryDriver:
             snap_reports = self.reports.copy()
             snap_repeat = self.repeat_events.copy()
             snap_private = self.private_targets.copy()
+            snap_recheck = self.recheck_queue.copy()
             try:
                 return await work(_MemoryTx(self))
             except _TxRollbackReturn as ret:
@@ -1141,6 +1194,7 @@ class _MemoryDriver:
                 self.reports = snap_reports
                 self.repeat_events = snap_repeat
                 self.private_targets = snap_private
+                self.recheck_queue = snap_recheck
                 return ret.value
             except BaseException:
                 self.send_rows = snap_send
@@ -1148,11 +1202,90 @@ class _MemoryDriver:
                 self.reports = snap_reports
                 self.repeat_events = snap_repeat
                 self.private_targets = snap_private
+                self.recheck_queue = snap_recheck
                 raise
 
     async def read_receipt_direct(self, player_id: int, request_id: bytes) -> ReceiptRow | None:
         row = self.send_rows.get((player_id, request_id))
         return validate_receipt(row) if row is not None else None
+
+    async def claim_platform_rechecks(self, protocol: Protocol, limit: int) -> list[PlatformRecheckTask]:
+        async with self._lock:
+            now = int(self.clock_ms())
+            since = max(0, now - PLATFORM_RECHECK_WINDOW_MS)
+            candidates = sorted(
+                (accepted_ms, sender)
+                for (sender, accepted_ms) in self.recheck_queue
+                if accepted_ms >= since and (sender, accepted_ms) not in self.recheck_done
+            )
+            tasks: list[PlatformRecheckTask] = []
+            for accepted_ms, sender in candidates:
+                if len(tasks) >= limit:
+                    break
+                key = (sender, accepted_ms)
+                claims = self.recheck_claims.get(key, [])
+                attempts = len(claims)
+                if attempts > 0 and claims[-1] + PLATFORM_RECHECK_LEASE_MS > now:
+                    continue
+                if attempts >= PLATFORM_RECHECK_MAX_ATTEMPTS:
+                    tasks.append(
+                        PlatformRecheckTask(
+                            sender_player_id=sender,
+                            accepted_ms=accepted_ms,
+                            attempt=attempts,
+                            exhausted=True,
+                        )
+                    )
+                    continue
+                self.recheck_claims.setdefault(key, []).append(now)
+                if key in self.retracted:
+                    tasks.append(
+                        PlatformRecheckTask(
+                            sender_player_id=sender,
+                            accepted_ms=accepted_ms,
+                            attempt=attempts,
+                            already_retracted=True,
+                        )
+                    )
+                    continue
+                stream_bytes = world_stream_key(sender).encode("utf-8")
+                matched_row = next(
+                    (
+                        row
+                        for (pid, _), row in self.send_rows.items()
+                        if pid == sender
+                        and row.state == ACCEPTED_STATE
+                        and row.accepted_ms == accepted_ms
+                        and row.stream == stream_bytes
+                    ),
+                    None,
+                )
+                if matched_row is None:
+                    tasks.append(
+                        PlatformRecheckTask(
+                            sender_player_id=sender,
+                            accepted_ms=accepted_ms,
+                            attempt=attempts,
+                            missing=True,
+                        )
+                    )
+                    continue
+                req = protocol.parse("chatpb.SendChatRequest", matched_row.request)
+                tasks.append(
+                    PlatformRecheckTask(
+                        sender_player_id=sender,
+                        accepted_ms=accepted_ms,
+                        attempt=attempts,
+                        content=str(req.message.content).strip(),
+                    )
+                )
+            return tasks
+
+    async def finish_platform_recheck(self, sender_player_id: int, accepted_ms: int, outcome: int) -> None:
+        async with self._lock:
+            key = (int(sender_player_id), int(accepted_ms))
+            if key not in self.recheck_done:
+                self.recheck_done[key] = (int(outcome), int(self.clock_ms()))
 
 
 class MemoryChatStore(ChatStoreCore):

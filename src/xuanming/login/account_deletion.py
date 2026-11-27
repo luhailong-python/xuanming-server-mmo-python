@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from . import gate_commands, tips
+from .passport import passport_subject
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +68,70 @@ def build_reply(protocol, ds_response):
     return response
 
 
+async def kick_account_players(
+    protocol,
+    data,
+    locator,
+    publish,
+    account: str,
+    *,
+    reason_tip: int = 0,
+) -> None:
+    """将账号名下全部在线角色踢下线（供账号注销冷静期与官方通行证会话吊销共用）。"""
+    if data is None or locator is None or publish is None:
+        return
+    try:
+        players = await data.read_account(account, False)
+    except Exception as error:
+        logger.info("Read roles for sign-out kick failed account=%s err=%s", mask_account(account), error)
+        return
+    for role in players:
+        try:
+            session = await locator.get(role.player_id)
+            if session is not None and session.gate_id and session.gate_instance_id:
+                built = gate_commands.kick_player(
+                    protocol,
+                    session.gate_id,
+                    session.gate_instance_id,
+                    session.session_id,
+                    role.player_id,
+                    session.login_generation + 1,
+                    reason_tip=reason_tip,
+                )
+                node_id, command = built
+                await publish(node_id, command, str(role.player_id).encode())
+                await locator.delete(role.player_id, session.session_id, session.gate_instance_id)
+        except Exception as error:
+            logger.info("Kick player failed player_id=%d err=%s", role.player_id, error)
+
+
 class AccountDeletionService:
     """账号注销申请与撤销编排器。"""
 
-    def __init__(self, protocol, data, tokens, locator=None, publish=None, apple_revoker=None) -> None:
+    def __init__(
+        self,
+        protocol,
+        data,
+        tokens,
+        locator=None,
+        publish=None,
+        apple_revoker=None,
+        passport_admin=None,
+    ) -> None:
         self.protocol = protocol
         self.data = data
         self.tokens = tokens
         self.locator = locator
         self.publish = publish
         self.apple_revoker = apple_revoker
+        self.passport_admin = passport_admin
+
+    async def delete_passport_user(self, account: str) -> None:
+        """注销执行阶段删除官方通行证（Casdoor）一侧的用户记录（幂等）。"""
+        sub = passport_subject(account)
+        if not sub or self.passport_admin is None:
+            return
+        await self.passport_admin.delete_user(sub)
 
     async def request(self, account: str, source: int, *, is_apple: bool = False, apple_code: str = ""):
         """提交账号注销（用户本人或客服代办），进入冷静期后吊销全部令牌并踢线。"""
@@ -131,23 +186,4 @@ class AccountDeletionService:
             except Exception as error:
                 logger.error("Revoke tokens failed during account deletion account=%s err=%s",
                              mask_account(account), error)
-        if self.locator is None or self.publish is None:
-            return
-        try:
-            players = await self.data.read_account(account, False)
-        except Exception as error:
-            logger.info("Read roles for sign-out kick failed account=%s err=%s", mask_account(account), error)
-            return
-        for role in players:
-            try:
-                session = await self.locator.get(role.player_id)
-                if session is not None and session.gate_id and session.gate_instance_id:
-                    built = gate_commands.kick_player(
-                        self.protocol, session.gate_id, session.gate_instance_id,
-                        session.session_id, role.player_id, session.login_generation + 1,
-                    )
-                    node_id, command = built
-                    await self.publish(node_id, command, str(role.player_id).encode())
-                    await self.locator.delete(role.player_id, session.session_id, session.gate_instance_id)
-            except Exception as error:
-                logger.info("Kick player failed during account deletion player_id=%d err=%s", role.player_id, error)
+        await kick_account_players(self.protocol, self.data, self.locator, self.publish, account)

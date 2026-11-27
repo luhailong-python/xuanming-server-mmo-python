@@ -231,6 +231,7 @@ class PlayerPresence:
     gender: int = 0
     appearance_id: str = ""
     hosted: bool = False
+    minor_play_deadline_ms: int = 0
 
 
 # -- UUID 与文本校验工具 -----------------------------------------------------------------------------
@@ -539,22 +540,37 @@ def spectate_visibility_for(
     has_activity_context: bool,
     *,
     allow_public_spectate: bool = False,
+    ranked_public_spectate: bool = False,
+    is_guild_war_activity: bool = False,
 ) -> int:
-    """判定开局的观战可见性：帮战、锦标赛与天墉生死状公开；自定义切磋按 allow_public_spectate 冻结；活动与单人 PVE 私密。"""
+    """判定开局的观战可见性：帮战、锦标赛、天墉生死状及高段公开排位公开；自定义切磋按 allow_public_spectate 冻结；其余活动与单人 PVE 私密。"""
+    if has_activity_context:
+        if is_guild_war_activity or mode in GUILD_WAR_MODES:
+            return SPECTATE_VISIBILITY_PUBLIC
+        return SPECTATE_VISIBILITY_PRIVATE
     if mode in GUILD_WAR_MODES or mode in (MODE_SEASON_TOURNAMENT, MODE_JIANGHU_DUEL):
         return SPECTATE_VISIBILITY_PUBLIC
+    if mode == MODE_PVP_TEAM:
+        return SPECTATE_VISIBILITY_PUBLIC if ranked_public_spectate else SPECTATE_VISIBILITY_PRIVATE
     if mode == MODE_PVP_CHALLENGE:
         return SPECTATE_VISIBILITY_PUBLIC if allow_public_spectate else SPECTATE_VISIBILITY_PRIVATE
-    if has_activity_context or mode == MODE_PVE_SOLO:
+    if mode == MODE_PVE_SOLO:
         return SPECTATE_VISIBILITY_PRIVATE
     return SPECTATE_VISIBILITY_PUBLIC
 
 
-def record_replay_for(mode: int, *, trial_journal_entry_id: int = 0) -> bool:
-    """PVP（含天墉生死状）默认录制战报回放；试炼志 V3 有格 PVE 受控开放录制。"""
+def record_replay_for(
+    mode: int,
+    *,
+    trial_journal_entry_id: int = 0,
+    tactical_puzzle_author_verify: bool = False,
+) -> bool:
+    """PVP（含天墉生死状）默认录制战报回放；试炼志 V3 有格 PVE 与残局坊作者自证验题局受控开放录制。"""
     if mode in PVP_MODES:
         return True
     if mode in (MODE_PVE_SOLO, MODE_PVE_TEAM) and int(trial_journal_entry_id) > 0:
+        return True
+    if mode == MODE_PVE_SOLO and tactical_puzzle_author_verify:
         return True
     return False
 

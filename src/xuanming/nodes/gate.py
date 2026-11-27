@@ -31,6 +31,9 @@ from .gate_scene_lane import SceneLane
 logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 10
 HEARTBEAT_TIMEOUT = 30
+HANDSHAKE_TIMEOUT = 10.0
+LOGIN_DEADLINE_AFTER_VERIFY = 60.0
+PRE_AUTH_MAX_MESSAGE_BYTES = 4096
 ROUTER_LANE_DEPTH = 32
 ROUTER_LANE_MAX_WAIT = 5.0
 SESSION_MASK = (1 << 17) - 1
@@ -43,6 +46,7 @@ MESSAGE_SIZE_EXCEEDED = 1010
 REQUEST_PARSE_ERROR = 1014
 LOGIN_IN_PROGRESS = 2005
 LOGIN_SESSION_NOT_FOUND = 2028
+LOGIN_MINOR_PLAY_TIME_OVER = 2049
 PYTHON_EXTENSION_ID_MIN = 10_000
 LOGIN_SERVICE = "loginpb.ClientPlayerLogin"
 _GM_CLIENT_MESSAGES = (
@@ -96,6 +100,8 @@ class Session:
     account: str = ""
     ticket_player_id: int = 0
     ticket_target_zone_id: int = 0
+    ticket_account_digest: bytes = b""
+    ticket_key: bytes = b""
     scene_id: int = 0
     scene_node_id: int = 0
     scene_instance_id: str = ""
@@ -108,12 +114,15 @@ class Session:
     entry_failed: bool = False
     routing: asyncio.Lock = field(default_factory=asyncio.Lock)
     verified: bool = False
+    verified_at: float | None = None
     login_started: bool = False
     logged_in: bool = False
     enter_requested: bool = False
     enter_player_id: int = 0
     redirected: bool = False
     lease_expired: bool = False
+    exit_scene_immediately_on_close: bool = False
+    scene_route_reset_pending: bool = False
     lane_busy: bool = False
     queued_leave: int = 0
     direct_tasks: set = field(default_factory=set)
@@ -200,7 +209,19 @@ class RouterForwarder:
 
 
 class GateNode:
-    def __init__(self, protocol, info, ticket_secret: bytes, forward, *, max_connections: int = 1024):
+    def __init__(
+        self,
+        protocol,
+        info,
+        ticket_secret: bytes,
+        forward,
+        *,
+        max_connections: int = 1024,
+        max_pre_auth_connections: int | None = None,
+        handshake_timeout: float = HANDSHAKE_TIMEOUT,
+        login_deadline_after_verify: float = LOGIN_DEADLINE_AFTER_VERIFY,
+        pre_auth_max_message_bytes: int = PRE_AUTH_MAX_MESSAGE_BYTES,
+    ):
         if not 0 < info.node_id < (1 << 15) or len(ticket_secret) < 32:
             raise ValueError("Gate 节点号或票据密钥无效")
         self.protocol = protocol
@@ -208,6 +229,12 @@ class GateNode:
         self.ticket_secret = ticket_secret
         self.forward = forward
         self.max_connections = max_connections
+        self.max_pre_auth_connections = (
+            max_connections if max_pre_auth_connections is None else max(0, int(max_pre_auth_connections))
+        )
+        self.handshake_timeout = float(handshake_timeout)
+        self.login_deadline_after_verify = float(login_deadline_after_verify)
+        self.pre_auth_max_message_bytes = int(pre_auth_max_message_bytes)
         self.scene = None
         self.spectate = None
         self.world_chat = WorldChatFanout(protocol, self._broadcast_all)
@@ -219,6 +246,18 @@ class GateNode:
         self._disconnect_id = protocol.message_ids["ClientPlayerLoginDisconnect"]
         self._illegal_threshold = _illegal_packet_threshold()
         self.sessions: dict[int, Session] = {}
+        self.pre_auth_connections: dict[int, float] = {}
+        self._active_tickets: dict[bytes, int] = {}
+        self.admission_counters: dict[str, int] = {
+            "accepted": 0,
+            "rejected_capacity": 0,
+            "rejected_preauth_budget": 0,
+            "rejected_ticket_in_use": 0,
+            "handshake_timeouts": 0,
+            "login_timeouts": 0,
+            "heartbeat_before_verify": 0,
+            "preauth_oversize": 0,
+        }
         self._generation = count(1)
         self._calls = count(1)
         self._handlers: set[asyncio.Task] = set()
@@ -228,6 +267,16 @@ class GateNode:
         self.login_renewal = LoginRenewal(self, sender) if sender is not None else None
         self.drain_migration = GateDrainMigration(self, getattr(forward, "request_migration", None))
 
+    @property
+    def pre_auth_count(self) -> int:
+        """当前处于未验签池中的连接数（对照 C++ gate_unauthenticated_connections）。"""
+        return len(self.pre_auth_connections)
+
+    @property
+    def total_connections(self) -> int:
+        """当前总连接数 = 已验签会话数 + 未验签连接数（总量上限按此口径校验）。"""
+        return len(self.sessions) + len(self.pre_auth_connections)
+
     def issue_ticket(self, *, ttl: int = 600, player_id: int = 0):
         return issue_gate_ticket(
             self.protocol, self.info.node_id, self.info.zone_id, self.ticket_secret,
@@ -235,32 +284,47 @@ class GateNode:
         )
 
     def details(self, session: Session, seq: int):
-        return self.protocol.message(
+        msg = self.protocol.message(
             "SessionDetails", session_id=session.session_id, player_id=session.player_id,
             gate_node_id=self.info.node_id, gate_instance_id=self.info.node_uuid,
             ticket_player_id=session.ticket_player_id, ticket_target_zone_id=session.ticket_target_zone_id,
             session_incarnation=session.incarnation, gate_call_seq=seq,
             owner_revision=session.owner_revision, authenticated_account=session.account,
         )
+        if session.ticket_account_digest and "ticket_account_digest" in msg.DESCRIPTOR.fields_by_name:
+            msg.ticket_account_digest = session.ticket_account_digest
+        return msg
 
     async def handle_client(self, reader, writer) -> None:
-        if len(self.sessions) >= self.max_connections:
+        if self.total_connections >= self.max_connections:
+            self.admission_counters["rejected_capacity"] += 1
+            writer.close()
+            return
+        if len(self.pre_auth_connections) >= self.max_pre_auth_connections:
+            self.admission_counters["rejected_preauth_budget"] += 1
             writer.close()
             return
         incarnation = next(self._generation)
-        session_id = self.info.node_id << 17 | incarnation & SESSION_MASK
-        while not session_id & SESSION_MASK or session_id in self.sessions or session_id == 0xFFFFFFFF:
-            incarnation = next(self._generation)
-            session_id = self.info.node_id << 17 | incarnation & SESSION_MASK
-        session = Session(session_id, incarnation, writer)
-        session.scene_lane = SceneLane(self, session)
-        self.sessions[session_id] = session
+        self.pre_auth_connections[incarnation] = time.monotonic()
+        self.admission_counters["accepted"] += 1
+        session_id = 0
+        session = Session(0, incarnation, writer)
         task = asyncio.current_task()
         self._handlers.add(task)
         io_tasks = []
         try:
             if not await self._verify(reader, session):
                 return
+            session_id = self.info.node_id << 17 | incarnation & SESSION_MASK
+            while not session_id & SESSION_MASK or session_id in self.sessions or session_id == 0xFFFFFFFF:
+                incarnation = next(self._generation)
+                session_id = self.info.node_id << 17 | incarnation & SESSION_MASK
+            session.session_id = session_id
+            session.scene_lane = SceneLane(self, session)
+            self.pre_auth_connections.pop(session.incarnation, None)
+            self.sessions[session_id] = session
+            if session.ticket_key:
+                self._active_tickets[session.ticket_key] = session_id
             io_tasks = [
                 asyncio.create_task(self._receive(reader, session)),
                 asyncio.create_task(self._write(session)),
@@ -273,6 +337,9 @@ class GateNode:
         except (FrameError, DecodeError, TimeoutError, OSError):
             logger.debug("客户端连接结束", exc_info=True)
         finally:
+            self.pre_auth_connections.pop(session.incarnation, None)
+            if session.ticket_key and self._active_tickets.get(session.ticket_key) == session_id:
+                self._active_tickets.pop(session.ticket_key, None)
             session.close()
             for pending in io_tasks:
                 pending.cancel()
@@ -287,11 +354,12 @@ class GateNode:
                 pending.add_done_callback(self._detached_direct.discard)
             if unsent:
                 await asyncio.gather(*unsent, return_exceptions=True)
-            self.sessions.pop(session_id, None)
+            if session_id:
+                self.sessions.pop(session_id, None)
             if self.login_renewal is not None:
                 self.login_renewal.forget(session)
             self.drain_migration.forget(session)
-            if self.spectate:
+            if self.spectate and session_id:
                 self.spectate.close_session(session_id)
             try:
                 if session.verified:
@@ -305,39 +373,85 @@ class GateNode:
         await self.handle_client(reader, writer)
 
     async def _verify(self, reader, session: Session) -> bool:
-        async with asyncio.timeout(10):
-            packet = await read_packet(reader)
-            if packet is None or packet.type_name != "ClientTokenVerifyRequest":
-                return False
-            request = self.protocol.parse(packet.type_name, packet.payload)
-            expected = hmac.new(self.ticket_secret, request.payload, "sha256").hexdigest().encode()
-            payload = self.protocol.parse("GateTokenPayload", request.payload)
-            valid = (
-                hmac.compare_digest(expected, request.signature)
-                and payload.gate_node_id == self.info.node_id
-                and payload.zone_id in (0, self.info.zone_id)
-                and payload.target_zone_id in (0, self.info.zone_id)
-                and payload.expire_timestamp > int(time.time())
-            )
-            reply = self.protocol.message("ClientTokenVerifyResponse", success=valid)
-            if valid:
-                session.ticket_player_id = payload.player_id
-                session.ticket_target_zone_id = payload.target_zone_id
-                reply.heartbeat_interval_ms = HEARTBEAT_INTERVAL * 1000
-                reply.heartbeat_timeout_ms = HEARTBEAT_TIMEOUT * 1000
-            else:
-                reply.error = "invalid gate token"
+        try:
+            async with asyncio.timeout(self.handshake_timeout):
+                packet = await read_packet(reader)
+        except TimeoutError:
+            self.admission_counters["handshake_timeouts"] += 1
+            return False
+        if packet is None:
+            return False
+        if len(packet.payload) > self.pre_auth_max_message_bytes:
+            self.admission_counters["preauth_oversize"] += 1
+            return False
+        if packet.type_name == "ClientHeartbeatRequest":
+            self.admission_counters["heartbeat_before_verify"] += 1
+            return False
+        if packet.type_name != "ClientTokenVerifyRequest":
+            return False
+        request = self.protocol.parse(packet.type_name, packet.payload)
+        expected = hmac.new(self.ticket_secret, request.payload, "sha256").hexdigest().encode()
+        payload = self.protocol.parse("GateTokenPayload", request.payload)
+        valid = (
+            hmac.compare_digest(expected, request.signature)
+            and payload.gate_node_id == self.info.node_id
+            and payload.zone_id in (0, self.info.zone_id)
+            and payload.target_zone_id in (0, self.info.zone_id)
+            and payload.expire_timestamp > int(time.time())
+        )
+        ticket_key = bytes(request.signature) if valid else b""
+        if valid and ticket_key and ticket_key in self._active_tickets:
+            self.admission_counters["rejected_ticket_in_use"] += 1
+            reply = self.protocol.message("ClientTokenVerifyResponse", success=False, error="gate token already in use")
             await write_packet(session.writer, Packet.from_message(reply))
-            session.verified = valid
-            return valid
+            return False
+        reply = self.protocol.message("ClientTokenVerifyResponse", success=valid)
+        if valid:
+            session.ticket_player_id = payload.player_id
+            session.ticket_target_zone_id = payload.target_zone_id
+            session.ticket_account_digest = bytes(getattr(payload, "account_digest", b""))
+            session.ticket_key = ticket_key
+            session.verified_at = time.monotonic()
+            reply.heartbeat_interval_ms = HEARTBEAT_INTERVAL * 1000
+            reply.heartbeat_timeout_ms = HEARTBEAT_TIMEOUT * 1000
+        else:
+            reply.error = "invalid gate token"
+        await write_packet(session.writer, Packet.from_message(reply))
+        session.verified = valid
+        return valid
 
     async def _receive(self, reader, session: Session) -> None:
         heartbeat_at = None
         heartbeats = 0
         while True:
-            async with asyncio.timeout(HEARTBEAT_TIMEOUT):
-                packet = await read_packet(reader)
+            read_timeout = float(HEARTBEAT_TIMEOUT)
+            if not session.logged_in and session.verified_at is not None and self.login_deadline_after_verify > 0:
+                login_left = self.login_deadline_after_verify - (time.monotonic() - session.verified_at)
+                if login_left <= 0:
+                    self.admission_counters["login_timeouts"] += 1
+                    return
+                read_timeout = min(read_timeout, login_left)
+            try:
+                async with asyncio.timeout(read_timeout):
+                    packet = await read_packet(reader)
+            except TimeoutError:
+                if (
+                    not session.logged_in
+                    and session.verified_at is not None
+                    and self.login_deadline_after_verify > 0
+                    and (time.monotonic() - session.verified_at) >= self.login_deadline_after_verify
+                ):
+                    self.admission_counters["login_timeouts"] += 1
+                return
             if packet is None:
+                return
+            if (
+                not session.logged_in
+                and session.verified_at is not None
+                and self.login_deadline_after_verify > 0
+                and (time.monotonic() - session.verified_at) >= self.login_deadline_after_verify
+            ):
+                self.admission_counters["login_timeouts"] += 1
                 return
             if packet.type_name == "ClientHeartbeatRequest":
                 request = self.protocol.parse(packet.type_name, packet.payload)
@@ -543,6 +657,7 @@ class GateNode:
         session.scene_instance_id = ""
         session.owner_epoch = 0
         session.account = ""
+        session.scene_route_reset_pending = True
         self._clear_scene_entry(session)
         session.last_scene_route = None
         session.enter_requested = False
@@ -652,6 +767,7 @@ class GateNode:
                         session.scene_instance_id = ""
                         session.owner_epoch = 0
                         session.account = ""
+                        session.scene_route_reset_pending = True
                         self._clear_scene_entry(session)
                         session.last_scene_route = None
                         session.enter_requested = False
@@ -752,7 +868,8 @@ class GateNode:
     async def _disconnect(self, session: Session) -> None:
         self._clear_scene_entry(session)
         try:
-            await self.exit_scene(session, 3 if session.lease_expired else 2)
+            exit_reason = 1 if session.exit_scene_immediately_on_close else (3 if session.lease_expired else 2)
+            await self.exit_scene(session, exit_reason)
         except (OSError, RpcError, grpc.RpcError, ValueError, RuntimeError):
             logger.warning("无法通知 Scene 会话断开 session=%s", session.session_id, exc_info=True)
         if not (session.login_started or session.player_id):
@@ -797,6 +914,7 @@ class GateNode:
         session.player_id = event.player_id
         session.owner_revision = event.owner_revision
         session.account = event.authenticated_account
+        session.scene_route_reset_pending = False
         session.version = event.session_version
         session.login_generation = event.login_generation
         binding_changed = previous_binding != self._entry_binding(session)
@@ -952,7 +1070,12 @@ class GateNode:
             elif event_id == ids["ContractsKafkaPlayerLeaseExpiredEvent"]:
                 event = self.protocol.parse("contracts.kafka.PlayerLeaseExpiredEvent", command.payload)
                 session = self.sessions.get(event.session_id)
-                if session and (not event.player_id or not session.player_id or session.player_id == event.player_id):
+                event_inc = int(getattr(event, "session_incarnation", 0))
+                if (
+                    session
+                    and (not event_inc or event_inc == session.incarnation)
+                    and (not event.player_id or not session.player_id or session.player_id == event.player_id)
+                ):
                     session.lease_expired = True
                     session.writer.transport.abort()
             elif event_id == ids["ContractsKafkaRedirectToGateEvent"]:
@@ -973,13 +1096,16 @@ class GateNode:
                         and (not event.login_generation or session.login_generation < event.login_generation)
                     )
                 ):
+                    reason_tip = int(getattr(event, "reason_tip", 0))
+                    if reason_tip == LOGIN_MINOR_PLAY_TIME_OVER:
+                        session.exit_scene_immediately_on_close = True
                     if session.redirected:
                         session.close()
                         return
                     # The native Gate writes the reason before a graceful shutdown.
                     # Write synchronously into the transport so close() can flush it;
                     # enqueuing it would race with cancellation of the writer task.
-                    kick = self.protocol.message("GameKickPlayerRequest", reason={"id": 2017})
+                    kick = self.protocol.message("GameKickPlayerRequest", reason={"id": reason_tip or 2017})
                     content = self.protocol.content(
                         self.protocol.message_ids["SceneClientPlayerCommonKickPlayer"],
                         body=kick.SerializeToString(),
@@ -1067,10 +1193,19 @@ class GateNode:
                 self.broadcast(method, self.protocol.parse(f"contracts.kafka.{method}Event", payload))
                 return
 
+    @staticmethod
+    def _bound_player_id(session: Session) -> int:
+        """返回会话当前有效绑定的玩家 ID；处于 LeaveGame 选角态或未绑定时返回 0（对齐 C++ BoundPlayerIdOf）。"""
+        if (session.scene_route_reset_pending and not session.account) or session.player_id in (0, (1 << 64) - 1):
+            return 0
+        return session.player_id
+
     def _deliver_to_session(self, session_id: int, player_id: int, content) -> None:
         session = self.sessions.get(session_id)
-        if (session and session.verified and (not player_id or
-                session.player_id not in (0, (1 << 64) - 1) and session.player_id == player_id)):
+        if session is None or not session.verified:
+            return
+        bound_id = self._bound_player_id(session)
+        if not player_id or (bound_id and bound_id == player_id):
             session.emit(content)
 
     def broadcast(self, method: str, event, *, scene_node_id: int = 0, scene_uuid: str = "") -> None:
@@ -1106,7 +1241,7 @@ class GateNode:
     def _broadcast_all(self, content, *, scene_id: int | None = None,
                        scene_node_id: int = 0, scene_uuid: str = "") -> None:
         for session in self.sessions.values():
-            if (session.player_id not in (0, (1 << 64) - 1) and session.verified
+            if (self._bound_player_id(session) and session.verified
                     and (scene_id is None or scene_id == session.scene_id)
                     and (not scene_node_id or session.scene_node_id == scene_node_id
                          and session.scene_instance_id == scene_uuid)):

@@ -16,6 +16,7 @@ from collections.abc import Callable
 import grpc
 from google.protobuf.message import Message
 
+from ..dualcontrol import DualControlError, extract_approval, validate_admin_approval
 from ..grpc_runtime import verify_service_call
 from ..login.caller_auth import AuthError, CallerVerifier, SESSION_DETAIL, parse_details
 from ..protocol import Protocol
@@ -64,6 +65,8 @@ class MailService:
         coordinator_secret: bytes,
         notifier: MailNotifier | None = None,
         request_budget_sec: float = 3.5,
+        approval_required_callers: tuple[str, ...] = ("admin",),
+        allow_unapproved: bool = True,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -73,6 +76,8 @@ class MailService:
         self._coordinator_secret = coordinator_secret
         self._notifier = notifier
         self._budget_sec = request_budget_sec
+        self._approval_required = frozenset(("admin", *(str(c) for c in approval_required_callers if str(c))))
+        self._allow_unapproved = bool(allow_unapproved)
         self._clock_ms = clock_ms
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -229,8 +234,38 @@ class MailService:
 
     # -- MailAdmin -----------------------------------------------------------------------------------
 
+    async def _admit_approval(self, context, caller: str, path: str, request: Message) -> None:
+        """核对 MailAdmin 发件的双人复核批准记录（先验调用证明，再验双人复核）。"""
+        approval = extract_approval(request)
+        if approval is None and caller not in self._approval_required:
+            return
+        try:
+            approved = validate_admin_approval(
+                approval,
+                operator="",
+                request_id=int(request.request_id),
+                allow_unapproved=self._allow_unapproved,
+            )
+        except DualControlError as exc:
+            logger.error(
+                "[mail] Rejecting %s from caller %s request_id=%d: %s",
+                path,
+                caller,
+                int(request.request_id),
+                exc,
+            )
+            await context.abort(CODE.PERMISSION_DENIED, str(exc))
+        if not approved:
+            logger.error(
+                "[mail] %s accepted without a dual-control approval record caller=%s request_id=%d (AdminAllowUnapproved is on)",
+                path,
+                caller,
+                int(request.request_id),
+            )
+
     async def _send(self, request: Message, context, path: str, kind: int) -> Message:
         caller = await self._admit_producer(context, request, path)
+        await self._admit_approval(context, caller, path, request)
         try:
             resp = await self._with_budget(self.store.send(caller, kind, request))
         except Exception as exc:

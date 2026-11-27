@@ -115,6 +115,7 @@ from .model import (
     ROLE_BLOCKER_TRIAL_LAUNCH_ROLE,
     ROLE_BLOCKER_TRIAL_LOBBY_SLOT,
     ROLE_BLOCKER_TRIAL_REWARD_OWED,
+    ROLE_BLOCKER_WAR_CREDIT_OWED,
     ROLE_FENCE_CALLER,
     ROLE_LEADER,
     ROLE_MEMBER,
@@ -123,6 +124,11 @@ from .model import (
     RoleFenceRow,
     RoleOriginal,
     RolePurgeResult,
+    CreditFenceVerdict,
+    WarCreditOwed,
+    WarCreditOwedCursor,
+    WarOwedConvertStatus,
+    classify_credit_fence,
     TEXT_VERDICT_MASKED,
     TEXT_VERDICT_PASS,
     TRIAL_BATTLE_STATE_EXPIRED,
@@ -678,6 +684,10 @@ class GuildTx(TypingProtocol):
     async def list_trial_rewards_owed(self, limit: int) -> list[TrialOwedRewardRecord]: ...
     async def count_trial_rewards_owed_by_player(self, player_id: int) -> dict[int, int]: ...
     async def increment_trial_reward_owed_attempts(self, player_id: int, battle_id: int) -> None: ...
+    async def insert_war_credit_owed(self, rec: WarCreditOwed) -> None: ...
+    async def delete_war_credit_owed(self, player_id: int, op_id: int) -> bool: ...
+    async def war_credit_owed_exists(self, player_id: int, op_id: int) -> bool: ...
+    async def list_war_credit_owed(self, after: WarCreditOwedCursor, limit: int) -> list[WarCreditOwed]: ...
 
 
 # -- 核心领域存储引擎（SqlGuildStore 与 MemoryGuildStore 复用全部业务逻辑） ----------------------
@@ -2842,6 +2852,172 @@ class GuildStoreCore:
             await self._run_tx(lambda tx: tx.increment_trial_reward_owed_attempts(owed.player_id, owed.battle_id))
         return status, op_row
 
+    # -- 帮战待入账行 guild_war_credit_owed（r2-gw#5 / #6）----------------------------------------
+
+    async def credit_or_owe_war_op(
+        self,
+        credit: WarCreditOwed,
+        now_ms: int,
+        *,
+        lease_until_ms: int = 0,
+        lease_token: int = 0,
+    ) -> tuple[AssetOpRow | None, WarCreditOwed | None, int]:
+        """帮战入账分流：正常插 GUILD_CREDIT 指令；冻结或本流未决已满则记 guild_war_credit_owed；墓碑则放弃。"""
+        if credit.player_id <= 0 or credit.op_id <= 0 or not credit.payload or now_ms <= 0:
+            raise ValueError("war credit requires non-zero player_id, op_id, payload, and now_ms")
+        healed = False
+        fence_enabled = self._role_directory is not None
+
+        while True:
+            need_heal_pid = 0
+
+            async def _op(tx: GuildTx) -> tuple[AssetOpRow | None, WarCreditOwed | None, int]:
+                nonlocal need_heal_pid
+                fence = await tx.lock_role_fence(credit.player_id)
+                # 独立内存夹具未装配目录时，若已显式写入本地护栏行仍遵守护栏状态。
+                effective_enabled = fence_enabled or (fence is not None)
+                verdict, need_heal = classify_credit_fence(
+                    fence, healed=healed, fence_enabled=effective_enabled,
+                )
+                if need_heal and fence_enabled:
+                    need_heal_pid = credit.player_id
+                    raise _TxRollbackReturn((None, None, CreditFenceVerdict.OPEN))
+                if need_heal and not fence_enabled:
+                    # 无外部目录可自愈：本地已有冻结令牌直接按 FROZEN 分流。
+                    verdict = CreditFenceVerdict.FROZEN if (fence is not None and fence.freeze_token != 0) else CreditFenceVerdict.OPEN
+                if verdict == CreditFenceVerdict.REMOVED:
+                    return None, None, CreditFenceVerdict.REMOVED
+                stamped = replace(credit, created_ms=now_ms)
+                if verdict == CreditFenceVerdict.FROZEN:
+                    await tx.insert_war_credit_owed(stamped)
+                    return None, stamped, CreditFenceVerdict.FROZEN
+                try:
+                    seq, epoch = await tx.allocate_seq(credit.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
+                except GuildAssetPendingError:
+                    await tx.insert_war_credit_owed(stamped)
+                    return None, stamped, CreditFenceVerdict.OPEN
+                row = AssetOpRow(
+                    op_id=credit.op_id,
+                    player_id=credit.player_id,
+                    stream=ASSET_STREAM_GUILD_CREDIT,
+                    seq=seq,
+                    guild_id=credit.guild_id,
+                    kind=credit.kind,
+                    status=OP_STATUS_PENDING,
+                    durable=0,
+                    attempts=0,
+                    next_attempt_ms=now_ms,
+                    deadline_ms=0,
+                    payload=credit.payload,
+                    ref_id=credit.ref_id,
+                    ref_count=1,
+                    period_key=credit.period_key,
+                    contribution_delta=0,
+                    funds_delta=0,
+                    reason_tip_id=0,
+                    created_ms=now_ms,
+                    updated_ms=now_ms,
+                    lease_until_ms=lease_until_ms,
+                    lease_token=lease_token,
+                    tx_type=credit.tx_type,
+                    last_outcome=0,
+                    last_reason=0,
+                    stream_epoch=epoch,
+                    last_send_ms=0,
+                )
+                await tx.insert_asset_op(row)
+                return row, None, CreditFenceVerdict.OPEN
+
+            result = await self._run_tx(_op)
+            if need_heal_pid:
+                healed = True
+                await self._heal_role_fence(need_heal_pid)
+                continue
+            return result
+
+    async def list_war_credit_owed(
+        self, after: WarCreditOwedCursor = WarCreditOwedCursor(), limit: int = 64
+    ) -> list[WarCreditOwed]:
+        if limit <= 0:
+            return []
+        return await self._run_tx(lambda tx: tx.list_war_credit_owed(after, limit), read_only=True)
+
+    async def convert_war_credit_owed(self, owed: WarCreditOwed, now_ms: int) -> tuple[int, AssetOpRow | None]:
+        """将一行 guild_war_credit_owed 原子转为 guild_asset_op（保留原 op_id 幂等防重）并点删待入账行。"""
+        if owed.player_id <= 0 or owed.op_id <= 0 or not owed.payload or now_ms <= 0:
+            raise ValueError("war credit owed requires non-zero player_id, op_id, payload, and now_ms")
+        healed = False
+        fence_enabled = self._role_directory is not None
+
+        while True:
+            need_heal_pid = 0
+
+            async def _op(tx: GuildTx) -> tuple[int, AssetOpRow | None]:
+                nonlocal need_heal_pid
+                fence = await tx.lock_role_fence(owed.player_id)
+                effective_enabled = fence_enabled or (fence is not None)
+                verdict, need_heal = classify_credit_fence(
+                    fence, healed=healed, fence_enabled=effective_enabled,
+                )
+                if need_heal and fence_enabled:
+                    need_heal_pid = owed.player_id
+                    raise _TxRollbackReturn((0, None))
+                if need_heal and not fence_enabled:
+                    verdict = CreditFenceVerdict.FROZEN if (fence is not None and fence.freeze_token != 0) else CreditFenceVerdict.OPEN
+                if verdict == CreditFenceVerdict.REMOVED:
+                    removed = await tx.delete_war_credit_owed(owed.player_id, owed.op_id)
+                    if not removed:
+                        raise _TxRollbackReturn((WarOwedConvertStatus.GONE, None))
+                    return WarOwedConvertStatus.ABANDONED, None
+                if verdict == CreditFenceVerdict.FROZEN:
+                    raise _TxRollbackReturn((WarOwedConvertStatus.FROZEN, None))
+                try:
+                    seq, epoch = await tx.allocate_seq(owed.player_id, ASSET_STREAM_GUILD_CREDIT, now_ms)
+                except GuildAssetPendingError:
+                    raise _TxRollbackReturn((WarOwedConvertStatus.STILL_FULL, None))
+                if not await tx.war_credit_owed_exists(owed.player_id, owed.op_id):
+                    raise _TxRollbackReturn((WarOwedConvertStatus.GONE, None))
+                row = AssetOpRow(
+                    op_id=owed.op_id,
+                    player_id=owed.player_id,
+                    stream=ASSET_STREAM_GUILD_CREDIT,
+                    seq=seq,
+                    guild_id=owed.guild_id,
+                    kind=owed.kind,
+                    status=OP_STATUS_PENDING,
+                    durable=0,
+                    attempts=0,
+                    next_attempt_ms=now_ms,
+                    deadline_ms=0,
+                    payload=owed.payload,
+                    ref_id=owed.ref_id,
+                    ref_count=1,
+                    period_key=owed.period_key,
+                    contribution_delta=0,
+                    funds_delta=0,
+                    reason_tip_id=0,
+                    created_ms=now_ms,
+                    updated_ms=now_ms,
+                    lease_until_ms=0,
+                    lease_token=0,
+                    tx_type=owed.tx_type,
+                    last_outcome=0,
+                    last_reason=0,
+                    stream_epoch=epoch,
+                    last_send_ms=0,
+                )
+                await tx.insert_asset_op(row)
+                if not await tx.delete_war_credit_owed(owed.player_id, owed.op_id):
+                    raise _TxRollbackReturn((WarOwedConvertStatus.GONE, None))
+                return WarOwedConvertStatus.CONVERTED, row
+
+            status, op_row = await self._run_tx(_op)
+            if need_heal_pid:
+                healed = True
+                await self._heal_role_fence(need_heal_pid)
+                continue
+            return status, op_row
+
     # -- GuildInternal.ListAppliedAssetOpsSince --------------------------------------------------
 
     async def list_applied_asset_ops_since(
@@ -2990,6 +3166,7 @@ class _MemoryState:
     trial_launch_roles: dict[tuple[int, int], TrialLaunchRoleRecord]  # (player_id, request_id) -> record
     trial_battles: dict[int, TrialBattleRecord]  # battle_id -> record
     trial_reward_owed: dict[tuple[int, int], TrialOwedRewardRecord]  # (player_id, battle_id) -> record
+    war_credit_owed: dict[tuple[int, int], WarCreditOwed]  # (player_id, op_id) -> record
     client_requests: dict[tuple[int, int], tuple[int, int]]  # (player_id, req_id) -> (op_id, created_ms)
     name_holds: dict[str, tuple[int, int, int]]  # name_norm -> (hold_id, guild_id, held_until_ms)
 
@@ -3011,6 +3188,7 @@ class _MemoryState:
             trial_launch_roles={},
             trial_battles={},
             trial_reward_owed={},
+            war_credit_owed={},
             client_requests={},
             name_holds={},
         )
@@ -3067,6 +3245,9 @@ class _MemoryTx:
             lob = self._s.trial_lobbies.get(slot.lobby_id)
             if lob is None or lob.state != TRIAL_LOBBY_STATE_ENDED:
                 return ROLE_BLOCKER_TRIAL_LOBBY_SLOT
+        for owed_pid, _ in self._s.war_credit_owed:
+            if owed_pid == pid:
+                return ROLE_BLOCKER_WAR_CREDIT_OWED
         return ""
 
     # guild_player_state
@@ -3947,6 +4128,28 @@ class _MemoryTx:
         cur = self._s.trial_reward_owed.get(key)
         if cur is not None:
             self._s.trial_reward_owed[key] = replace(cur, attempts=cur.attempts + 1)
+
+    async def insert_war_credit_owed(self, rec: WarCreditOwed) -> None:
+        key = (rec.player_id, rec.op_id)
+        if key in self._s.war_credit_owed:
+            raise GuildWriteConflictError(f"duplicate guild_war_credit_owed key {key}")
+        self._s.war_credit_owed[key] = rec
+
+    async def delete_war_credit_owed(self, player_id: int, op_id: int) -> bool:
+        return self._s.war_credit_owed.pop((player_id, op_id), None) is not None
+
+    async def war_credit_owed_exists(self, player_id: int, op_id: int) -> bool:
+        return (player_id, op_id) in self._s.war_credit_owed
+
+    async def list_war_credit_owed(self, after: WarCreditOwedCursor, limit: int) -> list[WarCreditOwed]:
+        cursor = (after.created_ms, after.player_id, after.op_id)
+        rows = [
+            rec
+            for rec in self._s.war_credit_owed.values()
+            if (rec.created_ms, rec.player_id, rec.op_id) > cursor
+        ]
+        rows.sort(key=lambda r: (r.created_ms, r.player_id, r.op_id))
+        return rows[:limit]
 
 
 class MemoryGuildStore(GuildStoreCore):

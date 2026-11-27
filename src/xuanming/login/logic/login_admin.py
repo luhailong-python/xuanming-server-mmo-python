@@ -7,6 +7,7 @@ import logging
 
 import grpc
 
+from ...dualcontrol import ApprovalMissingError, DualControlError, extract_approval, validate_admin_approval
 from .. import keys, tips
 from ..account_deletion import SOURCE_ADMIN, mask_account
 from ..directory import Conflict, Invalid, Missing
@@ -45,6 +46,48 @@ def authorize_admin(metadata, expected_token: str, method: str) -> None:
     if not got or not hmac.compare_digest(got.encode("utf-8"), expected_token.encode("utf-8")):
         logger.error("[LoginAdmin] %s refused: bad or missing %s present=%s", method, ADMIN_TOKEN_HEADER, bool(got))
         raise RpcAbort(grpc.StatusCode.PERMISSION_DENIED, f"{method} requires a valid {ADMIN_TOKEN_HEADER}")
+
+
+def admit_admin_approval(request, method: str, *, allow_unapproved: bool) -> None:
+    """LoginAdmin 双人复核拦截（对应 Go ``server/loginadmin/admin_approval.go``）。
+
+    - ``RemovePlayersFromAccounts``：``dry_run=True`` 时不强制要求批准记录，但带了仍须合格；
+    - ``ScheduleAccountDeletion`` 与 ``ResetAccountRealName``：恒要求合格的批准记录；
+    - 仅当 ``allow_unapproved=True``（本机开发）时放行缺失记录并打 ERROR。
+    """
+    short = method.rsplit("/", 1)[-1]
+    if short == "RemovePlayersFromAccounts":
+        required = not bool(getattr(request, "dry_run", False))
+    elif short in ("ScheduleAccountDeletion", "ResetAccountRealName"):
+        required = True
+    else:
+        logger.error("[LoginAdmin] %s refused: method is not classified for dual control", short)
+        raise RpcAbort(grpc.StatusCode.PERMISSION_DENIED, f"{short} is not classified for dual control")
+
+    approval = extract_approval(request)
+    if approval is None:
+        if not required:
+            return
+        if not allow_unapproved:
+            logger.error("[LoginAdmin] %s refused: dual-control approval record is missing", short)
+            raise RpcAbort(grpc.StatusCode.PERMISSION_DENIED, "dual_control_approval_required")
+        logger.error(
+            "[LoginAdmin] %s accepted without a dual-control approval record (AdminAllowUnapproved is on)",
+            short,
+        )
+        return
+    try:
+        validate_admin_approval(
+            approval,
+            operator=str(getattr(request, "operator", "") or ""),
+            allow_unapproved=False,
+            require_operator=True,
+        )
+    except ApprovalMissingError:
+        raise RpcAbort(grpc.StatusCode.PERMISSION_DENIED, "dual_control_approval_required") from None
+    except DualControlError as exc:
+        logger.error("[LoginAdmin] %s refused: %s", short, exc)
+        raise RpcAbort(grpc.StatusCode.PERMISSION_DENIED, f"dual_control_approval_invalid: {exc}") from exc
 
 
 def _valid_bounded_text(text: str, max_bytes: int) -> bool:

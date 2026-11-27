@@ -174,42 +174,107 @@ class SceneBattle:
                     continue
                 if hasattr(snapshot, "rows"):
                     raw = snapshot.rows.get(PlayerRowKind.PROFILE, b"")
-                    holds = self.protocol.parse("player_database", raw).item_holds.holds if raw else ()
+                    profile_db = self.protocol.parse("player_database", raw) if raw else None
+                    holds = profile_db.item_holds.holds if profile_db is not None else ()
+                    jh_comp = profile_db.jianghu_component if profile_db is not None else None
                 else:
-                    holds = self.scene.rows.assemble(snapshot).item_holds.holds
+                    assembled = self.scene.rows.assemble(snapshot)
+                    holds = assembled.item_holds.holds
+                    jh_comp = assembled.jianghu_component
                 battle_holds = [hold for hold in holds if hold.kind == 1 and hold.hold_id]
-                if not battle_holds:
+                pending_fee_bid = int(getattr(jh_comp, "pending_silver_fee_battle_id", 0)) if jh_comp is not None else 0
+                pending_fee_review = (
+                    int(getattr(jh_comp, "pending_silver_fee_review_after_ms", 0)) if jh_comp is not None else 0
+                )
+                if not battle_holds and not pending_fee_bid:
                     if save_seq is not None:
                         self._hold_checked_seq[player_id] = save_seq
                     continue
                 self._hold_checked_seq.pop(player_id, None)
-                if any(hold.review_after_ms <= now and hold.hold_id != self.current(player_id)
-                       for hold in battle_holds):
+                cur_bid = self.current(player_id)
+                hold_due = any(hold.review_after_ms <= now and hold.hold_id != cur_bid for hold in battle_holds)
+                fee_due = bool(pending_fee_bid and pending_fee_bid != cur_bid and pending_fee_review <= now)
+                if hold_due or fee_due:
                     self._hold_review_at[player_id] = now + _REAPER_INTERVAL_MS
                     self._hold_reviews[player_id] = asyncio.create_task(self._review_holds(player_id))
 
     async def _review_holds(self, player_id: int) -> None:
+        """统一复核战斗道具预留与普通生死状待退银两（对齐 C++ ReviewBattleHoldsAndFees）。"""
         try:
             player = self._player(player_id)
             if player is None:
                 return
+            now = self._clock()
+            cur_bid = self.current(player_id)
             data = self.scene.rows.assemble(player.snapshot)
-            candidates = [hold.hold_id for hold in data.item_holds.holds
-                          if hold.kind == 1 and hold.hold_id and hold.review_after_ms <= self._clock()
-                          and hold.hold_id != self.current(player_id)]
-            for hold_id in candidates:
-                verdict = (2, False) if self._applied(player, hold_id) else await self._decision(hold_id)
-                if verdict not in ((2, False), (0, False)):
+            hold_bids = {
+                int(hold.hold_id)
+                for hold in data.item_holds.holds
+                if hold.kind == 1 and hold.hold_id and hold.review_after_ms <= now and hold.hold_id != cur_bid
+            }
+            fee_bid = int(data.jianghu_component.pending_silver_fee_battle_id)
+            fee_review = int(data.jianghu_component.pending_silver_fee_review_after_ms)
+            fee_due_bid = fee_bid if (fee_bid and fee_bid != cur_bid and fee_review <= now) else 0
+            candidates = sorted(hold_bids | ({fee_due_bid} if fee_due_bid else set()))
+            jianghu_sys = (
+                getattr(self.scene, "jianghu", None)
+                or SceneJianghu(self.scene, self.tables, getattr(self.scene, "assets", None), clock=self._clock)
+            )
+            for battle_id in candidates:
+                has_hold = battle_id in hold_bids
+                has_fee = battle_id == fee_due_bid
+                applied_here = self._applied(player, battle_id)
+                # 仅道具预留且本地已应用结算：直接释放预留；待退银两必须查 SQL 终局（防作废结算退款失败被误吞）。
+                if has_hold and not has_fee and applied_here:
+                    verdict = (2, False)
+                else:
+                    verdict = await self._decision(battle_id)
+                releasable = verdict in ((2, False), (0, False))
+                consume_stale_fee = verdict == (1, False) and applied_here and has_fee
+                if not releasable and not consume_stale_fee:
                     continue
                 async with self.scene._lock(player_id):
-                    if self._player(player_id) is not player or not self.scene.mutable(player) or self.current(player_id) == hold_id:
+                    if self._player(player_id) is not player or not self.scene.mutable(player) or self.current(player_id) == battle_id:
                         continue
                     await self.scene.flush_player_rows(player)
                     current = self.scene.rows.assemble(player.snapshot)
-                    if release_item_hold(current, hold_id):
-                        await self.scene.commit_player_data(player, current)
+                    assets = getattr(self.scene, "assets", None)
+                    before = (
+                        type(current).FromString(current.SerializeToString())
+                        if (assets is not None and assets.audit_enabled)
+                        else None
+                    )
+                    changed = False
+                    refunded = 0
+                    if releasable:
+                        if release_item_hold(current, battle_id):
+                            changed = True
+                        if int(current.jianghu_component.pending_silver_fee_battle_id) == battle_id:
+                            j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
+                                current, battle_id, skip_silver_refund=False,
+                            )
+                            if j_changed:
+                                current.jianghu_component.pending_silver_fee_review_after_ms = 0
+                                changed = True
+                    elif consume_stale_fee and int(current.jianghu_component.pending_silver_fee_battle_id) == battle_id:
+                        current.jianghu_component.pending_silver_fee_battle_id = 0
+                        current.jianghu_component.pending_silver_fee_amount = 0
+                        current.jianghu_component.pending_silver_fee_review_after_ms = 0
+                        changed = True
+                    if changed:
+                        audit_cb = (
+                            assets.make_audit_callback(
+                                player, before, current, TX_JIANGHU_DUEL_REFUND, correlation=battle_id,
+                            )
+                            if (before is not None and refunded > 0)
+                            else None
+                        )
+                        if audit_cb is not None:
+                            await self.scene.commit_player_data(player, current, on_committed=audit_cb)
+                        else:
+                            await self.scene.commit_player_data(player, current)
         except (StoreRejected, StoreUnavailable, OSError, ValueError):
-            logger.warning("战斗道具预留复核待重试 player_id=%s", player_id, exc_info=True)
+            logger.warning("Battle hold and silver fee review pending retry player_id=%s", player_id, exc_info=True)
         finally:
             if self._hold_reviews.get(player_id) is asyncio.current_task():
                 self._hold_reviews.pop(player_id, None)
@@ -236,6 +301,13 @@ class SceneBattle:
                 if (verdict in ((2, False), (0, False)) or self._applied(player, context.battle_id)
                         or self._past_cap(player_id, entry)):
                     await self._release_expired(player_id, entry, player)
+                    # ABORT / 无可裁决原件：不会再有结算，一并释放道具预留并退还待退银两。
+                    if (
+                        verdict in ((2, False), (0, False))
+                        and player is not None
+                        and self.scene.mutable(player)
+                    ):
+                        await self._release_hold_and_fee_on_abort(player, context.battle_id)
                 else:
                     entry.retry_at = self._clock() + _REAPER_INTERVAL_MS
                     await self._store(_RENEW, player_id, entry)
@@ -272,6 +344,47 @@ class SceneBattle:
         if player is not None:
             player.battle_expired_id = battle_id
         await self._remove_lock(player_id, battle_id)
+
+    async def _release_hold_and_fee_on_abort(self, player, battle_id: int) -> None:
+        try:
+            await self.scene.flush_player_rows(player)
+            data = self.scene.rows.assemble(player.snapshot)
+            assets = getattr(self.scene, "assets", None)
+            before = (
+                type(data).FromString(data.SerializeToString())
+                if (assets is not None and assets.audit_enabled)
+                else None
+            )
+            changed = bool(release_item_hold(data, battle_id))
+            refunded = 0
+            if int(data.jianghu_component.pending_silver_fee_battle_id) == battle_id:
+                jianghu_sys = (
+                    getattr(self.scene, "jianghu", None)
+                    or SceneJianghu(self.scene, self.tables, assets, clock=self._clock)
+                )
+                j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
+                    data, battle_id, skip_silver_refund=False,
+                )
+                if j_changed:
+                    data.jianghu_component.pending_silver_fee_review_after_ms = 0
+                    changed = True
+            if changed:
+                audit_cb = (
+                    assets.make_audit_callback(
+                        player, before, data, TX_JIANGHU_DUEL_REFUND, correlation=battle_id,
+                    )
+                    if (before is not None and refunded > 0)
+                    else None
+                )
+                if audit_cb is not None:
+                    await self.scene.commit_player_data(player, data, on_committed=audit_cb)
+                else:
+                    await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError, ValueError):
+            logger.warning(
+                "Abort battle hold/fee cleanup deferred to review player_id=%s battle_id=%s",
+                player.player_id, battle_id, exc_info=True,
+            )
 
     def _thaw(self, player_id: int) -> None:
         if self._freezes.pop(player_id, None) is None:
@@ -421,10 +534,11 @@ class SceneBattle:
                         )
                         if fee_err:
                             error = fee_err
+                    hold_and_fee_review_after_ms = min(_UINT64_MAX, request.deadline_ms + _SETTLEMENT_GRACE_MS)
                     if not error and counts:
                         hold_err = self._inventory.place_item_hold(
                             data, request.battle_id, counts, created_at_ms=self._clock(),
-                            review_after_ms=min(_UINT64_MAX, request.deadline_ms + _SETTLEMENT_GRACE_MS),
+                            review_after_ms=hold_and_fee_review_after_ms,
                         )
                         if hold_err:
                             error = 1006
@@ -434,6 +548,8 @@ class SceneBattle:
                         )
                         if debit_err:
                             error = debit_err
+                        else:
+                            data.jianghu_component.pending_silver_fee_review_after_ms = hold_and_fee_review_after_ms
                     if not error and (counts or jianghu_silver_to_deduct > 0):
                         audit_cb = (
                             assets.make_audit_callback(
@@ -578,10 +694,10 @@ class SceneBattle:
                 )
                 return 1006
 
-        # 归元城 NPC 场景玩法（木桩/残局/奇谈）场景与预设准入校验。
+        # 归元城 NPC 场景玩法（木桩/残局/奇谈）场景与预设准入校验（314 豁免跨场景校验）。
         if is_npc_isolated_encounter and dungeon_row is not None:
             req_scene = int(getattr(dungeon_row, "scene_id", 0))
-            if req_scene != 0 and current_scene_config_id != req_scene:
+            if req_scene != 0 and int(getattr(request, "battle_config_id", 0)) != 314 and current_scene_config_id != req_scene:
                 logger.warning(
                     "PrepareBattle rejected: npc encounter scene mismatch player_id=%s battle_config_id=%s required=%s current=%s",
                     player.player_id, request.battle_config_id, req_scene, current_scene_config_id,
@@ -752,7 +868,7 @@ class SceneBattle:
 
     async def cancel(self, request):
         player_id = request.player_id
-        skip_silver_refund = bool(getattr(request, "skip_jianghu_silver_refund", False))
+        # skip_jianghu_silver_refund 已废弃：match 不再发退费邮件，普通生死状银两退还只走 scene 通道，读到 true 也照退。
         jianghu_sys = (
             getattr(self.scene, "jianghu", None)
             or SceneJianghu(self.scene, self.tables, getattr(self.scene, "assets", None), clock=self._clock)
@@ -781,9 +897,10 @@ class SceneBattle:
                     if SceneFestivalBeast.on_battle_prepare_cancelled_or_void(data, request.battle_id):
                         changed = True
                     j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
-                        data, request.battle_id, skip_silver_refund=skip_silver_refund,
+                        data, request.battle_id, skip_silver_refund=False,
                     )
                     if j_changed:
+                        data.jianghu_component.pending_silver_fee_review_after_ms = 0
                         changed = True
                     if changed:
                         audit_cb = (
@@ -813,9 +930,10 @@ class SceneBattle:
                     else None
                 )
                 j_changed, refunded = jianghu_sys.on_battle_prepare_cancelled(
-                    data, request.battle_id, skip_silver_refund=skip_silver_refund,
+                    data, request.battle_id, skip_silver_refund=False,
                 )
                 if j_changed:
+                    data.jianghu_component.pending_silver_fee_review_after_ms = 0
                     audit_cb = (
                         assets.make_audit_callback(
                             player, before, data, TX_JIANGHU_DUEL_REFUND, correlation=request.battle_id,

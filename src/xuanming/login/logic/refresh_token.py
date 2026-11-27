@@ -14,6 +14,15 @@ async def run(ctx, request, details):
     if not request.refresh_token:
         response.error_message.CopyFrom(tip(ctx.protocol, tips.ACCOUNT_NOT_FOUND))
         return response
+    passport_sessions = getattr(ctx, "passport_sessions", None)
+    if passport_sessions is not None:
+        try:
+            data = await ctx.tokens.read_refresh_payload(request.refresh_token)
+        except Exception:
+            data = None
+        if data is not None and await passport_sessions.check_refresh(data):
+            response.error_message.CopyFrom(tip(ctx.protocol, tips.ACCOUNT_NOT_FOUND))
+            return response
     try:
         pair = await ctx.tokens.refresh(request.refresh_token)
     except RefreshRejected as error:

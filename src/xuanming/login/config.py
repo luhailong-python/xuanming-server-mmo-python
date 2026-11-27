@@ -27,6 +27,8 @@ class LoginConfig:
     gate_token_ttl: int = 600
     # 运维面鉴权口令（空串表示停用 LoginAdmin，fail-closed）
     admin_token: str = ""
+    # 生产环境由 from_env 默认关闭（强制双人复核）；本机开发/单测默认 True 兼容既有调用方
+    admin_allow_unapproved: bool = True
     # 登录排队配置（默认关闭，开启后 AssignGate / QueryQueueStatus 走完整排队链）
     queue_enabled: bool = False
     queue_entry_ttl_s: int = 3600
@@ -59,6 +61,7 @@ class LoginConfig:
             directory_secret=secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_LOGIN"),
             dev_password_secret=environ.get("LOGIN_DEV_PASSWORD_SHARED_SECRET", ""),
             admin_token=environ.get("MMORPG_LOGIN_ADMIN_TOKEN", ""),
+            admin_allow_unapproved=environ.get("LOGIN_ADMIN_ALLOW_UNAPPROVED", "").lower() in ("1", "true", "yes"),
             queue_enabled=environ.get("LOGIN_QUEUE_ENABLED", "").lower() in ("1", "true", "yes"),
             gate_drain_migrate_enabled=environ.get("LOGIN_GATE_DRAIN_MIGRATE_ENABLED", "").lower() in ("1", "true", "yes"),
         )

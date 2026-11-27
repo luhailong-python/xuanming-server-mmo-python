@@ -106,6 +106,7 @@ class PlayerInboxConfig:
     enqueue_types: tuple[str, ...] = ()
     admin_token_env: str = ""
     admin_token: str = ""
+    admin_allow_unapproved: bool = False
     scene_secret: bytes = b""
     match_secret: bytes = b""
     coordinator_secret: bytes = b""

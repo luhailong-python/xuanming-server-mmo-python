@@ -434,6 +434,7 @@ class MatchStore(TypingProtocol):
         ranked_season_id: int = 0,
         jianghu_duel_context: bytes = b"",
         trial_vow_mask: int = 0,
+        tactical_puzzle_context: bytes = b"",
         skip_ticket_check: bool = False,
     ) -> Message: ...
     async def mark_formation_prepared(self, battle_id: int, player_id: int, endpoint: str) -> None: ...
@@ -487,6 +488,19 @@ class MatchStore(TypingProtocol):
         attacker_player_ids: list[int],
         defender_player_ids: list[int],
         activity_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]: ...
+    async def start_tactical_puzzle_battle(
+        self,
+        *,
+        caller: CallerIdentity,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        ranked_context_bytes: bytes,
+        tactical_puzzle_context_bytes: bytes,
         battle_node: tuple[int, str, str, int, str],
         battle_deadline_ms: int,
     ) -> tuple[Message, bool]: ...
@@ -2523,6 +2537,7 @@ class MemoryMatchStore:
         ranked_season_id: int = 0,
         jianghu_duel_context: bytes = b"",
         trial_vow_mask: int = 0,
+        tactical_puzzle_context: bytes = b"",
         skip_ticket_check: bool = False,
     ) -> Message:
         now = await self.now_ms()
@@ -2565,6 +2580,7 @@ class MemoryMatchStore:
                 is_wuxing_tower=tower_flag,
                 jianghu_duel_context=jianghu_duel_context,
                 trial_vow_mask=vow_mask,
+                tactical_puzzle_context=tactical_puzzle_context,
             )
             for pid, ticket_str, side, captain in members:
                 formation.members.add(player_id=pid, ticket=ticket_str, team_index=side, captain=captain)
@@ -3013,6 +3029,94 @@ class MemoryMatchStore:
                 selected_region=b_region,
                 owner_account=acct,
                 owner_revision=rev,
+            )
+            s.formations[battle_id] = formation
+            s.direct_intents[key] = (battle_id, payload_bytes, False)
+            return self._clone_msg(formation), True
+
+        return await self._run_tx(work)
+
+    async def start_tactical_puzzle_battle(
+        self,
+        *,
+        caller: CallerIdentity,
+        request_high: int,
+        request_low: int,
+        payload_bytes: bytes,
+        battle_config_id: int,
+        ranked_context_bytes: bytes,
+        tactical_puzzle_context_bytes: bytes,
+        battle_node: tuple[int, str, str, int, str],
+        battle_deadline_ms: int,
+    ) -> tuple[Message, bool]:
+        """万象残局坊单人开局（Kind=7 幂等键）：校验角色围栏与在途占用后建直连成局与票据。"""
+        now = await self.now_ms()
+        key = (7, caller.player_id, request_high, request_low)
+
+        def work(s: _MemState) -> tuple[Message, bool]:
+            self._check_fence_locked(s, caller.player_id, caller.account, caller.owner_revision)
+            prev = s.direct_intents.get(key)
+            if prev is not None:
+                bid, prev_payload, cancelled = prev
+                if prev_payload != payload_bytes:
+                    raise MatchBusinessError(ERR_INVALID_PARAMETER)
+                if cancelled:
+                    raise MatchBusinessError(ERR_MATCH_CANCEL_TOO_LATE)
+                return self._clone_msg(s.formations[bid]), False
+            tk = s.tickets.get(caller.player_id)
+            if tk is not None:
+                st = int(tk.state)
+                if st == TICKET_STATE_QUEUED and int(tk.expires_ms) > now:
+                    raise MatchBusinessError(ERR_MATCH_ALREADY_QUEUED)
+                if st == TICKET_STATE_FORMING:
+                    raise MatchBusinessError(ERR_MATCH_IN_BATTLE)
+                if st == TICKET_STATE_READY:
+                    prev_form = s.formations.get(int(tk.formation_id))
+                    if prev_form is not None and not formation_outcome_decided(prev_form):
+                        raise MatchBusinessError(ERR_MATCH_IN_BATTLE)
+            occ = s.occupancies.get(caller.player_id)
+            if occ is not None and occ.expires_ms > now:
+                raise MatchBusinessError(ERR_MATCH_IN_BATTLE)
+
+            b_node_id, b_uuid, b_endpoint, b_region, b_track = battle_node
+            battle_id = self._alloc_id_locked()
+            op_id = str(uuid.uuid4())
+            formation = self.protocol.message(
+                "match.MatchFormationRecord",
+                battle_id=battle_id,
+                operation_id=op_id,
+                state=FORMATION_STATE_PREPARING,
+                physical_region=b_region,
+                target_node_id=b_node_id,
+                target_instance_id=b_uuid,
+                target_endpoint=b_endpoint,
+                mode=MODE_PVE_SOLO,
+                config_id=battle_config_id,
+                created_ms=now,
+                deadline_ms=now + battle_deadline_ms,
+                retry_at_ms=now + 60_000,
+                requeue_on_failure=False,
+                release_track=b_track,
+                ranked_context=ranked_context_bytes,
+                tactical_puzzle_context=tactical_puzzle_context_bytes,
+            )
+            tk_id = f"pz-{battle_id}-{caller.player_id}"
+            formation.members.add(player_id=caller.player_id, ticket=tk_id, team_index=0, captain=True)
+            s.tickets[caller.player_id] = self.protocol.message(
+                "match.MatchAuthorityTicketRecord",
+                player_id=caller.player_id,
+                ticket=tk_id,
+                request_id=op_id,
+                mode=MODE_PVE_SOLO,
+                config_id=battle_config_id,
+                team_size=1,
+                state=TICKET_STATE_FORMING,
+                enqueued_ms=now,
+                formation_id=battle_id,
+                expires_ms=now + battle_deadline_ms,
+                selected_region=b_region,
+                owner_account=caller.account,
+                owner_revision=caller.owner_revision,
             )
             s.formations[battle_id] = formation
             s.direct_intents[key] = (battle_id, payload_bytes, False)

@@ -122,6 +122,7 @@ async def open_service(
         gate_verifier,
         world_pusher=world_pusher,
         platform_reviewer=reviewer,
+        admin_token=config.admin_token,
     )
     stack.push_async_callback(service.close)
     return service

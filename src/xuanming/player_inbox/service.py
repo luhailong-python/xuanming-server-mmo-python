@@ -18,6 +18,7 @@ from collections.abc import Callable
 import grpc
 from google.protobuf.message import Message
 
+from ..dualcontrol import DualControlError, extract_approval, validate_admin_approval
 from ..grpc_runtime import service_digest, sign_service_call, verify_service_call
 from ..protocol import Protocol
 from .config import MIN_ADMIN_TOKEN_BYTES
@@ -118,6 +119,7 @@ class PlayerInboxService:
         match_secret: bytes = b"",
         admin_token: str = "",
         request_budget_sec: float = 4.5,
+        allow_unapproved: bool = True,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -127,6 +129,7 @@ class PlayerInboxService:
         self._coordinator_secret = coordinator_secret
         self._admin_token = admin_token
         self._budget_sec = request_budget_sec
+        self._allow_unapproved = bool(allow_unapproved)
         self._clock_ms = clock_ms
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -304,8 +307,48 @@ class PlayerInboxService:
 
     # -- PlayerInboxAdmin -----------------------------------------------------------------------------
 
+    async def _admit_approval(
+        self,
+        context,
+        path: str,
+        request: Message,
+        *,
+        request_id: int | None = None,
+    ) -> None:
+        """核对 PlayerInboxAdmin 甲级写操作（GmSanctionPlayer / VoidItem）的双人复核批准记录。"""
+        approval = extract_approval(request)
+        operator = str(getattr(request, "operator", "") or "")
+        try:
+            approved = validate_admin_approval(
+                approval,
+                operator=operator,
+                request_id=request_id,
+                allow_unapproved=self._allow_unapproved,
+                require_operator=True,
+            )
+        except DualControlError as exc:
+            logger.error("[player_inbox] Rejecting %s: %s peer=%s", path, exc, _peer_addr(context))
+            await context.abort(CODE.PERMISSION_DENIED, f"{path}: {exc}")
+        if not approved:
+            logger.error(
+                "[player_inbox] %s accepted without a dual-control approval record operator=%r (PlayerInbox.AdminAllowUnapproved is on) peer=%s",
+                path,
+                operator,
+                _peer_addr(context),
+            )
+        else:
+            logger.info(
+                "[player_inbox] %s dual-control approval accepted approval_id=%r approver=%r operator=%r peer=%s",
+                path,
+                str(approval.approval_id),
+                str(approval.approver),
+                operator,
+                _peer_addr(context),
+            )
+
     async def gm_sanction_player(self, request: Message, context, path: str) -> Message:
         await self._admit_admin(context, path)
+        await self._admit_approval(context, path, request, request_id=int(request.request_id))
 
         def reject(code: int) -> Message:
             out = self.protocol.message("player_inbox.GmSanctionPlayerResponse")
@@ -419,6 +462,7 @@ class PlayerInboxService:
 
     async def void_item(self, request: Message, context, path: str) -> Message:
         await self._admit_admin(context, path)
+        await self._admit_approval(context, path, request)
         params = VoidParams(
             player_id=int(request.player_id),
             domain=int(request.domain),

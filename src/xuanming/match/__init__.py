@@ -37,6 +37,14 @@ from .rating import (
 from .spectate import SpectateManager
 from .sql_store import SqlMatchStore, open_pool
 from .store import MatchStore, MemoryMatchStore
+from .tactical_puzzle import (
+    TacticalPuzzleManager,
+    derive_honor,
+    deterministic_puzzle_seed,
+    normalize_and_validate_text,
+    validate_tactical_puzzle_spec,
+    validate_tag_mask,
+)
 from .team_service import KafkaTeamNotifier, NullTeamNotifier, TeamGrpcService
 from .tournament import (
     MatchMvpResult,
@@ -91,6 +99,7 @@ __all__ = [
     "SqlMatchStore",
     "StaticBattleNodeResolver",
     "TEAM_NODE_TYPE",
+    "TacticalPuzzleManager",
     "TeamGrpcService",
     "TournamentCatalog",
     "TournamentManager",

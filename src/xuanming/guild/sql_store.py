@@ -57,6 +57,7 @@ from .model import (
     ROLE_BLOCKER_TRIAL_LAUNCH_ROLE,
     ROLE_BLOCKER_TRIAL_LOBBY_SLOT,
     ROLE_BLOCKER_TRIAL_REWARD_OWED,
+    ROLE_BLOCKER_WAR_CREDIT_OWED,
     RoleFenceRow,
     TRIAL_BATTLE_STATE_STARTED,
     TRIAL_LAUNCH_ROLE_RELEASED,
@@ -69,6 +70,8 @@ from .model import (
     TrialLobbyRecord,
     TrialLobbySlotRecord,
     TrialOwedRewardRecord,
+    WarCreditOwed,
+    WarCreditOwedCursor,
     is_removal_token,
     role_rank,
     valid_role_fence_state,
@@ -436,6 +439,10 @@ class _SqlTx:
                 "ON l.lobby_id=s.lobby_id WHERE s.player_id=%s "
                 "AND (s.lobby_id IS NULL OR (s.lobby_id<>0 AND (l.lobby_id IS NULL OR l.state IS NULL OR l.state<>4))) "
                 "LIMIT 1 FOR UPDATE",
+            ),
+            (
+                ROLE_BLOCKER_WAR_CREDIT_OWED,
+                "SELECT op_id FROM `guild_war_credit_owed` WHERE player_id=%s LIMIT 1 FOR UPDATE",
             ),
         )
         for blocker, sql in checks:
@@ -1817,6 +1824,65 @@ class _SqlTx:
             "UPDATE `guild_trial_reward_owed` SET `attempts`=`attempts`+1 WHERE `player_id`=%s AND `battle_id`=%s",
             (player_id, battle_id),
         )
+
+    async def insert_war_credit_owed(self, rec: WarCreditOwed) -> None:
+        await self._cur.execute(
+            "INSERT INTO `guild_war_credit_owed` "
+            "(`player_id`,`op_id`,`guild_id`,`kind`,`tx_type`,`ref_id`,`period_key`,`payload`,`source_id`,`created_ms`) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,UNHEX(%s),%s,%s)",
+            (
+                rec.player_id,
+                rec.op_id,
+                rec.guild_id,
+                rec.kind,
+                rec.tx_type,
+                rec.ref_id,
+                rec.period_key,
+                rec.payload.hex(),
+                rec.source_id,
+                rec.created_ms,
+            ),
+        )
+
+    async def delete_war_credit_owed(self, player_id: int, op_id: int) -> bool:
+        await self._cur.execute(
+            "DELETE FROM `guild_war_credit_owed` WHERE `player_id`=%s AND `op_id`=%s",
+            (player_id, op_id),
+        )
+        return self._cur.rowcount == 1
+
+    async def war_credit_owed_exists(self, player_id: int, op_id: int) -> bool:
+        await self._cur.execute(
+            "SELECT 1 FROM `guild_war_credit_owed` WHERE `player_id`=%s AND `op_id`=%s",
+            (player_id, op_id),
+        )
+        return await self._cur.fetchone() is not None
+
+    async def list_war_credit_owed(self, after: WarCreditOwedCursor, limit: int) -> list[WarCreditOwed]:
+        await self._cur.execute(
+            "SELECT `player_id`,`op_id`,`guild_id`,`kind`,`tx_type`,`ref_id`,`period_key`,`payload`,`source_id`,`created_ms` "
+            "FROM `guild_war_credit_owed` "
+            "WHERE `created_ms`>%s OR (`created_ms`=%s AND (`player_id`>%s OR (`player_id`=%s AND `op_id`>%s))) "
+            "ORDER BY `created_ms` ASC, `player_id` ASC, `op_id` ASC LIMIT %s",
+            (after.created_ms, after.created_ms, after.player_id, after.player_id, after.op_id, limit),
+        )
+        out: list[WarCreditOwed] = []
+        for row in await self._cur.fetchall():
+            out.append(
+                WarCreditOwed(
+                    player_id=int(row[0]),
+                    op_id=int(row[1]),
+                    guild_id=int(row[2]),
+                    kind=int(row[3]),
+                    tx_type=int(row[4]),
+                    ref_id=int(row[5]),
+                    period_key=int(row[6]),
+                    payload=_to_bytes(row[7]),
+                    source_id=int(row[8]),
+                    created_ms=int(row[9]),
+                )
+            )
+        return out
 
 
 class SqlGuildStore(GuildStoreCore):

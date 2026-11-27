@@ -1,18 +1,20 @@
 """装备流派方案预设系统（536..539，对齐 C++ equip_loadout_rules.h 与 player_equip_loadout.cpp）。
 
 实例与布局严格分离：方案只记录 8 个正式槽位（EquipSlot 3..10）指向的真实装备 guid，
-不复制 ItemComp、不另建隐藏背包；支持 0 空格 8v8 原位原子互换、战法/加点联动与扩容符/灵石解锁。
+不复制 ItemComp、不另建隐藏背包；采用方案 A 统一 7 套三合一共享席位（与战法/加点共用），
+支持 0 空格 8v8 原位原子互换，以及战法/加点/首发灵宠/免费五行阵法联动。
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import SimpleNamespace
 
-from ..data import client_request
 from ..data.asset_inventory import (
     FEATURE_UNAVAILABLE,
     INVALID,
@@ -22,9 +24,25 @@ from ..data.asset_inventory import (
     clone,
 )
 from ..data.asset_ledger import UINT64_MAX
+from .battle_dropin_effects import (
+    MAX_WUXING_FORMATION_ID,
+    WUXING_FORMATIONS,
+    is_valid_formation_id,
+)
 from .scene_mission import effective_level
 from .scene_player import _bag, _fill_item
-from .scene_stats import class_id
+from .scene_stats import (
+    LOADOUT_BASE_FREE_SCHEMES,
+    LOADOUT_LIGHT_CARD_BONUS_SCHEMES,
+    LOADOUT_MAX_SCHEMES,
+    LOADOUT_RENT_MAX_REMAINING_DAYS,
+    LOADOUT_RENT_PERIOD_DAYS,
+    LOADOUT_RENT_UNIT_PRICE_DIAMOND,
+    active_rented_loadout_slots,
+    class_id,
+    free_loadout_schemes_for_level,
+    unlocked_skill_schemes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +51,27 @@ CLIENT_REQUEST_KIND_EQUIP_LOADOUT_UNLOCK = 20
 
 # EquipSlot.xlsx 正式 8 槽：3 武器 / 4 帽子 / 5 衣服 / 6 鞋子 / 7 首饰一 / 8 首饰二 / 9 法宝一 / 10 法宝二。
 FORMAL_SLOTS: tuple[int, ...] = (3, 4, 5, 6, 7, 8, 9, 10)
-FREE_SCHEMES = 1
-MAX_SCHEMES = 5
+FREE_SCHEMES = LOADOUT_BASE_FREE_SCHEMES
+MAX_SCHEMES = LOADOUT_MAX_SCHEMES
 MAX_ROLE_TAG = 4
 MAX_NAME_CODE_POINTS = 12
 UNLOCK_ITEM_CONFIG_ID = 3413
 
 CURRENCY_DIAMOND = 1
 CURRENCY_BIND_DIAMOND = 2
+
+# 宠物错误码（与 scene_pets.py / pet_error_tip.pb.h 对齐）。
+_PET_NOT_FOUND = 26000
+_PET_OWNER_LEVEL_LOW = 26003
+_PET_ALREADY_ACTIVE = 26004
+
+_FORMATION_DISPLAY_NAMES: dict[int, str] = {
+    1: "天覆阵",
+    2: "地载阵",
+    3: "风扬阵",
+    4: "云垂阵",
+    5: "虎翼阵",
+}
 
 # 错误码（与 C++ equip_error_tip.pb.h 严格对齐）。
 EQUIP_ITEM_NOT_FOUND = 28000
@@ -145,15 +176,26 @@ def valid_role_tag(role_tag: int) -> bool:
     return 0 <= role_tag <= MAX_ROLE_TAG
 
 
+@dataclass(frozen=True, slots=True)
+class UnifiedSeatState:
+    """方案 A（7 套三合一共享席位）统一权限投影。"""
+
+    free_schemes: int = LOADOUT_BASE_FREE_SCHEMES
+    light_card_bonus_schemes: int = 0
+    rented_extra_slots: int = 0
+    rent_expires_at_sec: int = 0
+    unlocked_schemes: int = LOADOUT_BASE_FREE_SCHEMES
+
+
 def effective_unlocked_count(stored: int) -> int:
     if stored < FREE_SCHEMES:
         return FREE_SCHEMES
     return min(stored, MAX_SCHEMES)
 
 
-def effective_active_scheme_id(stored: int, unlocked_count: int) -> int:
-    unlocked = effective_unlocked_count(unlocked_count)
-    return stored if 1 <= stored <= unlocked else 1
+def effective_active_scheme_id(stored: int, max_allowed: int = MAX_SCHEMES) -> int:
+    cap = effective_unlocked_count(max_allowed)
+    return stored if 1 <= stored <= cap else 1
 
 
 def effective_state_version(stored: int) -> int:
@@ -165,8 +207,20 @@ def valid_scheme_id(scheme_id: int, unlocked_count: int) -> bool:
 
 
 def default_scheme_name(scheme_id: int) -> str:
-    names = {1: "方案一", 2: "方案二", 3: "方案三", 4: "方案四", 5: "方案五"}
+    names = {
+        1: "方案一",
+        2: "方案二",
+        3: "方案三",
+        4: "方案四",
+        5: "方案五",
+        6: "方案六",
+        7: "方案七",
+    }
     return names.get(scheme_id, f"方案{scheme_id}")
+
+
+def formation_display_name(formation_id: int) -> str:
+    return _FORMATION_DISPLAY_NAMES.get(formation_id, "未布阵")
 
 
 def valid_request_id(request_id: str) -> bool:
@@ -310,8 +364,20 @@ def _find_or_create_scheme(comp, scheme_id: int):
     return comp.schemes.add(scheme_id=scheme_id, name=default_scheme_name(scheme_id), role_tag=0)
 
 
-def _skill_scheme_display_name(scheme_id: int) -> str:
-    names = {1: "战法方案一", 2: "战法方案二", 3: "战法方案三", 4: "战法方案四", 5: "战法方案五", 6: "战法方案六"}
+def _skill_scheme_display_name(data, scheme_id: int) -> str:
+    if data is not None and data.HasField("skill_list"):
+        for scheme in data.skill_list.loadout_schemes:
+            if int(scheme.scheme_id) == scheme_id and scheme.name:
+                return str(scheme.name)
+    names = {
+        1: "战法方案一",
+        2: "战法方案二",
+        3: "战法方案三",
+        4: "战法方案四",
+        5: "战法方案五",
+        6: "战法方案六",
+        7: "战法方案七",
+    }
     return names.get(scheme_id, f"战法方案{scheme_id}")
 
 
@@ -325,18 +391,74 @@ class SceneEquipLoadout:
         assets=None,
         *,
         name_filter: Callable[[str], bool] | None = None,
+        now_s: Callable[[], int] | None = None,
     ) -> None:
         self.scene = scene
         self.protocol = scene.protocol
         self.tables = tables
         self.assets = assets if assets is not None else getattr(scene, "assets", None)
         self.name_filter = name_filter
+        self._now_s = now_s
         tx_enum = self.protocol.pool.FindEnumTypeByName("TransactionType")
         unlock_tx = (
             tx_enum.values_by_name.get("TX_EQUIP_LOADOUT_UNLOCK")
             or tx_enum.values_by_name["TX_CURRENCY_DEDUCT"]
         )
         self.unlock_tx = unlock_tx.number
+
+    def _now_sec(self) -> int:
+        if self._now_s is not None:
+            return int(self._now_s())
+        for attr in ("afk_pass", "skills", "attributes"):
+            comp = getattr(self.scene, attr, None)
+            clock = getattr(comp, "now_s", None)
+            if callable(clock):
+                return int(clock())
+        return int(time.time())
+
+    def resolve_unified_seat_state(self, data, now_unix_sec: int | None = None) -> UnifiedSeatState:
+        """统一计算方案 A（7 套三合一共享席位）权限：基础 2 套 + 85 级 +1 + 轻享卡 +2 + 按月租用 0..5，封顶 7。"""
+        now_sec = self._now_sec() if now_unix_sec is None else int(now_unix_sec)
+        free_schemes = free_loadout_schemes_for_level(effective_level(data))
+        afk_pass = getattr(self.scene, "afk_pass", None)
+        if afk_pass is not None and hasattr(afk_pass, "is_active_data"):
+            light_card_active = bool(afk_pass.is_active_data(data))
+        else:
+            expires = int(getattr(data.uint64_pb_component, "afk_pass_expires_at", 0))
+            light_card_active = expires > now_sec
+        light_bonus = LOADOUT_LIGHT_CARD_BONUS_SCHEMES if light_card_active else 0
+        stored_rented = 0
+        stored_expires = 0
+        if data.HasField("skill_list"):
+            stored_rented = int(getattr(data.skill_list, "rented_extra_slots", 0))
+            stored_expires = int(getattr(data.skill_list, "rent_expires_at_sec", 0))
+        rented = active_rented_loadout_slots(stored_rented, stored_expires, now_sec)
+        expires_out = stored_expires if rented > 0 else 0
+        unlocked = unlocked_skill_schemes(
+            light_card_active, stored_rented, stored_expires, now_sec, free_schemes=free_schemes,
+        )
+        return UnifiedSeatState(
+            free_schemes=free_schemes,
+            light_card_bonus_schemes=light_bonus,
+            rented_extra_slots=rented,
+            rent_expires_at_sec=expires_out,
+            unlocked_schemes=unlocked,
+        )
+
+    @staticmethod
+    def _pet_exists(data, pet_id: int) -> bool:
+        if not pet_id or not data.HasField("pet_component"):
+            return False
+        return any(int(pet.pet_id) == pet_id for pet in data.pet_component.pets)
+
+    def _pet_display_name(self, pet) -> str:
+        if pet.name:
+            return str(pet.name)
+        if "Pet" in self.tables.tables:
+            row = self.tables["Pet"].get(int(pet.pet_table_id))
+            if row is not None and getattr(row, "name", ""):
+                return str(row.name)
+        return f"灵宠#{int(pet.pet_table_id)}"
 
     def register(self) -> None:
         """向 SceneNode 注册 536..539 装备方案预设 RPC。"""
@@ -380,10 +502,7 @@ class SceneEquipLoadout:
         skills = getattr(self.scene, "skills", None)
         if skills is not None and hasattr(skills, "unlocked_loadout_scheme_count"):
             return int(skills.unlocked_loadout_scheme_count(data))
-        afk_pass = getattr(self.scene, "afk_pass", None)
-        if afk_pass is not None and hasattr(afk_pass, "is_active_data"):
-            return 6 if afk_pass.is_active_data(data) else 3
-        return 3
+        return self.resolve_unified_seat_state(data).unlocked_schemes
 
     @staticmethod
     def _attribute_scheme_exists(data, scheme_id: int) -> bool:
@@ -426,32 +545,37 @@ class SceneEquipLoadout:
                 equip_craft.fill_v1_display(item, tmp.items[0])
             out.CopyFrom(tmp.items[0])
 
-    def build_snapshot(self, data, snapshot) -> int:
-        """构建完整装备方案快照（1..5 套位、实时 8 槽状态与可选联动列表）。"""
+    def build_snapshot(self, data, snapshot, *, now_unix_sec: int | None = None) -> int:
+        """构建完整装备方案快照（方案 A 1..7 套位、实时 8 槽状态与战法/加点/灵宠/阵法可选联动列表）。"""
         snapshot.Clear()
         if not self._required_present(data) or self.assets is None:
             return UNAVAILABLE
+        now_sec = self._now_sec() if now_unix_sec is None else int(now_unix_sec)
         comp = data.equip_loadout_component
-        unlocked = effective_unlocked_count(int(comp.unlocked_scheme_count))
-        active = effective_active_scheme_id(int(comp.active_scheme_id), unlocked)
+        seats = self.resolve_unified_seat_state(data, now_sec)
+        unlocked = seats.unlocked_schemes
+        # 到期只锁不删：保留 1..7 内的当前激活方案号，绝不强行切回方案一。
+        active = effective_active_scheme_id(int(comp.active_scheme_id), MAX_SCHEMES)
         version = effective_state_version(int(comp.state_version))
 
         snapshot.unlocked_scheme_count = unlocked
         snapshot.max_scheme_count = MAX_SCHEMES
         snapshot.active_scheme_id = active
         snapshot.state_version = version
+        snapshot.next_unlock_cost_diamond = 0
+        snapshot.next_unlock_allow_bind_diamond = False
         snapshot.unlock_item_config_id = UNLOCK_ITEM_CONFIG_ID
         snapshot.unlock_item_owned = self.assets.removable_count(data, UNLOCK_ITEM_CONFIG_ID)
         snapshot.diamond_balance = balance(data, CURRENCY_DIAMOND)
         snapshot.bind_diamond_balance = balance(data, CURRENCY_BIND_DIAMOND)
-
-        if unlocked < MAX_SCHEMES:
-            spec = unlock_spec_for_target(unlocked + 1)
-            snapshot.next_unlock_cost_diamond = spec.cost_diamond
-            snapshot.next_unlock_allow_bind_diamond = spec.allow_bind_diamond
-        else:
-            snapshot.next_unlock_cost_diamond = 0
-            snapshot.next_unlock_allow_bind_diamond = False
+        snapshot.free_schemes = seats.free_schemes
+        snapshot.light_card_bonus_schemes = seats.light_card_bonus_schemes
+        snapshot.rented_extra_slots = seats.rented_extra_slots
+        snapshot.rent_expires_at_sec = seats.rent_expires_at_sec
+        snapshot.server_now_sec = now_sec
+        snapshot.rent_unit_price_diamond = LOADOUT_RENT_UNIT_PRICE_DIAMOND
+        snapshot.rent_period_days = LOADOUT_RENT_PERIOD_DAYS
+        snapshot.rent_max_remaining_days = LOADOUT_RENT_MAX_REMAINING_DAYS
 
         worn_by_guid = {item.item_id: item for _, item in self.assets.entries(data.bag_component, 2)}
         bag_by_guid = {item.item_id: item for _, item in self.assets.entries(data.bag_component, 0)}
@@ -463,6 +587,8 @@ class SceneEquipLoadout:
             info.role_tag = int(stored.role_tag) if stored is not None else 0
             info.linked_skill_scheme_id = int(stored.linked_skill_scheme_id) if stored is not None else 0
             info.linked_attribute_scheme_id = int(stored.linked_attribute_scheme_id) if stored is not None else 0
+            info.linked_pet_id = int(stored.linked_pet_id) if stored is not None else 0
+            info.linked_formation_id = int(stored.linked_formation_id) if stored is not None else 0
 
             bound_by_slot: dict[int, int] = {}
             if stored is not None:
@@ -495,13 +621,28 @@ class SceneEquipLoadout:
 
         skill_schemes = self._unlocked_skill_scheme_count(data)
         for sid in range(1, skill_schemes + 1):
-            snapshot.skill_schemes.add(scheme_id=sid, name=_skill_scheme_display_name(sid))
+            snapshot.skill_schemes.add(scheme_id=sid, name=_skill_scheme_display_name(data, sid))
         if data.HasField("attribute_component"):
             for s in data.attribute_component.schemes:
                 snapshot.attribute_schemes.add(
                     scheme_id=s.scheme_id,
                     name=s.name or f"加点方案{s.scheme_id}",
                 )
+        if data.HasField("pet_component"):
+            active_pet_id = int(data.pet_component.active_pet_id)
+            for pet in data.pet_component.pets:
+                snapshot.pets.add(
+                    pet_id=int(pet.pet_id),
+                    pet_table_id=int(pet.pet_table_id),
+                    name=self._pet_display_name(pet),
+                    active=bool(pet.pet_id and int(pet.pet_id) == active_pet_id),
+                )
+        for formation in WUXING_FORMATIONS:
+            snapshot.formations.add(
+                scheme_id=formation.id,
+                name=formation_display_name(formation.id),
+                role_tag=formation.element,
+            )
         return 0
 
     def _fill_bags(self, player, data, response, *, include_equipment: bool) -> int:
@@ -572,8 +713,8 @@ class SceneEquipLoadout:
         if err := self._writable_error(player, data):
             return finish(err, data)
 
-        unlocked = effective_unlocked_count(int(comp.unlocked_scheme_count))
-        if not valid_scheme_id(int(request.scheme_id), unlocked):
+        seats = self.resolve_unified_seat_state(data)
+        if not valid_scheme_id(int(request.scheme_id), seats.unlocked_schemes):
             return finish(EQUIP_LOADOUT_SCHEME_INVALID, data)
         current_ver = effective_state_version(int(comp.state_version))
         if request.state_version != current_ver or int(comp.state_version) >= UINT64_MAX:
@@ -588,6 +729,12 @@ class SceneEquipLoadout:
         if request.linked_skill_scheme_id and request.linked_skill_scheme_id > self._unlocked_skill_scheme_count(data):
             return finish(INVALID, data)
         if request.linked_attribute_scheme_id and not self._attribute_scheme_exists(data, int(request.linked_attribute_scheme_id)):
+            return finish(INVALID, data)
+        linked_pet_id = int(getattr(request, "linked_pet_id", 0))
+        if linked_pet_id and not self._pet_exists(data, linked_pet_id):
+            return finish(INVALID, data)
+        linked_formation_id = int(getattr(request, "linked_formation_id", 0))
+        if linked_formation_id and not (1 <= linked_formation_id <= MAX_WUXING_FORMATION_ID):
             return finish(INVALID, data)
 
         worn_by_slot = {
@@ -641,6 +788,8 @@ class SceneEquipLoadout:
         scheme.role_tag = int(request.role_tag)
         scheme.linked_skill_scheme_id = int(request.linked_skill_scheme_id)
         scheme.linked_attribute_scheme_id = int(request.linked_attribute_scheme_id)
+        scheme.linked_pet_id = linked_pet_id
+        scheme.linked_formation_id = linked_formation_id
         del scheme.slots[:]
         for slot in sorted(validated_slots):
             guid = validated_slots[slot]
@@ -705,8 +854,8 @@ class SceneEquipLoadout:
         if err := self._writable_error(player, data):
             return finish(err, current_data=data)
 
-        unlocked = effective_unlocked_count(int(comp.unlocked_scheme_count))
-        if not valid_scheme_id(int(request.scheme_id), unlocked):
+        seats = self.resolve_unified_seat_state(data)
+        if not valid_scheme_id(int(request.scheme_id), seats.unlocked_schemes):
             return finish(EQUIP_LOADOUT_SCHEME_INVALID, current_data=data)
         current_ver = effective_state_version(int(comp.state_version))
         if request.state_version != current_ver or int(comp.state_version) >= UINT64_MAX:
@@ -844,6 +993,7 @@ class SceneEquipLoadout:
         sc.last_scheme_id = int(request.scheme_id)
 
         linked_changed = False
+        pet_changed = False
         if request.apply_linked_schemes and stored_scheme is not None:
             if stored_scheme.linked_skill_scheme_id:
                 skills = getattr(self.scene, "skills", None)
@@ -867,6 +1017,39 @@ class SceneEquipLoadout:
                         linked_changed = True
                 else:
                     response.linked_notices.append("属性加点方案暂不可切换，本次仅完成装备切换")
+            linked_pet_id = int(getattr(stored_scheme, "linked_pet_id", 0))
+            if linked_pet_id:
+                pets = getattr(self.scene, "pets", None)
+                if pets is not None and hasattr(pets, "_summon"):
+                    pet_err = int(pets._summon(staged, SimpleNamespace(pet_id=linked_pet_id)))
+                elif self._pet_exists(staged, linked_pet_id):
+                    if int(staged.pet_component.active_pet_id) == linked_pet_id:
+                        pet_err = _PET_ALREADY_ACTIVE
+                    else:
+                        staged.pet_component.active_pet_id = linked_pet_id
+                        pet_err = 0
+                else:
+                    pet_err = _PET_NOT_FOUND
+                if pet_err == 0:
+                    pet_changed = True
+                elif pet_err == _PET_NOT_FOUND:
+                    response.linked_notices.append("绑定的首发灵宠已不在灵宠栏，本次仅完成其余流派切换")
+                elif pet_err == _PET_OWNER_LEVEL_LOW:
+                    response.linked_notices.append("绑定的首发灵宠等级不满足出战条件，本次仅完成其余流派切换")
+                elif pet_err != _PET_ALREADY_ACTIVE:
+                    response.linked_notices.append("绑定的首发灵宠暂不可出战，本次仅完成其余流派切换")
+            linked_formation_id = int(getattr(stored_scheme, "linked_formation_id", 0))
+            if linked_formation_id:
+                season = getattr(self.scene, "season", None)
+                if season is not None and hasattr(season, "try_equip_linked_formation"):
+                    form_err = int(season.try_equip_linked_formation(player, staged, linked_formation_id))
+                elif is_valid_formation_id(linked_formation_id) and linked_formation_id > 0:
+                    staged.season_component.equipped_formation_id = linked_formation_id
+                    form_err = 0
+                else:
+                    form_err = INVALID
+                if form_err != 0:
+                    response.linked_notices.append("绑定的五行阵法暂不可切换，本次仅完成其余流派切换")
 
         if linked_changed:
             self.assets._update_worn_stats(data, staged)
@@ -874,8 +1057,11 @@ class SceneEquipLoadout:
         inbox = getattr(self.scene, "inbox", None)
         space_freed = len(plan.to_equip_from_bag) > len(plan.to_unequip)
         attributes = getattr(self.scene, "attributes", None)
+        pets_sys = getattr(self.scene, "pets", None)
 
         async def _on_committed(_snapshot):
+            if pet_changed and pets_sys is not None and hasattr(pets_sys, "notify"):
+                pets_sys.notify(player)
             if linked_changed and attributes is not None:
                 attributes.notify(player)
             if space_freed and inbox is not None:
@@ -894,138 +1080,31 @@ class SceneEquipLoadout:
         return finish(0, include_bags=True, current_data=staged)
 
     async def unlock_loadout(self, _world, player, _route, request):
-        """539 解锁下一个装备流派方案位（优先扣 3413 扩容符，其次按阶梯扣灵石/绑灵，幂等落盘）。"""
+        """539 方案 A（7 套流派席位合一）下退役旧单独买断入口，防止与战法·加点按月租用双扣费。"""
         response = self.protocol.message(
             "UnlockEquipLoadoutResponse", client_request_id=request.client_request_id,
         )
         data = self.scene.rows.assemble(player.snapshot)
+        now_sec = self._now_sec()
 
         def reject(tip: int, *, known: bool = True, current_data=None):
             response.outcome = _OUTCOME_REJECTED if known else _OUTCOME_UNKNOWN
             response.error_message.id = tip
             target_data = current_data if current_data is not None else self.scene.rows.assemble(player.snapshot)
-            response.current_unlocked_count = effective_unlocked_count(
-                int(target_data.equip_loadout_component.unlocked_scheme_count),
-            )
-            if self.build_snapshot(target_data, response.snapshot):
-                response.ClearField("snapshot")
-            return response
-
-        def fill_applied(current_data, unlocked_count: int, used_item_id: int, spent_bind: int, spent_diamond: int, replayed: bool):
-            response.outcome = _OUTCOME_APPLIED
-            response.replayed = replayed
-            response.durable = True
-            response.result_unlocked_count = unlocked_count
-            response.current_unlocked_count = effective_unlocked_count(
-                int(current_data.equip_loadout_component.unlocked_scheme_count),
-            )
-            response.used_item_config_id = used_item_id
-            response.spent_bind_diamond = spent_bind
-            response.spent_diamond = spent_diamond
-            snap_err = self.build_snapshot(current_data, response.snapshot)
-            if snap_err:
-                response.ClearField("snapshot")
-                response.error_message.id = snap_err
-            bag_err = self._fill_bags(player, current_data, response, include_equipment=False)
-            if bag_err:
-                response.ClearField("bag")
-                if not response.error_message.id:
-                    response.error_message.id = bag_err
+            if self._required_present(target_data) and self.assets is not None:
+                seats = self.resolve_unified_seat_state(target_data, now_sec)
+                response.current_unlocked_count = seats.unlocked_schemes
+                if self.build_snapshot(target_data, response.snapshot, now_unix_sec=now_sec):
+                    response.ClearField("snapshot")
             return response
 
         if not self._required_present(data) or self.assets is None:
             return reject(UNAVAILABLE, known=False, current_data=data)
-        if not request.client_request_id:
-            return reject(INVALID, known=True, current_data=data)
-
-        ledger = data.client_request_ledger
-        err, fingerprint, prior = client_request.check(ledger, request, CLIENT_REQUEST_KIND_EQUIP_LOADOUT_UNLOCK)
-        if err:
-            return reject(err, known=(err == INVALID), current_data=data)
-        if prior is not None:
-            return fill_applied(
-                data,
-                int(prior.equip_loadout_unlocked_count),
-                int(prior.equip_loadout_used_item_id),
-                int(prior.equip_loadout_spent_bind_diamond),
-                int(prior.equip_loadout_spent_diamond),
-                True,
-            )
-
         if err := self._writable_error(player, data):
             return reject(err, known=True, current_data=data)
 
-        comp = data.equip_loadout_component
-        current_unlocked = effective_unlocked_count(int(comp.unlocked_scheme_count))
-        if request.expected_unlocked_count != current_unlocked:
-            known = current_unlocked < request.expected_unlocked_count
-            return reject(EQUIP_LOADOUT_UNLOCK_COUNT_CHANGED, known=known, current_data=data)
-        if current_unlocked >= MAX_SCHEMES:
-            return reject(EQUIP_LOADOUT_MAX_UNLOCKED, known=True, current_data=data)
-        if int(ledger.next_seq) >= UINT64_MAX or int(comp.state_version) >= UINT64_MAX:
-            return reject(UNAVAILABLE, known=False, current_data=data)
-
-        target_scheme_id = current_unlocked + 1
-        spec = unlock_spec_for_target(target_scheme_id)
-        if not spec.valid:
-            return reject(EQUIP_LOADOUT_MAX_UNLOCKED, known=True, current_data=data)
-
-        talisman_avail = self.assets.removable_count(data, UNLOCK_ITEM_CONFIG_ID)
-        bind_bal = balance(data, CURRENCY_BIND_DIAMOND)
-        diamond_bal = balance(data, CURRENCY_DIAMOND)
-        payment = plan_unlock_payment(
-            spec, talisman_avail, bind_bal, diamond_bal, bool(request.use_bind_diamond_first),
-        )
-        if not payment.can_afford:
-            return reject(EQUIP_LOADOUT_DIAMOND_NOT_ENOUGH, known=True, current_data=data)
-
-        staged = clone(data)
-        used_item_id = 0
-        if payment.use_talisman:
-            consume_err = self.assets.consume_items(staged, {UNLOCK_ITEM_CONFIG_ID: 1})
-            if consume_err:
-                return reject(EQUIP_LOADOUT_DIAMOND_NOT_ENOUGH, known=True, current_data=data)
-            used_item_id = UNLOCK_ITEM_CONFIG_ID
-        else:
-            if payment.spend_bind_diamond > 0:
-                if self.assets.deduct_currency(staged, CURRENCY_BIND_DIAMOND, payment.spend_bind_diamond):
-                    return reject(EQUIP_LOADOUT_DIAMOND_NOT_ENOUGH, known=True, current_data=data)
-            if payment.spend_diamond > 0:
-                if self.assets.deduct_currency(staged, CURRENCY_DIAMOND, payment.spend_diamond):
-                    return reject(EQUIP_LOADOUT_DIAMOND_NOT_ENOUGH, known=True, current_data=data)
-
-        sc = staged.equip_loadout_component
-        sc.unlocked_scheme_count = target_scheme_id
-        if not sc.active_scheme_id:
-            sc.active_scheme_id = 1
-        _find_or_create_scheme(sc, target_scheme_id)
-        sc.state_version = effective_state_version(int(sc.state_version)) + 1
-
-        client_request.remember(
-            staged.client_request_ledger,
-            request.client_request_id,
-            CLIENT_REQUEST_KIND_EQUIP_LOADOUT_UNLOCK,
-            fingerprint,
-            equip_loadout_unlocked_count=target_scheme_id,
-            equip_loadout_used_item_id=used_item_id,
-            equip_loadout_spent_bind_diamond=payment.spend_bind_diamond,
-            equip_loadout_spent_diamond=payment.spend_diamond,
-        )
-
-        if not await self.assets._save(
-            player,
-            staged,
-            self.unlock_tx,
-            correlation=request.client_request_id,
-            item_extra={"source": "equip_loadout_unlock", "target_scheme": target_scheme_id},
-        ):
-            return reject(UNAVAILABLE, known=False)
-
         logger.info(
-            "Equip loadout unlocked player_id=%s unlocked=%s used_item=%s spent_bind=%s spent_diamond=%s req=%s",
-            player.player_id, target_scheme_id, used_item_id,
-            payment.spend_bind_diamond, payment.spend_diamond, request.client_request_id,
+            "Legacy separate equip loadout unlock rejected; unified 7-slot entitlement active player_id=%s req=%s",
+            player.player_id, request.client_request_id,
         )
-        return fill_applied(
-            staged, target_scheme_id, used_item_id, payment.spend_bind_diamond, payment.spend_diamond, False,
-        )
+        return reject(FEATURE_UNAVAILABLE, known=True, current_data=data)

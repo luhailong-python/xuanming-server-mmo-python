@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import grpc
 
 from . import gate_commands
-from .account_deletion import AccountDeletionService
+from .account_deletion import AccountDeletionService, kick_account_players
 from .caller_auth import SESSION_DETAIL, AuthError, CallerVerifier, parse_details
 from .cellroute import CellRouteConfig, Router, build_router, build_static_router
 from .config import LoginConfig
@@ -23,6 +23,7 @@ from .logic import (
     disconnect,
     enter_game,
     get_zone_role_count,
+    handle_passport_event,
     leave_game,
     login,
     login_admin,
@@ -68,6 +69,7 @@ class ServiceContext:
     password_provider: object = None
     anti_addiction: object = None
     account_deletion: object = None
+    passport_sessions: object = None
     content_guard_call: object = None
     merged_zones: dict[int, int] = field(default_factory=dict)
     zone_capacity_fn: object = None
@@ -124,6 +126,12 @@ class ServiceContext:
             return None
         return AccountDeletionService(self.protocol, self.data, self.tokens, self.locator, self.publish)
 
+    async def kick_account_players(self, account: str, reason_tip: int = 0) -> None:
+        """将账号名下全部在线角色踢下线（供官方通行证会话吊销调用）。"""
+        await kick_account_players(
+            self.protocol, self.data, self.locator, self.publish, account, reason_tip=reason_tip,
+        )
+
     def resolve_target_zone(self, zone_id: int) -> int:
         """解析合服后的最终归属区（沿 ``merged_zones`` 链路追踪并防环）。"""
         current = int(zone_id)
@@ -166,6 +174,7 @@ class LoginService:
                 "SubmitRealName": wrap(submit_real_name.run),
                 "RequestAccountDeletion": wrap(account_deletion.request_deletion),
                 "CancelAccountDeletion": wrap(account_deletion.cancel_deletion),
+                "HandlePassportEvent": wrap(handle_passport_event.run),
             },
             "loginpb.LoginAdmin": {
                 "RemovePlayersFromAccounts": admin(login_admin.remove_players_from_accounts),
@@ -213,6 +222,9 @@ class LoginService:
             await self._check_kill_switch(context, path)
             try:
                 login_admin.authorize_admin(context.invocation_metadata(), self.ctx.config.admin_token, path)
+                login_admin.admit_admin_approval(
+                    request, path, allow_unapproved=self.ctx.config.admin_allow_unapproved,
+                )
                 return await logic(self.ctx, request, None)
             except RpcAbort as error:
                 await context.abort(error.code, error.detail)

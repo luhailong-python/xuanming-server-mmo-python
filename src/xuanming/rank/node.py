@@ -86,6 +86,7 @@ async def open_service(
         caller_verifier=verifier,
         name_reader=GrpcNameReader(protocol, ds_client),
         request_budget_sec=config.request_budget_sec,
+        allow_unapproved=config.admin_allow_unapproved,
     )
     worker = RewardWorker(
         protocol,

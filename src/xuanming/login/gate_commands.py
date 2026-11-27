@@ -21,9 +21,23 @@ def bind_session(protocol, gate_id: str, gate_instance_id: str, event):
                     session_id=event.session_id, player_id=event.player_id, enter_gs_type=event.enter_gs_type)
 
 
-def kick_player(protocol, gate_id: str, gate_instance_id: str, session_id: int, player_id: int, generation: int):
-    event = protocol.message("contracts.kafka.KickPlayerEvent", session_id=session_id, player_id=player_id,
-                             login_generation=generation)
+def kick_player(
+    protocol,
+    gate_id: str,
+    gate_instance_id: str,
+    session_id: int,
+    player_id: int,
+    generation: int,
+    *,
+    reason_tip: int = 0,
+):
+    event = protocol.message(
+        "contracts.kafka.KickPlayerEvent",
+        session_id=session_id,
+        player_id=player_id,
+        login_generation=generation,
+        reason_tip=int(reason_tip),
+    )
     return _command(protocol, gate_id, gate_instance_id, "ContractsKafkaKickPlayerEvent", event,
                     session_id=session_id, player_id=player_id)
 

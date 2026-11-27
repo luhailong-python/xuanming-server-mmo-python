@@ -81,6 +81,28 @@ RENAME_ROLE_NOT_FOUND = 8
 RENAME_ROLE_EXPIRED = 9
 RENAME_ROLE_BUSY = 10
 
+_TERMINAL_RESULTS = frozenset({
+    RENAME_ROLE_OK,
+    RENAME_ROLE_TAKEN,
+    RENAME_ROLE_INVALID,
+    RENAME_ROLE_COOLDOWN,
+    RENAME_ROLE_FROZEN,
+    RENAME_ROLE_STALE_SEQ,
+    RENAME_ROLE_SAME_NAME,
+    RENAME_ROLE_NOT_FOUND,
+    RENAME_ROLE_EXPIRED,
+})
+
+
+def is_transient_result(result: int) -> bool:
+    """判定 DataService.RenameRole 枚举是否属于未终局结果（对齐 C++ player_rename::IsTransientResult）。
+
+    仅明确列举的终局取值才允许落结局；BUSY、UNSPECIFIED 以及未知新枚举一律视为瞬时结果，
+    保留 rename_op 与改名卡预留供后续按同一 seq 重试，绝不误释放改名卡。
+    """
+    return int(result) not in _TERMINAL_RESULTS
+
+
 _TIP_BY_RESULT = {
     RENAME_ROLE_TAKEN: ROLE_NAME_TAKEN,
     RENAME_ROLE_INVALID: ROLE_NAME_INVALID,
@@ -395,11 +417,52 @@ class SceneRename:
         task.add_done_callback(_cleanup)
         return task
 
+    def release_orphan_rename_holds(self, data, player_id: int) -> list[int]:
+        """无在途 rename_op 却残留改名卡预留时收集并释放，防止改名卡永久锁死（对齐 C++ ReleaseOrphanRenameHolds）。"""
+        orphans = [
+            int(hold.hold_id)
+            for hold in data.item_holds.holds
+            if int(hold.kind) == ITEM_HOLD_KIND_RENAME and int(hold.hold_id)
+        ]
+        for hold_id in orphans:
+            logger.error(
+                "metric=player_rename_orphan_hold player_id=%d hold_id=%d "
+                "a rename card hold has no pending rename; releasing it",
+                player_id, hold_id,
+            )
+            release_item_hold(data, hold_id)
+        return orphans
+
+    async def _release_orphan_holds_and_save(self, player_id: int) -> None:
+        async with self.scene._lock(player_id):
+            player = self._online_player(player_id)
+            if player is None or not self.scene.mutable(player):
+                return
+            data = self.scene.rows.assemble(player.snapshot)
+            if data.profile_component.HasField("rename_op"):
+                return
+            orphans = self.release_orphan_rename_holds(data, player_id)
+            if not orphans:
+                return
+            try:
+                await self.scene.commit_player_data(player, data)
+            except (StoreRejected, StoreUnavailable, OSError):
+                logger.warning("Orphan rename hold cleanup save failed player_id=%d", player_id, exc_info=True)
+
     def resume_pending(self, player) -> asyncio.Task | None:
-        """重启或角色重载后恢复已持久化的在途 ``rename_op``，按同一 ``seq`` 幂等续跑。"""
+        """重启或角色重载后恢复已持久化的在途 ``rename_op``，按同一 ``seq`` 幂等续跑；无在途改名时清理孤立预留。"""
         data = self.scene.rows.assemble(player.snapshot)
         profile = data.profile_component
         if not profile.HasField("rename_op"):
+            has_orphan = any(
+                int(hold.kind) == ITEM_HOLD_KIND_RENAME and int(hold.hold_id)
+                for hold in data.item_holds.holds
+            )
+            if has_orphan and self.scene.mutable(player):
+                return asyncio.create_task(
+                    self._release_orphan_holds_and_save(player.player_id),
+                    name=f"rename-orphan-{player.player_id}",
+                )
             return None
         seq = int(profile.rename_op.seq)
         if not seq:
@@ -427,6 +490,12 @@ class SceneRename:
         async with self.scene._lock(player_id):
             player = self._online_player(player_id)
             if player is None:
+                return
+            if not self.scene.mutable(player):
+                logger.info(
+                    "Player rename send deferred while player is not mutable player_id=%d seq=%d",
+                    player_id, seq,
+                )
                 return
             data = self.scene.rows.assemble(player.snapshot)
             profile = data.profile_component
@@ -509,9 +578,9 @@ class SceneRename:
             return
 
         result = int(resp.result)
-        if result in (RENAME_ROLE_UNSPECIFIED, RENAME_ROLE_BUSY):
+        if is_transient_result(result):
             logger.warning(
-                "DataService RenameRole returned transient result=%d, keeping rename_op player_id=%d seq=%d",
+                "DataService RenameRole returned transient or unknown result=%d, keeping rename_op player_id=%d seq=%d",
                 result, player_id, seq,
             )
             return
@@ -539,6 +608,12 @@ class SceneRename:
             player = self._online_player(player_id)
             if player is None:
                 return
+            if not self.scene.mutable(player):
+                logger.info(
+                    "RenameRole answered while player is not mutable, outcome kept for retry player_id=%d seq=%d",
+                    player_id, seq,
+                )
+                return
             try:
                 await self.scene.flush_player_rows(player)
             except (StoreRejected, StoreUnavailable, OSError):
@@ -558,10 +633,13 @@ class SceneRename:
             if card_item_id and card_count:
                 consume_err = self._consume_card(data, card_item_id, card_count, except_hold_id=hold_id)
                 if consume_err:
-                    logger.warning(
-                        "Committed rename card consumption returned non-zero player_id=%d seq=%d hold_id=%d err=%d",
+                    # 角色在 data_service 已改名但改名卡未扣成：保留 rename_op 与预留供重发同一 seq 重试，绝不白改。
+                    logger.error(
+                        "metric=player_rename_card_not_consumed player_id=%d seq=%d hold_id=%d err=%d "
+                        "role already renamed in data_service but rename card could not be consumed; keeping pending",
                         player_id, seq, hold_id, consume_err,
                     )
+                    return
             release_item_hold(data, hold_id)
 
             profile.name = final_name
@@ -595,6 +673,12 @@ class SceneRename:
         async with self.scene._lock(player_id):
             player = self._online_player(player_id)
             if player is None:
+                return
+            if not self.scene.mutable(player):
+                logger.info(
+                    "RenameRole abort deferred while player is not mutable player_id=%d seq=%d",
+                    player_id, seq,
+                )
                 return
             try:
                 await self.scene.flush_player_rows(player)

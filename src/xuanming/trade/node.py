@@ -32,7 +32,7 @@ from .economy_credit import (
     StoreReferencePriceReader,
 )
 from .mall_adapter import MallAdapter, MallPoller
-from .model import MergedZones, TRADE_NODE_TYPE
+from .model import MergedZones, TRADE_NODE_TYPE, TableWantedSkillCatalog
 from .rmb import RmbConsignments
 from .role_trade import GrpcContentGuardChecker, GrpcRoleSealer, GrpcRoleTradeDirectory, RmbIdentity
 from .service import TradeService
@@ -214,6 +214,7 @@ async def open_service(
             ledger_reader=ledger_reader,
             credits=seller_credits,
             player_trade_guard=player_trade_guard,
+            wanted_skills=TableWantedSkillCatalog() if config.wanted_skill_book_enabled else None,
         )
         if config.mall_url:
             mall_adapter = MallAdapter(
@@ -271,6 +272,7 @@ async def open_service(
         daily_outflow=daily_outflow,
         manual_resolution_secret=config.manual_resolution_secret,
         manual_resolution_environment=config.manual_resolution_environment,
+        manual_resolution_allow_unapproved=config.manual_resolution_allow_unapproved,
         request_budget_sec=config.request_budget_sec,
     )
     service.mall_poller = mall_poller

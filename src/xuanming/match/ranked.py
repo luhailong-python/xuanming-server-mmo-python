@@ -573,6 +573,46 @@ def evaluate_ranked_participation(fact, settlement, total_rounds: int, player_wo
 # -- 论剑排位业务服务 ---------------------------------------------------------------------------------
 
 
+FEATURED_BUILDS_CACHE_TTL_SEC = 5.0
+
+
+class RankedFeaturedCache:
+    """全服「问道名局」Top 热门流派单副本短时缓存（5 秒 TTL，按 season_id 自动失效，对齐 Go rankedFeaturedCache）。"""
+
+    def __init__(self, *, ttl_sec: float = FEATURED_BUILDS_CACHE_TTL_SEC, clock: Callable[[], float] | None = None) -> None:
+        self._ttl_sec = max(0.0, float(ttl_sec))
+        self._clock = clock or time.monotonic
+        self._season_id: int = 0
+        self._limit: int = 0
+        self._fetched_at: float = 0.0
+        self._filled: bool = False
+        self._items: list[RankedFeaturedBuildRow] = []
+
+    def get(self, season_id: int, limit: int) -> list[RankedFeaturedBuildRow] | None:
+        if (
+            self._ttl_sec <= 0
+            or not self._filled
+            or self._season_id != season_id
+            or self._limit < limit
+            or (self._clock() - self._fetched_at) >= self._ttl_sec
+        ):
+            return None
+        return list(self._items[:limit])
+
+    def put(self, season_id: int, limit: int, items: list[RankedFeaturedBuildRow]) -> None:
+        if self._ttl_sec <= 0:
+            return
+        self._season_id = season_id
+        self._limit = limit
+        self._fetched_at = self._clock()
+        self._filled = True
+        self._items = list(items)
+
+    def invalidate(self) -> None:
+        self._filled = False
+        self._items = []
+
+
 class RankedManager:
     """承载论剑排位 V1 客户端 RPC 与组队预设确认校验。"""
 
@@ -596,6 +636,46 @@ class RankedManager:
         self._char_preset_ids = frozenset(p.preset_id for p in self.presets if p.role_kind == ROLE_KIND_CHARACTER)
         self._pet_preset_ids = frozenset(p.preset_id for p in self.presets if p.role_kind == ROLE_KIND_PET)
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self.featured_cache = RankedFeaturedCache()
+
+    def invalidate_featured_cache(self) -> None:
+        """换季或热门构筑更新后主动清空单副本「问道名局」缓存。"""
+        self.featured_cache.invalidate()
+
+    async def release_season_featured_replays(self, season_id: int) -> int:
+        """换季封季时释放本季「问道名局」代表战报护航 ref_count 并失效缓存（对齐 Go releaseSeasonFeaturedReplaysTx）。"""
+        released = 0
+        state = getattr(self.store, "_state", None)
+        if state is not None:
+            for key, row in list(state.ranked_featured_builds.items()):
+                if key[0] != int(season_id) or not row.featured_battle_id:
+                    continue
+                bid = int(row.featured_battle_id)
+                rep = state.reports.get(bid)
+                if rep is not None:
+                    rep.ref_count = max(0, rep.ref_count - 1)
+                    if rep.ref_count == 0:
+                        state.reports.pop(bid, None)
+                state.ranked_featured_builds[key] = RankedFeaturedBuildRow(
+                    season_id=row.season_id,
+                    build_key=row.build_key,
+                    season_seal_id=row.season_seal_id,
+                    starter_pet_table_id=row.starter_pet_table_id,
+                    core_skill_ids=row.core_skill_ids,
+                    appearances=row.appearances,
+                    wins=row.wins,
+                    high_tier_wins=row.high_tier_wins,
+                    featured_battle_id=0,
+                    featured_player_id=row.featured_player_id,
+                    featured_player_name=row.featured_player_name,
+                    featured_rating_centi=row.featured_rating_centi,
+                    featured_team_size=row.featured_team_size,
+                    featured_total_rounds=row.featured_total_rounds,
+                    updated_ms=row.updated_ms,
+                )
+                released += 1
+        self.featured_cache.invalidate()
+        return released
 
     def is_valid_preset_pair(self, char_preset_id: int, pet_preset_id: int) -> bool:
         return int(char_preset_id) in self._char_preset_ids and int(pet_preset_id) in self._pet_preset_ids
@@ -794,7 +874,11 @@ class RankedManager:
                         )
                     resp.history.add().CopyFrom(self._player_season_proto(s_meta, hist, hist.rating_centi))
 
-            for fb in await self.store.list_ranked_featured_builds(season.season_id, limit=5):
+            featured_rows = self.featured_cache.get(season.season_id, 5)
+            if featured_rows is None:
+                featured_rows = await self.store.list_ranked_featured_builds(season.season_id, limit=5)
+                self.featured_cache.put(season.season_id, 5, featured_rows)
+            for fb in featured_rows:
                 entry = resp.featured_builds.add(
                     build_key=fb.build_key,
                     season_seal_id=fb.season_seal_id,
@@ -1053,6 +1137,7 @@ class RankedManager:
                     player_won=(outcome_kind == 1),
                     settled_at_ms=now_ms,
                 )
+                self.featured_cache.invalidate()
 
         summary = self.protocol.message(
             "match.RankedBattleSettlementView",

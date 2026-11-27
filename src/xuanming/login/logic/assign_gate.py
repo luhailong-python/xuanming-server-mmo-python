@@ -67,10 +67,10 @@ def _fill_admit(response, admit) -> None:
 
 
 def _make_admit_signer(ctx):
-    """领票时现签：先复核放行时选定的 gate，若已排空/满载/下线则按快速通道规则重挑。"""
+    """领票时现签：先复核放行时选定的 gate，若已排空/满载/下线则按快速通道规则重挑，并绑定入队账号。"""
     protocol, config = ctx.protocol, ctx.config
 
-    async def sign(slot: AdmitSlot):
+    async def sign(slot: AdmitSlot, account: str = ""):
         chosen = GateCandidate(
             node_id=slot.node_id, ip=slot.ip, port=slot.port, zone_id=slot.zone_id, ws_url=slot.ws_url,
         )
@@ -86,12 +86,14 @@ def _make_admit_signer(ctx):
                         chosen = repicked
             except Exception:
                 logger.info("Admit gate recheck failed; signing original slot gate=%d", slot.node_id)
-        return sign_gate_token(protocol, chosen, config.gate_token_secret, config.gate_token_ttl)
+        return sign_gate_token(
+            protocol, chosen, config.gate_token_secret, config.gate_token_ttl, account=account,
+        )
 
     return sign
 
 
-async def _sign_fast_path(ctx, zone_id: int, response, player_id: int = 0):
+async def _sign_fast_path(ctx, zone_id: int, response, player_id: int = 0, account: str = ""):
     try:
         candidates = await _load_candidates(ctx, zone_id)
         candidates = select_cell_affinity_candidates(ctx.cell_router, player_id, candidates)
@@ -102,7 +104,9 @@ async def _sign_fast_path(ctx, zone_id: int, response, player_id: int = 0):
     if gate is None:
         response.status, response.error = STATUS_ERROR, "no gate available"
         return response
-    admit = sign_gate_token(ctx.protocol, gate, ctx.config.gate_token_secret, ctx.config.gate_token_ttl)
+    admit = sign_gate_token(
+        ctx.protocol, gate, ctx.config.gate_token_secret, ctx.config.gate_token_ttl, account=account,
+    )
     _fill_admit(response, admit)
     return response
 
@@ -199,7 +203,7 @@ async def run(ctx, request, details):
 
     # 3. 排队关闭时走快速通道
     if not queue_enabled:
-        return await _sign_fast_path(ctx, request.zone_id or config.zone_id, response)
+        return await _sign_fast_path(ctx, request.zone_id or config.zone_id, response, account=account)
 
     # 4. 排队开启时仅服务本 login 所属区
     if request.zone_id != config.zone_id:
@@ -215,7 +219,9 @@ async def run(ctx, request, details):
                 await queue.hold_reconnect_slot(config.zone_id, reconnecting_pid)
             except Exception:
                 logger.exception("Hold reconnect slot failed zone=%d player_id=%d", config.zone_id, reconnecting_pid)
-            return await _sign_fast_path(ctx, config.zone_id, response, player_id=reconnecting_pid)
+            return await _sign_fast_path(
+                ctx, config.zone_id, response, player_id=reconnecting_pid, account=account,
+            )
 
     # 6. 容量核算与空队列快速通道原子占位
     try:
@@ -237,12 +243,12 @@ async def run(ctx, request, details):
     if qlen == 0 and free > 0:
         budget = max(0, capacity - online)
         try:
-            reserved = await queue.try_reserve_fast_path_slot(config.zone_id, budget)
+            reserved = await queue.try_reserve_fast_path_slot(config.zone_id, budget, account=account)
         except Exception:
             logger.exception("AssignGate fast-path slot reservation failed zone=%d", config.zone_id)
             reserved = False
         if reserved:
-            return await _sign_fast_path(ctx, config.zone_id, response)
+            return await _sign_fast_path(ctx, config.zone_id, response, account=account)
 
     # 7. 入队
     try:

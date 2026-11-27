@@ -17,6 +17,7 @@ from typing import Protocol as TypingProtocol, runtime_checkable
 import grpc
 from google.protobuf.message import Message
 
+from ..dualcontrol import ApprovalMissingError, DualControlError, extract_approval, validate_admin_approval
 from ..grpc_runtime import GrpcClient, verify_service_call
 from ..login.caller_auth import AuthError, CallerVerifier, SESSION_DETAIL, parse_details
 from ..protocol import Protocol
@@ -96,6 +97,7 @@ class RankService:
         caller_verifier: CallerVerifier | None = None,
         name_reader: NameReader | None = None,
         request_budget_sec: float = 3.0,
+        allow_unapproved: bool = True,
         clock_ms: Callable[[], int] = lambda: time.time_ns() // 1_000_000,
     ) -> None:
         self.protocol = protocol
@@ -104,6 +106,7 @@ class RankService:
         self._caller_verifier = caller_verifier
         self._name_reader = name_reader
         self._budget_sec = request_budget_sec
+        self._allow_unapproved = bool(allow_unapproved)
         self._clock_ms = clock_ms
 
     def services(self) -> dict[str, dict[str, Callable]]:
@@ -269,8 +272,52 @@ class RankService:
             )
             return self._reject("rankpb.FreezeRankGenerationResponse", ERR_SERVICE_UNAVAILABLE)
 
+    async def _admit_remove_approval(self, context, caller: str, path: str, request: Message) -> None:
+        """核对 RankAdmin 删除/隐藏条目的双人复核批准记录（仅 caller=='admin' 强制，其余带了照样核）。"""
+        approval = extract_approval(request)
+        if approval is None and caller != "admin":
+            return
+        try:
+            approved = validate_admin_approval(
+                approval,
+                operator="",
+                request_id=int(request.request_id),
+                allow_unapproved=self._allow_unapproved,
+            )
+        except ApprovalMissingError:
+            logger.error(
+                "[RankAdmin] %s refused: dual-control approval record is missing caller=%s board_id=%d generation=%d request_id=%d",
+                path,
+                caller,
+                int(request.board_id),
+                int(request.generation),
+                int(request.request_id),
+            )
+            await context.abort(CODE.PERMISSION_DENIED, "dual_control_approval_required")
+        except DualControlError as exc:
+            logger.error(
+                "[RankAdmin] %s refused: %s caller=%s board_id=%d generation=%d request_id=%d",
+                path,
+                exc,
+                caller,
+                int(request.board_id),
+                int(request.generation),
+                int(request.request_id),
+            )
+            await context.abort(CODE.PERMISSION_DENIED, f"dual_control_approval_invalid: {exc}")
+        if not approved:
+            logger.error(
+                "[RankAdmin] %s accepted without a dual-control approval record caller=%s board_id=%d generation=%d request_id=%d (AdminAllowUnapproved is on)",
+                path,
+                caller,
+                int(request.board_id),
+                int(request.generation),
+                int(request.request_id),
+            )
+
     async def remove_rank_entry(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_admin(context, request, path)
+        await self._admit_remove_approval(context, caller, path, request)
         try:
             await self._with_budget(self.store.remove_entry(caller, request, hide=False))
             return self._reject("rankpb.RankAdminResponse", 0)
@@ -288,6 +335,7 @@ class RankService:
 
     async def delete_rank_generation(self, request: Message, context, path: str) -> Message:
         caller = await self._admit_admin(context, request, path)
+        await self._admit_remove_approval(context, caller, path, request)
         try:
             await self._with_budget(self.store.remove_entry(caller, request, hide=True))
             return self._reject("rankpb.RankAdminResponse", 0)
