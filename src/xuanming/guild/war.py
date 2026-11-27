@@ -174,7 +174,7 @@ class GuildWarRuleConfig:
     dividend_interval_sec: int = 3600
     dividend_guild_weekly_cap: int = 24
     dividend_player_weekly_cap: int = 12
-    dividend_min_personal_merit: int = 30
+    dividend_min_personal_merit: int = 15
     bounty_normal_silver: int = 5000
     bounty_heavy_silver: int = 15000
     bounty_public_funds: int = 2000
@@ -239,7 +239,7 @@ def load_guild_war_tables(
                 dividend_interval_sec=max(60, int(getattr(row, "dividend_interval_sec", 3600))),
                 dividend_guild_weekly_cap=int(getattr(row, "dividend_guild_weekly_cap", 24)),
                 dividend_player_weekly_cap=int(getattr(row, "dividend_player_weekly_cap", 12)),
-                dividend_min_personal_merit=int(getattr(row, "dividend_min_personal_merit", 30)),
+                dividend_min_personal_merit=int(getattr(row, "dividend_min_personal_merit", 15)),
                 bounty_normal_silver=int(getattr(row, "bounty_normal_silver", 5000)),
                 bounty_heavy_silver=int(getattr(row, "bounty_heavy_silver", 15000)),
                 bounty_public_funds=int(getattr(row, "bounty_public_funds", 2000)),

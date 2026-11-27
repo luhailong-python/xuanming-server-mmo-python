@@ -650,7 +650,7 @@ class TournamentRuleSpec:
     qualifier_max_matches: int = 6
     participation_min_matches: int = 2
     knockout_max_teams: int = 16
-    knockout_round_timeout_seconds: int = 1800
+    knockout_round_timeout_seconds: int = 14400
     qualifier_win_points: int = 3
     qualifier_draw_points: int = 1
     qualifier_loss_points: int = 0
@@ -2731,7 +2731,7 @@ class TournamentManager:
             cur.knockout_team_count = bracket_size
             if bracket_size > 0:
                 total_rounds = total_knockout_rounds(bracket_size)
-                round_window_ms = (rule.knockout_round_timeout_seconds or 1800) * 1000
+                round_window_ms = (rule.knockout_round_timeout_seconds or 14400) * 1000
                 pairs = seed_pairs(bracket_size)
                 round_matches: dict[int, list[_MatchRecord]] = {}
                 for r in range(1, total_rounds + 1):

@@ -299,6 +299,10 @@ def evaluate_weekly_silver_cap(raw_silver: int, used_this_week: int, rule: Weekl
     return out
 
 
+_BATTLE_SILVER_WEEK_MS = 7 * 86_400_000
+_BATTLE_SILVER_ROLLOVER_MAX_WEEKS = 3
+
+
 def prepare_economy_ledger(
     current_ledger,
     current_week_start_ms: int,
@@ -308,12 +312,41 @@ def prepare_economy_ledger(
     reward_rows: list[ModeRewardRow],
     rule: WeeklySilverRule | None,
 ) -> tuple[object, BattleProgressionDelta]:
-    """统一在当前周账本上计算本局最终经验、实得银两与更新后的周账本候选。"""
+    """统一在当前周账本上计算本局最终经验、实得银两与更新后的周滚存账本候选（最多滚存 3 周）。"""
     candidate = clone(current_ledger)
     delta = BattleProgressionDelta()
 
+    rule_valid = rule is not None and validate_weekly_silver_rule(rule)
     week_reset = False
     if current_week_start_ms > candidate.week_starts_at_ms:
+        prev_week_start = int(candidate.week_starts_at_ms)
+        prev_used = int(candidate.battle_silver_this_week)
+        if rule_valid:
+            assert rule is not None
+            max_soft = min(UINT64_MAX, rule.soft_cap * _BATTLE_SILVER_ROLLOVER_MAX_WEEKS)
+            max_hard = min(UINT64_MAX, rule.hard_cap * _BATTLE_SILVER_ROLLOVER_MAX_WEEKS) if rule.hard_cap > 0 else 0
+            next_soft = rule.soft_cap
+            next_hard = rule.hard_cap
+            if prev_week_start > 0:
+                stored_soft = int(getattr(candidate, "silver_rollover_soft_cap", 0))
+                stored_hard = int(getattr(candidate, "silver_rollover_hard_cap", 0))
+                prev_soft = max(rule.soft_cap, min(max_soft, stored_soft)) if stored_soft > 0 else rule.soft_cap
+                prev_hard = (
+                    (max(rule.hard_cap, min(max_hard, stored_hard)) if stored_hard > 0 else rule.hard_cap)
+                    if rule.hard_cap > 0
+                    else 0
+                )
+                elapsed_weeks = max(1, (current_week_start_ms - prev_week_start) // _BATTLE_SILVER_WEEK_MS)
+                added_weeks = min(elapsed_weeks, _BATTLE_SILVER_ROLLOVER_MAX_WEEKS)
+                carry_soft = max(0, prev_soft - prev_used)
+                next_soft = min(max_soft, max(rule.soft_cap, carry_soft + added_weeks * rule.soft_cap))
+                if rule.hard_cap > 0:
+                    carry_hard = max(0, prev_hard - prev_used)
+                    next_hard = min(max_hard, max(rule.hard_cap, carry_hard + added_weeks * rule.hard_cap))
+            if hasattr(candidate, "silver_rollover_soft_cap"):
+                candidate.silver_rollover_soft_cap = next_soft
+            if hasattr(candidate, "silver_rollover_hard_cap"):
+                candidate.silver_rollover_hard_cap = next_hard
         candidate.week_starts_at_ms = current_week_start_ms
         candidate.battle_silver_this_week = 0
         candidate.battle_exp_this_week = 0
@@ -337,10 +370,26 @@ def prepare_economy_ledger(
     used_after = int(candidate.battle_silver_this_week)
     soft_cap = 0
 
-    if rule is not None and validate_weekly_silver_rule(rule):
-        soft_cap = rule.soft_cap
+    if rule_valid:
+        assert rule is not None
+        max_soft = min(UINT64_MAX, rule.soft_cap * _BATTLE_SILVER_ROLLOVER_MAX_WEEKS)
+        max_hard = min(UINT64_MAX, rule.hard_cap * _BATTLE_SILVER_ROLLOVER_MAX_WEEKS) if rule.hard_cap > 0 else 0
+        stored_soft = int(getattr(candidate, "silver_rollover_soft_cap", 0))
+        stored_hard = int(getattr(candidate, "silver_rollover_hard_cap", 0))
+        effective_soft = max(rule.soft_cap, min(max_soft, stored_soft)) if stored_soft > 0 else rule.soft_cap
+        effective_hard = (
+            (max(rule.hard_cap, min(max_hard, stored_hard)) if stored_hard > 0 else rule.hard_cap)
+            if rule.hard_cap > 0
+            else 0
+        )
+        effective_rule = WeeklySilverRule(
+            soft_cap=effective_soft,
+            diminished_rate_permyriad=rule.diminished_rate_permyriad,
+            hard_cap=effective_hard,
+        )
+        soft_cap = effective_rule.soft_cap
         if table_silver > 0:
-            ev = evaluate_weekly_silver_cap(raw_silver, int(candidate.battle_silver_this_week), rule)
+            ev = evaluate_weekly_silver_cap(raw_silver, int(candidate.battle_silver_this_week), effective_rule)
             credited_silver = ev.credited_silver
             used_after = ev.used_after
             diminished = ev.diminished

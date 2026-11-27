@@ -204,9 +204,14 @@ class BattleSettlement:
             if self.assets.currency_blocked(data, kind):
                 del currencies[kind]
                 if kind == 0:
-                    candidate_economy.battle_silver_this_week = existing_economy.battle_silver_this_week
+                    restored_used = (
+                        int(existing_economy.battle_silver_this_week)
+                        if int(existing_economy.week_starts_at_ms) == int(candidate_economy.week_starts_at_ms)
+                        else 0
+                    )
+                    candidate_economy.battle_silver_this_week = restored_used
                     prog_delta.silver_gain = 0
-                    prog_delta.weekly_silver_used_after = int(existing_economy.battle_silver_this_week)
+                    prog_delta.weekly_silver_used_after = restored_used
                 continue
             if any(debt.currency_type == kind and carries_unknown(debt) for debt in data.currency.debts):
                 return False
@@ -214,9 +219,14 @@ class BattleSettlement:
             if error == ASSET_BLOCKED:
                 del currencies[kind]
                 if kind == 0:
-                    candidate_economy.battle_silver_this_week = existing_economy.battle_silver_this_week
+                    restored_used = (
+                        int(existing_economy.battle_silver_this_week)
+                        if int(existing_economy.week_starts_at_ms) == int(candidate_economy.week_starts_at_ms)
+                        else 0
+                    )
+                    candidate_economy.battle_silver_this_week = restored_used
                     prog_delta.silver_gain = 0
-                    prog_delta.weekly_silver_used_after = int(existing_economy.battle_silver_this_week)
+                    prog_delta.weekly_silver_used_after = restored_used
             elif error:
                 return False
         if prog_delta.ledger_changed:

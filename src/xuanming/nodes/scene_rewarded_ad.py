@@ -34,7 +34,9 @@ CURRENCY_BIND_GOLD = 3
 TX_SYSTEM_GRANT = 8
 
 DAY_MS = 86_400_000
+WEEK_MS = 7 * DAY_MS
 SHIFT_MS = 10_800_000  # UTC+8 05:00 切日
+FIRST_MONDAY_05_UTC8_MS = 3 * DAY_MS + 21 * 3_600_000  # 1970-01-05 05:00 UTC+8 切周基准
 MAX_DAILY_LIMIT = 20
 MAX_SESSION_TTL_SEC = 3600
 MAX_REWARD_AMOUNT = 100_000
@@ -87,6 +89,17 @@ def resolve_game_day(now_ms: int) -> tuple[int, int] | None:
     day_start = 0 if day_index == 0 else day_index * DAY_MS - SHIFT_MS
     next_day = (day_index + 1) * DAY_MS - SHIFT_MS
     return day_start, next_day
+
+
+def resolve_game_week(now_ms: int) -> tuple[int, int] | None:
+    """解析 now_ms 所属游戏周区间 [week_start, next_week)，切点 UTC+8 每周一 05:00。"""
+    if now_ms < FIRST_MONDAY_05_UTC8_MS:
+        return None
+    offset = (now_ms - FIRST_MONDAY_05_UTC8_MS) % WEEK_MS
+    week_start = now_ms - offset
+    if week_start > UINT64_MAX - WEEK_MS:
+        return None
+    return week_start, week_start + WEEK_MS
 
 
 def platform_bit(client_platform: int) -> int:
@@ -317,7 +330,7 @@ class SceneRewardedAd:
         data = self.scene.rows.assemble(player.snapshot)
         if not _ledger_is_valid(data.client_request_ledger):
             return self._reject(route, REWARDED_AD_UNAVAILABLE)
-        day_pair = resolve_game_day(now_val)
+        day_pair = resolve_game_week(now_val)
         if day_pair is None:
             return self._reject(route, REWARDED_AD_UNAVAILABLE)
         day_start_ms, next_day_ms = day_pair
@@ -384,7 +397,7 @@ class SceneRewardedAd:
         if int(data.level_component.level) < cfg.min_level:
             return self._reject(route, REWARDED_AD_LEVEL_NOT_ENOUGH)
 
-        day_pair = resolve_game_day(now_val)
+        day_pair = resolve_game_week(now_val)
         if day_pair is None:
             return self._reject(route, REWARDED_AD_UNAVAILABLE)
         day_start_ms, _ = day_pair
@@ -454,7 +467,7 @@ class SceneRewardedAd:
                 gold_balance=balance(data, CURRENCY_GOLD),
                 replayed=True,
             )
-            day_pair = resolve_game_day(now_val)
+            day_pair = resolve_game_week(now_val)
             cfg, _ = self._resolve_slot(int(request.slot_id))
             if day_pair is not None and cfg is not None:
                 _fill_slot_view(
@@ -487,7 +500,7 @@ class SceneRewardedAd:
         if player_level < cfg.min_level:
             return self._reject(route, REWARDED_AD_LEVEL_NOT_ENOUGH)
 
-        day_pair = resolve_game_day(now_val)
+        day_pair = resolve_game_week(now_val)
         if day_pair is None:
             return self._reject(route, REWARDED_AD_UNAVAILABLE)
         day_start_ms, next_day_ms = day_pair

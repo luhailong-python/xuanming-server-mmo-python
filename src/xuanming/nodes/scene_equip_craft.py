@@ -66,6 +66,10 @@ MATERIAL_REWARD_BONUS_UNITS = 5
 MATERIAL_REWARD_LIFETIME_LIMIT = 660
 MATERIAL_REWARD_TRADABLE_LIFETIME_LIMIT = 60
 MATERIAL_REWARD_WEEKLY_LIMIT = 150
+MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_WEEKS = 4
+MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_POOL = (
+    MATERIAL_REWARD_WEEKLY_LIMIT * MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_WEEKS
+)
 CRAFTING_MATERIAL_ID = 3001
 ENHANCEMENT_STONE_ID = 3002
 LEGACY_ENHANCEMENT_STONE_ID = 2001
@@ -121,6 +125,27 @@ class _MaterialRewardState:
     earned_this_week: int = 0
     migrated_to_v2: bool = False
     stage1_tradable_confirmed: int = 0
+    stage2_pool_cap: int = 0
+
+
+def resolve_stage2_week_state(state: _MaterialRewardState, week_start: int) -> tuple[int, int, bool]:
+    """解析阶段二滚存蓄水池状态 -> (earned, pool_cap, clock_rollback)，4 周上限 600，抗时钟回拨。"""
+    if state.week_starts_at_ms == 0:
+        return 0, MATERIAL_REWARD_WEEKLY_LIMIT, False
+    prev_cap = (
+        max(MATERIAL_REWARD_WEEKLY_LIMIT, min(MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_POOL, state.stage2_pool_cap))
+        if state.stage2_pool_cap > 0
+        else MATERIAL_REWARD_WEEKLY_LIMIT
+    )
+    if week_start < state.week_starts_at_ms:
+        return state.earned_this_week, prev_cap, True
+    if week_start == state.week_starts_at_ms:
+        return state.earned_this_week, prev_cap, False
+    elapsed_weeks = max(1, (week_start - state.week_starts_at_ms) // WEEK_MS)
+    carry = max(0, prev_cap - state.earned_this_week)
+    added_quota = min(elapsed_weeks, MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_WEEKS) * MATERIAL_REWARD_WEEKLY_LIMIT
+    pool_cap = min(MATERIAL_REWARD_WEEKLY_ROLLOVER_MAX_POOL, max(MATERIAL_REWARD_WEEKLY_LIMIT, carry + added_quota))
+    return 0, pool_cap, False
 
 
 def resolve_game_day(now_ms_val: int) -> tuple[int, int] | None:
@@ -800,6 +825,7 @@ class SceneEquipCraft:
                     earned_this_week=mem.earned_this_week,
                     migrated_to_v2=mem.migrated_to_v2,
                     stage1_tradable_confirmed=mem.stage1_tradable_confirmed,
+                    stage2_pool_cap=mem.stage2_pool_cap,
                 )
             return _MaterialRewardState(
                 day_starts_at_ms=mr.day_starts_at_ms,
@@ -813,6 +839,7 @@ class SceneEquipCraft:
                 earned_this_week=int(getattr(mr, "earned_this_week", 0)),
                 migrated_to_v2=bool(getattr(mr, "migrated_to_v2", False)),
                 stage1_tradable_confirmed=int(getattr(mr, "stage1_tradable_confirmed", 0)),
+                stage2_pool_cap=int(getattr(mr, "stage2_pool_cap", 0)),
             )
         if mem is None:
             mem = _MaterialRewardState()
@@ -836,6 +863,8 @@ class SceneEquipCraft:
             mr.earned_this_week = state.earned_this_week
             mr.migrated_to_v2 = state.migrated_to_v2
             mr.stage1_tradable_confirmed = state.stage1_tradable_confirmed
+            if hasattr(mr, "stage2_pool_cap"):
+                mr.stage2_pool_cap = state.stage2_pool_cap
             if persisted:
                 self._material_rewards.pop(player_id, None)
             elif player_id in self._material_rewards:
@@ -851,6 +880,7 @@ class SceneEquipCraft:
                     earned_this_week=state.earned_this_week,
                     migrated_to_v2=state.migrated_to_v2,
                     stage1_tradable_confirmed=state.stage1_tradable_confirmed,
+                    stage2_pool_cap=state.stage2_pool_cap,
                 )
         else:
             self._material_rewards[player_id] = state
@@ -965,17 +995,16 @@ class SceneEquipCraft:
                     max(self._account_stage1_used.get(player_id, 0) + 1, state.tradable_earned_total),
                 )
         else:
-            if week_start < state.week_starts_at_ms:
+            earned_week, pool_cap, clock_rollback = resolve_stage2_week_state(state, week_start)
+            if clock_rollback or earned_week >= pool_cap:
                 return 0, 0
-            earned_week = 0 if week_start > state.week_starts_at_ms else state.earned_this_week
-            if earned_week >= MATERIAL_REWARD_WEEKLY_LIMIT:
-                return 0, 0
-            add_total = min(gross_units, MATERIAL_REWARD_WEEKLY_LIMIT - earned_week)
+            add_total = min(gross_units, pool_cap - earned_week)
             add_tradable = 1 if (light_card_active and is_win and add_total >= MATERIAL_REWARD_BATTLE_UNITS) else 0
             if state.available_units > _MAX_UINT64 - add_total:
                 return 0, 0
             state.migrated_to_v2 = True
             state.week_starts_at_ms = week_start
+            state.stage2_pool_cap = pool_cap
             state.earned_this_week = earned_week + add_total
             state.available_units += add_total
             if add_tradable > 0:
@@ -2209,7 +2238,11 @@ class SceneEquipCraft:
             avail_tradable = min(state.available_tradable_units, state.available_units)
             batch_tradable = min(out.batch_units, avail_tradable)
             weekly_phase = state.lifetime_earned >= MATERIAL_REWARD_LIFETIME_LIMIT
-            earned_week = state.earned_this_week if (weekly_phase and state.week_starts_at_ms == week_start) else 0
+            earned_week, pool_cap, _ = (
+                resolve_stage2_week_state(state, week_start)
+                if weekly_phase
+                else (0, MATERIAL_REWARD_WEEKLY_LIMIT, False)
+            )
             out.lifetime_earned = state.lifetime_earned
             out.lifetime_limit = MATERIAL_REWARD_LIFETIME_LIMIT
             out.tradable_earned_total = self.known_account_stage1_tradable_used(player.player_id, data)
@@ -2220,7 +2253,7 @@ class SceneEquipCraft:
             out.week_starts_at_ms = week_start
             out.next_week_reset_at_ms = next_week
             out.earned_this_week = earned_week
-            out.weekly_limit = MATERIAL_REWARD_WEEKLY_LIMIT
+            out.weekly_limit = pool_cap
         else:
             weekly_phase = False
 
@@ -2233,9 +2266,9 @@ class SceneEquipCraft:
                 light_card = self._light_card_active(data, stamp)
                 out.unavailable_reason = (
                     (
-                        "完成主要战斗可获得本周材料自选份数（每周上限150份，仙途轻享卡生效中：胜局含1份可交易）。"
+                        "完成主要战斗可获得材料自选份数（每周一 05:00 +150 滚存蓄水，最多存 4 周至 600 份；仙途轻享卡生效中：胜局含 1 份可交易）。"
                         if light_card else
-                        "完成主要战斗可获得本周材料自选份数（每周上限150份，全绑定；开通仙途轻享卡可解锁胜局可交易产出）。"
+                        "完成主要战斗可获得材料自选份数（每周一 05:00 +150 滚存蓄水，最多存 4 周至 600 份，全绑定；开通仙途轻享卡可解锁胜局可交易产出）。"
                     )
                     if weekly_phase else
                     "完成主要战斗可获得首套材料自选份数（首套总池660份，无每日限制）。"
@@ -2392,6 +2425,7 @@ class SceneEquipCraft:
             earned_this_week=state.earned_this_week,
             migrated_to_v2=state.migrated_to_v2,
             stage1_tradable_confirmed=state.stage1_tradable_confirmed,
+            stage2_pool_cap=state.stage2_pool_cap,
         )
         if hasattr(staged.client_request_ledger, "material_reward"):
             self._save_reward_state(player.player_id, staged, next_state)

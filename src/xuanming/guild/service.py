@@ -80,6 +80,7 @@ from .model import (
     DEFAULT_RANK_PAGE_SIZE,
     FinalizedAssetOp,
     GuildData,
+    LIFETIME_PERIOD_KEY,
     MAX_APPLIED_OPS_PAGE_LIMIT,
     MAX_APPLIED_OPS_PLAYER_IDS,
     MAX_RANK_PAGE_SIZE,
@@ -1296,8 +1297,8 @@ class GuildService:
                     error_message=self._tip(ERR_GUILD_NOT_IN_GUILD, "not a member of the guild"),
                 )
             total_c, balance_c = contrib
-            d_key = day_key(now_ms)
-            usage = await self.store.get_counter_usage(actor.player_id, COUNTER_KIND_DONATE, (d_key,))
+            w_key = week_key(now_ms)
+            usage = await self.store.get_counter_usage(actor.player_id, COUNTER_KIND_DONATE, (w_key,))
             pending = await self.store.list_pending_ops(actor.player_id, ASSET_STREAM_GUILD_DEBIT, ASSET_OP_MAX_PENDING)
             recent = await self.store.list_recent_ops(actor.player_id, ASSET_STREAM_GUILD_DEBIT, RECENT_SCAN_LIMIT)
         except Exception as exc:
@@ -1309,7 +1310,7 @@ class GuildService:
             "guildpb.GetGuildDonateOptionsResponse",
             contribution_total=total_c,
             contribution_balance=balance_c,
-            next_daily_reset_ms=next_daily_reset_ms(now_ms),
+            next_daily_reset_ms=next_weekly_reset_ms(now_ms),
         )
         for cfg in self.store.catalog.sorted_donates():
             resp.options.add(
@@ -1320,7 +1321,7 @@ class GuildService:
                 contribution_gain=cfg.contribution_gain,
                 funds_gain=cfg.funds_gain,
                 daily_limit=cfg.daily_limit,
-                used_today=usage.get((cfg.donate_id, d_key), 0),
+                used_today=usage.get((cfg.donate_id, w_key), 0),
                 min_guild_level=cfg.min_guild_level,
                 unlocked=guild.level >= cfg.min_guild_level,
             )
@@ -1425,7 +1426,7 @@ class GuildService:
                     contribution_gain=donate_cfg.contribution_gain,
                     funds_gain=donate_cfg.funds_gain,
                     daily_limit=donate_cfg.daily_limit,
-                    period_key_val=day_key(now_ms),
+                    period_key_val=week_key(now_ms),
                     deadline_ms=deadline_ms,
                     lease_until_ms=now_ms + self._asset_op_lease_ms,
                     payload=payload,
@@ -1489,7 +1490,9 @@ class GuildService:
             _, balance_c = contrib
             d_key = day_key(now_ms)
             w_key = week_key(now_ms)
-            usage = await self.store.get_counter_usage(actor.player_id, COUNTER_KIND_SHOP, (d_key, w_key))
+            usage = await self.store.get_counter_usage(
+                actor.player_id, COUNTER_KIND_SHOP, (d_key, w_key, LIFETIME_PERIOD_KEY)
+            )
             pending = await self.store.list_pending_ops(actor.player_id, ASSET_STREAM_GUILD_CREDIT, ASSET_OP_MAX_PENDING)
             recent = await self.store.list_recent_ops(actor.player_id, ASSET_STREAM_GUILD_CREDIT, RECENT_SCAN_LIMIT)
         except Exception as exc:

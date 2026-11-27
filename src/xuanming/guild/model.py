@@ -175,6 +175,9 @@ TRIAL_LAUNCH_WINDOW_MS = 5_000
 LIMIT_PERIOD_NONE = 0
 LIMIT_PERIOD_DAILY = 1
 LIMIT_PERIOD_WEEKLY = 2
+LIMIT_PERIOD_LIFETIME = 3
+# 终身限购固定周期键（与 0=不限、6位周键 >=100000、8位日键 >=19700101 完全不相交，永不被清理任务删除）
+LIFETIME_PERIOD_KEY = 1
 
 # 角色护栏常量
 ROLE_FENCE_CALLER = "guild"
@@ -314,6 +317,8 @@ def period_key(limit_period: int, now_ms: int) -> tuple[int, bool]:
         return day_key(now_ms), True
     if limit_period == LIMIT_PERIOD_WEEKLY:
         return week_key(now_ms), True
+    if limit_period == LIMIT_PERIOD_LIFETIME:
+        return LIFETIME_PERIOD_KEY, True
     return 0, False
 
 
