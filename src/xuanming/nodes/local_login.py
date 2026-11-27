@@ -132,7 +132,12 @@ class LocalLogin:
         return self._player_accounts.get(int(player_id), "")
 
     def role_of(self, player_id: int):
-        return self._profiles.get(int(player_id))
+        role = self._profiles.get(int(player_id))
+        if role is None:
+            return None
+        copied = type(role)()
+        copied.CopyFrom(role)
+        return copied
 
     def all_roles(self) -> list[tuple[str, object]]:
         result: list[tuple[str, object]] = []
@@ -154,8 +159,9 @@ class LocalLogin:
                 setattr(profile, field, value)
 
     async def __call__(self, gate, session, route, request, seq):
+        make_error = getattr(gate, "make_error_content", None) or gate._error
         if route.service != _LOGIN_SERVICE:
-            return gate._error(request, _UNAVAILABLE)
+            return make_error(request, _UNAVAILABLE)
         payload = self.protocol.parse(route.request_type, request.body)
         response = self.protocol.message(route.response_type)
         key = session.session_id, session.incarnation
@@ -171,16 +177,20 @@ class LocalLogin:
         elif route.method == "LeaveGame":
             await gate.exit_scene(session, _EXIT_LOGOUT)
             self._forget(session)
-            session.player_id = session.scene_id = session.scene_node_id = session.owner_revision = 0
-            session.account = ""
-            session.pending_route = None
+            reset_fn = getattr(gate, "reset_session_on_leave", None)
+            if reset_fn is not None:
+                reset_fn(session)
+            else:
+                session.player_id = session.scene_id = session.scene_node_id = session.owner_revision = 0
+                session.account = ""
+                session.pending_route = None
         elif route.method == "Disconnect":
             if seq != 0 or payload.session_id != session.session_id:
-                return gate._error(request, _INVALID_PARAMETER)
+                return make_error(request, _INVALID_PARAMETER)
             self._forget(session)
             return None
         else:
-            return gate._error(request, _UNAVAILABLE)
+            return make_error(request, _UNAVAILABLE)
         return self.protocol.content(
             request.message_id, request.id, body=response.SerializeToString()
         )
@@ -279,11 +289,15 @@ class LocalLogin:
             return
         self._active[player_id] = (session.session_id, session.incarnation, generation)
         if active is not None:
-            previous_session = gate.sessions.get(active[0])
-            if previous_session is not None and previous_session is not session and (
-                previous_session.incarnation == active[1]
-            ):
-                previous_session.close()
+            close_superseded = getattr(gate, "close_superseded_session", None)
+            if close_superseded is not None:
+                close_superseded(active[0], active[1], session)
+            else:
+                previous_session = gate.sessions.get(active[0])
+                if previous_session is not None and previous_session is not session and (
+                    previous_session.incarnation == active[1]
+                ):
+                    previous_session.close()
         response.player_id = player_id
 
     def _forget(self, session) -> None:

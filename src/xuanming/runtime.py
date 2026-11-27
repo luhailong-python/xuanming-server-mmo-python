@@ -667,7 +667,7 @@ class Runtime:
             scene.register("SceneSceneClientPlayer", "TravelToZone", scene.local_zone_travel)
             if self.local_services is not None:
                 match_call = self.local_services.call_raw
-                account_secret = self.local_services._internal_secret
+                account_secret = self.local_services.internal_secret
         else:
             account_secret = secret("MMORPG_ACCOUNT_DIRECTORY_SECRET_SCENE")
             scene.travel = await create_scene_travel(scene, tables, self.settings, self.directory)
@@ -827,7 +827,7 @@ class Runtime:
             await asyncio.sleep(self.settings.scene_tick_seconds)
             now = time.monotonic()
             await self.scene.tick(min(now - previous, 0.25))
-            if getattr(self.scene, "appearance", None) is not None and self.scene.appearance._active_trials:
+            if getattr(self.scene, "appearance", None) is not None and self.scene.appearance.has_active_trials:
                 await self.scene.appearance.expire_trials()
             if self._scene_agones is not None:
                 self._scene_agones.touch_heartbeat()

@@ -124,19 +124,7 @@ class _LocalDirectoryBridge:
         gate = self.gate
         if gate is None or not player_id:
             return None
-        for session in gate.sessions.values():
-            if session.player_id == player_id and not session.writer.is_closing():
-                return session
-        return None
-
-    def _find_scene_player(self, player_id: int):
-        scene = self.scene
-        if scene is None or not player_id:
-            return None
-        location = scene.locations.get(player_id)
-        if location is None:
-            return None
-        return location.players.get(player_id)
+        return gate.find_active_session_by_player(int(player_id))
 
     def _account_for(self, player_id: int) -> str:
         session = self._find_session(player_id)
@@ -161,22 +149,17 @@ class _LocalDirectoryBridge:
                 class_id = int(role.class_id or class_id)
                 gender = int(role.gender or gender)
                 appearance_id = str(role.appearance_id or appearance_id)
-        player = self._find_scene_player(player_id)
-        if player is not None:
+        if self.scene is not None:
             try:
-                data = self.scene.rows.assemble(player.snapshot)
-                if data.profile_component.name:
-                    name = str(data.profile_component.name)
-                if data.level_component.level:
-                    level = int(data.level_component.level)
-                if getattr(data.uint32_pb_component, "class", 0):
-                    class_id = int(getattr(data.uint32_pb_component, "class"))
-                if data.profile_component.gender:
-                    gender = int(data.profile_component.gender)
-                if data.profile_component.appearance_id:
-                    appearance_id = str(data.profile_component.appearance_id)
+                brief = self.scene.snapshot_player_brief(player_id)
+                if brief is not None:
+                    name = str(brief["name"] or name)
+                    level = int(brief["level"] or level)
+                    class_id = int(brief["class_id"] or class_id)
+                    gender = int(brief["gender"] or gender)
+                    appearance_id = str(brief["appearance_id"] or appearance_id)
             except Exception:
-                logger.debug("local directory assemble failed player_id=%s", player_id, exc_info=True)
+                logger.debug("local directory snapshot brief failed player_id=%s", player_id, exc_info=True)
         return PlayerBrief(
             name=name or f"player-{player_id}",
             level=level,
@@ -375,7 +358,7 @@ class _LocalGatePusher:
         msg_id = self.protocol.message_ids.get("ClientPlayerChatNotifyWorldChat")
         if msg_id is None:
             return
-        gate._broadcast_all(self.protocol.content(msg_id, body=message.SerializeToString()))
+        gate.broadcast_content(self.protocol.content(msg_id, body=message.SerializeToString()))
 
     async def push_world_retract(self, notify: Message) -> None:
         gate = self.bridge.gate
@@ -384,7 +367,7 @@ class _LocalGatePusher:
         msg_id = self.protocol.message_ids.get("ClientPlayerChatNotifyWorldChatRetracted")
         if msg_id is None:
             return
-        gate._broadcast_all(self.protocol.content(msg_id, body=notify.SerializeToString()))
+        gate.broadcast_content(self.protocol.content(msg_id, body=notify.SerializeToString()))
 
     # -- FriendPusher --------------------------------------------------------------------------
 
@@ -439,8 +422,8 @@ class _LocalGatePusher:
 
     async def refresh_scene(self, player_id: int) -> None:
         scene = self.bridge.scene
-        if scene is not None and getattr(scene, "team", None) is not None:
-            scene.team.hint(int(player_id))
+        if scene is not None:
+            scene.hint_team_refresh(int(player_id))
 
 
 class _LocalBattleNodeResolver:
@@ -605,6 +588,10 @@ class LocalServiceHub:
         self._signer: Ed25519PrivateKey | None = None
         self.chat = None
         self.mail_sender = _LocalMailSender(self)
+
+    @property
+    def internal_secret(self) -> bytes:
+        return self._internal_secret
 
     @property
     def tables(self) -> ConfigTables:

@@ -1177,6 +1177,10 @@ class SceneAppearance:
     def departed(self, player_id: int) -> None:
         self._active_trials.pop(player_id, None)
 
+    @property
+    def has_active_trials(self) -> bool:
+        return bool(self._active_trials)
+
     async def expire_trials(self, now_sec: int | None = None) -> list[int]:
         """扫描已到期的试用形象，还原为永久形象并广播变更与状态推送；返回本次还原的玩家 ID 列表。"""
         now_unix = self.now_s() if now_sec is None else int(now_sec)
