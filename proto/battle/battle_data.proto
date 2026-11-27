@@ -706,6 +706,9 @@ message BattleTrialJournalFacts {
   bool all_self_cleaves_parried = 24;          // 首领试炼 V2：本人及本人宝宝被重劈点名>=1次且100%合法化解(不含倒地/退出取消)
   bool self_parried_cleave_at_least_once = 25; // 首领试炼 V2：本人或本人宝宝至少合法化解过 1 次重劈
   uint32 challenge_vow_mask = 26;              // 五行试炼志 V3：本局生效的自选试炼誓约位掩码（0..15）
+  bool self_cast_season_skill = 27;            // 五行试炼志 V4：本人本场至少施放过 1 次当季免费赛季主动技能
+  bool self_triggered_season_resonance = 28;   // 五行试炼志 V4：本人本场至少触发过 1 次技印共鸣（R1..R8）
+  uint32 self_season_resonance_mask = 29;      // 五行试炼志 V4：本人本场触发过的技印共鸣位掩码（bit = resonance_kind - 1）
 }
 
 // ---- 全服赛季战队锦标赛《群仙问道赛》V2：BO3 与五行灵脉阵眼开局冻结上下文(docs/design/season-team-tournament-v2.md) ----

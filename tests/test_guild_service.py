@@ -787,10 +787,10 @@ async def test_upgrade_economy_and_activities():
         assert resp_t.error_message.id == ERR_GUILD_ACTIVITY_NOT_OPEN
 
         # 实表默认关闭所有日常/强在线帮会活动（反上班化）；确认默认全关后，显式启用内存行以继续覆盖灯会与团圆状态机。
+        from dataclasses import replace as _replace_dc
         assert all(a.state == ACTIVITY_STATE_DISABLED for a in acts.activities)
-        h.store.catalog = replace(
-            h.store.catalog,
-            activities=tuple(replace(r, enabled=True) if r.activity_id == 1 else r for r in h.store.catalog.activities),
+        h.store.catalog.activities = tuple(
+            _replace_dc(r, enabled=True) if r.activity_id == 1 else r for r in h.store.catalog.activities
         )
 
         # 元宵灯会（activity_id=1，无物品奖励，阈值 3，资金 500）
@@ -817,9 +817,9 @@ async def test_upgrade_economy_and_activities():
 
     # 再测 asset_op_enabled=True 时的捐献/商店入队、幂等键与中秋团圆领奖（带物品奖励）
     async with GuildTestHarness(asset_op_enabled=True) as h:
-        h.store.catalog = replace(
-            h.store.catalog,
-            activities=tuple(replace(r, enabled=True) if r.activity_id == 2 else r for r in h.store.catalog.activities),
+        from dataclasses import replace as _replace_dc
+        h.store.catalog.activities = tuple(
+            _replace_dc(r, enabled=True) if r.activity_id == 2 else r for r in h.store.catalog.activities
         )
         h.register_player(101, zone_id=1, online=True)
         h.register_player(102, zone_id=1, online=True)

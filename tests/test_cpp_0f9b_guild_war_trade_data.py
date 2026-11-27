@@ -909,7 +909,7 @@ def test_guild_war_v2_full_rules_and_invariants():
 
             # 8) 每小时灵脉分红 + 每周战功里程碑宝箱 + 换帮不重领防白嫖
             now[0] += 2 * 3_600_000 + 1000  # 推进 2 小时 -> 灵脉 1 产出 2 份分红
-            svc.war._ensure_weekly(gid1, svc.war._ensure_player(102, 1, now[0]).weekly_week_key, now[0]).guild_merit = 1500
+            svc.war._ensure_weekly(gid1, svc.war._ensure_player(102, 1, now[0]).weekly_week_key, now[0]).guild_merit = 900
             svc.war._ensure_weekly(gid2, svc.war._ensure_player(102, 1, now[0]).weekly_week_key, now[0]).guild_merit = 6500
             svc.war._ensure_player(102, 1, now[0]).weekly_merit = 50
 
