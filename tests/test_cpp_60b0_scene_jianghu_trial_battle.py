@@ -318,7 +318,7 @@ def test_jianghu_tcp_rpc_eligibility_fee_settlement_and_clear_mark(tmp_path):
                         await control.call("/scene_node.SceneNodeGrpc/PrepareBattle", prep_void.SerializeToString()),
                     )
                     assert not ready_void.error_message.id
-                    assert balance(scene.rows.assemble(player.snapshot), 0) == 4000
+                    assert balance(scene.rows.assemble(player.snapshot), 0) == 4500
                     await scene.battle.confirm(
                         p.message("BattleConfirmedEvent", player_id=1, battle_id=5003, deadline_ms=now + 60_000)
                     )
@@ -400,7 +400,7 @@ def test_jianghu_tcp_rpc_eligibility_fee_settlement_and_clear_mark(tmp_path):
                             await asyncio.sleep(0.02)
 
                     saved = scene.rows.assemble(player.snapshot)
-                    assert balance(saved, 0) == 4500  # 生死状零银两产出
+                    assert balance(saved, 0) == 5000  # 生死状零银两产出
                     assert saved.level_component.level == level_before
                     assert saved.level_component.total_exp == exp_before  # 零经验产出
                     assert scene.assets.removable_count(saved, DEFAULT_GOLD_WRIT_ITEM_ID) == 1  # 消耗 1 张金帖
@@ -421,14 +421,14 @@ def test_jianghu_tcp_rpc_eligibility_fee_settlement_and_clear_mark(tmp_path):
                     assert not clear_resp.error_message.id
                     assert clear_resp.replayed is False
                     assert clear_resp.profile.has_active_defeat_mark is False
-                    assert clear_resp.profile.silver_balance == 3500
+                    assert clear_resp.profile.silver_balance == 4000
 
                     replay_resp = await client.rpc(
                         rpc_id["SceneJianghuClientPlayerClearJianghuDefeatMark"], 6, clear_silver_req,
                     )
                     assert not replay_resp.error_message.id
                     assert replay_resp.replayed is True
-                    assert replay_resp.profile.silver_balance == 3500
+                    assert replay_resp.profile.silver_balance == 4000
 
                     mismatch_resp = await client.rpc(
                         rpc_id["SceneJianghuClientPlayerClearJianghuDefeatMark"], 7,

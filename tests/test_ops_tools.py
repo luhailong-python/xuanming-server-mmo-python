@@ -340,7 +340,7 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
         f"{res_a.manifest.bundle_sha256}  {bundle_a.name}\n"
     )
     sidecar_manifest = json.loads(res_a.manifest_path.read_text(encoding="utf-8"))
-    assert sidecar_manifest["version"] == "101"
+    assert sidecar_manifest["version"] == "104"
     assert sidecar_manifest["bundle_sha256"] == res_a.manifest.bundle_sha256
     assert len(sidecar_manifest["files"]) == 169
 
@@ -358,7 +358,7 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert (dest_dir / DESCRIPTOR_FILENAME).read_bytes() == DESCRIPTORS_FILE.read_bytes()
 
     loaded_tables = ConfigTables(dest_dir, fmt="pb", descriptor_set=dest_dir / DESCRIPTOR_FILENAME)
-    assert loaded_tables.version == 101
+    assert loaded_tables.version == 104
     assert len(loaded_tables.tables) == 83
 
 
