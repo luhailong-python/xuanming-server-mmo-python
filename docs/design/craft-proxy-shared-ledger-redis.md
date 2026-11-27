@@ -53,7 +53,8 @@
    6. 提交抛错时，看待存盘行还在不在：不在（如 `StoreRejected`）说明确定没写进去，归还；还在（如 `StoreUnavailable`）说明结果未知，场景下一次落盘会重试这批行，所以不归还，只扣镜像；
    7. 成功 → 镜像扣掉取走的部分，再把摊位写穿（口碑与雅号变了）。
 3. **刷新**：`refresh_loop` 在 runtime 配了 `scene_control_redis` 时启动，每 5 秒一次，启动时先刷一次。
-   - 一次非事务 pipeline 发出三条命令：摊位目录 `HGETALL`、待回账表 `HGETALL`，以及求和脚本 `SUM_PROXY_HOT_LUA` 的 `EVAL`（KEYS 为当前小时与前 23 个小时共 24 个热榜桶）。用结果覆盖摊位、待回账、热榜三份镜像；求和应答形状不对（结果未知）时只保留旧的热榜；
+   - 一次非事务 pipeline 发出三条命令：摊位目录 `HGETALL`、待回账表 `HGETALL`，以及求和脚本 `SUM_PROXY_HOT_LUA` 的 `EVAL`（KEYS 为当前小时与前 23 个小时共 24 个热榜桶）。用结果覆盖摊位、待回账、热榜三份镜像；
+   - 三条命令各自成败：`execute(raise_on_error=False)`，与 C++ 三条命令各有回调相同。某条报错（比如键类型不对、脚本出错）或求和应答形状不对时，只保留那一份旧镜像，另外两份照常刷新。原先一条报错整次刷新作废，摊位目录和待回账会跟着停刷；
    - 给本节点在线、镜像里有待回账提示的宗师投回账任务；
    - Redis 故障只告警，保留旧镜像；
    - 刷新里出了意料之外的异常（非 Redis 故障，比如解析代码的缺陷），循环也只 `logger.exception` 一下，下一轮照刷。runtime 把任何后台任务结束都当成节点故障并停机，为展示用的目录停掉整个 scene 不值得。C++ 的定时器同样不会因为一次应答处理出错而停。
@@ -126,7 +127,7 @@
 ## 6. 执行步骤
 
 - [x] 代码：`src/xuanming/nodes/scene_skill_craft.py`、`src/xuanming/nodes/scene.py`、`src/xuanming/nodes/scene_equip_craft.py`、`src/xuanming/runtime.py`
-- [x] 单测：新增 `tests/test_craft_proxy_reputation_ledger.py`（13 例，含热榜窗口滚动与刷新循环不退出）；改 `tests/test_actor_isolation.py`（锁忙转投那条改走 `FakeRedis` 台账）、`tests/test_cpp_60b0_skill_wanted_and_rent.py`（`record_pending_reputation` → `record_order`）；`tests/login_fakes.py` 的 `FakeRedis` 补 `hset` / `hdel` / `hgetall` / `hincrby` / `expire`
+- [x] 单测：新增 `tests/test_craft_proxy_reputation_ledger.py`（14 例，含热榜窗口滚动、刷新循环不退出、刷新三条命令各自成败）；改 `tests/test_actor_isolation.py`（锁忙转投那条改走 `FakeRedis` 台账）、`tests/test_cpp_60b0_skill_wanted_and_rent.py`（`record_pending_reputation` → `record_order`）；`tests/login_fakes.py` 的 `FakeRedis` 补 `hset` / `hdel` / `hgetall` / `hincrby` / `expire`
 - [x] C++ 热榜窗口：`cpp/libs/services/scene/player/system/player_craft.{h,cpp}` 与 `cpp/tests/bag_test/player_craft_quality_test.cpp`（C++ 仓，编译与 GTest 交 Gemini，命令见 C++ 仓 `docs/PROGRESS.md` 2026-11-27「热榜读取改走台账接缝」一条）
 - [ ] Gemini 运行（仓库根目录）：
   - `.venv\Scripts\python -m pytest -q tests/test_craft_proxy_reputation_ledger.py tests/test_actor_isolation.py`

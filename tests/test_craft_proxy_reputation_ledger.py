@@ -479,3 +479,34 @@ def test_refresh_loop_survives_unexpected_errors(monkeypatch):
 
     asyncio.run(run())
     assert calls == [0, 1]
+
+
+def test_refresh_parts_fail_independently(tmp_path):
+    # 同 C++ 三条刷新命令各自回调：求和脚本报错只保留旧热榜，摊位目录与待回账照常刷新。
+    async def run():
+        redis = craft_ledger_redis()
+        scene = await _scene_with_players(tmp_path, redis, 1)
+        directory = scene.craft_proxy_directory
+        try:
+            await directory.record_order(300, 1, 0, 0, "")
+            await directory.refresh(scene)
+            assert directory.hot_window()[300].orders == 1
+
+            def broken_sum(_keys, _argv):
+                raise RuntimeError("ERR user_script: simulated Lua failure")
+
+            redis.scripts[SUM_PROXY_HOT_LUA] = broken_sum
+            remote = scene.protocol.message(
+                "CraftProxyStallInfo", master_player_id=301, master_name="远端宗师",
+                scroll_mastery_tier=3, proxy_scroll_fee_gold=90,
+            )
+            redis.data[_STALLS] = {b"301": remote.SerializeToString()}
+            redis.data[_LEDGER][b"301:o"] = b"2"
+            await directory.refresh(scene)
+            assert directory.hot_window()[300].orders == 1
+            assert directory.find(301) is not None
+            assert directory.has_pending(301)
+        finally:
+            await scene.close()
+
+    asyncio.run(run())

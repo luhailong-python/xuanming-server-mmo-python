@@ -29,8 +29,17 @@ class Pipeline:
     def __getattr__(self, name):
         return lambda *args, **kwargs: self.calls.append((name, args, kwargs))
 
-    async def execute(self):
-        return [await getattr(self.redis, name)(*args, **kwargs) for name, args, kwargs in self.calls]
+    async def execute(self, raise_on_error=True):
+        # 同 redis-py：raise_on_error=False 时某条命令报错就把异常放在它的结果位上，其余命令照常返回。
+        results = []
+        for name, args, kwargs in self.calls:
+            try:
+                results.append(await getattr(self.redis, name)(*args, **kwargs))
+            except Exception as exc:
+                if raise_on_error:
+                    raise
+                results.append(exc)
+        return results
 
 
 class FakeRedis:

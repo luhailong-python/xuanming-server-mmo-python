@@ -728,17 +728,24 @@ class CraftProxyStallDirectory:
         pipe.hgetall(self._ledger_key)
         pipe.eval(SUM_PROXY_HOT_LUA, len(hot_keys), *hot_keys)
         try:
-            stalls_raw, ledger_raw, hot_reply = await pipe.execute()
+            # 三条命令各自成败（同 C++ 三条命令各自的回调）：哪条报错只保留那一份旧镜像，不拖累另外两份。
+            stalls_raw, ledger_raw, hot_reply = await pipe.execute(raise_on_error=False)
         except Exception as exc:
             if not _redis_failure(exc):
                 raise
             logger.warning("Craft proxy directory refresh failed; keeping cached stalls and counters error=%s", exc)
             return
-        self._stalls = self._parse_stalls(stalls_raw)
-        self._pending_reputation = _parse_reputation_ledger(ledger_raw)
-        hot_totals = _parse_hot_totals(hot_reply)
+        if isinstance(stalls_raw, Exception):
+            logger.warning("Craft proxy stall refresh failed; keeping cached stalls error=%s", stalls_raw)
+        else:
+            self._stalls = self._parse_stalls(stalls_raw)
+        if isinstance(ledger_raw, Exception):
+            logger.warning("Craft proxy reputation refresh failed; keeping cached pending error=%s", ledger_raw)
+        else:
+            self._pending_reputation = _parse_reputation_ledger(ledger_raw)
+        hot_totals = None if isinstance(hot_reply, Exception) else _parse_hot_totals(hot_reply)
         if hot_totals is None:
-            logger.warning("Unexpected hot ranking reply shape; keeping cached counters reply=%r", hot_reply)
+            logger.warning("Craft proxy hot ranking refresh failed or malformed; keeping cached counters reply=%r", hot_reply)
         else:
             self._hot_refreshed_totals = hot_totals
             self._hot_local_buckets.clear()
