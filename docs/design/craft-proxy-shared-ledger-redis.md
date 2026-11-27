@@ -30,17 +30,18 @@
 | `craft_proxy_stall:{ctl:<zone>}` | `<宗师 player_id 十进制>` | `CraftProxyStallInfo` 二进制 | 宗师所在节点开摊、收摊、回账后写穿（`HSET` / `HDEL`） | 各节点每 5 秒 `HGETALL` |
 | `craft_proxy_reputation:{ctl:<zone>}` | `<M>:o` / `:s` / `:r` / `:g` | 待回账单数 / 极品数 / 稀世数 / 净银两（`HINCRBY`） | 买家所在节点；归还时宗师所在节点 | 刷新与取走 |
 | 同上 | `<M>:b` | 最近一位买家角色名（`HSET` 覆盖） | 同上 | 同上 |
-| 同上 | `<M>:24o` / `:24s` | 热榜单数 / 极品数（`HINCRBY`） | 买家所在节点 | 刷新；回账不取 |
+| `craft_proxy_hot:{ctl:<zone>}:<UTC 秒 // 3600>` | `<M>:o` / `:s` | 这一个小时的热榜单数 / 极品数（`HINCRBY`，每写一次 `EXPIRE` 续 25 小时） | 买家所在节点 | 刷新读当前小时与前 23 个小时共 24 个桶；回账不取 |
 
 - 取走脚本 `TAKE_PROXY_REPUTATION_LUA` 与 C++ `kTakeProxyReputationLua` 同文，单测钉死文本。
 - 解析口径照 C++：负数（旧版回账多扣出来的）与非数字按 0，超出 int64 封顶，u32 计数饱和；取走应答不是 5 项数组、或元素不是字符串 / nil，算结果未知。
-- 两个哈希同一个 hash tag `{ctl:<zone>}`，与本仓 `scene_manager/keys.py` 的控制域一致。
+- 所有键同一个 hash tag `{ctl:<zone>}`（同槽），与本仓 `scene_manager/keys.py` 的控制域一致。
+- 待回账表里早先的 `<M>:24o` / `:24s` 已停用（只累加不归零，见 §2.4），读到按未知后缀跳过。
 
 ### 2.2 流程
 
 1. **记账（买家的任务）**：`craft_skill_book` 与 `commit_equipment_craft` 在买家提交成功后调 `record_proxy_order_reputation`：
-   - 本节点镜像先累加热榜与待回账；
-   - 一次非事务 pipeline 发出 `HINCRBY :24o/:24s/:o/:s/:r/:g`，买家名非空时再发 `HSET :b`；为 0 的项不发，`:g` 只写 `(0, int64]`；
+   - 本节点镜像先累加待回账，并在当前小时的热榜桶里加一笔；
+   - 一次非事务 pipeline 发出待回账 `HINCRBY :o/:s/:r/:g`，买家名非空时再发 `HSET :b`；为 0 的项不发，`:g` 只写 `(0, int64]`。同一个 pipeline 里再给当前小时的热榜桶 `HINCRBY <M>:o 1`，有极品时加 `<M>:s`，最后对这个桶 `EXPIRE 90000`；
    - 等 pipeline 返回再往下走，保证随后投的回账能取到这一笔；
    - 宗师在本节点在线 → `scene.schedule_player_task(宗师, 回账)`；不在 → 什么都不做。他所在的节点在 5 秒内刷新时会看到，他上线时也会回账。
 2. **回账（宗师自己的锁内）**：`drain_pending_proxy_reputation(scene, 宗师)`。调用点有：进场 `_load_player`，宗师自己的 `GetSkillCraftingState`、`SetCraftProxyStall`、`AckCraftProxyDigest`，记账投来的回账任务，以及刷新后投的回账任务。
@@ -52,12 +53,31 @@
    6. 提交抛错时，看待存盘行还在不在：不在（如 `StoreRejected`）说明确定没写进去，归还；还在（如 `StoreUnavailable`）说明结果未知，场景下一次落盘会重试这批行，所以不归还，只扣镜像；
    7. 成功 → 镜像扣掉取走的部分，再把摊位写穿（口碑与雅号变了）。
 3. **刷新**：`refresh_loop` 在 runtime 配了 `scene_control_redis` 时启动，每 5 秒一次，启动时先刷一次。
-   - `HGETALL` 两张表，覆盖摊位、待回账、热榜三份镜像；
+   - 一次非事务 pipeline 发出三条命令：摊位目录 `HGETALL`、待回账表 `HGETALL`，以及求和脚本 `SUM_PROXY_HOT_LUA` 的 `EVAL`（KEYS 为当前小时与前 23 个小时共 24 个热榜桶）。用结果覆盖摊位、待回账、热榜三份镜像；求和应答形状不对（结果未知）时只保留旧的热榜；
    - 给本节点在线、镜像里有待回账提示的宗师投回账任务；
-   - Redis 故障只告警，保留旧镜像。
+   - Redis 故障只告警，保留旧镜像；
+   - 刷新里出了意料之外的异常（非 Redis 故障，比如解析代码的缺陷），循环也只 `logger.exception` 一下，下一轮照刷。runtime 把任何后台任务结束都当成节点故障并停机，为展示用的目录停掉整个 scene 不值得。C++ 的定时器同样不会因为一次应答处理出错而停。
 4. **写穿**：`sync_player` 在摊位合格时更新镜像并 `HSET`；不合格时，若镜像里原来有、或已收摊，就删镜像并 `HDEL`。条件同 C++ `SyncPlayerProxyStall`。
 5. **买家解析摊位**：`find(master_id, scene=...)` 同 C++ `ResolveSharedProxyStall`。宗师在本节点在线时以他的存档为准（不可写就找不到），否则查镜像。补这一条是因为镜像现在会被整表刷新覆盖：宗师开摊那次写穿若失败，刷新会把他从镜像里抹掉，可他明明就在本节点，本节点的买家应该能找到他。
-6. **西市列表**：`list_stalls` 逻辑未改：取镜像摊位与本节点在线宗师的实时快照，叠加待回账镜像 `(o, s, r)` 与热榜镜像，Top 3 评选与 C++ 一致。
+6. **西市列表**：`list_stalls` 取镜像摊位与本节点在线宗师的实时快照，叠加待回账镜像 `(o, s, r)` 与近 24 小时热榜（`hot_window()`），Top 3 评选与 C++ 一致。遍历在线玩家改为按 `locations`（player_id → 所在世界）一人一次：原先按世界去重遍历，每个在线玩家都把他所在世界的全部玩家扫一遍，开销是在线人数的平方。
+
+### 2.4 热榜近 24 小时：按小时分桶（11-27，C++ 与 Python 同改）
+
+- **问题**：原先热榜单数 / 极品数是待回账表里的 `<M>:24o` / `:24s`，只 `HINCRBY +`，从不过期也不扣减，「近 24 小时」实际是开摊以来的累计，几天后热榜就成了老宗师的累计榜。C++ 原实现如此，Python 移植时照搬，核对时发现。
+- **方案**：与 C++ 设计稿 §2.6 相同。每个 UTC 小时一个桶 `craft_proxy_hot:{ctl:<zone>}:<hour>`，成交写当前小时，每写一次续 25 小时过期；近 24 小时 = 当前小时与前 23 个小时的桶之和，实际覆盖 23～24 小时。
+- **读法与 C++ 相同**：用同一段只读求和脚本，`SUM_PROXY_HOT_LUA` 与 C++ `kSumProxyHotLua` 逐字节一致，单测钉文本。KEYS 取 `proxy_hot_window_bucket_keys(zone, 当前小时)`，同 C++ `ProxyHotWindowBucketKeys`。Redis 端按宗师求和，一次往返；数据量由桶的 TTL 封顶。
+- **本节点镜像分两部分**：
+  - `_hot_refreshed_totals`：上次整表刷新读回的近 24 小时之和；
+  - `_hot_local_buckets`：之后本节点按 UTC 小时记下的成交。
+  - `hot_window()` 返回两者之和，并丢掉比窗口更早的本地桶。下次刷新成功时，桶和接替整个镜像，本地桶清空：这些成交已在 Redis 里，不会重复计。
+  - 本地单进程模式没有刷新，只有本地桶，窗口靠它按小时滚动，镜像也不会无限长。
+- **11-27 中途改过一次**：起初 Python 用 pipeline 读回 24 个桶、在本地求和，数据格式与 C++ 相同。按统筹会话「Lua 与 C++ 逐字节一致」的要求改成现在这样：两边只维护一段读法，真实 Redis 上也只需验证一段脚本。
+- **被否决的做法**：同 C++ §2.6，即表内按小时加字段由刷新方删、有序集合记每笔成交、自然日清零。
+
+### 2.5 本轮顺带修掉的两处
+
+- **刷新循环不因意外异常退出**：见上文 2.2 第 3 步。
+- **西市列表的平方级遍历**：见上文 2.2 第 6 步。`_find_online_player_in_scene` 也改为按 `locations` O(1) 直取，刷新后给待回账宗师逐个判断在线不再遍历全部在线玩家。
 
 ### 2.3 运行模式
 
@@ -89,6 +109,10 @@
 | 计数溢出 | u32 饱和、int64 封顶；`:g` 只写 `(0, int64]` |
 | 待回账宗师很多 | 刷新后按镜像逐个 O(1) 查是否在线，不遍历全部在线玩家 |
 | Redis 卡住 | 客户端 3 秒超时；这期间买家的代打请求在订单已提交后最多多等 3 秒，展示计数照丢 |
+| 热榜只累加不归零 | 按 UTC 小时分桶、桶带 25 小时过期，只加近 24 个桶（§2.4） |
+| 本地单进程热榜镜像无限长 | `hot_window()` 求和时丢掉比窗口更早的桶 |
+| 刷新代码出意料之外的异常 | 循环记日志后继续，不让后台任务结束（否则 runtime 判节点故障停机） |
+| 西市列表在线人数大时变慢 | 按 `locations` 一人一次遍历，不再是在线人数的平方 |
 
 ## 5. 步骤分析
 
@@ -96,12 +120,14 @@
 2. 改写 `scene_skill_craft.py` 里的目录与回账，删掉买家任务里当场提交宗师存档的分支和不再使用的 `_get_player_lock`。
 3. 调整调用点：`scene.py` 进场写穿改成 `await`；`scene_equip_craft.py` 与制书路径解析摊位时带上 `scene`。
 4. `runtime.py` 按 `scene_control_redis` 建目录，配了就起刷新循环。
-5. 单测：仓内 `FakeRedis` 补通用哈希命令，取走脚本写成 Python 双生体。
+5. 单测：仓内 `FakeRedis` 补通用哈希命令与 `expire`，取走脚本写成 Python 双生体。
+6. 热榜窗口：C++（权威）与 Python 同改为小时分桶，C++ 设计稿 §2.6 写定键、写法、读法与被否决的做法；Java 登记 `PARITY.md` 待做。
 
 ## 6. 执行步骤
 
 - [x] 代码：`src/xuanming/nodes/scene_skill_craft.py`、`src/xuanming/nodes/scene.py`、`src/xuanming/nodes/scene_equip_craft.py`、`src/xuanming/runtime.py`
-- [x] 单测：新增 `tests/test_craft_proxy_reputation_ledger.py`；改 `tests/test_actor_isolation.py`（锁忙转投那条改走 `FakeRedis` 台账）、`tests/test_cpp_60b0_skill_wanted_and_rent.py`（`record_pending_reputation` → `record_order`）；`tests/login_fakes.py` 的 `FakeRedis` 补 `hset` / `hdel` / `hgetall` / `hincrby`
+- [x] 单测：新增 `tests/test_craft_proxy_reputation_ledger.py`（13 例，含热榜窗口滚动与刷新循环不退出）；改 `tests/test_actor_isolation.py`（锁忙转投那条改走 `FakeRedis` 台账）、`tests/test_cpp_60b0_skill_wanted_and_rent.py`（`record_pending_reputation` → `record_order`）；`tests/login_fakes.py` 的 `FakeRedis` 补 `hset` / `hdel` / `hgetall` / `hincrby` / `expire`
+- [x] C++ 热榜窗口：`cpp/libs/services/scene/player/system/player_craft.{h,cpp}` 与 `cpp/tests/bag_test/player_craft_quality_test.cpp`（C++ 仓，编译与 GTest 交 Gemini，命令见 C++ 仓 `docs/PROGRESS.md` 2026-11-27「热榜读取改走台账接缝」一条）
 - [ ] Gemini 运行（仓库根目录）：
   - `.venv\Scripts\python -m pytest -q tests/test_craft_proxy_reputation_ledger.py tests/test_actor_isolation.py`
   - `.venv\Scripts\python -m pytest -q tests/test_cpp_60b0_skill_wanted_and_rent.py tests/test_latest_cpp_sync_systems.py`
@@ -111,5 +137,5 @@
 
 ## 7. 已知边界
 
-- 热榜字段名带 24h，但 C++ 实现只累加，不衰减也不过期；Python 照 C++。口径要改须 C++ 与 Python 同改。
-- Java 版用自己的键（`<ns>:world:{z:<zone>}:craft-proxy-reputation`）。双版本只共享客户端契约，Java 不与 C++/Python 同区混跑，本任务不涉及 Java 代码。
+- 热榜窗口按整小时分桶，实际覆盖 23～24 小时；Redis 断连期间热榜不衰减（保留旧镜像），恢复后第一次刷新即纠正。
+- Java 版用自己的键（`<ns>:world:{z:<zone>}:craft-proxy-reputation`）。双版本只共享客户端契约，Java 不与 C++/Python 同区混跑；Java 热榜仍是累计，已登记 Java 仓 `PARITY.md` 待做，本任务不写 Java 代码。

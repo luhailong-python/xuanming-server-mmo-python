@@ -196,6 +196,12 @@ class FakeRedis:
         if self._alive(key) is not None:
             self._px(key, ms)
 
+    async def expire(self, key, seconds):
+        if self._alive(key) is None:
+            return 0
+        self._px(key, int(seconds) * 1000)
+        return 1
+
     async def hmget(self, key, *fields):
         return [self._hget(key, field) for field in fields]
 

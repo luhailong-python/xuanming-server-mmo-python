@@ -368,13 +368,19 @@ class PendingProxyReputation:
 
 @dataclass(slots=True)
 class HotProxyCounters:
-    orders_24h: int = 0
-    supreme_24h: int = 0
+    """热榜计数：一个小时桶里的，或近 24 小时各桶之和。"""
+
+    orders: int = 0
+    supreme: int = 0
 
 
-# ── 名匠代打共享摊位目录与口碑台账：按区控制 Redis 的两个哈希，键、字段与取走脚本和 C++ player_craft.cpp 逐字节一致，
+# ── 名匠代打共享摊位目录与口碑台账：按区控制 Redis 的哈希，键、字段与取走脚本和 C++ player_craft.cpp 逐字节一致，
 #    混跑时两版读写同一份（设计见 docs/design/craft-proxy-shared-ledger-redis.md）。
 PROXY_DIRECTORY_REFRESH_INTERVAL_SEC = 5.0
+# 西市热榜按 UTC 小时分桶：近 24 小时 = 当前小时与前 23 个小时的桶之和；桶每写一次续 25 小时过期，出窗后自然消失。
+PROXY_HOT_WINDOW_HOURS = 24
+_PROXY_HOT_BUCKET_TTL_SEC = 25 * 3600
+_MS_PER_HOUR = 3_600_000
 # 取走 = 同一段脚本里先 HMGET 再 HDEL：两个节点同时取同一名宗师，只有先执行的一方拿到值；热榜的 :24o / :24s 不取。
 TAKE_PROXY_REPUTATION_LUA = (
     "local k=KEYS[1] local p=ARGV[1] "
@@ -382,8 +388,19 @@ TAKE_PROXY_REPUTATION_LUA = (
     "redis.call('HDEL',k,p..':o',p..':s',p..':r',p..':g',p..':b') "
     "return v"
 )
+# 近 24 小时热榜 = KEYS 里的小时桶按字段求和（只读，同槽一次执行读完），应答同 HGETALL 的字段、值交替；与 C++ kSumProxyHotLua 同文。
+SUM_PROXY_HOT_LUA = (
+    "local acc={} "
+    "for i=1,#KEYS do "
+    "local kv=redis.call('HGETALL',KEYS[i]) "
+    "for j=1,#kv,2 do local n=tonumber(kv[j+1]) if n then acc[kv[j]]=(acc[kv[j]] or 0)+n end end "
+    "end "
+    "local out={} "
+    "for f,n in pairs(acc) do out[#out+1]=f out[#out+1]=string.format('%d',n) end "
+    "return out"
+)
 _PENDING_FIELD_BY_SUFFIX = {b"o": "orders", b"s": "supreme", b"r": "rare", b"g": "net_gold"}
-_HOT_FIELD_BY_SUFFIX = {b"24o": "orders_24h", b"24s": "supreme_24h"}
+_HOT_FIELD_BY_SUFFIX = {b"o": "orders", b"s": "supreme"}
 
 
 def proxy_stall_directory_key(zone_id: int) -> str:
@@ -392,8 +409,18 @@ def proxy_stall_directory_key(zone_id: int) -> str:
 
 
 def proxy_reputation_ledger_key(zone_id: int) -> str:
-    """按区口碑台账：<id>:o/s/r/g/b 是待回账，<id>:24o / <id>:24s 是热榜；与摊位目录同一 hash tag。"""
+    """按区口碑待回账：<id>:o/s/r/g/b；与摊位目录、热榜桶同一 hash tag。"""
     return f"craft_proxy_reputation:{{ctl:{zone_id}}}"
+
+
+def proxy_hot_bucket_key(zone_id: int, hour_index: int) -> str:
+    """西市热榜一个小时的桶：<id>:o 单数、<id>:s 极品数；hour_index = UTC 秒 // 3600。"""
+    return f"craft_proxy_hot:{{ctl:{zone_id}}}:{hour_index}"
+
+
+def proxy_hot_window_bucket_keys(zone_id: int, newest_hour: int) -> list[str]:
+    """窗口里的 24 个桶键，从 newest_hour 往前排（同 C++ ProxyHotWindowBucketKeys）。"""
+    return [proxy_hot_bucket_key(zone_id, newest_hour - back) for back in range(min(PROXY_HOT_WINDOW_HOURS, newest_hour + 1))]
 
 
 def _redis_failure(exc: BaseException) -> bool:
@@ -426,31 +453,55 @@ def _parse_taken_reputation(reply) -> PendingProxyReputation | None:
     )
 
 
-def _parse_reputation_ledger(raw: dict) -> tuple[dict[int, PendingProxyReputation], dict[int, HotProxyCounters]]:
-    """把台账整表解析成待回账与热榜镜像（同 C++ OnProxyReputationReply）；认不出的字段跳过，全 0 的待回账不留。"""
+def _split_master_field(field, value) -> tuple[int, bytes] | None:
+    """台账与热榜桶的字段都是 <宗师 player_id>:<后缀>（同 C++ ParseReputationField）；认不出的返回 None。"""
+    if not isinstance(field, bytes) or not isinstance(value, bytes):
+        return None
+    master_text, sep, suffix = field.partition(b":")
+    master_id = int(master_text) if master_text.isdigit() else 0
+    if not sep or not suffix or not 0 < master_id <= _MAX_UINT64:
+        return None
+    return master_id, suffix
+
+
+def _parse_reputation_ledger(raw: dict) -> dict[int, PendingProxyReputation]:
+    """把待回账整表解析成镜像（同 C++ OnProxyReputationReply）；认不出的字段跳过，全 0 的待回账不留。"""
     pending: dict[int, PendingProxyReputation] = {}
-    hot: dict[int, HotProxyCounters] = {}
     for field, value in raw.items():
-        if not isinstance(field, bytes) or not isinstance(value, bytes):
+        parsed = _split_master_field(field, value)
+        if parsed is None:
             continue
-        master_text, sep, suffix = field.partition(b":")
-        master_id = int(master_text) if master_text.isdigit() else 0
-        if not sep or not suffix or not 0 < master_id <= _MAX_UINT64:
-            continue
+        master_id, suffix = parsed
         if suffix == b"b":
             pending.setdefault(master_id, PendingProxyReputation()).last_buyer = value.decode("utf-8", "replace")
             continue
         count = _ledger_count(value)
-        if count == 0:
-            continue
-        if suffix in _PENDING_FIELD_BY_SUFFIX:
+        if count and suffix in _PENDING_FIELD_BY_SUFFIX:
             attr = _PENDING_FIELD_BY_SUFFIX[suffix]
             entry = pending.setdefault(master_id, PendingProxyReputation())
             setattr(entry, attr, count if attr == "net_gold" else min(count, _MAX_UINT32))
-        elif suffix in _HOT_FIELD_BY_SUFFIX:
-            entry = hot.setdefault(master_id, HotProxyCounters())
-            setattr(entry, _HOT_FIELD_BY_SUFFIX[suffix], min(count, _MAX_UINT32))
-    return {mid: entry for mid, entry in pending.items() if not entry.is_empty}, hot
+    return {mid: entry for mid, entry in pending.items() if not entry.is_empty}
+
+
+def _parse_hot_totals(reply) -> dict[int, HotProxyCounters] | None:
+    """求和脚本的应答：<id>:o / <id>:s 与和交替（同 C++ ParseProxyHotTotals）。形状不对 = 结果未知，返回 None。"""
+    if not isinstance(reply, (list, tuple)) or len(reply) % 2:
+        return None
+    return _parse_hot_bucket(dict(zip(reply[::2], reply[1::2])))
+
+
+def _parse_hot_bucket(raw: dict) -> dict[int, HotProxyCounters]:
+    """把热榜桶（或求和脚本的应答）解析成 {宗师: 计数}，字段口径同 C++ ParseProxyHotTotals。"""
+    bucket: dict[int, HotProxyCounters] = {}
+    for field, value in raw.items():
+        parsed = _split_master_field(field, value)
+        if parsed is None:
+            continue
+        master_id, suffix = parsed
+        count = _ledger_count(value)
+        if count and suffix in _HOT_FIELD_BY_SUFFIX:
+            setattr(bucket.setdefault(master_id, HotProxyCounters()), _HOT_FIELD_BY_SUFFIX[suffix], min(count, _MAX_UINT32))
+    return bucket
 
 
 def _iter_online_players(scene):
@@ -479,14 +530,19 @@ class CraftProxyStallDirectory:
     「谁可能有待回账」，入账数额以原子取走的为准。没配控制 Redis（本地单进程模式）时镜像就是台账本身。
     """
 
-    def __init__(self, protocol, *, control_redis=None, zone_id: int = 0) -> None:
+    def __init__(self, protocol, *, control_redis=None, zone_id: int = 0, clock_ms: Callable[[], int] = now_ms) -> None:
         self.protocol = protocol
         self._redis = control_redis
+        self._zone_id = zone_id
+        self._clock_ms = clock_ms
         self._stall_key = proxy_stall_directory_key(zone_id)
         self._ledger_key = proxy_reputation_ledger_key(zone_id)
         self._stalls: dict[int, object] = {}
         self._pending_reputation: dict[int, PendingProxyReputation] = {}
-        self._hot_counters: dict[int, HotProxyCounters] = {}
+        # 热榜镜像 = 上次整表刷新读回的近 24 小时之和 + 之后本节点按 UTC 小时记下的成交（本地单进程模式只有后者，
+        # 窗口靠它按小时滚动）。下次刷新用桶和整体接替；hot_window() 求和时丢掉比窗口更早的本地桶。
+        self._hot_refreshed_totals: dict[int, HotProxyCounters] = {}
+        self._hot_local_buckets: dict[int, dict[int, HotProxyCounters]] = {}
 
     @staticmethod
     def _display_name(data, player_id: int) -> str:
@@ -575,12 +631,13 @@ class CraftProxyStallDirectory:
     async def record_order(
         self, master_player_id: int, supreme_delta: int, rare_delta: int, net_gold_earned: int, buyer_name: str,
     ) -> None:
-        """记一笔代打成交：热榜与待回账一律 HINCRBY / HSET 进按区台账，本节点镜像同步累加供西市列表叠加展示。"""
+        """记一笔代打成交：待回账 HINCRBY / HSET 进按区台账，热榜 HINCRBY 进当前小时的桶；本节点镜像同步累加。"""
         if not master_player_id:
             return
-        hot = self._hot_counters.setdefault(master_player_id, HotProxyCounters())
-        hot.orders_24h = _sat_add_u32(hot.orders_24h, 1)
-        hot.supreme_24h = _sat_add_u32(hot.supreme_24h, supreme_delta)
+        hour = self._clock_ms() // _MS_PER_HOUR
+        hot = self._hot_local_buckets.setdefault(hour, {}).setdefault(master_player_id, HotProxyCounters())
+        hot.orders = _sat_add_u32(hot.orders, 1)
+        hot.supreme = _sat_add_u32(hot.supreme, supreme_delta)
         pending = self._pending_reputation.setdefault(master_player_id, PendingProxyReputation())
         pending.orders = _sat_add_u32(pending.orders, 1)
         pending.supreme = _sat_add_u32(pending.supreme, supreme_delta)
@@ -588,11 +645,18 @@ class CraftProxyStallDirectory:
         pending.net_gold = _sat_add_u64(pending.net_gold, net_gold_earned)
         if buyer_name:
             pending.last_buyer = buyer_name
-        await self._add_to_ledger(
-            "record reputation", master_player_id,
-            {":24o": 1, ":24s": supreme_delta, ":o": 1, ":s": supreme_delta, ":r": rare_delta, ":g": net_gold_earned},
-            buyer_name,
+        if self._redis is None:
+            return
+        pipe = self._redis.pipeline(transaction=False)
+        self._queue_ledger_increments(
+            pipe, master_player_id, {":o": 1, ":s": supreme_delta, ":r": rare_delta, ":g": net_gold_earned}, buyer_name,
         )
+        hot_key = proxy_hot_bucket_key(self._zone_id, hour)
+        pipe.hincrby(hot_key, f"{master_player_id}:o", 1)
+        if supreme_delta > 0:
+            pipe.hincrby(hot_key, f"{master_player_id}:s", supreme_delta)
+        pipe.expire(hot_key, _PROXY_HOT_BUCKET_TTL_SEC)
+        await self._guarded_write("record reputation", master_player_id, pipe.execute())
 
     def has_pending(self, master_player_id: int) -> bool:
         """本节点镜像里这名宗师可能有待回账（只是提示，数额以取走的为准）。"""
@@ -627,11 +691,15 @@ class CraftProxyStallDirectory:
 
     async def give_back(self, master_player_id: int, taken: PendingProxyReputation) -> None:
         """取走的数额确定没写进存档：原样 HINCRBY 还回台账，下一次再取（本地单进程模式镜像没扣，不用还）。"""
-        await self._add_to_ledger(
-            "give back reputation", master_player_id,
+        if self._redis is None:
+            return
+        pipe = self._redis.pipeline(transaction=False)
+        self._queue_ledger_increments(
+            pipe, master_player_id,
             {":o": taken.orders, ":s": taken.supreme, ":r": taken.rare, ":g": taken.net_gold},
             taken.last_buyer,
         )
+        await self._guarded_write("give back reputation", master_player_id, pipe.execute())
 
     def settle_taken(self, master_player_id: int, taken: PendingProxyReputation) -> None:
         """取走的数额已归宗师存档：镜像扣掉这部分，取走之后本节点又记下的增量留着。"""
@@ -650,32 +718,60 @@ class CraftProxyStallDirectory:
         self._pending_reputation.pop(master_player_id, None)
 
     async def refresh(self, scene) -> None:
-        """整表读回按区目录与台账覆盖本节点镜像（同 C++ RequestProxyDirectoryRefresh），再给本节点在线且镜像里
-        可能有待回账的宗师投回账任务。Redis 故障只告警，保留镜像。"""
+        """整表读回按区目录与待回账、近 24 小时热榜桶之和，覆盖本节点镜像（同 C++ RequestProxyDirectoryRefresh +
+        RefreshProxyHotRanking），再给本节点在线且镜像里可能有待回账的宗师投回账任务。Redis 故障只告警，保留镜像。"""
         if self._redis is None:
             return
+        hot_keys = proxy_hot_window_bucket_keys(self._zone_id, self._clock_ms() // _MS_PER_HOUR)
+        pipe = self._redis.pipeline(transaction=False)
+        pipe.hgetall(self._stall_key)
+        pipe.hgetall(self._ledger_key)
+        pipe.eval(SUM_PROXY_HOT_LUA, len(hot_keys), *hot_keys)
         try:
-            stalls_raw = await self._redis.hgetall(self._stall_key)
-            ledger_raw = await self._redis.hgetall(self._ledger_key)
+            stalls_raw, ledger_raw, hot_reply = await pipe.execute()
         except Exception as exc:
             if not _redis_failure(exc):
                 raise
             logger.warning("Craft proxy directory refresh failed; keeping cached stalls and counters error=%s", exc)
             return
         self._stalls = self._parse_stalls(stalls_raw)
-        self._pending_reputation, self._hot_counters = _parse_reputation_ledger(ledger_raw)
+        self._pending_reputation = _parse_reputation_ledger(ledger_raw)
+        hot_totals = _parse_hot_totals(hot_reply)
+        if hot_totals is None:
+            logger.warning("Unexpected hot ranking reply shape; keeping cached counters reply=%r", hot_reply)
+        else:
+            self._hot_refreshed_totals = hot_totals
+            self._hot_local_buckets.clear()
         for master_id in tuple(self._pending_reputation):
             if _find_online_player_in_scene(scene, master_id) is not None:
                 _schedule_proxy_reputation_drain(scene, master_id)
 
     async def refresh_loop(self, scene) -> None:
-        """每 5 秒刷新一次本节点镜像（同 C++ StartProxyStallDirectory 的定时器），启动时先刷一次。"""
+        """每 5 秒刷新一次本节点镜像（同 C++ StartProxyStallDirectory 的定时器），启动时先刷一次。
+
+        这是 runtime 的后台任务，任务结束会被当成节点故障停机：展示用的目录出了意料之外的错，只记日志、下一轮再刷。"""
         logger.info(
             "Craft proxy directory refresh started interval_sec=%s", PROXY_DIRECTORY_REFRESH_INTERVAL_SEC,
         )
         while True:
-            await self.refresh(scene)
+            try:
+                await self.refresh(scene)
+            except Exception:
+                logger.exception("Craft proxy directory refresh raised unexpectedly; retrying next round")
             await asyncio.sleep(PROXY_DIRECTORY_REFRESH_INTERVAL_SEC)
+
+    def hot_window(self) -> dict[int, HotProxyCounters]:
+        """近 24 小时热榜 = 上次刷新读回的桶和 + 之后本节点记下、仍在窗口里的小时桶；比窗口更早的本地桶丢掉。"""
+        oldest = self._clock_ms() // _MS_PER_HOUR - PROXY_HOT_WINDOW_HOURS + 1
+        for stale_hour in [hour for hour in self._hot_local_buckets if hour < oldest]:
+            del self._hot_local_buckets[stale_hour]
+        totals = {mid: replace(counts) for mid, counts in self._hot_refreshed_totals.items()}
+        for bucket in self._hot_local_buckets.values():
+            for master_id, counts in bucket.items():
+                total = totals.setdefault(master_id, HotProxyCounters())
+                total.orders = _sat_add_u32(total.orders, counts.orders)
+                total.supreme = _sat_add_u32(total.supreme, counts.supreme)
+        return totals
 
     def _parse_stalls(self, raw: dict) -> dict[int, object]:
         stalls: dict[int, object] = {}
@@ -689,18 +785,12 @@ class CraftProxyStallDirectory:
                 stalls[int(info.master_player_id)] = info
         return stalls
 
-    async def _add_to_ledger(
-        self, action: str, master_player_id: int, increments: dict[str, int], buyer_name: str,
-    ) -> None:
-        if self._redis is None:
-            return
-        pipe = self._redis.pipeline(transaction=False)
+    def _queue_ledger_increments(self, pipe, master_player_id: int, increments: dict[str, int], buyer_name: str) -> None:
         for suffix, delta in increments.items():
             if 0 < delta <= _MAX_INT64:
                 pipe.hincrby(self._ledger_key, f"{master_player_id}{suffix}", delta)
         if buyer_name:
             pipe.hset(self._ledger_key, f"{master_player_id}:b", buyer_name.encode())
-        await self._guarded_write(action, master_player_id, pipe.execute())
 
     @staticmethod
     async def _guarded_write(action: str, master_player_id: int, command) -> None:
@@ -731,6 +821,7 @@ class CraftProxyStallDirectory:
                 else:
                     merged.pop(pid, None)
         rows = []
+        hot_window = self.hot_window()
         for pid in sorted(merged):
             stall = merged[pid]
             if not self.is_valid_stall(stall):
@@ -740,9 +831,9 @@ class CraftProxyStallDirectory:
                 stall.proxy_orders_completed = _sat_add_u32(stall.proxy_orders_completed, pending.orders)
                 stall.supreme_forged_count = _sat_add_u32(stall.supreme_forged_count, pending.supreme)
                 stall.rare_books_crafted_count = _sat_add_u32(stall.rare_books_crafted_count, pending.rare)
-            hot = self._hot_counters.get(pid)
-            stall.recent_24h_orders = hot.orders_24h if hot is not None else 0
-            stall.recent_24h_supreme = hot.supreme_24h if hot is not None else 0
+            hot = hot_window.get(pid)
+            stall.recent_24h_orders = hot.orders if hot is not None else 0
+            stall.recent_24h_supreme = hot.supreme if hot is not None else 0
             stall.hot_rank = 0
             stall.viewer_gets_free_proxy = bool(
                 scene is not None

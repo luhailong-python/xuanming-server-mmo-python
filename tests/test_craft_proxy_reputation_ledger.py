@@ -8,15 +8,22 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
+import xuanming.nodes.scene_skill_craft as craft_module
 from login_fakes import FakeRedis
 from xuanming.data import PlayerRowCodec, SqlitePlayerStore, StoreRejected, StoreUnavailable
 from xuanming.nodes.scene import SceneNode
 from xuanming.nodes.scene_skill_craft import (
+    SUM_PROXY_HOT_LUA,
     TAKE_PROXY_REPUTATION_LUA,
     CraftProxyStallDirectory,
+    _parse_hot_bucket,
     _parse_reputation_ledger,
     _parse_taken_reputation,
     drain_pending_proxy_reputation,
+    proxy_hot_bucket_key,
+    proxy_hot_window_bucket_keys,
     proxy_reputation_ledger_key,
     proxy_stall_directory_key,
     record_proxy_order_reputation,
@@ -26,10 +33,16 @@ from xuanming.protocol import Protocol
 _ZONE_ID = 1
 _LEDGER = proxy_reputation_ledger_key(_ZONE_ID).encode()
 _STALLS = proxy_stall_directory_key(_ZONE_ID).encode()
+_HOUR_MS = 3_600_000
+_START_HOUR = 500_000  # 固定时钟：UTC 1_800_000_000_000 毫秒所在小时
+
+
+def _hot_key(hour: int) -> bytes:
+    return proxy_hot_bucket_key(_ZONE_ID, hour).encode()
 
 
 def craft_ledger_redis() -> FakeRedis:
-    """带取走脚本双生体的 FakeRedis：缺的字段回 None（同 Lua 里 HMGET 的 false 回成 nil）。"""
+    """带两段脚本双生体的 FakeRedis：取走缺的字段回 None（同 Lua 里 HMGET 的 false 回成 nil）；求和跨 KEYS 按字段累加。"""
     redis = FakeRedis()
 
     def take(keys_, argv):
@@ -40,17 +53,30 @@ def craft_ledger_redis() -> FakeRedis:
             record.pop(field, None)
         return values
 
+    def sum_hot(keys_, _argv):
+        acc: dict[bytes, int] = {}
+        for key in keys_:
+            alive = redis._alive(key)
+            for field, value in (redis.data[alive].items() if alive is not None else ()):
+                if value.lstrip(b"-").isdigit():  # Lua tonumber 认不出的跳过
+                    acc[field] = acc.get(field, 0) + int(value)
+        return [item for field, total in acc.items() for item in (field, str(total).encode())]
+
     redis.scripts[TAKE_PROXY_REPUTATION_LUA] = take
+    redis.scripts[SUM_PROXY_HOT_LUA] = sum_hot
     return redis
 
 
-async def _scene_with_players(tmp_path, redis, *player_ids):
+async def _scene_with_players(tmp_path, redis, *player_ids, clock=None):
     protocol = Protocol()
     store = SqlitePlayerStore(tmp_path / "players.sqlite")
     rows = PlayerRowCodec(protocol)
     info = protocol.message("NodeInfo", node_id=7, node_uuid="craft-ledger-scene", zone_id=_ZONE_ID)
     scene = SceneNode(protocol, info, store, rows, lambda *_: None)
-    scene.craft_proxy_directory = CraftProxyStallDirectory(protocol, control_redis=redis, zone_id=_ZONE_ID)
+    clock = clock if clock is not None else [_START_HOUR * _HOUR_MS]
+    scene.craft_proxy_directory = CraftProxyStallDirectory(
+        protocol, control_redis=redis, zone_id=_ZONE_ID, clock_ms=lambda: clock[0],
+    )
     scene.create(protocol.message("CreateSceneRequest", scene_id=1, config_id=1))
     for pid in player_ids:
         seed = await store.load_and_claim(pid, f"seed-{pid}".encode())
@@ -79,14 +105,27 @@ async def _drain_as_master(scene, pid) -> bool:
 
 
 def test_keys_and_take_script_match_cpp():
-    # 与 C++ PlayerCraftSystem::ProxyStallDirectoryKey / ProxyReputationLedgerKey / kTakeProxyReputationLua 同文。
+    # 与 C++ PlayerCraftSystem::ProxyStallDirectoryKey / ProxyReputationLedgerKey / ProxyHotBucketKey / kTakeProxyReputationLua 同文。
     assert proxy_stall_directory_key(7) == "craft_proxy_stall:{ctl:7}"
     assert proxy_reputation_ledger_key(7) == "craft_proxy_reputation:{ctl:7}"
+    assert proxy_hot_bucket_key(7, 491234) == "craft_proxy_hot:{ctl:7}:491234"
+    window = proxy_hot_window_bucket_keys(7, 1000)
+    assert len(window) == 24 and window[0] == "craft_proxy_hot:{ctl:7}:1000" and window[-1] == "craft_proxy_hot:{ctl:7}:977"
     assert TAKE_PROXY_REPUTATION_LUA == (
         "local k=KEYS[1] local p=ARGV[1] "
         "local v=redis.call('HMGET',k,p..':o',p..':s',p..':r',p..':g',p..':b') "
         "redis.call('HDEL',k,p..':o',p..':s',p..':r',p..':g',p..':b') "
         "return v"
+    )
+    assert SUM_PROXY_HOT_LUA == (  # C++ kSumProxyHotLua
+        "local acc={} "
+        "for i=1,#KEYS do "
+        "local kv=redis.call('HGETALL',KEYS[i]) "
+        "for j=1,#kv,2 do local n=tonumber(kv[j+1]) if n then acc[kv[j]]=(acc[kv[j]] or 0)+n end end "
+        "end "
+        "local out={} "
+        "for f,n in pairs(acc) do out[#out+1]=f out[#out+1]=string.format('%d',n) end "
+        "return out"
     )
 
 
@@ -96,13 +135,15 @@ def test_take_reply_and_ledger_parsing_follow_cpp():
     assert _parse_taken_reputation([b"1", b"0"]) is None  # 形状不对 = 结果未知
     assert _parse_taken_reputation([b"1", 2, None, None, None]) is None
 
-    pending, hot = _parse_reputation_ledger({
+    pending = _parse_reputation_ledger({
         b"2:o": b"3", b"2:s": b"-1", b"2:g": b"40", b"2:b": "丙".encode(), b"2:24o": b"5",
-        b"9:b": b"only-buyer", b"300:24s": b"2", b"abc:o": b"1", b"0:o": b"1", b"5:": b"1", b"5:x": b"1",
+        b"9:b": b"only-buyer", b"abc:o": b"1", b"0:o": b"1", b"5:": b"1", b"5:x": b"1",
     })
-    assert set(pending) == {2}  # 只剩买家名、没有计数的不留
+    assert set(pending) == {2}  # 只剩买家名、没有计数的不留；旧版热榜字段 :24o 不再认
     assert (pending[2].orders, pending[2].supreme, pending[2].net_gold, pending[2].last_buyer) == (3, 0, 40, "丙")
-    assert (hot[2].orders_24h, hot[300].supreme_24h) == (5, 2)
+
+    bucket = _parse_hot_bucket({b"2:o": b"4", b"2:s": b"1", b"300:o": b"-3", b"7:b": b"x", b"x:o": b"1"})
+    assert set(bucket) == {2} and (bucket[2].orders, bucket[2].supreme) == (4, 1)
 
 
 def test_record_order_writes_cpp_ledger_fields_and_survives_redis_failure(tmp_path):
@@ -114,10 +155,11 @@ def test_record_order_writes_cpp_ledger_fields_and_survives_redis_failure(tmp_pa
             await record_proxy_order_reputation(scene, 200, supreme_delta=1, net_gold_earned=95, buyer_name="甲侠士")
             await record_proxy_order_reputation(scene, 200, rare_delta=1, net_gold_earned=76, buyer_name="乙侠士")
             assert redis.data[_LEDGER] == {
-                b"200:24o": b"2", b"200:24s": b"1",
-                b"200:o": b"2", b"200:s": b"1", b"200:r": b"1", b"200:g": b"171",
-                b"200:b": "乙侠士".encode(),
+                b"200:o": b"2", b"200:s": b"1", b"200:r": b"1", b"200:g": b"171", b"200:b": "乙侠士".encode(),
             }
+            # 热榜进当前小时的桶，并带 25 小时过期。
+            assert redis.data[_hot_key(_START_HOUR)] == {b"200:o": b"2", b"200:s": b"1"}
+            assert 24 * _HOUR_MS < redis.ttl_ms(_hot_key(_START_HOUR)) <= 25 * _HOUR_MS
             assert not scene._actor_tasks
 
             # 控制 Redis 写失败只告警：买家的订单已提交，不能因展示计数失败；本节点镜像照记。
@@ -148,7 +190,8 @@ def test_online_master_takes_atomically_in_own_actor_and_keeps_hot_counters(tmp_
             craft = _craft(scene, 2)
             assert (craft.proxy_orders_completed, craft.supreme_forged_count) == (1, 1)
             assert craft.unread_proxy_digest_net_gold == 95 and craft.unread_proxy_digest_last_buyer == "甲侠士"
-            assert redis.data[_LEDGER] == {b"2:24o": b"1", b"2:24s": b"1"}  # 待回账已取走，热榜不取
+            assert redis.data[_LEDGER] == {}  # 待回账已全部取走
+            assert redis.data[_hot_key(_START_HOUR)] == {b"2:o": b"1", b"2:s": b"1"}  # 热榜桶不受回账影响
             assert not scene.craft_proxy_directory.has_pending(2)
         finally:
             await scene.close()
@@ -317,14 +360,15 @@ def test_stall_publish_refresh_and_live_lookup_follow_cpp(tmp_path):
             )
             redis.data[_STALLS][b"300"] = remote.SerializeToString()
             redis.data[_STALLS][b"301"] = b"\xff\xff"  # 坏数据跳过
-            redis.data[_LEDGER] = {b"2:o": b"3", b"2:g": b"40", b"2:b": "丙".encode(), b"300:24o": b"2"}
+            redis.data[_LEDGER] = {b"2:o": b"3", b"2:g": b"40", b"2:b": "丙".encode()}
+            redis.data[_hot_key(_START_HOUR - 1)] = {b"300:o": b"2"}
             await directory.refresh(scene)
             assert directory.find(300).viewer_gets_free_proxy is False
             await asyncio.gather(*tuple(scene._actor_tasks))
             craft = _craft(scene, 2)
             assert (craft.proxy_orders_completed, craft.unread_proxy_digest_net_gold) == (3, 40)
             assert craft.unread_proxy_digest_last_buyer == "丙"
-            assert redis.data[_LEDGER] == {b"300:24o": b"2"}
+            assert redis.data[_LEDGER] == {}
             listed = {s.master_player_id: s for s in directory.list_stalls(scene=scene, viewer_player_id=1)}
             assert listed[2].proxy_orders_completed == 3 and listed[300].recent_24h_orders == 2
 
@@ -349,3 +393,89 @@ def test_stall_publish_refresh_and_live_lookup_follow_cpp(tmp_path):
             await scene.close()
 
     asyncio.run(run())
+
+
+def test_hot_ranking_counts_only_the_last_24_hourly_buckets(tmp_path):
+    async def run():
+        redis = craft_ledger_redis()
+        clock = [_START_HOUR * _HOUR_MS + 59 * 60_000]  # 第 H 小时的最后一分钟
+        scene = await _scene_with_players(tmp_path, redis, 1, clock=clock)
+        try:
+            await scene.craft_proxy_directory.record_order(300, 1, 0, 95, "甲侠士")
+            clock[0] = (_START_HOUR + 1) * _HOUR_MS
+            await scene.craft_proxy_directory.record_order(300, 0, 0, 76, "乙侠士")
+            assert redis.data[_hot_key(_START_HOUR)] == {b"300:o": b"1", b"300:s": b"1"}
+            assert redis.data[_hot_key(_START_HOUR + 1)] == {b"300:o": b"1"}
+
+            # 另一个节点靠整表刷新看热榜（求和脚本读 24 个桶）。
+            other = CraftProxyStallDirectory(
+                scene.protocol, control_redis=redis, zone_id=_ZONE_ID, clock_ms=lambda: clock[0],
+            )
+
+            def counts():
+                window = other.hot_window().get(300)
+                return None if window is None else (window.orders, window.supreme)
+
+            clock[0] = (_START_HOUR + 23) * _HOUR_MS
+            await other.refresh(scene)
+            assert counts() == (2, 1)  # 第 H+23 小时：两单都在窗口里
+            # 两次刷新之间本节点又成交一单：先在本地小时桶里加上；下次刷新由桶和接替，不重复计。
+            await other.record_order(300, 0, 0, 0, "")
+            assert counts() == (3, 1)
+            await other.refresh(scene)
+            assert counts() == (3, 1)
+
+            # 求和应答畸形（结果未知）：保留上次的桶和。
+            sum_hot = redis.scripts[SUM_PROXY_HOT_LUA]
+            redis.scripts[SUM_PROXY_HOT_LUA] = lambda _keys, _argv: [b"300:o"]
+            clock[0] = (_START_HOUR + 24) * _HOUR_MS
+            await other.refresh(scene)
+            assert counts() == (3, 1)
+            redis.scripts[SUM_PROXY_HOT_LUA] = sum_hot
+
+            expected = {24: (2, 0), 25: (1, 0), 47: None}  # H 那单出窗 → H+1 那单出窗 → 全部出窗
+            for hours_later, want in expected.items():
+                clock[0] = (_START_HOUR + hours_later) * _HOUR_MS
+                await other.refresh(scene)
+                assert counts() == want, hours_later
+        finally:
+            await scene.close()
+
+    asyncio.run(run())
+
+
+def test_hot_ranking_window_without_redis_drops_stale_hours():
+    clock = [_START_HOUR * _HOUR_MS]
+    directory = CraftProxyStallDirectory(Protocol(), clock_ms=lambda: clock[0])
+
+    async def run():
+        await directory.record_order(300, 1, 0, 0, "")
+        clock[0] = (_START_HOUR + 23) * _HOUR_MS
+        assert directory.hot_window()[300].orders == 1
+        clock[0] = (_START_HOUR + 24) * _HOUR_MS
+        assert directory.hot_window() == {}
+        assert directory._hot_local_buckets == {}  # 出窗的桶丢掉，本地单进程镜像不会无限长
+
+    asyncio.run(run())
+
+
+def test_refresh_loop_survives_unexpected_errors(monkeypatch):
+    # runtime 把后台任务结束当成节点故障：展示用的目录刷新出意料之外的错，只记日志、下一轮再刷。
+    directory = CraftProxyStallDirectory(Protocol(), control_redis=craft_ledger_redis())
+    calls: list[int] = []
+
+    async def flaky_refresh(_scene):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("unexpected parse bug")
+        raise asyncio.CancelledError  # 能走到第二轮就说明第一轮的异常没让循环退出；借取消结束循环
+
+    monkeypatch.setattr(craft_module, "PROXY_DIRECTORY_REFRESH_INTERVAL_SEC", 0)
+    monkeypatch.setattr(directory, "refresh", flaky_refresh)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await directory.refresh_loop(None)
+
+    asyncio.run(run())
+    assert calls == [0, 1]

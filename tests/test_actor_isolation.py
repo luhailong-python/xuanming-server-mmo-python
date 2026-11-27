@@ -11,6 +11,7 @@ from xuanming.nodes.gate import GateNode, Session
 from xuanming.nodes.local_login import LocalLogin
 from xuanming.nodes.scene_skill_craft import (
     CraftProxyStallDirectory,
+    proxy_hot_bucket_key,
     proxy_reputation_ledger_key,
     record_proxy_order_reputation,
 )
@@ -84,6 +85,7 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
         commits: list[int] = []
         redis = craft_ledger_redis()
         ledger = proxy_reputation_ledger_key(1).encode()
+        hot_bucket = proxy_hot_bucket_key(1, 500_000).encode()  # 固定时钟所在的 UTC 小时
 
         class _FakeRows:
             def assemble(self, snap):
@@ -106,7 +108,9 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
                 self._locks: dict[int, asyncio.Lock] = {}
                 self._actor_tasks: set[asyncio.Task] = set()
                 self.locations = {master.player_id: SimpleNamespace(players={master.player_id: master})}
-                self.craft_proxy_directory = CraftProxyStallDirectory(protocol, control_redis=redis, zone_id=1)
+                self.craft_proxy_directory = CraftProxyStallDirectory(
+                    protocol, control_redis=redis, zone_id=1, clock_ms=lambda: 500_000 * 3_600_000,
+                )
                 self.commit_observed_locked: list[bool] = []
 
             def player_lock(self, pid: int) -> asyncio.Lock:
@@ -149,7 +153,8 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
         await asyncio.gather(*tuple(scene._actor_tasks))
         assert commits == [200]
         assert scene.commit_observed_locked == [True]
-        assert redis.data[ledger] == {b"200:24o": b"1", b"200:24s": b"1"}
+        assert redis.data[ledger] == {}
+        assert redis.data[hot_bucket] == {b"200:o": b"1", b"200:s": b"1"}
         assert not directory.has_pending(200)
         craft = master.snapshot.data.craft_component
         assert craft.proxy_orders_completed == 1 and craft.supreme_forged_count == 1
