@@ -662,11 +662,11 @@ def test_guild_war_v2_full_rules_and_invariants():
                 )
                 assert not rv.error_message.id
 
-            # 1) 总览读取配表：3 灵脉 + 4 档周战功里程碑 (300/1200/3000/6000)
+            # 1) 总览读取配表：3 灵脉 + 4 档周战功里程碑 (200/600/1200/2000)
             ov = await call_guild(101, "GetGuildWarOverview", "GetGuildWarOverviewRequest", "GetGuildWarOverviewResponse")
             assert not ov.error_message.id
             assert len(ov.leylines) == 3
-            assert [m.required_merit for m in ov.milestones] == [300, 1200, 3000, 6000]
+            assert [m.required_merit for m in ov.milestones] == [200, 600, 1200, 2000]
             assert 1 <= ov.gold_leyline_id <= 3
             assert ov.public_bounty_daily_limit == 2
 

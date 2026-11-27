@@ -721,20 +721,20 @@ async def test_upgrade_economy_and_activities():
         assert insuff.error_message.id == ERR_GUILD_FUNDS_INSUFFICIENT
         assert insuff.guild.guild_id == gid and insuff.guild.level == 1
 
-        # 充入足够资金升到 2 级（花费 20000）
+        # 充入足够资金升到 2 级（花费 5000）
         h.store.set_guild_funds_for_test(gid, 30000)
         up = await h.call_guild(
             "UpgradeGuild", "guildpb.UpgradeGuildRequest", "guildpb.UpgradeGuildResponse", player_id=101, expected_level=1
         )
         assert up.error_message.id == ERR_OK
-        assert up.guild.level == 2 and up.guild.funds == 10000 and up.guild.max_members == 35
+        assert up.guild.level == 2 and up.guild.funds == 25000 and up.guild.max_members == 35
 
         # 过期 expected_level=1：幂等回 OK + 最新 GuildInfo，不再扣资金
         stale_up = await h.call_guild(
             "UpgradeGuild", "guildpb.UpgradeGuildRequest", "guildpb.UpgradeGuildResponse", player_id=101, expected_level=1
         )
         assert stale_up.error_message.id == ERR_OK
-        assert stale_up.guild.level == 2 and stale_up.guild.funds == 10000
+        assert stale_up.guild.level == 2 and stale_up.guild.funds == 25000
 
         # asset_op_enabled=False 时捐献与商店购买均回 kGuildAssetPending
         d_off = await h.call_guild(
@@ -786,6 +786,13 @@ async def test_upgrade_economy_and_activities():
         assert start_t.error_message.id == ERR_GUILD_ACTIVITY_NOT_OPEN
         assert resp_t.error_message.id == ERR_GUILD_ACTIVITY_NOT_OPEN
 
+        # 实表默认关闭所有日常/强在线帮会活动（反上班化）；确认默认全关后，显式启用内存行以继续覆盖灯会与团圆状态机。
+        assert all(a.state == ACTIVITY_STATE_DISABLED for a in acts.activities)
+        h.store.catalog = replace(
+            h.store.catalog,
+            activities=tuple(replace(r, enabled=True) if r.activity_id == 1 else r for r in h.store.catalog.activities),
+        )
+
         # 元宵灯会（activity_id=1，无物品奖励，阈值 3，资金 500）
         l1 = await h.call_guild(
             "LightGuildLantern", "guildpb.LightGuildLanternRequest", "guildpb.LightGuildLanternResponse", player_id=101, activity_id=1
@@ -806,10 +813,14 @@ async def test_upgrade_economy_and_activities():
         assert l3.error_message.id == ERR_OK and l3.activity.progress == 3
         assert l3.activity.threshold_reached and l3.activity.funds_granted
         after_g = await h.store.get_guild(gid)
-        assert after_g is not None and after_g.funds == 10000 + 500
+        assert after_g is not None and after_g.funds == 25000 + 500
 
     # 再测 asset_op_enabled=True 时的捐献/商店入队、幂等键与中秋团圆领奖（带物品奖励）
     async with GuildTestHarness(asset_op_enabled=True) as h:
+        h.store.catalog = replace(
+            h.store.catalog,
+            activities=tuple(replace(r, enabled=True) if r.activity_id == 2 else r for r in h.store.catalog.activities),
+        )
         h.register_player(101, zone_id=1, online=True)
         h.register_player(102, zone_id=1, online=True)
         h.register_player(103, zone_id=1, online=False)

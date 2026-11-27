@@ -470,16 +470,23 @@ def test_rewarded_ad_full_lifecycle_idempotency_limits_ssv_and_guards(tmp_path):
             )
             assert limit_resp.error_message.id == REWARDED_AD_DAILY_LIMIT_REACHED
 
-            # 7. 跨过 UTC+8 05:00 次日重置；超时(>300s)会话返回 SESSION_EXPIRED
-            next_day_ms = _NOW_MS + DAY_MS
-            clock_box[0] = next_day_ms
+            # 7. 同周次日不重置（周池 14/周），跨过 UTC+8 周一 05:00 重置；超时(>300s)会话返回 SESSION_EXPIRED
+            clock_box[0] = _NOW_MS + DAY_MS
+            same_week_resp = await _dispatch(
+                scene, player, "BeginRewardedAdSession",
+                protocol.message("BeginRewardedAdSessionRequest", slot_id=1, client_platform=1),
+            )
+            assert same_week_resp.error_message.id == REWARDED_AD_DAILY_LIMIT_REACHED
+
+            next_week_ms = int(claim2.slot.next_reset_ms)
+            clock_box[0] = next_week_ms
             begin3 = await _dispatch(
                 scene, player, "BeginRewardedAdSession",
                 protocol.message("BeginRewardedAdSessionRequest", slot_id=1, client_platform=1),
             )
             assert begin3.error_message.id == 0
 
-            clock_box[0] = next_day_ms + 301_000
+            clock_box[0] = next_week_ms + 301_000
             expired_resp = await _dispatch(
                 scene, player, "ClaimRewardedAd",
                 protocol.message(

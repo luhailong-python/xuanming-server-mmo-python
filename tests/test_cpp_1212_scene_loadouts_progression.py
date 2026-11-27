@@ -539,13 +539,42 @@ def test_battle_progression_level_up_weekly_silver_cap_and_npc_isolation(tmp_pat
         env = await _make_full_scene(tmp_path, level=1, gold=0, now_ms_ref=now_ref)
         assert env.attributes.validate_progression_tables() is True
 
-        # 纯函数验证跨 30000 软上限（衰减 20%）与 45000 硬封顶精确拆分
+        # 纯函数验证跨 30000 软上限（衰减 20%）与 45000 硬封顶精确拆分，以及最多 3 周银两滚存蓄水池（90k/135k）
         rule = WeeklySilverRule(soft_cap=30_000, diminished_rate_permyriad=2000, hard_cap=45_000)
         ev1 = evaluate_weekly_silver_cap(2000, 29_000, rule)
         assert ev1.credited_silver == 1200  # 1000 满额 + 1000 * 20% = 1200
         assert ev1.used_after == 30_200 and ev1.diminished is True
         ev2 = evaluate_weekly_silver_cap(1000, 45_000, rule)
         assert ev2.credited_silver == 0 and ev2.diminished is True
+
+        from xuanming.nodes.scene_attributes import prepare_economy_ledger
+        from xuanming.nodes.scene_equip_craft import _MaterialRewardState, resolve_stage2_week_state, WEEK_MS
+        pve_probe = env.protocol.message(
+            "BattleSettlementData",
+            player_id=1, battle_id=1999, outcome=1, player_team_index=0,
+            total_rounds=3, match_mode=4, battle_config_id=1,
+        )
+        rows = env.attributes.load_battle_progression_rewards()
+        empty_econ = env.protocol.message("BattleEconomyLedger")
+        wk1 = 1_795_381_200_000
+        cand1, d1 = prepare_economy_ledger(empty_econ, wk1, pve_probe, 0, 0, rows, rule)
+        assert int(cand1.silver_rollover_soft_cap) == 30_000
+        assert int(cand1.silver_rollover_hard_cap) == 45_000
+        cand1.battle_silver_this_week = 10_000
+        cand2, d2 = prepare_economy_ledger(cand1, wk1 + WEEK_MS, pve_probe, 0, 0, rows, rule)
+        assert int(cand2.silver_rollover_soft_cap) == 50_000
+        assert int(cand2.silver_rollover_hard_cap) == 80_000
+        assert d2.weekly_silver_soft_cap == 50_000
+        cand10, d10 = prepare_economy_ledger(cand2, wk1 + 10 * WEEK_MS, pve_probe, 0, 0, rows, rule)
+        assert int(cand10.silver_rollover_soft_cap) == 90_000
+        assert int(cand10.silver_rollover_hard_cap) == 135_000
+        assert d10.weekly_silver_soft_cap == 90_000
+
+        # 阶段二材料 4 周滚存蓄水池（+150/周，封顶 600，抗时钟回拨）
+        st = _MaterialRewardState(week_starts_at_ms=wk1, earned_this_week=15, stage2_pool_cap=150)
+        assert resolve_stage2_week_state(st, wk1 - WEEK_MS) == (15, 150, True)
+        assert resolve_stage2_week_state(st, wk1 + 2 * WEEK_MS) == (0, 435, False)
+        assert resolve_stage2_week_state(st, wk1 + 10 * WEEK_MS) == (0, 600, False)
 
         player = env.scene.locations[1].players[1]
         data = env.scene.rows.assemble(player.snapshot)

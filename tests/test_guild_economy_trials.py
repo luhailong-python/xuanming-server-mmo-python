@@ -826,6 +826,12 @@ async def test_guild_trial_full_lifecycle_win_settlement_owed_overflow_and_fallb
         h.clock.advance(48 * MS_PER_HOUR)
 
         trial_row = next(r for r in h.store.catalog.activities if r.activity_type == ACTIVITY_TYPE_TRIAL)
+        # 实表默认关闭日常帮会历练（反上班化）；本用例显式启用内存行以继续覆盖历练状态机与对账。
+        trial_row = replace(trial_row, enabled=True)
+        h.store.catalog = replace(
+            h.store.catalog,
+            activities=tuple(trial_row if r.activity_id == trial_row.activity_id else r for r in h.store.catalog.activities),
+        )
 
         # 1. StartGuildTrial -> AcquireTrialOccupancy -> SQL lobby PENDING
         st = await h.call_guild(
@@ -1010,6 +1016,12 @@ async def test_guild_trial_cancel_activity_battle_and_reply_signature_verificati
         gid = await h.create_guild_with_members("取消验签堂", 4001, [4002])
         h.clock.advance(48 * MS_PER_HOUR)
         trial_row = next(r for r in h.store.catalog.activities if r.activity_type == ACTIVITY_TYPE_TRIAL)
+        # 实表默认关闭日常帮会历练（反上班化）；本用例显式启用内存行以继续覆盖历练状态机与对账。
+        trial_row = replace(trial_row, enabled=True)
+        h.store.catalog = replace(
+            h.store.catalog,
+            activities=tuple(trial_row if r.activity_id == trial_row.activity_id else r for r in h.store.catalog.activities),
+        )
 
         # 1. 发起历练并模拟 StartActivityBattle 被拒 + CancelActivityBattle 回包签名被篡改（fail-closed）
         st = await h.call_guild(
@@ -1259,6 +1271,12 @@ async def test_guild_trial_loss_settlement_and_daily_funded_win_cap():
         gid = await h.create_guild_with_members("封顶历练宗", 6001, [6002])
         h.clock.advance(48 * MS_PER_HOUR)
         trial_row = next(r for r in h.store.catalog.activities if r.activity_type == ACTIVITY_TYPE_TRIAL)
+        # 实表默认关闭日常帮会历练（反上班化）；本用例显式启用内存行以继续覆盖历练状态机与对账。
+        trial_row = replace(trial_row, enabled=True)
+        h.store.catalog = replace(
+            h.store.catalog,
+            activities=tuple(trial_row if r.activity_id == trial_row.activity_id else r for r in h.store.catalog.activities),
+        )
         assert trial_row.guild_threshold >= 1
 
         # 1. LOSS 结算：不发放资金与帮贡，但标记 SETTLED/LOSS
