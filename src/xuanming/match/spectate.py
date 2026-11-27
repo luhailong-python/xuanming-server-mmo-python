@@ -107,6 +107,7 @@ class SpectateManager:
         presence: PresenceProvider,
         *,
         lobby_cache_ttl_sec: float = 0.0,
+        on_battle_forgotten: Callable[[int], None] | None = None,
     ) -> None:
         self.protocol = protocol
         self.store = store
@@ -114,10 +115,14 @@ class SpectateManager:
         self.rpc = rpc
         self.presence = presence
         self.lobby_cache = SpectateLobbyCache(ttl_sec=lobby_cache_ttl_sec)
+        self.on_battle_forgotten = on_battle_forgotten
 
     def forget_battle(self, battle_id: int) -> None:
-        """通知观战列表缓存摘除已结束或不再公开的对局。"""
-        self.lobby_cache.forget(int(battle_id))
+        """通知观战列表缓存摘除已结束或不再公开的对局，并联动关闭观战交流室。"""
+        bid = int(battle_id)
+        self.lobby_cache.forget(bid)
+        if self.on_battle_forgotten is not None and bid > 0:
+            self.on_battle_forgotten(bid)
 
     async def list_watchable_battles(
         self, caller: CallerIdentity, limit: int, *, ranked_only: bool = False
@@ -159,6 +164,8 @@ class SpectateManager:
                 summary.ranked_team_size = ranked_team_size
             if "ranked_peak_rating_centi" in summary.DESCRIPTOR.fields_by_name and ranked_peak_rating:
                 summary.ranked_peak_rating_centi = ranked_peak_rating
+            if "spectate_chat_enabled" in summary.DESCRIPTOR.fields_by_name:
+                summary.spectate_chat_enabled = bool(getattr(create_req, "spectate_chat_enabled", False))
             for p in create_req.players:
                 summary.player_names.append(p.player_name)
             raw_items.append(summary.SerializeToString(deterministic=True))

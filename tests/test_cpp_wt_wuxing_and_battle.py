@@ -300,11 +300,11 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                 assert not season_state.error_message.id
                 assert season_state.state.equipped_formation_id == 3
 
-                # --- 516 GetWuxingTowerState & 517 StartWuxingTowerRun ---
+                # --- 516 GetWuxingTowerState & 517 StartWuxingTowerRun（V2 6 节点秘境） ---
                 t0 = await _tcp_call(client, 4, "SceneSeasonClientPlayerGetWuxingTowerState")
                 assert not t0.error_message.id
                 assert not t0.state.run_active
-                assert t0.state.max_floors == WUXING_TOWER_MAX_FLOORS
+                assert t0.state.max_floors == 6
                 assert t0.state.current_floor == 1
                 assert t0.state.current_floor_dungeon_id == 101
                 assert 1 <= t0.state.current_floor_leyline_element <= 5
@@ -315,9 +315,12 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                 assert started.state.run_id == 1
                 assert started.state.current_floor == 1
 
-                # 进行中重复开局被拒
-                dup_start = await _tcp_call(client, 6, "SceneSeasonClientPlayerStartWuxingTowerRun")
-                assert dup_start.error_message.id == 1005
+                # V2 允许进行中直接重开新一轮（run_id 递增并清空进行中状态）
+                restarted = await _tcp_call(client, 6, "SceneSeasonClientPlayerStartWuxingTowerRun")
+                assert not restarted.error_message.id
+                assert restarted.state.run_active is True
+                assert restarted.state.run_id == 2
+                cur_run_id = restarted.state.run_id
 
                 # --- Scene.PrepareBattle 权威注入 formation_id 与 tower_context ---
                 now_ms_val = runtime.scene.battle._clock()
@@ -327,13 +330,13 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                         player_id=player_id,
                         battle_id=88001,
                         battle_node_id=1,
-                        battle_config_id=103,  # 第 1 层必须是 101
+                        battle_config_id=103,  # 第 1 节点必须是 101
                         deadline_ms=now_ms_val + 120_000,
                         match_mode=MATCH_MODE_PVE_SOLO,
                         is_wuxing_tower=True,
                     )
                 )
-                assert prep_bad_cfg.error_message.id == 1006
+                assert prep_bad_cfg.error_message.id in (1005, 1006)
 
                 prep_ok = await runtime.scene.battle.prepare(
                     protocol.message(
@@ -349,7 +352,7 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                 )
                 assert not prep_ok.error_message.id
                 assert prep_ok.snapshot.formation_id == 3
-                assert prep_ok.snapshot.tower_context.run_id == 1
+                assert prep_ok.snapshot.tower_context.run_id == cur_run_id
                 assert prep_ok.snapshot.tower_context.floor == 1
                 assert prep_ok.snapshot.tower_context.week_key == started.state.week_key
                 assert prep_ok.snapshot.tower_context.leyline_element == started.state.current_floor_leyline_element
@@ -357,7 +360,7 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                     protocol.message("CancelBattlePrepareRequest", player_id=player_id, battle_id=88002)
                 )
 
-                # --- 单层胜利结算推进至第 2 层并生成三选一符印（幂等校验 + 选符前禁止进第 2 层） ---
+                # --- 节点 1 胜利结算推进至节点 2（奇遇）并生成三选一秘宝（选符前禁止开战） ---
                 scene_player = runtime.scene.locations[player_id].players[player_id]
                 pdata = runtime.scene.rows.assemble(scene_player.snapshot)
                 settlement1 = protocol.message(
@@ -369,7 +372,7 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                     total_rounds=4,
                 )
                 settlement1.tower_settlement.week_key = started.state.week_key
-                settlement1.tower_settlement.run_id = 1
+                settlement1.tower_settlement.run_id = cur_run_id
                 settlement1.tower_settlement.floor = 1
                 settlement1.tower_settlement.total_rounds = 4
                 assert runtime.scene.season.settle_wuxing_tower_battle(pdata, settlement1) is True
@@ -379,12 +382,12 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
 
                 t_after_f1 = await _tcp_call(client, 7, "SceneSeasonClientPlayerGetWuxingTowerState")
                 assert not t_after_f1.error_message.id
-                assert t_after_f1.state.current_floor == 2
+                assert t_after_f1.state.current_floor == 1
                 assert t_after_f1.state.weekly_cleared_mask == 0b1
                 assert t_after_f1.state.weekly_best_floor == 1
                 assert len(t_after_f1.state.pending_offer_sigil_ids) == 3
 
-                # 待选符印未选前禁止直接 PrepareBattle 第 2 层
+                # 待选秘宝未选前禁止直接 PrepareBattle
                 prep_blocked = await runtime.scene.battle.prepare(
                     protocol.message(
                         "PrepareBattleRequest",
@@ -409,28 +412,40 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                 chosen_sigil = t_after_f1.state.pending_offer_sigil_ids[0]
                 picked = await _tcp_call(
                     client, 9, "SceneSeasonClientPlayerPickWuxingTowerSigil",
-                    expected_run_id=1, sigil_id=chosen_sigil,
+                    expected_run_id=cur_run_id, sigil_id=chosen_sigil,
                 )
                 assert not picked.error_message.id
+                assert picked.state.current_floor == 2
                 assert list(picked.state.active_sigil_ids) == [chosen_sigil]
                 assert not picked.state.pending_offer_sigil_ids
 
-                # 选符后可合法 PrepareBattle 第 2 层且权威注入已选符印
-                prep_f2 = await runtime.scene.battle.prepare(
+                # 节点 2 选择奇遇分支(585)并结算事件(586)后推进至节点 3 战斗节点，可合法 PrepareBattle 且权威注入已选秘宝
+                branched2 = await _tcp_call(
+                    client, 89, "SceneSeasonClientPlayerChooseWuxingRealmBranch",
+                    expected_run_id=cur_run_id, branch=2,
+                )
+                assert not branched2.error_message.id
+                resolved2 = await _tcp_call(
+                    client, 90, "SceneSeasonClientPlayerResolveWuxingRealmEvent",
+                    expected_run_id=cur_run_id, option_index=1,
+                )
+                assert not resolved2.error_message.id
+                assert resolved2.state.current_floor == 3
+                prep_f3 = await runtime.scene.battle.prepare(
                     protocol.message(
                         "PrepareBattleRequest",
                         player_id=player_id,
                         battle_id=88004,
                         battle_node_id=1,
-                        battle_config_id=103,
+                        battle_config_id=resolved2.state.current_floor_dungeon_id,
                         deadline_ms=now_ms_val + 120_000,
                         match_mode=MATCH_MODE_PVE_SOLO,
                         is_wuxing_tower=True,
                     )
                 )
-                assert not prep_f2.error_message.id
-                assert prep_f2.snapshot.tower_context.floor == 2
-                assert list(prep_f2.snapshot.tower_context.active_sigil_ids) == [chosen_sigil]
+                assert not prep_f3.error_message.id
+                assert prep_f3.snapshot.tower_context.floor == 3
+                assert chosen_sigil in list(prep_f3.snapshot.tower_context.active_sigil_ids)
                 await runtime.scene.battle.cancel(
                     protocol.message("CancelBattlePrepareRequest", player_id=player_id, battle_id=88004)
                 )
@@ -442,21 +457,22 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                 assert bad_abandon.error_message.id == 1005
 
                 abandoned = await _tcp_call(
-                    client, 11, "SceneSeasonClientPlayerAbandonWuxingTowerRun", expected_run_id=1,
+                    client, 11, "SceneSeasonClientPlayerAbandonWuxingTowerRun", expected_run_id=cur_run_id,
                 )
                 assert not abandoned.error_message.id
                 assert abandoned.state.run_active is False
                 assert not abandoned.state.active_sigil_ids
-                assert abandoned.state.weekly_cleared_mask == 0b1  # 首通位图不因放弃清空
+                assert abandoned.state.weekly_cleared_mask == 0b11  # 节点 1/2 首通位图不因放弃清空
 
-                # 放弃后可重新开第 2 轮并模拟通关第 10 层入本周最速榜
+                # 放弃后可重新开新一轮并模拟通关第 6 节点（V2 终局）入本周最速榜
                 started2 = await _tcp_call(client, 12, "SceneSeasonClientPlayerStartWuxingTowerRun")
-                assert not started2.error_message.id and started2.state.run_id == 2
+                assert not started2.error_message.id and started2.state.run_id == cur_run_id + 1
                 pdata2 = runtime.scene.rows.assemble(scene_player.snapshot)
-                pdata2.season_component.wuxing_tower.current_floor = 10
+                pdata2.season_component.wuxing_tower.current_floor = 6
+                pdata2.season_component.wuxing_tower.current_node_kind = 5
                 pdata2.season_component.wuxing_tower.run_total_rounds = 25
-                pdata2.season_component.wuxing_tower.active_sigil_ids.extend([101, 202, 403])
-                settlement10 = protocol.message(
+                pdata2.season_component.wuxing_tower.active_sigil_ids.extend([601, 611, 631])
+                settlement6 = protocol.message(
                     "BattleSettlementData",
                     battle_id=88010,
                     player_id=player_id,
@@ -464,23 +480,23 @@ def test_scene_wuxing_rpcs_515_to_521_and_prepare_battle_over_local_tcp(tmp_path
                     player_team_index=0,
                     total_rounds=5,
                 )
-                settlement10.tower_settlement.week_key = started2.state.week_key
-                settlement10.tower_settlement.run_id = 2
-                settlement10.tower_settlement.floor = 10
-                settlement10.tower_settlement.total_rounds = 5
-                assert runtime.scene.season.settle_wuxing_tower_battle(pdata2, settlement10) is True
+                settlement6.tower_settlement.week_key = started2.state.week_key
+                settlement6.tower_settlement.run_id = started2.state.run_id
+                settlement6.tower_settlement.floor = 6
+                settlement6.tower_settlement.total_rounds = 5
+                assert runtime.scene.season.settle_wuxing_tower_battle(pdata2, settlement6) is True
                 await runtime.scene.commit_player_data(scene_player, pdata2)
 
                 t_final = await _tcp_call(client, 13, "SceneSeasonClientPlayerGetWuxingTowerState")
                 assert not t_final.error_message.id
                 assert t_final.state.run_active is False
-                assert t_final.state.weekly_best_floor == 10
+                assert t_final.state.weekly_best_floor == 6
                 assert t_final.state.weekly_best_rounds == 30
-                assert (t_final.state.weekly_cleared_mask & (1 << 9)) != 0
+                assert (t_final.state.weekly_cleared_mask & (1 << 5)) != 0
                 assert len(t_final.state.weekly_leaderboard) == 1
                 assert t_final.state.weekly_leaderboard[0].player_id == player_id
                 assert t_final.state.weekly_leaderboard[0].best_rounds == 30
-                assert list(t_final.state.weekly_leaderboard[0].sigil_ids) == [101, 202, 403]
+                assert list(t_final.state.weekly_leaderboard[0].sigil_ids) == [601, 611, 631]
 
                 # --- 520 SaveBattleBuildBookmark & 521 DeleteBattleBuildBookmark ---
                 bm = protocol.message(

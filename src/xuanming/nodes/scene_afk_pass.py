@@ -136,9 +136,31 @@ class SceneAfkPass:
         self.player_redis = player_redis
         self._allow_gm = allow_gm
         self.now_s = now_s or (lambda: time.time_ns() // 1_000_000_000)
+        self._projection_failures: int = 0
         tx_enum = self.protocol.pool.FindEnumTypeByName("TransactionType")
         buy_tx = tx_enum.values_by_name.get("TX_AFK_PASS_BUY") or tx_enum.values_by_name["TX_CURRENCY_DEDUCT"]
         self.buy_tx = buy_tx.number
+
+    @property
+    def projection_failures(self) -> int:
+        """累计挂机月卡 Redis 投影写失败次数（对齐 C++ AfkPassSystem::ProjectionFailures）。"""
+        return self._projection_failures
+
+    def render_metrics(self, hosting_events: dict[str, int] | None = None) -> str:
+        """导出挂机托管与月卡投影失败计数 Prometheus 文本指标（对齐 C++ AfkHostingSystem::WriteMetrics）。"""
+        events = hosting_events or {}
+        lines = [
+            "# HELP scene_afk_hosting_events_total Offline hosting events on this scene node since process start.",
+            "# TYPE scene_afk_hosting_events_total counter",
+        ]
+        for name in ("probe", "probe_failed", "hosted", "renewed", "ended"):
+            lines.append(f'scene_afk_hosting_events_total{{event="{name}"}} {int(events.get(name, 0))}')
+        lines.extend([
+            "# HELP scene_afk_pass_projection_failures_total AFK pass Redis projection writes that failed since process start.",
+            "# TYPE scene_afk_pass_projection_failures_total counter",
+            f"scene_afk_pass_projection_failures_total {self._projection_failures}",
+        ])
+        return "\n".join(lines) + "\n"
 
     @property
     def allow_gm(self) -> bool:
@@ -237,10 +259,12 @@ class SceneAfkPass:
                 await self.player_redis.delete(key)
             return True
         except Exception:
+            self._projection_failures += 1
             logger.warning(
-                "AfkPass redis projection failed player_id=%d expires_at=%d",
+                "AfkPass redis projection failed player_id=%d expires_at=%d failures_total=%d",
                 player_id,
                 expires_at,
+                self._projection_failures,
                 exc_info=True,
             )
             return False

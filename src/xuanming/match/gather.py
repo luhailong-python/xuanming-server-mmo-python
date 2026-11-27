@@ -51,6 +51,7 @@ from .model import (
     record_replay_for,
     spectate_visibility_for,
 )
+from .spectate_chat import spectate_chat_enabled_for_battle
 from .store import MatchStore
 from .tactical_puzzle import deterministic_puzzle_seed
 from .trial_cards import build_trial_battle_context
@@ -513,6 +514,21 @@ class GatherPipeline:
             else (secrets.randbits(64) or 1)
         )
         puzzle_author_verify = bool(tactical_puzzle_ctx.is_author_verify) if tactical_puzzle_ctx is not None else False
+        spectate_visibility = spectate_visibility_for(
+            int(formation.mode),
+            has_activity,
+            allow_public_spectate=allow_public_spectate,
+            ranked_public_spectate=ranked_public_spectate,
+            is_guild_war_activity=is_guild_war_activity,
+        )
+        all_snapshots = [snap for _, _, snap, _ in prepared_members] + list(ai_defender_snapshots)
+        spectate_chat_enabled = spectate_chat_enabled_for_battle(
+            self.config.spectate_chat,
+            int(formation.mode),
+            spectate_visibility,
+            activity_msg,
+            all_snapshots,
+        )
         create_req = self.protocol.message(
             "CreateBattleRequest",
             battle_id=battle_id,
@@ -527,19 +543,15 @@ class GatherPipeline:
             target_instance_id=formation.target_instance_id,
             admit_before_ms=prepare_deadline_ms,
             outcome_protocol_version=1,
-            spectate_visibility=spectate_visibility_for(
-                int(formation.mode),
-                has_activity,
-                allow_public_spectate=allow_public_spectate,
-                ranked_public_spectate=ranked_public_spectate,
-                is_guild_war_activity=is_guild_war_activity,
-            ),
+            spectate_visibility=spectate_visibility,
             record_replay=record_replay_for(
                 int(formation.mode),
                 trial_journal_entry_id=trial_entry_id,
                 tactical_puzzle_author_verify=puzzle_author_verify,
             ),
         )
+        if "spectate_chat_enabled" in create_req.DESCRIPTOR.fields_by_name:
+            create_req.spectate_chat_enabled = spectate_chat_enabled
         if activity_msg is not None:
             create_req.activity_context.CopyFrom(activity_msg)
         if ranked_ctx is not None:

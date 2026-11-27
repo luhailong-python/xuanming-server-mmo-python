@@ -126,10 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`f4947968a99725c088e5328ed642063094438a3a`（短哈希 `f4947968a`，555 条路由 / 83 张配表 version 104 / `battle_table_fingerprint = c51ba644116ac1ee8bdd8a2ed1fc055e`）
-  - 追平范围：涵盖 `60b0bd6b3..f4947968a` 全部 14 笔提交（含 11 条新 RPC `574~584`）：万象残局坊 V1/V1.5（`575~581` 残局草稿校验、作者自证发布、官方通关回放、点赞、五行灵脉阵眼与预设禁招、Dungeon 314 战斗规则与回合耗尽败北）、Battle 未成年人游玩截止强制断开与 Gate 预鉴权池/心跳期限/租约世代护栏/分层观战中枢、聚宝斋技能书求购单（`582~584`，严格拒收绑银 `CURRENCY_TYPE_BIND_GOLD=3` 与绑定书）、跨服务共享双人复核（`src/xuanming/dualcontrol.py` 覆盖 LoginAdmin/Trade/Mail/Rank/PlayerInbox/DataService）、Login 通行证事件 `574 HandlePassportEvent` 与 Token 家族撤销、Chat 平台复检与运维鉴权、ContentGuard 逃逸检测加固、Scene 装备方案 A 统一 7 格席位与宠物/阵法联动、任务完成位图 `complete_missions` 迁移、帮会战欠账恢复 `guild_war_credit_owed`、DataService 合服 etcd 副本读取与 SceneManager 宿主网关实例护栏。
+  - Commit SHA：`da97bfb11afc864a5778b67d95136d51ce148e7d`（短哈希 `da97bfb11`，557 条路由 / 83 张配表 version 106 / `battle_table_fingerprint = c51ba644116ac1ee8bdd8a2ed1fc055e`）
+  - 追平范围：涵盖 `f4947968a..da97bfb11` 全部 9 笔提交（退役旧 Scene 技能书悬赏单 `560~563` 统一迁聚宝斋 `582~584`，新增 6 条 RPC `585~590`）：五行秘境 V2（`585 ChooseWuxingRealmBranch`、`586 ResolveWuxingRealmEvent`、6 节点分支与奇遇/休整事件、15 枚 V2 秘宝与 5 元素 3 联动共鸣、公平 3x3 预设与自养/预设双榜、Battle 6 组 Prometheus 指标）、观战聊天全链路（Match `587 SendBattleSpectateChat` / `588 PullBattleSpectateChat` 60 条环形缓冲与 fail-closed 内容风控 + Scene `589 GetSpectateChatSetting` / `590 SetSpectateChatSetting` 与战斗脱敏透传）、Gate 请求/场景通道排空与入场重试统计、Scene 生命周期/释放护栏与冻结指标、江湖决斗未结清预扣银两重发拦截、帮会资产人工核销静默证人与角色围栏清理、Trade 尝试次数限流/RMB 缺口重发隔离及 PlayerInbox 启动建表校验。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline f4947968a99725c088e5328ed642063094438a3a..HEAD`。
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline da97bfb11afc864a5778b67d95136d51ce148e7d..HEAD`。
   2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

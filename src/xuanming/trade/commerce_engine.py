@@ -132,6 +132,22 @@ _TICK_RETRY_BACKOFF_MS = 10_000
 _TICK_PENDING_BACKOFF_MS = 60_000
 _TICK_ROLE_CONFLICT_BACKOFF_MS = 300_000
 
+# 寄售与求购单尝试成交次数上限（对齐 Go engine.go r2-craft#1 复查）：先按人限 3 次防零成本耗尽，再按单限 256 次保 workflow 有界。
+MAX_ATTEMPTS_PER_ACTOR = 3
+MAX_ATTEMPTS_PER_LISTING = 256
+
+
+def attempt_allowed(w: Message, leg_prefix: str, player_id: int) -> bool:
+    """判定玩家还能否对这张单发起一次尝试（寄售 buyer_debit_，求购单 seller_debit_）；重放不新建腿不计次。"""
+    if int(w.quantity_reserved) >= MAX_ATTEMPTS_PER_LISTING:
+        return False
+    mine = sum(
+        1
+        for leg in w.legs
+        if int(leg.player_id) == int(player_id) and str(leg.role).startswith(leg_prefix)
+    )
+    return mine < MAX_ATTEMPTS_PER_ACTOR
+
 
 # -- 合同与腿纯辅助函数 ---------------------------------------------------------------------------------
 
@@ -573,7 +589,7 @@ def _failed_official_reversal_legs(w: Message) -> list[Message]:
 
 def _reissuable_quarantine(q: Message) -> bool:
     if q.reason == MANUAL_REASON_FINAL_CREDIT:
-        return q.stage in ("deliver", "return")
+        return q.stage in ("deliver", "return", "rmb_delivery")
     if q.reason == MANUAL_REASON_RMB_RETURN:
         return True
     if q.reason == MANUAL_REASON_PAYMENT_REVERSAL:
@@ -1333,7 +1349,7 @@ class CommerceEngine:
                     raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot buy own consignment")
                 if int(w.designated_buyer_player_id) != 0 and int(w.designated_buyer_player_id) != me:
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "consignment reserved for designated buyer")
-                if int(w.quantity_reserved) >= 32:
+                if not attempt_allowed(w, "buyer_debit_", me):
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "consignment reservation limit")
                 rec.buyer_player_id = me
                 buyer_fence = await self.store.read_ownership(tx, me)
@@ -1377,7 +1393,7 @@ class CommerceEngine:
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "wanted order is not open")
                 if me == int(rec.buyer_player_id):
                     raise TradeRejection(ERR_TRADE_CANNOT_TRADE_SELF, "cannot fulfill own wanted order")
-                if int(w.quantity_reserved) >= MAX_WANTED_FULFILL_ATTEMPTS:
+                if not attempt_allowed(w, WANTED_DEBIT_PREFIX, me):
                     raise TradeRejection(ERR_TRADE_ORDER_STATE_CONFLICT, "wanted fulfill attempt limit reached")
                 seller_fence = await self.store.read_ownership(tx, me)
                 rec.seller_player_id = me
@@ -2402,8 +2418,8 @@ class CommerceEngine:
             self._apply_refund(rec, w, returns, res)
 
         elif req.action == "partial":
-            if int(rec.kind) in (COMMERCE_KIND_OFFICIAL, COMMERCE_KIND_RMB_CONSIGNMENT):
-                raise ManualNotAllowedError("partial not supported for official/rmb contracts")
+            if int(rec.kind) == COMMERCE_KIND_OFFICIAL:
+                raise ManualNotAllowedError("partial not supported for official contracts")
             named = set()
             credit_fixes = []
             for part in req.parts:
@@ -2412,6 +2428,10 @@ class CommerceEngine:
                     raise ManualNotAllowedError(f"leg {part.leg} is not an active partial leg")
                 named.add(l.role)
                 if int(l.stream) != ASSET_STREAM_TRADE_CREDIT:
+                    if int(rec.kind) == COMMERCE_KIND_RMB_CONSIGNMENT:
+                        raise ManualNotAllowedError(
+                            f"rmb consignment escrow partial debit {l.role} must be handled with mall order"
+                        )
                     raise ManualNotAllowedError(f"partial debit recovery not automated for {l.role}")
                 shortfall = _credit_shortfall(self.protocol, l.bundle, part.missing)
                 credit_fixes.append((l, shortfall))

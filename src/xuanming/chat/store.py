@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import logging
 import secrets
@@ -109,6 +110,11 @@ _ACTOR_VERIFY_MAX_ENTRIES = 1 << 16
 _PROFILE_CACHE_MAX_ENTRIES = 1 << 16
 
 T = TypeVar("T")
+
+
+def detach_background_context() -> contextvars.Context:
+    """构造剥离请求级上下文（SessionDetails/gRPC metadata/鉴权态）的干净后台 Context（对齐 Go ctxdetach.Detach）。"""
+    return contextvars.Context()
 
 
 class _TxRollbackReturn(Exception):
@@ -844,7 +850,11 @@ class ChatStoreCore:
             rows = await self._read_world_rows(tx, self._rules.max_pull_rows())
             return WorldSnapshot(rows=tuple(rows), db_now_ms=now_ms)
 
-        return await self._driver.run_tx(tx_work)
+        # 共享世界窗后台重读与触发请求彻底解耦，防止请求级上下文变量泄漏进共享快照加载。
+        return await asyncio.create_task(
+            self._driver.run_tx(tx_work),
+            context=detach_background_context(),
+        )
 
     async def pull(self, identity: ActorIdentity, request: Message, limit: int) -> list[Message]:
         """拉取世界或私聊最近 limit 条可见历史（新在前，含闲置 TTL 截断）。"""

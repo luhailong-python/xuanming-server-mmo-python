@@ -258,6 +258,60 @@ class GateNode:
             "heartbeat_before_verify": 0,
             "preauth_oversize": 0,
         }
+        # 对齐 C++ client_request_lane / client_scene_lane / scene_entry_dispatch 单源计数
+        self.router_lane_counters: dict[str, int] = {
+            "admitted": 0,
+            "sent": 0,
+            "replied": 0,
+            "failed": 0,
+            "expired": 0,
+            "expired_in_queue": 0,
+            "no_router": 0,
+            "call_not_built": 0,
+            "rejected_full": 0,
+            "rejected_redirected": 0,
+            "late_dropped": 0,
+            "incarnation_mismatch": 0,
+            "dropped_on_close": 0,
+            "dropped_on_redirect": 0,
+            "rejected_not_logged_in": 0,
+            "rejected_stale_identity": 0,
+            "rejected_before_send": 0,
+        }
+        self._router_lane_in_flight = 0
+        self._router_lane_max_depth_seen = 0
+        self.scene_lane_counters: dict[str, int] = {
+            "admitted": 0,
+            "sent": 0,
+            "replied": 0,
+            "failed": 0,
+            "no_content": 0,
+            "dropped_uncorrelated": 0,
+            "held": 0,
+            "retry_verdicts": 0,
+            "expired_on_hold": 0,
+            "expired_in_queue": 0,
+            "no_scene": 0,
+            "rejected_full": 0,
+            "dropped_on_redirect": 0,
+            "one_way_direct": 0,
+            "one_way_queued": 0,
+            "one_way_sent": 0,
+            "one_way_dropped": 0,
+            "sent_on_new_route": 0,
+            "inflight_lost": 0,
+            "late_dropped": 0,
+        }
+        self._scene_lane_in_flight = 0
+        self._scene_lane_max_depth_seen = 0
+        self.scene_entry_counters: dict[str, int] = {
+            "deferred": 0,
+            "recovered": 0,
+            "gave_up": 0,
+            "superseded": 0,
+            "session_closed": 0,
+            "player_changed": 0,
+        }
         self._generation = count(1)
         self._calls = count(1)
         self._handlers: set[asyncio.Task] = set()
@@ -276,6 +330,57 @@ class GateNode:
     def total_connections(self) -> int:
         """当前总连接数 = 已验签会话数 + 未验签连接数（总量上限按此口径校验）。"""
         return len(self.sessions) + len(self.pre_auth_connections)
+
+    def collect_lane_metrics(self) -> dict[str, object]:
+        """返回与 C++ gate_router_lane_* / gate_scene_lane_* / gate_scene_entry_* 同源的计数与瞬时量快照。"""
+        holding_sessions = sum(
+            1
+            for s in self.sessions.values()
+            if s.scene_lane is not None and s.scene_lane.queue and s.scene_lane.queue[0].retry_at
+        )
+        pending_entries = sum(1 for s in self.sessions.values() if s.pending_route is not None)
+        return {
+            "router_lane": {
+                "events": dict(self.router_lane_counters),
+                "in_flight": self._router_lane_in_flight,
+                "max_depth_seen": self._router_lane_max_depth_seen,
+            },
+            "scene_lane": {
+                "events": dict(self.scene_lane_counters),
+                "in_flight": self._scene_lane_in_flight,
+                "holding_sessions": holding_sessions,
+                "max_depth_seen": self._scene_lane_max_depth_seen,
+            },
+            "scene_entry": {
+                "events": dict(self.scene_entry_counters),
+                "pending_sessions": pending_entries,
+            },
+        }
+
+    def format_lane_summary(self) -> dict[str, str]:
+        """按与 C++ VisitLaneCounters / VisitSceneLaneCounters / VisitSceneEntryCounters 相同的键序生成汇总行。"""
+        snap = self.collect_lane_metrics()
+        rl = snap["router_lane"]
+        sl = snap["scene_lane"]
+        se = snap["scene_entry"]
+        return {
+            "router_lane": (
+                "[lane] summary "
+                + " ".join(f"{k}={v}" for k, v in rl["events"].items())
+                + f" in_flight={rl['in_flight']} max_depth_seen={rl['max_depth_seen']}"
+            ),
+            "scene_lane": (
+                "[scene_lane] summary "
+                + " ".join(f"{k}={v}" for k, v in sl["events"].items())
+                + f" in_flight={sl['in_flight']} holding_sessions={sl['holding_sessions']}"
+                + f" max_depth_seen={sl['max_depth_seen']}"
+            ),
+            "scene_entry": (
+                "[SceneEntry] "
+                + " ".join(f"{k}={v}" for k, v in se["events"].items())
+                + f" pending={se['pending_sessions']}"
+            ),
+        }
 
     def issue_ticket(self, *, ttl: int = 600, player_id: int = 0):
         return issue_gate_ticket(
@@ -473,6 +578,10 @@ class GateNode:
                 direct_rpc = (getattr(self.forward, "direct_mode", False) and route is not None
                               and route.node_type not in (RouteNode.SCENE, RouteNode.GATE, RouteNode.BATTLE))
                 if session.redirected and not direct_rpc:
+                    if route is not None and route.node_type == RouteNode.SCENE:
+                        self.scene_lane_counters["dropped_on_redirect"] += 1
+                    else:
+                        self.router_lane_counters["rejected_redirected"] += 1
                     session.emit(self.protocol.content(request.message_id, request.id, error=UNAVAILABLE))
                     continue
                 if (session.queued_leave and route is not None
@@ -485,7 +594,18 @@ class GateNode:
                         if reply is not None:
                             session.emit(reply)
                     else:
-                        await session.scene_lane.admit_wait(request, route.kind == RpcKind.ONE_WAY)
+                        one_way = route.kind == RpcKind.ONE_WAY
+                        lane = session.scene_lane
+                        self.scene_lane_counters["admitted"] += 1
+                        if one_way:
+                            if not lane.queue or lane.queue[0].retry_at:
+                                self.scene_lane_counters["one_way_direct"] += 1
+                            else:
+                                self.scene_lane_counters["one_way_queued"] += 1
+                        await lane.admit_wait(request, one_way)
+                        depth = len(lane.queue) + int(lane.inflight is not None)
+                        if depth > self._scene_lane_max_depth_seen:
+                            self._scene_lane_max_depth_seen = depth
                     continue
                 if route is not None and route.node_type == RouteNode.GATE:
                     reply = await self._dispatch(session, next(self._calls), request)
@@ -542,7 +662,9 @@ class GateNode:
                 await write_packet(session.writer, Packet.from_message(message))
 
     def _admit_router(self, session: Session, request, now: float) -> None:
-        if session.requests.qsize() + int(session.lane_busy) >= ROUTER_LANE_DEPTH:
+        depth = session.requests.qsize() + int(session.lane_busy)
+        if depth >= ROUTER_LANE_DEPTH:
+            self.router_lane_counters["rejected_full"] += 1
             session.emit(self.protocol.content(request.message_id, request.id, error=RATE_LIMIT_EXCEEDED))
             return
         seq = next(self._calls)
@@ -555,6 +677,10 @@ class GateNode:
         identity = (details.player_id, details.authenticated_account, details.owner_revision) if details.authenticated_account else None
         is_leave = request.message_id == self.protocol.message_ids["ClientPlayerLoginLeaveGame"]
         session.requests.put_nowait(RouterLaneItem(seq, request, identity, details, now, is_leave))
+        self.router_lane_counters["admitted"] += 1
+        new_depth = depth + 1
+        if new_depth > self._router_lane_max_depth_seen:
+            self._router_lane_max_depth_seen = new_depth
         if is_leave:
             session.queued_leave += 1
 
@@ -686,27 +812,51 @@ class GateNode:
                 session.emit(self.protocol.content(request.message_id, request.id, error=UNAVAILABLE))
 
     async def _lane(self, session: Session) -> None:
-        while True:
-            item = await session.requests.get()
-            request = item.request
-            session.lane_busy = True
-            try:
-                identity = session.player_id, session.account, session.owner_revision
-                if (session.redirected or session.entry_failed
-                        or time.monotonic() - item.admitted_at > ROUTER_LANE_MAX_WAIT):
-                    reply = self.protocol.content(request.message_id, request.id, error=UNAVAILABLE)
-                elif item.admitted_identity is not None and item.admitted_identity != identity:
-                    reply = self.protocol.content(request.message_id, request.id, error=LOGIN_SESSION_NOT_FOUND)
-                else:
-                    reply = await self._dispatch(session, item.sequence, request, router_details=item.details,
-                                                 lane_item=item)
-                if reply is not None:
-                    session.emit(reply)
-            finally:
-                if item.leave_barrier:
-                    session.queued_leave = max(0, session.queued_leave - 1)
-                session.lane_busy = False
+        try:
+            while True:
+                item = await session.requests.get()
+                request = item.request
+                session.lane_busy = True
+                try:
+                    identity = session.player_id, session.account, session.owner_revision
+                    if session.redirected:
+                        self.router_lane_counters["rejected_redirected"] += 1
+                        reply = self.protocol.content(request.message_id, request.id, error=UNAVAILABLE)
+                    elif session.entry_failed:
+                        self.router_lane_counters["rejected_before_send"] += 1
+                        reply = self.protocol.content(request.message_id, request.id, error=UNAVAILABLE)
+                    elif time.monotonic() - item.admitted_at > ROUTER_LANE_MAX_WAIT:
+                        self.router_lane_counters["expired_in_queue"] += 1
+                        reply = self.protocol.content(request.message_id, request.id, error=UNAVAILABLE)
+                    elif item.admitted_identity is not None and item.admitted_identity != identity:
+                        self.router_lane_counters["rejected_stale_identity"] += 1
+                        reply = self.protocol.content(request.message_id, request.id, error=LOGIN_SESSION_NOT_FOUND)
+                    else:
+                        self._router_lane_in_flight += 1
+                        self.router_lane_counters["sent"] += 1
+                        try:
+                            reply = await self._dispatch(
+                                session, item.sequence, request, router_details=item.details, lane_item=item
+                            )
+                        finally:
+                            self._router_lane_in_flight = max(0, self._router_lane_in_flight - 1)
+                        if reply is not None and getattr(reply, "error_message", None) and reply.error_message.id == UNAVAILABLE:
+                            self.router_lane_counters["failed"] += 1
+                        elif reply is not None:
+                            self.router_lane_counters["replied"] += 1
+                    if reply is not None:
+                        session.emit(reply)
+                finally:
+                    if item.leave_barrier:
+                        session.queued_leave = max(0, session.queued_leave - 1)
+                    session.lane_busy = False
+                    session.requests.task_done()
+        except asyncio.CancelledError:
+            while not session.requests.empty():
+                session.requests.get_nowait()
                 session.requests.task_done()
+                self.router_lane_counters["dropped_on_close"] += 1
+            raise
 
     async def _dispatch(self, session: Session, seq: int, request, *, router_details=None, lane_item=None):
         route = self.protocol.routes.get(request.message_id)
@@ -736,6 +886,7 @@ class GateNode:
                     return self._error(request, REQUEST_PARSE_ERROR)
             if route.service == LOGIN_SERVICE:
                 if route.method in ("CreatePlayer", "EnterGame", "LeaveGame") and not session.logged_in:
+                    self.router_lane_counters["rejected_not_logged_in"] += 1
                     return self._error(request, LOGIN_SESSION_NOT_FOUND)
                 if route.method == "Login" and validate_direct is None:
                     session.login_started = True
@@ -814,15 +965,35 @@ class GateNode:
             options["on_sent"] = on_sent
         if can_send is not None:
             options["can_send"] = can_send
-        data = await self.scene.call(
-            target[0], self.protocol.message_ids["SceneProcessClientPlayerMessage"],
-            payload, one_way=one_way, expected_uuid=target[3] or None, **options,
-        )
+        self._scene_lane_in_flight += 1
+        self.scene_lane_counters["sent"] += 1
+        if one_way:
+            self.scene_lane_counters["one_way_sent"] += 1
+        if previous_route:
+            self.scene_lane_counters["sent_on_new_route"] += 1
+        try:
+            data = await self.scene.call(
+                target[0], self.protocol.message_ids["SceneProcessClientPlayerMessage"],
+                payload, one_way=one_way, expected_uuid=target[3] or None, **options,
+            )
+        except Exception:
+            self.scene_lane_counters["failed"] += 1
+            raise
+        finally:
+            self._scene_lane_in_flight = max(0, self._scene_lane_in_flight - 1)
         if not one_way:
             result = self.protocol.parse("ProcessClientPlayerMessageResponse", data)
             if lane_response:
                 if result.session_id not in (0, session.session_id):
+                    self.scene_lane_counters["dropped_uncorrelated"] += 1
                     raise ValueError("场景响应会话不匹配")
+                if result.HasField("message_content"):
+                    self.scene_lane_counters["replied"] += 1
+                elif result.dispatch_verdict == 1:
+                    self.scene_lane_counters["retry_verdicts"] += 1
+                    self.scene_lane_counters["held"] += 1
+                else:
+                    self.scene_lane_counters["no_content"] += 1
                 return result
             # ExitGame has an Empty inner response. C++ Scene consequently sends
             # an empty outer response, even when this RPC0 call expects a reply.
@@ -866,6 +1037,8 @@ class GateNode:
         await self._scene_request(session, request, one_way=reason != 1, empty_exit_response=reason == 1)
 
     async def _disconnect(self, session: Session) -> None:
+        if session.pending_route is not None:
+            self.scene_entry_counters["session_closed"] += 1
         self._clear_scene_entry(session)
         try:
             exit_reason = 1 if session.exit_scene_immediately_on_close else (3 if session.lease_expired else 2)
@@ -958,6 +1131,11 @@ class GateNode:
         loop = asyncio.get_running_loop()
         entry = PendingSceneEntry(snapshot, enter_type, loop.time() if started is None else started,
                                   self._entry_binding(session) if session.player_id else None)
+        if previous is not None and not from_bind:
+            if previous.event.player_id != event.player_id:
+                self.scene_entry_counters["player_changed"] += 1
+            else:
+                self.scene_entry_counters["superseded"] += 1
         self._clear_scene_entry(session)
         session.pending_route = entry
         session.last_scene_route = snapshot
@@ -1033,6 +1211,7 @@ class GateNode:
                 session.routing.release()
 
         async def give_up() -> None:
+            self.scene_entry_counters["gave_up"] += 1
             logger.warning("场景入场失败 session=%s scene=%s target=%s attempts=%d first=%s last=%s",
                            session.session_id, entry.event.scene_id, entry.event.target_node_id,
                            entry.attempts, entry.first_failure, entry.last_failure)
@@ -1046,8 +1225,23 @@ class GateNode:
             if self.sessions.get(session.session_id) is session:
                 session.close()
 
+        deferred_counted = False
+
+        async def tracked_attempt(budget: float) -> None:
+            nonlocal deferred_counted
+            try:
+                await attempt(budget)
+            except Exception:
+                if not deferred_counted:
+                    deferred_counted = True
+                    self.scene_entry_counters["deferred"] += 1
+                raise
+            else:
+                if deferred_counted:
+                    self.scene_entry_counters["recovered"] += 1
+
         try:
-            await retry_entry(entry, current, attempt, give_up)
+            await retry_entry(entry, current, tracked_attempt, give_up)
         finally:
             if session.pending_route is entry:
                 session.pending_route = None
@@ -1143,13 +1337,17 @@ class GateNode:
             return
         session.redirected = True
         self.drain_migration.redirected(session)
+        if session.pending_route is not None:
+            self.scene_entry_counters["superseded"] += 1
         self._clear_scene_entry(session)
         session.last_scene_route = None
         if session.scene_lane is not None:
+            self.scene_lane_counters["dropped_on_redirect"] += len(session.scene_lane.queue)
             session.scene_lane.redirect()
         while not session.requests.empty():
             queued = session.requests.get_nowait()
             session.requests.task_done()
+            self.router_lane_counters["dropped_on_redirect"] += 1
             if isinstance(queued, RouterLaneItem):
                 session.emit(self.protocol.content(queued.request.message_id, queued.request.id, error=UNAVAILABLE))
         session.queued_leave = 0
@@ -1178,8 +1376,20 @@ class GateNode:
                                        target_port=response.target_gate_port, token_payload=response.token_payload,
                                        token_signature=response.token_signature, token_deadline=response.token_deadline)
         session.redirected = True
+        if session.pending_route is not None:
+            self.scene_entry_counters["superseded"] += 1
+        self._clear_scene_entry(session)
+        session.last_scene_route = None
         if session.scene_lane is not None:
+            self.scene_lane_counters["dropped_on_redirect"] += len(session.scene_lane.queue)
             session.scene_lane.redirect()
+        while not session.requests.empty():
+            queued = session.requests.get_nowait()
+            session.requests.task_done()
+            self.router_lane_counters["dropped_on_redirect"] += 1
+            if isinstance(queued, RouterLaneItem):
+                session.emit(self.protocol.content(queued.request.message_id, queued.request.id, error=UNAVAILABLE))
+        session.queued_leave = 0
         session.emit(self.protocol.content(self.protocol.message_ids["SceneClientPlayerCommonRedirectToGate"],
                                            body=notify.SerializeToString()))
         if session.writer.is_closing():
@@ -1200,6 +1410,33 @@ class GateNode:
             return 0
         return session.player_id
 
+    def find_active_session_by_player(self, player_id: int) -> Session | None:
+        """按玩家 ID 查找当前未关闭的在线会话（供单进程本地模式公开查询，不直接遍历 sessions）。"""
+        pid = int(player_id)
+        if pid <= 0:
+            return None
+        for session in self.sessions.values():
+            if session.player_id == pid and not session.writer.is_closing():
+                return session
+        return None
+
+    def make_error_content(self, request, code: int):
+        """构造统一错误应答信封（公开接口，避免跨模块直调私有 _error）。"""
+        return self._error(request, code)
+
+    @staticmethod
+    def reset_session_on_leave(session: Session) -> None:
+        """LeaveGame 返回选角态时由 Gate 统一清空会话绑定字段，禁止外部模块直接覆写内部属性。"""
+        session.player_id = session.scene_id = session.scene_node_id = session.owner_revision = 0
+        session.account = ""
+        session.pending_route = None
+
+    def close_superseded_session(self, session_id: int, incarnation: int, current: Session) -> None:
+        """顶号成功后关闭被替换的旧会话（公开边界，不暴露 sessions 字典给外部直改）。"""
+        previous = self.sessions.get(session_id)
+        if previous is not None and previous is not current and previous.incarnation == incarnation:
+            previous.close()
+
     def _deliver_to_session(self, session_id: int, player_id: int, content) -> None:
         session = self.sessions.get(session_id)
         if session is None or not session.verified:
@@ -1207,6 +1444,12 @@ class GateNode:
         bound_id = self._bound_player_id(session)
         if not player_id or (bound_id and bound_id == player_id):
             session.emit(content)
+
+    @staticmethod
+    def _clone_content_from_bytes(message_type, raw: bytes):
+        copied = message_type()
+        copied.ParseFromString(raw)
+        return copied
 
     def broadcast(self, method: str, event, *, scene_node_id: int = 0, scene_uuid: str = "") -> None:
         if not event.HasField("message_content"):
@@ -1228,24 +1471,36 @@ class GateNode:
                     return
             if event.player_list and len(event.player_list) != len(targets):
                 return
+            msg_type = type(event.message_content)
+            raw = event.message_content.SerializeToString()
             for index, session_id in enumerate(targets):
                 self._deliver_to_session(
-                    session_id, event.player_list[index] if event.player_list else 0, event.message_content,
+                    session_id,
+                    event.player_list[index] if event.player_list else 0,
+                    self._clone_content_from_bytes(msg_type, raw),
                 )
         elif method == "BroadcastToScene" and event.scene_id:
-            self._broadcast_all(event.message_content, scene_id=event.scene_id,
-                                scene_node_id=scene_node_id, scene_uuid=scene_uuid)
+            self.broadcast_content(event.message_content, scene_id=event.scene_id,
+                                   scene_node_id=scene_node_id, scene_uuid=scene_uuid)
         elif method == "BroadcastToAll":
-            self._broadcast_all(event.message_content)
+            self.broadcast_content(event.message_content)
 
-    def _broadcast_all(self, content, *, scene_id: int | None = None,
-                       scene_node_id: int = 0, scene_uuid: str = "") -> None:
+    def broadcast_content(self, content, *, scene_id: int | None = None,
+                          scene_node_id: int = 0, scene_uuid: str = "") -> None:
+        """向匹配条件的在线会话广播隔离副本（公开边界；先冻结字节再逐会话克隆，禁止共享可变 Protobuf）。"""
+        msg_type = type(content)
+        raw = content.SerializeToString()
         for session in self.sessions.values():
             if (self._bound_player_id(session) and session.verified
                     and (scene_id is None or scene_id == session.scene_id)
                     and (not scene_node_id or session.scene_node_id == scene_node_id
                          and session.scene_instance_id == scene_uuid)):
-                session.emit(content)
+                session.emit(self._clone_content_from_bytes(msg_type, raw))
+
+    def _broadcast_all(self, content, *, scene_id: int | None = None,
+                       scene_node_id: int = 0, scene_uuid: str = "") -> None:
+        self.broadcast_content(content, scene_id=scene_id,
+                               scene_node_id=scene_node_id, scene_uuid=scene_uuid)
 
     async def close(self) -> None:
         await self.drain_migration.close()

@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -382,9 +384,15 @@ class RankedRivalryRow:
     updated_ms: int
 
 
+def featured_build_key_hash(build_key: str) -> tuple[int, int]:
+    """计算 build_key 的 SHA-256 前 128 位大端拆分为 (build_key_high, build_key_low)（对齐 Go featuredBuildKeyHash）。"""
+    digest = hashlib.sha256(build_key.encode("utf-8")).digest()
+    return struct.unpack(">QQ", digest[:16])
+
+
 @dataclass(frozen=True, slots=True)
 class RankedFeaturedBuildRow:
-    """``match_ranked_featured_build`` 表行模型（论剑 V6 问道名局热门流派聚合）。"""
+    """``match_ranked_featured_build`` 表行模型（论剑 V6 问道名局热门流派聚合，含 D-14 整数复合主键哈希）。"""
 
     season_id: int
     build_key: str
@@ -401,6 +409,14 @@ class RankedFeaturedBuildRow:
     featured_team_size: int
     featured_total_rounds: int
     updated_ms: int
+    build_key_high: int = 0
+    build_key_low: int = 0
+
+    def __post_init__(self) -> None:
+        if self.build_key and self.build_key_high == 0 and self.build_key_low == 0:
+            high, low = featured_build_key_hash(self.build_key)
+            object.__setattr__(self, "build_key_high", high)
+            object.__setattr__(self, "build_key_low", low)
 
 
 def is_rivalry_revenge_target(rec: RankedRivalryRow | None) -> bool:

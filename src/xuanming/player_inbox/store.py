@@ -120,6 +120,41 @@ _DATA_SERVICE_PREFIX = "/data_service.DataService/"
 _UNMAPPED_HOME_ZONE_TEXT = "no home zone mapping"
 _ITEM_GAIN_SANCTION_TYPES = (MSG_GM_BLOCK_ITEM_GAIN, MSG_GM_UNBLOCK_ITEM_GAIN)
 
+# 启动期表与核心列自检清单（与 Go player_inbox/internal/inbox/store.go VerifySchema 严格对齐）。
+INBOX_REQUIRED_SCHEMA: dict[str, tuple[str, ...]] = {
+    "player_inbox_stream": ("shard", "player_id", "domain", "next_seq", "fence_epoch"),
+    "player_inbox_item": ("shard", "player_id", "domain", "seq", "state", "owner_account", "owner_revision"),
+    "player_inbox_audit": ("shard", "player_id", "domain", "seq", "operator"),
+}
+
+
+async def verify_inbox_schema(cursor) -> None:
+    """启动期只读核验 player_inbox 三张权威表与核心列存在性（缺表缺列立即拒启，提示先跑 -migrate）。"""
+    await cursor.execute(
+        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME IN ('player_inbox_stream', 'player_inbox_item', 'player_inbox_audit')"
+    )
+    found: dict[str, set[str]] = {}
+    for table_name, column_name in await cursor.fetchall():
+        tname = table_name.decode("utf-8") if isinstance(table_name, (bytes, bytearray)) else str(table_name)
+        cname = column_name.decode("utf-8") if isinstance(column_name, (bytes, bytearray)) else str(column_name)
+        found.setdefault(tname.lower(), set()).add(cname.lower())
+
+    missing_tables = [t for t in INBOX_REQUIRED_SCHEMA if t not in found]
+    if missing_tables:
+        raise StoreUnavailableError(
+            f"player_inbox schema check failed (run player_inbox -migrate first): missing tables {missing_tables}"
+        )
+    for table_name, required_cols in INBOX_REQUIRED_SCHEMA.items():
+        cols = found[table_name]
+        missing_cols = [c for c in required_cols if c not in cols]
+        if missing_cols:
+            raise StoreUnavailableError(
+                f"player_inbox schema check failed (run player_inbox -migrate first): "
+                f"table {table_name} missing columns {missing_cols}"
+            )
+
 T = TypeVar("T")
 
 

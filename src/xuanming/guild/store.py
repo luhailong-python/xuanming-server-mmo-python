@@ -200,6 +200,38 @@ _CONTENT_GUARD_TIMEOUT_SEC = 1.0
 
 T = TypeVar("T")
 
+# 人工终结审计列长度上限（与 Go asset_store.go resolvedByMaxRunes / resolveReasonMaxRunes 对齐）
+RESOLVED_BY_MAX_RUNES = 64
+RESOLVE_REASON_MAX_RUNES = 191
+
+
+@dataclass(frozen=True, slots=True)
+class QuietWitness:
+    """人工终结前最后一次读行时的静默见证（与 Go assetop.QuietWitness 对齐：租约、发送时刻与 attempts）。"""
+
+    lease_until_ms: int
+    last_send_ms: int
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class ManualResolution:
+    """帮会资产指令人工终结请求（与 Go assetop.ManualResolution 对齐）。"""
+
+    op_id: int
+    final_status: int
+    operator: str
+    reason: str
+
+
+def _validate_manual_resolution(res: ManualResolution) -> None:
+    if res.final_status not in (OP_STATUS_APPLIED, OP_STATUS_REJECTED, OP_STATUS_ABORTED, OP_STATUS_ABANDONED):
+        raise ValueError(f"manual resolve op {res.op_id}: status {res.final_status} is not terminal")
+    if not res.operator.strip() or len(res.operator) > RESOLVED_BY_MAX_RUNES:
+        raise ValueError(f"manual resolve op {res.op_id}: operator must be 1..{RESOLVED_BY_MAX_RUNES} chars")
+    if len(res.reason) > RESOLVE_REASON_MAX_RUNES:
+        raise ValueError(f"manual resolve op {res.op_id}: reason exceeds {RESOLVE_REASON_MAX_RUNES} chars")
+
 
 class _TxCommitThen(Exception):
     """在事务块内提交已完成写入并返回指定业务异常的内部控制流信号（用于惰性清理过期申请）。"""
@@ -586,6 +618,15 @@ class GuildTx(TypingProtocol):
         now_ms: int,
     ) -> bool: ...
     async def abandon_asset_op_cas(self, op_id: int, lease_token: int, now_ms: int) -> bool: ...
+    async def resolve_asset_op_manual_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        operator: str,
+        reason: str,
+        now_ms: int,
+        witness: QuietWitness | None = None,
+    ) -> bool: ...
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]: ...
     async def list_recent_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]: ...
     async def accelerate_donation_deadlines(self, guild_id: int, player_ids: Sequence[int], now_ms: int) -> None: ...
@@ -688,6 +729,7 @@ class GuildTx(TypingProtocol):
     async def delete_war_credit_owed(self, player_id: int, op_id: int) -> bool: ...
     async def war_credit_owed_exists(self, player_id: int, op_id: int) -> bool: ...
     async def list_war_credit_owed(self, after: WarCreditOwedCursor, limit: int) -> list[WarCreditOwed]: ...
+    async def count_war_credit_owed(self, limit: int) -> int: ...
 
 
 # -- 核心领域存储引擎（SqlGuildStore 与 MemoryGuildStore 复用全部业务逻辑） ----------------------
@@ -1886,6 +1928,45 @@ class GuildStoreCore:
         if not done:
             raise AssetOpLeaseLostError(f"guild asset op {op.op_id} abandon CAS missed")
 
+    async def resolve_manually(self, resolution: ManualResolution, now_ms: int) -> bool:
+        """人工终结未决资产指令并同步对侧账（对齐 Go GuildAssetStore.ResolveManually）。"""
+        _validate_manual_resolution(resolution)
+        return await self._terminate_asset_op(
+            resolution.op_id,
+            resolution.final_status,
+            cas_fn=lambda tx: tx.resolve_asset_op_manual_cas(
+                resolution.op_id,
+                resolution.final_status,
+                resolution.operator,
+                resolution.reason,
+                now_ms,
+                None,
+            ),
+            now_ms=now_ms,
+        )
+
+    async def resolve_manually_if_quiet(
+        self,
+        resolution: ManualResolution,
+        witness: QuietWitness,
+        now_ms: int,
+    ) -> bool:
+        """静默条件人工终结（对齐 Go GuildAssetStore.ResolveManuallyIfQuiet）：须租约、last_send_ms 与 attempts 全一致。"""
+        _validate_manual_resolution(resolution)
+        return await self._terminate_asset_op(
+            resolution.op_id,
+            resolution.final_status,
+            cas_fn=lambda tx: tx.resolve_asset_op_manual_cas(
+                resolution.op_id,
+                resolution.final_status,
+                resolution.operator,
+                resolution.reason,
+                now_ms,
+                witness,
+            ),
+            now_ms=now_ms,
+        )
+
     # -- 同道历练（guild_trial_lobby / slot / launch / launch_role / battle / reward_owed） -------
 
     async def get_trial_roster_members(self, guild_id: int, player_ids: Sequence[int]) -> dict[int, int]:
@@ -2942,6 +3023,12 @@ class GuildStoreCore:
             return []
         return await self._run_tx(lambda tx: tx.list_war_credit_owed(after, limit), read_only=True)
 
+    async def count_war_credit_owed(self, limit: int = 10_000) -> int:
+        """普通读帮战待入账积压行数，至多数到 limit（对齐 Go WarRepo.CountWarCreditOwed）。"""
+        if limit <= 0:
+            return 0
+        return await self._run_tx(lambda tx: tx.count_war_credit_owed(limit), read_only=True)
+
     async def convert_war_credit_owed(self, owed: WarCreditOwed, now_ms: int) -> tuple[int, AssetOpRow | None]:
         """将一行 guild_war_credit_owed 原子转为 guild_asset_op（保留原 op_id 幂等防重）并点删待入账行。"""
         if owed.player_id <= 0 or owed.op_id <= 0 or not owed.payload or now_ms <= 0:
@@ -3719,6 +3806,36 @@ class _MemoryTx:
         )
         return True
 
+    async def resolve_asset_op_manual_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        operator: str,
+        reason: str,
+        now_ms: int,
+        witness: QuietWitness | None = None,
+    ) -> bool:
+        op = self._s.asset_ops.get(op_id)
+        if op is None or op.status != OP_STATUS_PENDING:
+            return False
+        if witness is not None and (
+            op.lease_until_ms != witness.lease_until_ms
+            or op.last_send_ms != witness.last_send_ms
+            or op.attempts != witness.attempts
+        ):
+            return False
+        self._s.asset_ops[op_id] = replace(
+            op,
+            status=final_status,
+            resolved_by=operator,
+            resolve_reason=reason,
+            lease_until_ms=0,
+            lease_token=0,
+            next_attempt_ms=now_ms,
+            updated_ms=now_ms,
+        )
+        return True
+
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]:
         rows = [
             op
@@ -3926,6 +4043,9 @@ class _MemoryTx:
             del self._s.daily_counters[key]
         for key in [k for k in self._s.client_requests if k[0] == player_id]:
             del self._s.client_requests[key]
+        # 注销删角同步清理帮战待入账行（对齐 Go role_fence_purge.go purgeWarRowsOfPlayer）。
+        for key in [k for k in self._s.war_credit_owed if k[0] == player_id]:
+            del self._s.war_credit_owed[key]
 
     # guild_trial_lobby / slot / launch / launch_role / battle / reward_owed
     async def get_trial_lobby(self, lobby_id: int) -> TrialLobbyRecord | None:
@@ -4150,6 +4270,9 @@ class _MemoryTx:
         ]
         rows.sort(key=lambda r: (r.created_ms, r.player_id, r.op_id))
         return rows[:limit]
+
+    async def count_war_credit_owed(self, limit: int) -> int:
+        return min(len(self._s.war_credit_owed), max(0, int(limit)))
 
 
 class MemoryGuildStore(GuildStoreCore):

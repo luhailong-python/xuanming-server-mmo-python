@@ -2271,6 +2271,7 @@ class GuildService:
         if res is None:
             return self.protocol.message("rolefence.PurgeRemovedRoleResponse", retry=True)
 
+        await self.war.purge_player_war_data(res.player_id)
         if res.guild_id != 0:
             if res.disbanded:
                 try:
@@ -2280,6 +2281,8 @@ class GuildService:
                     logger.error(
                         "guild role purge bury rank failed guild=%d zone=%d err=%s", res.guild_id, res.zone_id, exc
                     )
+                # 解散了就与 DisbandGuild 一样释放占领的灵脉，防止已解散帮会永久占旗。
+                await self.war.on_guild_disbanded(res.guild_id)
             elif res.successor != 0:
                 await self._notify_best_effort(
                     CHANGE_LEADER_TRANSFERRED, res.guild_id, 0, res.successor, res.members

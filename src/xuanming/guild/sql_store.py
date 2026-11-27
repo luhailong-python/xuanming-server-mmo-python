@@ -78,6 +78,7 @@ from .model import (
 )
 from .store import (
     GuildStoreCore,
+    QuietWitness,
     RoleFenceDirectory,
     _DuplicateKeyError,
     _GuildLockRow,
@@ -168,6 +169,19 @@ SQL_UPSERT_COUNTER_WITH_LIMIT = (
     "ON DUPLICATE KEY UPDATE "
     "`updated_ms`=IF(`used_count`+%s<=%s,%s,`updated_ms`),"
     "`used_count`=IF(`used_count`+%s<=%s,`used_count`+%s,`used_count`)"
+)
+
+SQL_RESOLVE_ASSET_OP = (
+    "UPDATE `guild_asset_op` SET `status`=%s,`resolved_by`=%s,`resolve_reason`=%s,"
+    "`lease_until_ms`=0,`lease_token`=0,`next_attempt_ms`=%s,`updated_ms`=%s "
+    "WHERE `op_id`=%s AND `status`=%s"
+)
+# 静默人工终结要求 lease_until_ms / last_send_ms / attempts 均与读证据时一致（对齐 Go asset_store.go）。
+SQL_RESOLVE_ASSET_OP_QUIET = (
+    SQL_RESOLVE_ASSET_OP + " AND `lease_until_ms`=%s AND `last_send_ms`=%s AND `attempts`=%s"
+)
+SQL_COUNT_WAR_CREDIT_OWED_CAPPED = (
+    "SELECT COUNT(*) FROM (SELECT 1 FROM `guild_war_credit_owed` LIMIT %s) AS capped"
 )
 
 T = TypeVar("T")
@@ -1133,6 +1147,38 @@ class _SqlTx:
         )
         return self._cur.rowcount == 1
 
+    async def resolve_asset_op_manual_cas(
+        self,
+        op_id: int,
+        final_status: int,
+        operator: str,
+        reason: str,
+        now_ms: int,
+        witness: QuietWitness | None = None,
+    ) -> bool:
+        if witness is None:
+            await self._cur.execute(
+                SQL_RESOLVE_ASSET_OP,
+                (final_status, operator, reason, now_ms, now_ms, op_id, OP_STATUS_PENDING),
+            )
+        else:
+            await self._cur.execute(
+                SQL_RESOLVE_ASSET_OP_QUIET,
+                (
+                    final_status,
+                    operator,
+                    reason,
+                    now_ms,
+                    now_ms,
+                    op_id,
+                    OP_STATUS_PENDING,
+                    witness.lease_until_ms,
+                    witness.last_send_ms,
+                    witness.attempts,
+                ),
+            )
+        return self._cur.rowcount == 1
+
     async def list_pending_ops(self, player_id: int, stream: int, limit: int) -> list[AssetOpRow]:
         await self._cur.execute(
             f"SELECT {SQL_ASSET_OP_COLUMNS} FROM `guild_asset_op` "
@@ -1469,6 +1515,19 @@ class _SqlTx:
             await self._cur.execute(
                 "DELETE FROM `guild_client_request` WHERE `player_id`=%s AND `client_request_id`=%s",
                 (player_id, int(req_id)),
+            )
+
+        # 帮战个人数据：按锁序 14 -> 16 -> 24 清理守旗快照、个人帮战状态与待入账行（对齐 Go purgeWarRowsOfPlayer）。
+        for table in ("guild_war_garrison", "guild_war_player_state"):
+            await self._cur.execute(f"DELETE FROM `{table}` WHERE `player_id`=%s", (player_id,))
+        await self._cur.execute(
+            "SELECT `op_id` FROM `guild_war_credit_owed` WHERE `player_id`=%s ORDER BY `op_id`",
+            (player_id,),
+        )
+        for (owed_op_id,) in await self._cur.fetchall():
+            await self._cur.execute(
+                "DELETE FROM `guild_war_credit_owed` WHERE `player_id`=%s AND `op_id`=%s",
+                (player_id, int(owed_op_id)),
             )
 
     # -- guild_trial_lobby / slot / launch / launch_role / battle / reward_owed ------------------
@@ -1883,6 +1942,13 @@ class _SqlTx:
                 )
             )
         return out
+
+    async def count_war_credit_owed(self, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        await self._cur.execute(SQL_COUNT_WAR_CREDIT_OWED_CAPPED, (int(limit),))
+        row = await self._cur.fetchone()
+        return int(row[0]) if row else 0
 
 
 class SqlGuildStore(GuildStoreCore):

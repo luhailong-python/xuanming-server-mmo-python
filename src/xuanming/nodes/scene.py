@@ -39,6 +39,11 @@ SAVE_INTERVAL = 30
 SHUTDOWN_SAVE_BUDGET = 15.0
 SHUTDOWN_SAVE_RETRY = 0.25
 STALE_SAVE_RESULTS = {"SAVE_PLAYER_STALE_OWNER", "SAVE_PLAYER_NOT_HOLDER", "SAVE_PLAYER_UNCLAIMED"}
+_SPECTATE_CHAT_PREF_ALLOW = 1
+_SPECTATE_CHAT_PREF_FORBID = 2
+_INVALID_PARAMETER = 1005
+_FEATURE_UNAVAILABLE = 1006
+_SAVE_SEQ_MAX = (1 << 64) - 1
 
 # 与 C++ player_handoff_gate 一致：默认不允许跨场景重放。
 _HANDOFF_SERVICES = frozenset({
@@ -49,6 +54,8 @@ _HANDOFF_SERVICES = frozenset({
 _HANDOFF_METHODS = frozenset({
     ("SceneSkillClientPlayer", "ListSkills"), ("SceneSkillClientPlayer", "UpgradeSkill"),
     ("SceneSceneClientPlayer", "GetSyncDigest"), ("SceneSceneClientPlayer", "SceneInfoC2S"),
+    ("SceneSceneClientPlayer", "GetSpectateChatSetting"),
+    ("SceneSceneClientPlayer", "SetSpectateChatSetting"),
 })
 
 
@@ -195,6 +202,7 @@ class SceneNode:
         self._maintenance: dict[int, asyncio.Task] = {}
         self._ids = count(1)
         self._locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+        self._actor_tasks: set[asyncio.Task] = set()
         self._closing = False
         self._closed = False
         self._admission_closed = False
@@ -215,15 +223,96 @@ class SceneNode:
         self.skill_casts = None
         self.initialize_player = None
         self.tables = None
-        self._mutating: set[tuple[str, str]] = set()
+        # 对齐 C++ enter_fence / release_fence / save_seq / player_lifecycle 单源计数（日志与指标出口同源）
+        self.enter_fence_counters: dict[str, int] = {
+            "admit_new": 0,
+            "admit_reentry": 0,
+            "admit_relocate": 0,
+            "reject_incomplete": 0,
+            "reject_closing_or_draining": 0,
+            "reject_sealed": 0,
+            "reject_hosted_invalid": 0,
+            "reject_stale_generation": 0,
+            "reject_stale_epoch": 0,
+            "reject_revision_mismatch": 0,
+            "reject_handoff_busy": 0,
+            "reject_hold_not_resumable": 0,
+            "bind_rejected": 0,
+            "session_update_rejected": 0,
+            "stale_gate_instance_rejected": 0,
+        }
+        self.release_fence_counters: dict[str, int] = {
+            "accepted": 0,
+            "not_found": 0,
+            "rejected_stale_epoch": 0,
+            "rejected_stale_session": 0,
+            "session_ended": 0,
+            "session_ended_kept_held": 0,
+        }
+        self.exit_persist_counters: dict[str, int] = {
+            "exit_superseded": 0,
+            "exit_intent_missing": 0,
+            "exit_resave": 0,
+            "exit_resave_capped": 0,
+            "exit_exhausted_rekick": 0,
+            "exit_fastpath_deferred": 0,
+            "exit_client_msg_rejected": 0,
+            "exit_deposed_on_reentry": 0,
+        }
+        self.connection_lost_hold_counters: dict[str, int] = {
+            "held": 0,
+            "resumed": 0,
+            "expired": 0,
+            "superseded_by_exit": 0,
+            "exit_now": 0,
+            "hosted_arrived": 0,
+            "hosted_relocating": 0,
+        }
+        self.save_seq_counters: dict[str, int] = {
+            "observe_beyond_bound": 0,
+            "personal_floor_issued": 0,
+            "exhausted": 0,
+        }
+        self._save_seq_floor: dict[int, int] = {}
+        self._mutating: set[tuple[str, str]] = {
+            ("SceneSceneClientPlayer", "SetSpectateChatSetting"),
+        }
         self._handlers = {
             "SceneMovementClientPlayer": {
                 "MoveStart": self._movement, "MoveStop": self._movement, "MoveSync": self._movement,
                 "TeleportRequest": self._teleport_request,
             },
-            "SceneSceneClientPlayer": {"SceneInfoC2S": self._scene_info},
+            "SceneSceneClientPlayer": {
+                "SceneInfoC2S": self._scene_info,
+                "GetSpectateChatSetting": self._get_spectate_chat_setting,
+                "SetSpectateChatSetting": self._set_spectate_chat_setting,
+            },
         }
         register_player_handlers(self)
+
+    def collect_lifecycle_metrics(self) -> dict[str, dict[str, int]]:
+        """返回与 C++ /metrics 同源的入场/释放/退出/断线保留/存盘序号计数快照。"""
+        return {
+            "enter_fence": dict(self.enter_fence_counters),
+            "release_fence": dict(self.release_fence_counters),
+            "exit_persist": dict(self.exit_persist_counters),
+            "connection_lost_hold": dict(self.connection_lost_hold_counters),
+            "save_seq": dict(self.save_seq_counters),
+        }
+
+    def format_lifecycle_summary(self) -> dict[str, str]:
+        """按与 C++ Visit* 相同的键顺序格式化结构化汇总行，避免日志与指标漂移。"""
+        tags = (
+            ("enter_fence", "[EnterFence]", self.enter_fence_counters),
+            ("release_fence", "[ReleaseFence]", self.release_fence_counters),
+            ("exit_persist", "[ExitPersist]", self.exit_persist_counters),
+            ("connection_lost_hold", "[ConnectionLostHold]", self.connection_lost_hold_counters),
+            ("save_seq", "[SaveSeq]", self.save_seq_counters),
+        )
+        return {
+            name: f"{prefix} " + " ".join(f"{k}={v}" for k, v in counters.items())
+            for name, prefix, counters in tags
+        }
 
     def register(self, service: str, method: str, handler, *, mutating: bool = False) -> None:
         route = next((
@@ -310,16 +399,22 @@ class SceneNode:
     async def enter(self, request, gate_uuid: str, *, hosted: bool = False):
         player_id = request.player_id
         if self._closing or self._admission_closed or not all((player_id, request.owner_revision)) or not session_bound(request.session_id):
+            key = "reject_closing_or_draining" if (self._closing or self._admission_closed) else "reject_incomplete"
+            self.enter_fence_counters[key] += 1
             raise ValueError("入场身份不完整")
         if self.travel and not all((request.owner_epoch, request.login_generation)):
+            self.enter_fence_counters["reject_incomplete"] += 1
             raise ValueError("入场身份不完整")
         async with self._lock(player_id):
             if self._closing or self._admission_closed:
+                self.enter_fence_counters["reject_closing_or_draining"] += 1
                 raise ValueError("场景正在关闭")
             if self.travel and self.travel.sealed(player_id):
+                self.enter_fence_counters["reject_sealed"] += 1
                 raise ValueError("角色原入场世代正在封存")
             world = self.worlds.get(request.scene_id)
             if world is None or world.draining:
+                self.enter_fence_counters["reject_closing_or_draining"] += 1
                 raise ValueError("场景尚未创建")
             key = gate_uuid, request.session_id
             with self._reserve_entry(world, key, player_id):
@@ -329,14 +424,17 @@ class SceneNode:
                 replacement_admission = None
                 if old is not None:
                     if hosted and old.disconnect_at is None:
+                        self.enter_fence_counters["reject_hosted_invalid"] += 1
                         raise ValueError("在线角色不能接收托管落点")
                     if hosted and (self._releasing(old) or not self.connection_holds.held(old)):
+                        self.enter_fence_counters["reject_hosted_invalid"] += 1
                         raise ValueError("退出中的角色不能接收托管落点")
                     same_session = (old.session_id == request.session_id if hosted
                                     else (old.gate_uuid, old.session_id) == key)
                     # 原版 enter_fence：同一绑定会话允许迟到请求，先校验再处理交接。
                     if (hosted and (not same_session or request.login_generation != old.generation)
                             or not hosted and not same_session and request.login_generation <= old.generation):
+                        self.enter_fence_counters["reject_stale_generation"] += 1
                         raise ValueError("过期的场景入场请求")
                 if published and request.owner_epoch > old.snapshot.owner_epoch:
                     # 原版 RoleAdmission 在废黜旧实体前完成；新账号修订由权威服务验证。
@@ -347,6 +445,7 @@ class SceneNode:
                         await self.travel.retire(replacement_admission)
                         raise
                     self.travel.superseded(old)
+                    self.exit_persist_counters["exit_deposed_on_reentry"] += 1
                     self._evict(previous, old)
                     try:
                         await self.travel.retire(old.admission, old.snapshot, transferred=True)
@@ -355,21 +454,26 @@ class SceneNode:
                     old = None
                 if old is not None:
                     if self.battle and self.battle.frozen(player_id) and previous is not world:
+                        self.enter_fence_counters["reject_handoff_busy"] += 1
                         raise ValueError("角色备战期间不可切换场景")
-                    if (
-                        request.owner_epoch and request.owner_epoch < old.snapshot.owner_epoch
-                        or request.owner_revision != old.owner_revision
-                    ):
+                    if request.owner_epoch and request.owner_epoch < old.snapshot.owner_epoch:
+                        self.enter_fence_counters["reject_stale_epoch"] += 1
+                        raise ValueError("过期的场景入场请求")
+                    if request.owner_revision != old.owner_revision:
+                        self.enter_fence_counters["reject_revision_mismatch"] += 1
                         raise ValueError("过期的场景入场请求")
                     same_epoch = request.owner_epoch in (0, old.snapshot.owner_epoch)
                     rebound = not same_session or old.generation < request.login_generation
                     if published and (rebound or not same_epoch):
+                        self.enter_fence_counters["reject_handoff_busy"] += 1
                         raise ValueError("玩家原入场世代正在交接")
                     if not hosted and self.connection_holds.held(old) and not self.connection_holds.resumable(
                         old, request.session_id, request.login_generation,
                     ):
+                        self.enter_fence_counters["reject_hold_not_resumable"] += 1
                         raise ValueError("已断开的会话不能接回角色")
                     if same_epoch and not self._releasing(old):
+                        was_held = self.connection_holds.held(old)
                         if self.travel and (rebound or previous is not world and not published):
                             await self.flush_player_rows(old)
                             former = old.admission
@@ -424,6 +528,8 @@ class SceneNode:
                                     logger.exception("关闭旧角色入场世代待重试 player_id=%s", player_id)
                         if not hosted and (rebound or old.disconnect_at is not None):
                             self.connection_holds.forget(old)
+                            if was_held:
+                                self.connection_lost_hold_counters["resumed"] += 1
                             old_key = old.gate_uuid, old.session_id
                             if self.sessions.get(old_key) is old:
                                 del self.sessions[old_key]
@@ -435,9 +541,12 @@ class SceneNode:
                             self.sessions[key] = old
                         old.generation = max(old.generation, request.login_generation)
                         if previous is not world:
+                            self.enter_fence_counters["admit_relocate"] += 1
                             self._relocate(previous, world, old)
-                        elif rebound or request.enter_gs_type in (2, 3):
-                            self._announce_neighbors(world, old)
+                        else:
+                            self.enter_fence_counters["admit_reentry"] += 1
+                            if rebound or request.enter_gs_type in (2, 3):
+                                self._announce_neighbors(world, old)
                         if rebound and self.battle:
                             await self.battle.restore(old)
                         if rebound and self.inbox:
@@ -460,13 +569,17 @@ class SceneNode:
                             await self.travel.retire(player.admission, player.snapshot)
                     except Exception:
                         logger.exception("停机期间撤销入场失败 player_id=%s", player_id)
+                    self.enter_fence_counters["reject_closing_or_draining"] += 1
                     raise ValueError("场景正在关闭")
                 if hosted:
                     player.disconnect_at = time.monotonic() + self.disconnect_grace
                     if not self.connection_holds.start(player):
                         if self.travel and player.admission:
                             await self.travel.retire(player.admission)
+                        self.enter_fence_counters["reject_hosted_invalid"] += 1
                         raise ValueError("无法建立托管断线保留")
+                    self.connection_lost_hold_counters["hosted_arrived"] += 1
+                self.enter_fence_counters["admit_new"] += 1
                 world.add(player)
                 self.locations[player_id] = world
                 if not hosted:
@@ -532,6 +645,7 @@ class SceneNode:
     def _reserve_entry(self, world, key, player_id):
         bound = self.sessions.get(key)
         if key in self._pending_sessions or bound is not None and bound.player_id != player_id:
+            self.enter_fence_counters["bind_rejected"] += 1
             raise ValueError("会话已绑定其他角色或正在入场")
         self._pending_sessions.add(key)
         task = asyncio.current_task()
@@ -687,6 +801,7 @@ class SceneNode:
                     message = self.protocol.parse(route.request_type, content.serialized_message)
                     # 退出优先；只有明确仍在跨节点交接的玩家才允许重投。
                     if self._releasing(player):
+                        self.exit_persist_counters["exit_client_msg_rejected"] += 1
                         if route.kind == RpcKind.REQUEST:
                             response = self.protocol.message(route.response_type)
                             tip = response.DESCRIPTOR.fields_by_name.get("error_message")
@@ -740,8 +855,10 @@ class SceneNode:
             already_held=held,
         )
         if decision is HoldDecision.EXIT_NOW:
+            self.connection_lost_hold_counters["exit_now"] += 1
             await self._remove(world, player)
         elif decision is HoldDecision.HOLD and self.connection_holds.start(player):
+            self.connection_lost_hold_counters["held"] += 1
             self._stop_motion(world, player)
             key = player.gate_uuid, player.session_id
             if self.sessions.get(key) is player:
@@ -755,6 +872,8 @@ class SceneNode:
 
     async def release(self, request):
         player_id = request.player_id
+        if request.session_ended:
+            self.release_fence_counters["session_ended"] += 1
         async with self._lock(player_id):
             world = self.locations.get(player_id)
             if world is not None:
@@ -765,10 +884,25 @@ class SceneNode:
                     generation > player.generation or generation == player.generation
                     and request.covered_session_id in (0, player.session_id)
                 )
-                if covers_epoch and covers_session:
+                if not covers_epoch:
+                    self.release_fence_counters["rejected_stale_epoch"] += 1
+                elif not covers_session:
+                    self.release_fence_counters["rejected_stale_session"] += 1
+                elif (
+                    request.session_ended
+                    and bool(getattr(request, "keep_held", False))
+                    and self.connection_holds.held(player)
+                ):
+                    self.release_fence_counters["session_ended_kept_held"] += 1
+                else:
+                    self.release_fence_counters["accepted"] += 1
+                    if self.connection_holds.held(player):
+                        self.connection_lost_hold_counters["superseded_by_exit"] += 1
                     await self._remove(world, player, release_credential=request.session_ended)
-            elif self.travel and request.session_ended:
-                await self.travel.release_credential(player_id, request.expected_owner_epoch)
+            else:
+                self.release_fence_counters["not_found"] += 1
+                if self.travel and request.session_ended:
+                    await self.travel.release_credential(player_id, request.expected_owner_epoch)
         return self.protocol.message("Empty")
 
     async def lease_expired(self, player_id: int, session_id: int, gate_uuid: str, scene_id: int):
@@ -786,6 +920,53 @@ class SceneNode:
             lock = asyncio.Lock()
             self._locks[player_id] = lock
         return lock
+
+    def player_lock(self, player_id: int) -> asyncio.Lock:
+        """返回指定玩家的串行执行锁（公开边界，替代跨模块直接访问 _lock）。"""
+        return self._lock(int(player_id))
+
+    def schedule_player_task(self, player_id: int, coro_factory) -> asyncio.Task | None:
+        """在目标玩家独立的串行执行锁内异步投递任务，避免跨玩家嵌套持锁死锁。"""
+        if self._closing or self._closed:
+            return None
+        pid = int(player_id)
+
+        async def _runner() -> None:
+            try:
+                async with self._lock(pid):
+                    await coro_factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("玩家异步 Actor 任务执行失败 player_id=%s", pid, exc_info=True)
+
+        task = asyncio.create_task(_runner(), name=f"scene-player-actor-{pid}")
+        self._actor_tasks.add(task)
+        task.add_done_callback(self._actor_tasks.discard)
+        return task
+
+    def snapshot_player_brief(self, player_id: int) -> dict[str, object] | None:
+        """从不可变 PlayerSnapshot 提取在线玩家只读展示投影，避免外部模块直接穿透 locations/rows。"""
+        pid = int(player_id)
+        world = self.locations.get(pid)
+        if world is None:
+            return None
+        player = world.players.get(pid)
+        if player is None:
+            return None
+        data = self.rows.assemble(player.snapshot)
+        return {
+            "name": str(data.profile_component.name or ""),
+            "level": int(data.level_component.level or 0),
+            "class_id": int(getattr(data.uint32_pb_component, "class", 0) or 0),
+            "gender": int(data.profile_component.gender or 0),
+            "appearance_id": str(data.profile_component.appearance_id or ""),
+        }
+
+    def hint_team_refresh(self, player_id: int) -> None:
+        """通知组队同步子系统刷新指定玩家队伍视图（公开边界）。"""
+        if self.team is not None:
+            self.team.hint(int(player_id))
 
     def mutable(self, player: Player) -> bool:
         # 断线会话已解绑，保留中的写权仍可处理结算和资产事务。
@@ -829,6 +1010,15 @@ class SceneNode:
             raise StoreUnavailable("玩家有待确认存档，请先确认原件")
         if player.snapshot.released:
             raise StoreRejected("SAVE_PLAYER_NOT_HOLDER")
+        observed_seq = int(getattr(player.snapshot, "save_seq", 0))
+        if observed_seq >= _SAVE_SEQ_MAX:
+            self.save_seq_counters["exhausted"] += 1
+            raise StoreRejected("SAVE_SEQ_EXHAUSTED")
+        floor = self._save_seq_floor.get(player.player_id, 0)
+        if observed_seq > 0 and floor > 0 and observed_seq < floor:
+            self.save_seq_counters["personal_floor_issued"] += 1
+        elif observed_seq > floor:
+            self._save_seq_floor[player.player_id] = observed_seq
         player.pending_save = PendingSave(dict(rows), force, False, False, on_committed)
         await self.flush_player_rows(player)
         return player.snapshot
@@ -1021,6 +1211,8 @@ class SceneNode:
                 evacuating_hosted = bool(held and world.draining and self.travel
                                          and self.connection_holds.placement_eligible(player))
                 if held and ((world.draining and not evacuating_hosted) or self.connection_holds.expired(player, now)):
+                    if self.connection_holds.expired(player, now):
+                        self.connection_lost_hold_counters["expired"] += 1
                     await self._remove(world, player)
                 elif player.disconnect_at is not None and not held:
                     if now >= player.disconnect_at:
@@ -1084,6 +1276,9 @@ class SceneNode:
         saves = {}
         try:
             async with asyncio.timeout_at(deadline):
+                if self._actor_tasks:
+                    pending_actor = tuple(self._actor_tasks)
+                    await asyncio.gather(*pending_actor, return_exceptions=True)
                 if self.skill_casts is not None:
                     await self.skill_casts.close()
                 await self.channels.close()
@@ -1134,6 +1329,34 @@ class SceneNode:
 
     def _scene_info(self, world, player, route, request):
         self.channels.query(world, player, request)
+
+    def _get_spectate_chat_setting(self, _world, player, _route, _request):
+        """589 GetSpectateChatSetting：读取玩家个人「局外人观战交流」偏好及解析后的生效值。"""
+        profile_row = self.protocol.parse("player_database", player.snapshot.rows.get(PlayerRowKind.PROFILE, b""))
+        pref = int(profile_row.profile_component.spectate_chat_pref)
+        return self.protocol.message(
+            "GetSpectateChatSettingResponse",
+            preference=pref,
+            effective_allow=(pref != _SPECTATE_CHAT_PREF_FORBID),
+        )
+
+    async def _set_spectate_chat_setting(self, _world, player, _route, request):
+        """590 SetSpectateChatSetting：校验并持久化玩家个人「局外人观战交流」偏好（仅控交流，不禁止观战）。"""
+        resp = self.protocol.message("SetSpectateChatSettingResponse")
+        pref = int(request.preference)
+        if pref not in (_SPECTATE_CHAT_PREF_ALLOW, _SPECTATE_CHAT_PREF_FORBID):
+            resp.error_message.id = _INVALID_PARAMETER
+            return resp
+        if not self.mutable(player):
+            resp.error_message.id = _FEATURE_UNAVAILABLE
+            return resp
+        saved = self.rows.assemble(player.snapshot)
+        if int(saved.profile_component.spectate_chat_pref) != pref:
+            saved.profile_component.spectate_chat_pref = pref
+            await self.commit_player_data(player, saved)
+        resp.preference = pref
+        resp.effective_allow = (pref != _SPECTATE_CHAT_PREF_FORBID)
+        return resp
 
     def _teleport_request(self, _world, _player, _route, _request):
         # 与原版一致，缺少传送规则时明确返回业务不可用。

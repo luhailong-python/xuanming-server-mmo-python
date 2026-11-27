@@ -1,7 +1,7 @@
 """match（含 team）微服务包对外导出。"""
 
 from .battle_scripts import BattleScriptCatalog, BattleScriptManager, ConfigTableScriptLookup
-from .config import MatchConfig
+from .config import MatchConfig, SpectateChatConfig
 from .gather import (
     EtcdBattleNodeResolver,
     GatherPipeline,
@@ -10,7 +10,13 @@ from .gather import (
     MemoryPresenceProvider,
     StaticBattleNodeResolver,
 )
-from .jianghu import JianghuBattleGrudgeSummary, JianghuManager, JianghuRuleConfig, load_jianghu_rule
+from .jianghu import (
+    JianghuBattleGrudgeSummary,
+    JianghuManager,
+    JianghuRuleConfig,
+    evaluate_scene_eligibility_response,
+    load_jianghu_rule,
+)
 from .match_service import MatchGrpcService, MatchServer
 from .model import MATCH_NODE_TYPE, TEAM_NODE_TYPE, BattleNodeEntry, CallerIdentity, PlayerPresence
 from .node import open_service, run
@@ -23,6 +29,7 @@ from .ranked import (
     RankedRivalryRow,
     RankedRuleConfig,
     RankedSeasonRow,
+    featured_build_key_hash,
     tier_for_rating,
 )
 from .rating import (
@@ -35,6 +42,19 @@ from .rating import (
     compute_elo_delta,
 )
 from .spectate import SpectateManager
+from .spectate_chat import (
+    SpectateChatGuardResult,
+    SpectateChatGuardVerdict,
+    SpectateChatHub,
+    SpectateChatManager,
+    SpectateChatModeRule,
+    SpectateChatRoomInfo,
+    adapt_content_guard_engine,
+    resolve_player_spectate_chat_allow,
+    sanitize_sender_name,
+    spectate_chat_enabled_for_battle,
+    spectate_chat_rule_of_mode,
+)
 from .sql_store import SqlMatchStore, open_pool
 from .store import MatchStore, MemoryMatchStore
 from .tactical_puzzle import (
@@ -94,6 +114,13 @@ __all__ = [
     "RankedRuleConfig",
     "RankedSeasonRow",
     "RatingApplyResult",
+    "SpectateChatConfig",
+    "SpectateChatGuardResult",
+    "SpectateChatGuardVerdict",
+    "SpectateChatHub",
+    "SpectateChatManager",
+    "SpectateChatModeRule",
+    "SpectateChatRoomInfo",
     "SpectateCheerHub",
     "SpectateManager",
     "SqlMatchStore",
@@ -106,13 +133,20 @@ __all__ = [
     "TournamentRewardSpec",
     "TournamentRuleSpec",
     "TrialChallengeCardManager",
+    "adapt_content_guard_engine",
     "apply_battle_result",
     "build_trial_battle_context",
     "compute_elo_delta",
+    "evaluate_scene_eligibility_response",
+    "featured_build_key_hash",
     "load_jianghu_rule",
     "open_pool",
     "open_service",
+    "resolve_player_spectate_chat_allow",
     "run",
+    "sanitize_sender_name",
+    "spectate_chat_enabled_for_battle",
+    "spectate_chat_rule_of_mode",
     "supports_trial_vows",
     "tier_for_rating",
 ]

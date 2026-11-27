@@ -192,11 +192,22 @@ def plan_rmb(protocol: Protocol, policy: TradePolicy, rec: Message, w: Message, 
         if not _leg_applied(debit):
             raise ValueError("rmb delivery missing applied seller_debit")
         _transfer_leg(protocol, w, "rmb_buyer_credit", int(rec.buyer_player_id), debit)
-        credit = _find_leg(w, "rmb_buyer_credit")
+        # 交付腿部分发放后由人工补发缺口（planPartial），沿 current_leg 追踪最新补发腿判结局。
+        credit = _current_leg(w, "rmb_buyer_credit")
         if _leg_done(credit):
             if _leg_applied(credit):
                 w.stage = "rmb_delivered"
                 rec.status = COMMERCE_SETTLED
+            elif str(credit.role) != "rmb_buyer_credit":
+                # 补发没到账：买家手里已有一部分，绝不退款，转人工继续 reissue（jubaozhai-market.md §16.1）。
+                if w.stage != "manual":
+                    w.quarantine.stage = w.stage
+                    w.quarantine.status = int(rec.status)
+                    w.quarantine.reason = "final_credit_failed"
+                    w.quarantine.detail = truncate_utf8("rmb consignment delivery reissue failed", QUARANTINE_DETAIL_MAX_BYTES)
+                    w.quarantine.at_ms = int(now_ms)
+                rec.status = COMMERCE_MANUAL
+                w.stage = "manual"
             else:
                 w.stage = "rmb_refund"
                 rec.status = COMMERCE_REFUND_PENDING

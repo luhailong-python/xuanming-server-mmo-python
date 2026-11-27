@@ -1,6 +1,6 @@
 # 玄冥服务端 · Python
 
-这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `f4947968a`（完整 SHA：`f4947968a99725c088e5328ed642063094438a3a`，含消息号 `574~584`、83 张配表 v104 与 555 条路由，2026-11-27；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
+这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `da97bfb11`（完整 SHA：`da97bfb11afc864a5778b67d95136d51ce148e7d`，含消息号 `585~590`、退役 `560~563`、83 张配表 v106 与 557 条路由，2026-11-27；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
 
 ## 游戏预览与类型简介（《五行奇谈》）
 

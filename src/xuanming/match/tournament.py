@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 import unicodedata
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
 from google.protobuf.message import Message
 
 from ..protocol import Protocol
 from .errors import (
+    ERR_MAIL_RECIPIENT_BOX_FULL,
     ERR_MATCH_INTERNAL,
     ERR_MATCH_TOURNAMENT_ALREADY_CHEERED,
     ERR_MATCH_TOURNAMENT_ALREADY_IN_SQUAD,
@@ -1041,6 +1043,7 @@ class TournamentManager:
         clock_ms: Callable[[], int] | None = None,
         battle_id_alloc: Callable[[], int] | None = None,
         cheer_hub: SpectateCheerHub | None = None,
+        reward_mail_sender: Callable[[int, _RewardRecord], tuple[int, int] | Awaitable[tuple[int, int]]] | None = None,
     ) -> None:
         self.protocol = protocol
         self.catalog = catalog if catalog is not None else TournamentCatalog.from_tables(tables)
@@ -1048,6 +1051,7 @@ class TournamentManager:
         self._next_id = 100_000
         self._battle_id_alloc = battle_id_alloc
         self.cheer_hub = cheer_hub if cheer_hub is not None else SpectateCheerHub()
+        self.reward_mail_sender = reward_mail_sender
 
         self._seasons: dict[int, _SeasonRecord] = {}
         self._squads: dict[int, _SquadRecord] = {}
@@ -2040,6 +2044,38 @@ class TournamentManager:
             return set_tip(resp, ERR_MATCH_TOURNAMENT_REWARD_UNAVAILABLE)
         pending.sort(key=lambda r: (-r.season_id, r.tier_kind))
         for r in pending:
+            if self.reward_mail_sender is not None:
+                try:
+                    sent = self.reward_mail_sender(caller.player_id, r)
+                    if inspect.isawaitable(sent):
+                        sent = await sent
+                    mail_id, tip_id = int(sent[0]), int(sent[1])
+                except Exception:
+                    logger.error(
+                        "tournament SendPersonalMail failed reward_id=%d player_id=%d; reward stays claimable",
+                        r.reward_id, caller.player_id, exc_info=True,
+                    )
+                    if not resp.claimed_rewards:
+                        return set_tip(resp, ERR_MATCH_INTERNAL)
+                    break
+                # 收件箱满是玩家自己能处理的：原样回 mail 满箱提示（17002），行保持可领取，清出空位再领即补。
+                if tip_id == ERR_MAIL_RECIPIENT_BOX_FULL:
+                    logger.info(
+                        "tournament recipient mailbox is full reward_id=%d player_id=%d; reward stays claimable",
+                        r.reward_id, caller.player_id,
+                    )
+                    if not resp.claimed_rewards:
+                        return set_tip(resp, ERR_MAIL_RECIPIENT_BOX_FULL)
+                    break
+                if tip_id != 0 or mail_id <= 0:
+                    logger.error(
+                        "tournament SendPersonalMail rejected reward_id=%d tip=%d mail_id=%d; reward stays claimable",
+                        r.reward_id, tip_id, mail_id,
+                    )
+                    if not resp.claimed_rewards:
+                        return set_tip(resp, ERR_MATCH_INTERNAL)
+                    break
+                r.mail_id = mail_id
             r.delivery_state = DELIVERY_CLAIMED
             r.claimed_ms = stamp
             r.updated_ms = stamp

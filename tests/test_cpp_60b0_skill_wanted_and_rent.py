@@ -1,12 +1,12 @@
-"""C++ 60b0bd6b3 / bc6e70850 技能制书扩展与 7 套流派方案租用回归测试（558..563, 565, 573）。
+"""C++ 60b0bd6b3 / bc6e70850 / da97bfb11 技能制书扩展与 7 套流派方案租用回归测试（558, 559, 565, 573；560..563 退役验真）。
 
 覆盖范围：
 1. 558 ClaimScrollCollectionMilestone：典籍藏经阁小成(>=50%->20 绑残页)/圆满(100%->40 绑残页)位图领奖、去尾0与高位未知bit透传、防重与幂等重放。
 2. 559 BatchDismantleSkillBooks：一次拆解 1..20 本未学常规书（禁稀世、禁重复、禁超 20）、返还绑定残页与幂等重放。
-3. 560..563 SkillBookWantedOrder：西市悬赏求书发榜（严格非绑银两防洗白、单人上限 3 条）、列表筛选排序、撤单全退、书架/封卷 3414 揭榜交卷（宗师署名校验、5% 税销毁、幂等重放）。
+3. 560..563 退役验真：Scene 旧悬赏求书接口已退役并墓碑保留，悬赏求书改由 trade（ClientPlayerJubaozhai 582..584）承载。
 4. 573 AckCraftProxyDigest + V2/V5 宗师口碑/雅号印款/同队 0 费情义代制/24h 极品热榜 Top 3/离线回账与未读战报清零。
 5. 565 RentSkillLoadoutSlots + 7 套战法·加点一体化方案：2 免费 + 85 级满级赠第 3 套 + 轻享卡+2 + 按月真实灵石租用（防溢买、补差向上取整、180 天封顶、TX_SKILL_LOADOUT_RENT=48 审计、到期只锁不删、方案名与敏感词校验、一体化四维加点与洗点费/切换冷却联动）。
-6. 真实 TCP Runtime("local") 端到端贯通 558..563, 565, 573 全部 8 条新 RPC。
+6. 真实 TCP Runtime("local") 端到端贯通 558, 559, 565, 573 全部在役新 RPC。
 """
 
 from __future__ import annotations
@@ -208,10 +208,18 @@ def test_new_skill_and_craft_message_ids_registered():
     p = Protocol()
     assert p.message_ids["SceneSkillClientPlayerClaimScrollCollectionMilestone"] == 558
     assert p.message_ids["SceneSkillClientPlayerBatchDismantleSkillBooks"] == 559
-    assert p.message_ids["SceneSkillClientPlayerPostSkillBookWantedOrder"] == 560
-    assert p.message_ids["SceneSkillClientPlayerCancelSkillBookWantedOrder"] == 561
-    assert p.message_ids["SceneSkillClientPlayerListSkillBookWantedOrders"] == 562
-    assert p.message_ids["SceneSkillClientPlayerFulfillSkillBookWantedOrder"] == 563
+    for retired_id in (560, 561, 562, 563):
+        assert retired_id not in p.routes
+    for retired_name in (
+        "SceneSkillClientPlayerPostSkillBookWantedOrder",
+        "SceneSkillClientPlayerCancelSkillBookWantedOrder",
+        "SceneSkillClientPlayerListSkillBookWantedOrders",
+        "SceneSkillClientPlayerFulfillSkillBookWantedOrder",
+    ):
+        assert retired_name not in p.message_ids
+    assert p.message_ids["ClientPlayerJubaozhaiCreateWantedSkillBookOrder"] == 582
+    assert p.message_ids["ClientPlayerJubaozhaiFulfillWantedSkillBookOrder"] == 583
+    assert p.message_ids["ClientPlayerJubaozhaiListWantedSkillBookOrders"] == 584
     assert p.message_ids["SceneSkillClientPlayerRentSkillLoadoutSlots"] == 565
     assert p.message_ids["SceneSkillClientPlayerAckCraftProxyDigest"] == 573
 
@@ -360,179 +368,44 @@ def test_558_claim_scroll_milestone_and_559_batch_dismantle(tmp_path):
     asyncio.run(run())
 
 
-def test_560_to_563_wanted_orders_escrow_cancel_and_fulfill_bookshelf_and_sealed(tmp_path):
+def test_560_to_563_retired_and_craft_state_clean(tmp_path):
+    """验证 560..563 旧 Scene 悬赏求书接口彻底退役，保留字段号不复用，GetSkillCraftingState 与封卷/开卷正常运作。"""
     async def run():
-        # 玩家 1 仅给 5000 流通银两 + 50000 绑定银两，验证严格防洗白（不可用绑定银两发悬赏）
         env = await _make_two_player_scene(tmp_path, gold=5_000, bind_gold=50_000)
         try:
+            for retired_method in (
+                "post_wanted_order",
+                "cancel_wanted_order",
+                "list_wanted_orders",
+                "fulfill_wanted_order",
+            ):
+                assert not hasattr(env.skill_craft, retired_method)
+
             st = await env.rpc(1, "SceneSkillClientPlayer", "GetSkillCraftingState")
+            assert not st.error_message.id
+            assert "my_wanted_orders" not in st.state.DESCRIPTOR.fields_by_name
+            d1 = env.scene.rows.assemble(env.p1.snapshot)
+            assert "wanted_orders" not in d1.craft_component.DESCRIPTOR.fields_by_name
+            assert "next_wanted_order_seq" not in d1.craft_component.DESCRIPTOR.fields_by_name
+            rec_desc = env.protocol.message("ClientRequestRecord").DESCRIPTOR
+            assert "wanted_order_id" not in rec_desc.fields_by_name
+            assert "wanted_order_gold" not in rec_desc.fields_by_name
+
+            # 封卷入包（3414）链路仍完整可用，供 trade 582..584 求购单揭榜流通。
             reg_scroll = next(s for s in st.state.scrolls if s.rarity_tier == 0)
-            rare_scroll = next(s for s in st.state.scrolls if s.rarity_tier == 1)
             reg_skill_a = reg_scroll.skill_table_ids[0]
-            reg_skill_b = reg_scroll.skill_table_ids[1]
-            rare_skill = rare_scroll.skill_table_ids[0]
-
-            # 1. 校验边界：金额越界(<100 / >50000)、稀世技(7014)、绑银不可抵扣(7012)
-            assert (await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, reward_gold=50, expected_revision=0, client_request_id=6001,
-            )).error_message.id == 1005
-            assert (await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=rare_skill, reward_gold=500, expected_revision=0, client_request_id=6002,
-            )).error_message.id == SKILL_SCROLL_INVALID
-            assert (await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, reward_gold=6000, expected_revision=0, client_request_id=6003,
-            )).error_message.id == SKILL_GOLD_NOT_ENOUGH
-
-            # 2. 发榜 2 条悬赏（单 1 要求宗师署名 1000 银两；单 2 不限署名 2000 银两）
-            post1 = await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, require_master_signature=True, reward_gold=1000,
-                expected_revision=0, client_request_id=6010,
-            )
-            assert not post1.error_message.id and not post1.replayed
-            assert post1.order.order_id == 1 and post1.order.seller_net_gold == 950
-            assert post1.state.gold_balance == 4000
-
-            post1_rep = await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, require_master_signature=True, reward_gold=1000,
-                expected_revision=0, client_request_id=6010,
-            )
-            assert not post1_rep.error_message.id and post1_rep.replayed and post1_rep.order.order_id == 1
-
-            post2 = await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_b, require_master_signature=False, reward_gold=2000,
-                expected_revision=post1.state.scroll_craft_revision, client_request_id=6011,
-            )
-            assert not post2.error_message.id and post2.order.order_id == 2
-            assert post2.state.gold_balance == 2000
-
-            post3 = await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, require_master_signature=False, reward_gold=500,
-                expected_revision=post2.state.scroll_craft_revision, client_request_id=6012,
-            )
-            assert not post3.error_message.id and post3.order.order_id == 3
-
-            # 第 4 条被单人上限 3 条拒绝
-            post4 = await env.rpc(
-                1, "SceneSkillClientPlayer", "PostSkillBookWantedOrder",
-                skill_table_id=reg_skill_a, reward_gold=500,
-                expected_revision=post3.state.scroll_craft_revision, client_request_id=6013,
-            )
-            assert post4.error_message.id == 1005
-
-            # 3. 562 ListSkillBookWantedOrders：按悬赏降序排列，支持 skill 筛选与 only_mine
-            listed_all = await env.rpc(2, "SceneSkillClientPlayer", "ListSkillBookWantedOrders")
-            assert [o.order_id for o in listed_all.orders] == [2, 1, 3]
-            listed_filtered = await env.rpc(
-                2, "SceneSkillClientPlayer", "ListSkillBookWantedOrders", filter_skill_table_id=reg_skill_a,
-            )
-            assert [o.order_id for o in listed_filtered.orders] == [1, 3]
-            listed_mine = await env.rpc(
-                2, "SceneSkillClientPlayer", "ListSkillBookWantedOrders", only_mine=True,
-            )
-            assert len(listed_mine.orders) == 0
-
-            # 4. 561 CancelSkillBookWantedOrder 撤单 3 全额退 500 非绑银两 + 幂等重放
-            cancel3 = await env.rpc(
-                1, "SceneSkillClientPlayer", "CancelSkillBookWantedOrder",
-                order_id=3, expected_revision=post3.state.scroll_craft_revision, client_request_id=6101,
-            )
-            assert not cancel3.error_message.id and not cancel3.replayed
-            assert cancel3.refunded_gold == 500
-            assert cancel3.state.gold_balance == 2000
-            cancel3_rep = await env.rpc(
-                1, "SceneSkillClientPlayer", "CancelSkillBookWantedOrder",
-                order_id=3, expected_revision=post3.state.scroll_craft_revision, client_request_id=6101,
-            )
-            assert not cancel3_rep.error_message.id and cancel3_rep.replayed and cancel3_rep.refunded_gold == 500
-
-            # 5. 563 FulfillSkillBookWantedOrder：卖家 2 分别通过书架（需宗师署名）与 3414 封卷道籍揭榜交卷
             d2 = env.scene.rows.assemble(env.p2.snapshot)
-            # 无署名常规书（应被单 1 拒绝）
             d2.craft_component.skill_books.add(
-                book_id=201, skill_table_id=reg_skill_a, scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
-            )
-            # 宗师署名未绑定常规书（可揭单 1）
-            d2.craft_component.skill_books.add(
-                book_id=202, skill_table_id=reg_skill_a, scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
-                crafter_name="制卷宗师·乙宗师", crafter_player_id=2,
-            )
-            # 书架未绑定常规书 reg_skill_b -> 封卷成 3414 揭单 2
-            d2.craft_component.skill_books.add(
-                book_id=203, skill_table_id=reg_skill_b, scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
+                book_id=203, skill_table_id=reg_skill_a, scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
             )
             d2.craft_component.next_book_seq = 204
             await env.scene.commit_player_data(env.p2, d2)
 
-            # 自己不能揭自己的单
-            self_fulfill = await env.rpc(
-                1, "SceneSkillClientPlayer", "FulfillSkillBookWantedOrder",
-                poster_player_id=1, order_id=1, bookshelf_book_id=1,
-                expected_revision=cancel3.state.scroll_craft_revision, client_request_id=6300,
-            )
-            assert self_fulfill.error_message.id == 1005
-
-            # 无署名书揭要求宗师署名的单 1 被拒
-            unsigned_fail = await env.rpc(
-                2, "SceneSkillClientPlayer", "FulfillSkillBookWantedOrder",
-                poster_player_id=1, order_id=1, bookshelf_book_id=201,
-                expected_revision=0, client_request_id=6301,
-            )
-            assert unsigned_fail.error_message.id == 1005
-
-            # 宗师署名书成功揭单 1：扣 5% 税，卖家得 950 银两，买家书架获署名书
-            gold2_before = env.scene.rows.assemble(env.p2.snapshot).currency.values[0]
-            fulfill1 = await env.rpc(
-                2, "SceneSkillClientPlayer", "FulfillSkillBookWantedOrder",
-                poster_player_id=1, order_id=1, bookshelf_book_id=202,
-                expected_revision=0, client_request_id=6302,
-            )
-            assert not fulfill1.error_message.id and not fulfill1.replayed
-            assert fulfill1.order_id == 1 and fulfill1.seller_net_gold == 950
-            assert fulfill1.state.gold_balance == gold2_before + 950
-            p1_after1 = env.scene.rows.assemble(env.p1.snapshot)
-            assert len(p1_after1.craft_component.skill_books) == 1
-            delivered1 = p1_after1.craft_component.skill_books[0]
-            assert delivered1.skill_table_id == reg_skill_a
-            assert delivered1.crafter_name == "制卷宗师·乙宗师"
-            assert delivered1.crafter_player_id == 2
-            assert not delivered1.bound
-
-            # 封卷 book 203 成 3414 道籍后揭单 2（2000 银两 -> 税后 1900 银两）
             sealed = await env.rpc(
                 2, "SceneSkillClientPlayer", "SealSkillBook",
-                book_id=203, expected_revision=fulfill1.state.scroll_craft_revision, client_request_id=6303,
+                book_id=203, expected_revision=0, client_request_id=6303,
             )
-            assert not sealed.error_message.id and sealed.item_id > 0
-
-            fulfill2 = await env.rpc(
-                2, "SceneSkillClientPlayer", "FulfillSkillBookWantedOrder",
-                poster_player_id=1, order_id=2, sealed_item_id=sealed.item_id,
-                expected_revision=sealed.state.scroll_craft_revision, client_request_id=6304,
-            )
-            assert not fulfill2.error_message.id and not fulfill2.replayed
-            assert fulfill2.order_id == 2 and fulfill2.seller_net_gold == 1900
-            assert fulfill2.state.gold_balance == gold2_before + 950 + 1900
-
-            # 幂等重放
-            fulfill2_rep = await env.rpc(
-                2, "SceneSkillClientPlayer", "FulfillSkillBookWantedOrder",
-                poster_player_id=1, order_id=2, sealed_item_id=sealed.item_id,
-                expected_revision=sealed.state.scroll_craft_revision, client_request_id=6304,
-            )
-            assert not fulfill2_rep.error_message.id and fulfill2_rep.replayed
-            assert fulfill2_rep.seller_net_gold == 1900
-
-            # 买家书架已有 2 本书且悬赏单已清空
-            p1_final = env.scene.rows.assemble(env.p1.snapshot)
-            assert len(p1_final.craft_component.wanted_orders) == 0
-            assert sorted(b.skill_table_id for b in p1_final.craft_component.skill_books) == sorted([reg_skill_a, reg_skill_b])
+            assert not sealed.error_message.id and sealed.item_id > 0 and sealed.skill_table_id == reg_skill_a
         finally:
             await env.skills.close()
             await env.scene.close()
@@ -840,107 +713,61 @@ async def _tcp_call(client, call_id: int, message_name: str, **fields):
     return await client.rpc(msg_id, call_id, req)
 
 
-def test_real_tcp_local_runtime_all_eight_new_skill_rpcs(tmp_path):
-    """通过真实 TCP Runtime('local') 端到端验证 558..563, 565, 573 全部 8 条新 RPC 路由与持久化。"""
+def test_real_tcp_local_runtime_all_active_new_skill_rpcs(tmp_path):
+    """通过真实 TCP Runtime('local') 端到端验证 558, 559, 565, 573 全部在役新 RPC 路由与持久化（560..563 已退役）。"""
     async def scenario():
         settings = _settings(tmp_path)
         async with Runtime(settings, "local", dev_token=TOKEN) as runtime:
             async with _enter(runtime, account="craft-buyer") as (client_a, pid_a):
-                async with _enter(runtime, account="craft-seller") as (client_b, pid_b):
-                    scene = runtime.scene
-                    pa = scene.locations[pid_a].players[pid_a]
-                    pb = scene.locations[pid_b].players[pid_b]
+                scene = runtime.scene
+                pa = scene.locations[pid_a].players[pid_a]
 
-                    # 预置双人银两、灵石、已解锁卷宗技能与待拆/待交卷书籍
-                    st0 = await _tcp_call(client_a, 1, "SceneSkillClientPlayerGetSkillCraftingState")
-                    assert not st0.error_message.id
-                    reg_scroll = next(s for s in st0.state.scrolls if s.rarity_tier == 0)
-                    pool = list(reg_scroll.skill_table_ids)
-                    half_need = (len(pool) + 1) // 2
+                # 预置银两、灵石、已解锁卷宗技能与待拆书籍
+                st0 = await _tcp_call(client_a, 1, "SceneSkillClientPlayerGetSkillCraftingState")
+                assert not st0.error_message.id
+                reg_scroll = next(s for s in st0.state.scrolls if s.rarity_tier == 0)
+                pool = list(reg_scroll.skill_table_ids)
+                half_need = (len(pool) + 1) // 2
 
-                    da = scene.rows.assemble(pa.snapshot)
-                    while len(da.currency.values) < 4:
-                        da.currency.values.append(0)
-                    da.currency.values[0] = 20_000
-                    da.currency.values[1] = 200
-                    da.craft_component.book_unlocked_skill_ids.extend(pool[:half_need])
-                    da.craft_component.skill_books.add(
-                        book_id=10, skill_table_id=pool[0], scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
-                    )
-                    da.craft_component.next_book_seq = 11
-                    da.craft_component.unread_proxy_digest_orders = 1
-                    da.craft_component.unread_proxy_digest_net_gold = 76
-                    da.craft_component.unread_proxy_digest_last_buyer = "路人甲"
-                    await scene.commit_player_data(pa, da)
+                da = scene.rows.assemble(pa.snapshot)
+                while len(da.currency.values) < 4:
+                    da.currency.values.append(0)
+                da.currency.values[0] = 20_000
+                da.currency.values[1] = 200
+                da.craft_component.book_unlocked_skill_ids.extend(pool[:half_need])
+                da.craft_component.skill_books.add(
+                    book_id=10, skill_table_id=pool[0], scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
+                )
+                da.craft_component.next_book_seq = 11
+                da.craft_component.unread_proxy_digest_orders = 1
+                da.craft_component.unread_proxy_digest_net_gold = 76
+                da.craft_component.unread_proxy_digest_last_buyer = "路人甲"
+                await scene.commit_player_data(pa, da)
 
-                    db = scene.rows.assemble(pb.snapshot)
-                    while len(db.currency.values) < 4:
-                        db.currency.values.append(0)
-                    db.currency.values[0] = 1_000
-                    db.craft_component.skill_books.add(
-                        book_id=20, skill_table_id=pool[0], scroll_id=reg_scroll.scroll_id, rarity_tier=0, bound=False,
-                    )
-                    db.craft_component.next_book_seq = 21
-                    await scene.commit_player_data(pb, db)
+                # 558 ClaimScrollCollectionMilestone
+                r558 = await _tcp_call(
+                    client_a, 2, "SceneSkillClientPlayerClaimScrollCollectionMilestone",
+                    scroll_id=reg_scroll.scroll_id, milestone_tier=1, expected_revision=0, client_request_id=8558,
+                )
+                assert not r558.error_message.id and r558.rewarded_fragments == 20
 
-                    # 558 ClaimScrollCollectionMilestone
-                    r558 = await _tcp_call(
-                        client_a, 2, "SceneSkillClientPlayerClaimScrollCollectionMilestone",
-                        scroll_id=reg_scroll.scroll_id, milestone_tier=1, expected_revision=0, client_request_id=8558,
-                    )
-                    assert not r558.error_message.id and r558.rewarded_fragments == 20
+                # 559 BatchDismantleSkillBooks
+                r559 = await _tcp_call(
+                    client_a, 3, "SceneSkillClientPlayerBatchDismantleSkillBooks",
+                    book_ids=[10], expected_revision=r558.state.scroll_craft_revision, client_request_id=8559,
+                )
+                assert not r559.error_message.id and r559.dismantled_count == 1
 
-                    # 559 BatchDismantleSkillBooks
-                    r559 = await _tcp_call(
-                        client_a, 3, "SceneSkillClientPlayerBatchDismantleSkillBooks",
-                        book_ids=[10], expected_revision=r558.state.scroll_craft_revision, client_request_id=8559,
-                    )
-                    assert not r559.error_message.id and r559.dismantled_count == 1
+                # 565 RentSkillLoadoutSlots
+                r565 = await _tcp_call(
+                    client_a, 4, "SceneSkillClientPlayerRentSkillLoadoutSlots",
+                    client_request_id=8565, target_rented_slots=2, add_periods=1, expected_cost_diamond=60,
+                )
+                assert not r565.error_message.id and r565.rented_extra_slots == 2 and r565.spent_diamond == 60
+                assert r565.state.loadout.unlocked_schemes == 4
 
-                    # 560 PostSkillBookWantedOrder（发 2 单：单 1 撤单，单 2 由乙揭榜）
-                    r560_1 = await _tcp_call(
-                        client_a, 4, "SceneSkillClientPlayerPostSkillBookWantedOrder",
-                        skill_table_id=pool[0], reward_gold=400,
-                        expected_revision=r559.state.scroll_craft_revision, client_request_id=85601,
-                    )
-                    assert not r560_1.error_message.id and r560_1.order.order_id == 1
-
-                    r560_2 = await _tcp_call(
-                        client_a, 5, "SceneSkillClientPlayerPostSkillBookWantedOrder",
-                        skill_table_id=pool[0], reward_gold=1000,
-                        expected_revision=r560_1.state.scroll_craft_revision, client_request_id=85602,
-                    )
-                    assert not r560_2.error_message.id and r560_2.order.order_id == 2
-
-                    # 562 ListSkillBookWantedOrders
-                    r562 = await _tcp_call(client_b, 6, "SceneSkillClientPlayerListSkillBookWantedOrders")
-                    assert not r562.error_message.id and [o.order_id for o in r562.orders] == [2, 1]
-
-                    # 561 CancelSkillBookWantedOrder
-                    r561 = await _tcp_call(
-                        client_a, 7, "SceneSkillClientPlayerCancelSkillBookWantedOrder",
-                        order_id=1, expected_revision=r560_2.state.scroll_craft_revision, client_request_id=8561,
-                    )
-                    assert not r561.error_message.id and r561.refunded_gold == 400
-
-                    # 563 FulfillSkillBookWantedOrder
-                    r563 = await _tcp_call(
-                        client_b, 8, "SceneSkillClientPlayerFulfillSkillBookWantedOrder",
-                        poster_player_id=pid_a, order_id=2, bookshelf_book_id=20,
-                        expected_revision=0, client_request_id=8563,
-                    )
-                    assert not r563.error_message.id and r563.seller_net_gold == 950
-
-                    # 565 RentSkillLoadoutSlots
-                    r565 = await _tcp_call(
-                        client_a, 9, "SceneSkillClientPlayerRentSkillLoadoutSlots",
-                        client_request_id=8565, target_rented_slots=2, add_periods=1, expected_cost_diamond=60,
-                    )
-                    assert not r565.error_message.id and r565.rented_extra_slots == 2 and r565.spent_diamond == 60
-                    assert r565.state.loadout.unlocked_schemes == 4
-
-                    # 573 AckCraftProxyDigest
-                    r573 = await _tcp_call(client_a, 10, "SceneSkillClientPlayerAckCraftProxyDigest")
-                    assert not r573.error_message.id and not r573.state.HasField("unread_proxy_digest")
+                # 573 AckCraftProxyDigest
+                r573 = await _tcp_call(client_a, 5, "SceneSkillClientPlayerAckCraftProxyDigest")
+                assert not r573.error_message.id and not r573.state.HasField("unread_proxy_digest")
 
     asyncio.run(scenario())

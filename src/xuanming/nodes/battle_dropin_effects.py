@@ -1858,6 +1858,9 @@ class EquipmentBattleEffects:
             self.engine.total_shield_granted_by_player[owner_id] = min(
                 U64_MAX, self.engine.total_shield_granted_by_player.get(owner_id, 0) + capacity,
             )
+        mark_empowered = getattr(self.engine, "mark_wuxing_heal_shield_empowered", None)
+        if callable(mark_empowered):
+            mark_empowered(actor)
         if commit_artifacts and turn is not None:
             for idx in contributions:
                 self.use_artifact(
@@ -4719,6 +4722,9 @@ class ConfiguredAbilitiesController:
         )
         if discount_pct > 0:
             cost = SeasonBattleRules.compute_mana_discounted(cost, discount_pct)
+        free_cast_fn = getattr(self.engine, "is_wuxing_free_first_cast", None)
+        if callable(free_cast_fn) and free_cast_fn(actor):
+            cost = 0
         if cost > actor.attributes.mana:
             return 7004
         if action.target_id != 0:
@@ -5013,6 +5019,9 @@ class ConfiguredAbilitiesController:
                 )
             if value > 0:
                 receiver.attributes.health += value
+                mark_empowered = getattr(self.engine, "mark_wuxing_heal_shield_empowered", None)
+                if callable(mark_empowered):
+                    mark_empowered(receiver)
                 if season_seal_heal_gain > 0 and SeasonBattleRules.seal_available(caster, 4, self.engine.round_index):
                     seal = caster.equipment_effects.season_seal
                     SeasonBattleRules.use_seal(
@@ -5095,6 +5104,16 @@ class ConfiguredAbilitiesController:
             return
 
         # 持久化 Buff / 控制 / 蓄力 / 易伤 / 免控分支
+        has_realm_boon_fn = getattr(self.engine, "has_realm_boon", None)
+        extend_control_boon = (
+            hostile
+            and op == BattleEffectOp.CONTROL
+            and 1 <= row.state_kind <= 6
+            and caster.team_index == 0
+            and receiver.team_index != 0
+            and callable(has_realm_boon_fn)
+            and has_realm_boon_fn(BOON_WATER_EXTEND_CONTROL)
+        )
         if hostile and op == BattleEffectOp.CONTROL and 1 <= row.state_kind <= 6:
             control_banned_fn = getattr(self.engine, "is_control_banned_for_actor", None)
             if control_banned_fn(caster) if callable(control_banned_fn) else getattr(self.engine, "ban_control_skills", False):
@@ -5108,12 +5127,16 @@ class ConfiguredAbilitiesController:
                 )
                 return
             if self.try_consume_control_immunity(caster, receiver, buff_id, turn, group, hit):
+                if extend_control_boon:
+                    self.engine.boon_runtime.vulnerable_until_round[receiver.actor_id] = self.engine.round_index + 2
                 return
             base_chance = row.application_chance if row.application_chance > 0.0 else 1.0
             if not self.engine.equipment_effects.roll_ailment_with_equipment(
                 caster, receiver, base_chance, row.state_kind, buff_id, self.engine.round_index, turn, group,
                 is_primary=(receiver.actor_id == primary_target_id),
             ):
+                if extend_control_boon:
+                    self.engine.boon_runtime.vulnerable_until_round[receiver.actor_id] = self.engine.round_index + 2
                 return
         elif hostile and op == BattleEffectOp.MODIFIER and 0.0 < row.application_chance < 1.0:
             if self.engine.rng.unit() >= row.application_chance:
@@ -5125,6 +5148,8 @@ class ConfiguredAbilitiesController:
 
         instance_id = self.engine.effects.next_buff_id()
         remain = row.config_duration_rounds if row.config_duration_rounds > 0 else (0 if row.infinite else row.duration_rounds)
+        if extend_control_boon and remain > 0:
+            remain += 1
         mystic_resonance_extended = False
         mystic_bonus_rounds = 0
         eq = self.engine.equipment_effects
@@ -5242,6 +5267,12 @@ class ConfiguredAbilitiesController:
             consume_breath_resonance = discount_pct > 0
             if consume_breath_resonance:
                 cost = SeasonBattleRules.compute_mana_discounted(cost, discount_pct)
+            free_cast_fn = getattr(self.engine, "is_wuxing_free_first_cast", None)
+            if callable(free_cast_fn) and free_cast_fn(actor):
+                cost = 0
+            mark_free_cast = getattr(self.engine, "mark_wuxing_free_first_cast_used", None)
+            if callable(mark_free_cast):
+                mark_free_cast(actor)
             paid_mana = cost
             if cost > 0:
                 cost = min(cost, actor.attributes.mana)
@@ -5853,6 +5884,304 @@ def roll_tower_sigil_offer(
 def is_valid_custom_duel_round_limit(round_limit_override: int) -> bool:
     """自定义切磋回合上限白名单：0=默认；仅允许 8/12/20 回合。"""
     return round_limit_override in (0, 8, 12, 20)
+
+
+# ---- 五行幻境 V2：15 枚机制改造型五行奇策与 6 关分岔探索纯规则（对照 wuxing_expansion_rules.h） ----
+
+WUXING_REALM_V2_VERSION = 2
+WUXING_REALM_V2_MAX_NODES = 6
+WUXING_REALM_V2_RESONANCE_THRESHOLD = 3
+
+REALM_NODE_NEED_BRANCH = 0  # 第 2 / 4 关待选分岔
+REALM_NODE_NORMAL = 1       # 普通战
+REALM_NODE_ELITE = 2        # 精英强敌（必出灵/仙奇策）
+REALM_NODE_BOSS = 3         # 第 6 关终局首领
+REALM_NODE_EVENT = 4        # 第 2 关右路：奇遇事件
+REALM_NODE_REST = 5         # 第 4 关右路：秘境休整
+
+REALM_EVENT_NONE = 0
+REALM_EVENT_ENCOUNTER = 1
+REALM_EVENT_REST = 2
+
+REALM_BRANCH_ELITE = 1      # 左路：精英强敌
+REALM_BRANCH_SPECIAL = 2    # 右路：奇遇事件 / 秘境休整
+
+# 五行幻境 V2 15 枚机制改造型五行奇策 ID（5 行 × 3 档，号段 601..643，与 V1 101..503 物理隔离）。
+BOON_METAL_BREAK_REFUND = 601    # 金·凡：破盾返还 50% 法力并追加 60% 斩击
+BOON_METAL_CRIT_SPLASH = 602     # 金·灵：暴击向随机另一存活敌方溅射 40% 实伤
+BOON_METAL_FIRST_PIERCE = 603    # 金·仙：每回合己方首次直击无视 35% 防御（+35% 穿透增伤）
+BOON_WOOD_DOT_SPREAD = 611       # 木·凡：敌方持续伤害跳字向其余存活敌方传染 50%
+BOON_WOOD_HEAL_EMPOWER = 612     # 木·灵：获得治疗或护盾后下次直击 +20% 伤害
+BOON_WOOD_PET_FOLLOW_UP = 613    # 木·仙：主角普攻/单体技能后出战灵宠免费追击 70% 普攻（每回合 1 次）
+BOON_WATER_FREE_FIRST_CAST = 621 # 水·凡：每回合己方首招主动技能法力消耗降至 0
+BOON_WATER_EXTEND_CONTROL = 622  # 水·灵：硬控/封印成功持续 +1 回合；免疫则附加 2 回合 18% 易伤
+BOON_WATER_SKILL_ECHO = 623      # 水·仙：主角每第 3 次施放主动进攻技能额外以 55% 威力连发 1 次
+BOON_FIRE_SHIELD_BLAST = 631     # 火·凡：任意护盾碎裂时对敌方全体造成护盾上限 30% 真伤（封顶 1800）
+BOON_FIRE_LOW_HP_FURY = 632      # 火·灵：气血低于 60% 时按已损气血比例获至高 +35% 直伤与 +20% 暴击
+BOON_FIRE_ROUND_END_BURN = 633   # 火·仙：回合末对最高气血敌人叠 1 层灼伤（至多 3 层，每层 4% 上限 1500）
+BOON_EARTH_DOUBLE_REFLECT = 641  # 土·凡：反震伤害翻倍（×200%）且附 2 回合破甲（降防 15%）
+BOON_EARTH_CLUTCH_SHIELD = 642   # 土·灵：每战首次气血跌破 35% 自动获得 25% 最大气血护盾
+BOON_EARTH_SHIELD_STRIKE = 643   # 土·仙：开局获 18% 护盾，持盾期间攻击附加当前护盾 25% 伤害（封顶 1200）
+
+BOON_SHIELD_SHATTER_DAMAGE_CAP = 1800
+BOON_SHIELD_ATTACK_BONUS_CAP = 1200
+BOON_ROUND_END_BURN_CAP = 1500
+BOON_MAX_PROC_DEPTH = 1
+
+# 公平 3x3 试炼预设白名单（与 RankedPreset 101..103 / 201..203 严格一致）。
+DEFAULT_FAIR_CHAR_PRESET_ID = 101
+DEFAULT_FAIR_PET_PRESET_ID = 201
+
+
+def is_valid_fair_char_preset_id(preset_id: int) -> bool:
+    """校验公平 3x3 试炼人物预设 ID 白名单（101..103）。"""
+    return 101 <= int(preset_id) <= 103
+
+
+def is_valid_fair_pet_preset_id(preset_id: int) -> bool:
+    """校验公平 3x3 试炼灵宠预设 ID 白名单（201..203）。"""
+    return 201 <= int(preset_id) <= 203
+
+
+@dataclass(frozen=True, slots=True)
+class WuxingRealmBoonDef:
+    """五行幻境 V2 机制改造型奇策定义（与 C++ `WuxingRealmBoonDef` 逐项一致）。"""
+
+    id: int = 0
+    element: int = WUXING_ELEMENT_NONE
+    rarity: int = 1
+    bit_index: int = 0
+
+
+WUXING_REALM_BOONS: tuple[WuxingRealmBoonDef, ...] = (
+    WuxingRealmBoonDef(BOON_METAL_BREAK_REFUND, WUXING_ELEMENT_METAL, 1, 0),
+    WuxingRealmBoonDef(BOON_METAL_CRIT_SPLASH, WUXING_ELEMENT_METAL, 2, 1),
+    WuxingRealmBoonDef(BOON_METAL_FIRST_PIERCE, WUXING_ELEMENT_METAL, 3, 2),
+    WuxingRealmBoonDef(BOON_WOOD_DOT_SPREAD, WUXING_ELEMENT_WOOD, 1, 3),
+    WuxingRealmBoonDef(BOON_WOOD_HEAL_EMPOWER, WUXING_ELEMENT_WOOD, 2, 4),
+    WuxingRealmBoonDef(BOON_WOOD_PET_FOLLOW_UP, WUXING_ELEMENT_WOOD, 3, 5),
+    WuxingRealmBoonDef(BOON_WATER_FREE_FIRST_CAST, WUXING_ELEMENT_WATER, 1, 6),
+    WuxingRealmBoonDef(BOON_WATER_EXTEND_CONTROL, WUXING_ELEMENT_WATER, 2, 7),
+    WuxingRealmBoonDef(BOON_WATER_SKILL_ECHO, WUXING_ELEMENT_WATER, 3, 8),
+    WuxingRealmBoonDef(BOON_FIRE_SHIELD_BLAST, WUXING_ELEMENT_FIRE, 1, 9),
+    WuxingRealmBoonDef(BOON_FIRE_LOW_HP_FURY, WUXING_ELEMENT_FIRE, 2, 10),
+    WuxingRealmBoonDef(BOON_FIRE_ROUND_END_BURN, WUXING_ELEMENT_FIRE, 3, 11),
+    WuxingRealmBoonDef(BOON_EARTH_DOUBLE_REFLECT, WUXING_ELEMENT_EARTH, 1, 12),
+    WuxingRealmBoonDef(BOON_EARTH_CLUTCH_SHIELD, WUXING_ELEMENT_EARTH, 2, 13),
+    WuxingRealmBoonDef(BOON_EARTH_SHIELD_STRIKE, WUXING_ELEMENT_EARTH, 3, 14),
+)
+
+_REALM_BOON_BY_ID: dict[int, WuxingRealmBoonDef] = {d.id: d for d in WUXING_REALM_BOONS}
+
+
+@dataclass(slots=True)
+class WuxingBoonRuntime:
+    """单场战斗的五行幻境 V2 奇策与共鸣运行时状态（归属单场 TurnEngine 实例）。"""
+
+    boon_mask: int = 0
+    resonance_element: int = WUXING_ELEMENT_NONE
+    proc_depth: int = 0
+    free_mana_used_this_round: set[int] = field(default_factory=set)
+    first_attack_used_this_round: set[int] = field(default_factory=set)
+    pet_assist_used_this_round: set[int] = field(default_factory=set)
+    heal_shield_empowered_actors: set[int] = field(default_factory=set)
+    emergency_shield_triggered: set[int] = field(default_factory=set)
+    skill_cast_counts: dict[int, int] = field(default_factory=dict)
+    fire_burn_stacks: dict[int, int] = field(default_factory=dict)
+    vulnerable_until_round: dict[int, int] = field(default_factory=dict)
+    armor_broken_until_round: dict[int, int] = field(default_factory=dict)
+
+
+def find_realm_boon(boon_id: int) -> WuxingRealmBoonDef | None:
+    """按 V2 五行奇策 ID 查找定义，不存在返回 None。"""
+    return _REALM_BOON_BY_ID.get(int(boon_id))
+
+
+def is_valid_realm_boon_id(boon_id: int) -> bool:
+    """校验 ID 是否属于 15 枚合法 V2 五行奇策（601..643）。"""
+    return int(boon_id) in _REALM_BOON_BY_ID
+
+
+def is_valid_tower_or_boon_id(item_id: int) -> bool:
+    """校验 ID 是否属于合法 V1 符印（101..503）或 V2 奇策（601..643）。"""
+    return is_valid_tower_sigil_id(item_id) or is_valid_realm_boon_id(item_id)
+
+
+def realm_boon_bit(boon_id: int) -> int:
+    """返回 V2 奇策对应的位图掩码位，非法 ID 返回 0。"""
+    defn = _REALM_BOON_BY_ID.get(int(boon_id))
+    return (1 << defn.bit_index) if defn is not None else 0
+
+
+def compute_realm_boon_mask(ids: Iterable[int]) -> int:
+    """汇总奇策 ID 集合为 15 位奇策位图掩码。"""
+    mask = 0
+    for bid in ids:
+        mask |= realm_boon_bit(bid)
+    return mask
+
+
+def compute_active_resonance_element(ids: Iterable[int]) -> int:
+    """统计同系奇策数量：任意五行集齐 >= 3 枚即点亮对应共鸣（按 1..5 稳定取最小元素）。"""
+    counts = [0] * 6
+    for bid in ids:
+        defn = _REALM_BOON_BY_ID.get(int(bid))
+        if defn is not None and 1 <= defn.element <= 5:
+            counts[defn.element] += 1
+    for elem in range(1, 6):
+        if counts[elem] >= WUXING_REALM_V2_RESONANCE_THRESHOLD:
+            return elem
+    return WUXING_ELEMENT_NONE
+
+
+def dominant_boon_element(ids: Iterable[int]) -> int:
+    """返回当前持有奇策最多且尚未满共鸣的五行（供第 4 关秘境休整「同源寻策」使用）。"""
+    counts = [0] * 6
+    for bid in ids:
+        defn = _REALM_BOON_BY_ID.get(int(bid))
+        if defn is not None and 1 <= defn.element <= 5:
+            counts[defn.element] += 1
+    best_elem = WUXING_ELEMENT_NONE
+    best_count = 0
+    for elem in range(1, 6):
+        if counts[elem] > best_count and counts[elem] < WUXING_REALM_V2_RESONANCE_THRESHOLD:
+            best_count = counts[elem]
+            best_elem = elem
+    if best_elem == WUXING_ELEMENT_NONE:
+        for elem in range(1, 6):
+            if counts[elem] > best_count:
+                best_count = counts[elem]
+                best_elem = elem
+    return best_elem
+
+
+def next_upgrade_boon_id(current_boon_id: int, owned: Sequence[int]) -> int:
+    """淬炼升品：将一枚已持有的凡/灵品奇策升级为同五行更高一档未持有奇策（失败返回 0）。"""
+    cur = _REALM_BOON_BY_ID.get(int(current_boon_id))
+    if cur is None or cur.rarity >= 3:
+        return 0
+    owned_set = set(owned)
+    for target_rarity in range(cur.rarity + 1, 4):
+        for defn in WUXING_REALM_BOONS:
+            if defn.element == cur.element and defn.rarity == target_rarity and defn.id not in owned_set:
+                return defn.id
+    return 0
+
+
+def realm_node_default_kind(node_index: int) -> int:
+    """返回五行幻境 V2 指定关卡的默认节点类型（第 2/4 关为待选分岔，第 5 关精英，第 6 关首领）。"""
+    return {
+        1: REALM_NODE_NORMAL,
+        2: REALM_NODE_NEED_BRANCH,
+        3: REALM_NODE_NORMAL,
+        4: REALM_NODE_NEED_BRANCH,
+        5: REALM_NODE_ELITE,
+        6: REALM_NODE_BOSS,
+    }.get(int(node_index), REALM_NODE_NORMAL)
+
+
+def is_realm_combat_node_kind(node_kind: int) -> bool:
+    """校验 V2 节点类型是否为允许进入战斗的战斗节点（普通/精英/首领）。"""
+    return int(node_kind) in (REALM_NODE_NORMAL, REALM_NODE_ELITE, REALM_NODE_BOSS)
+
+
+def realm_node_dungeon_id(node_index: int, node_kind: int) -> int:
+    """将 V2 关卡号与节点类型映射至既有稳定首领试炼普通副本 ID。"""
+    n = int(node_index)
+    k = int(node_kind)
+    if k == REALM_NODE_BOSS or n >= WUXING_REALM_V2_MAX_NODES:
+        return 107
+    if k == REALM_NODE_ELITE:
+        return 103 if n <= 2 else 105
+    if n == 1:
+        return 101
+    if n == 3:
+        return 105
+    return 103
+
+
+def realm_monster_health_pct(node_index: int, node_kind: int) -> int:
+    """计算五行幻境 V2 战斗节点的怪物气血倍率百分比。"""
+    n = int(node_index) if 1 <= int(node_index) <= WUXING_REALM_V2_MAX_NODES else 1
+    pct = 82 + (n - 1) * 10
+    if int(node_kind) == REALM_NODE_ELITE:
+        pct += 16
+    if int(node_kind) == REALM_NODE_BOSS or n == WUXING_REALM_V2_MAX_NODES:
+        pct += 16
+    return pct
+
+
+def realm_monster_attack_pct(node_index: int, node_kind: int) -> int:
+    """计算五行幻境 V2 战斗节点的怪物攻击倍率百分比。"""
+    n = int(node_index) if 1 <= int(node_index) <= WUXING_REALM_V2_MAX_NODES else 1
+    pct = 82 + (n - 1) * 7
+    if int(node_kind) == REALM_NODE_ELITE:
+        pct += 10
+    if int(node_kind) == REALM_NODE_BOSS or n == WUXING_REALM_V2_MAX_NODES:
+        pct += 8
+    return pct
+
+
+def roll_realm_boon_offer(
+    week_key: int,
+    run_id: int,
+    node_index: int,
+    node_kind: int,
+    reroll_count: int,
+    owned: Sequence[int],
+    preferred_element: int = WUXING_ELEMENT_NONE,
+) -> list[int]:
+    """确定性抽取 3 枚未持有的 V2 五行奇策（与 C++ `RollRealmBoonOffer` 逐位一致）。"""
+    owned_set = set(owned)
+    offers: list[int] = []
+    seed_in = (
+        ((week_key & 0xFFFFFFFF) << 32)
+        ^ mix_seed_u64(run_id & U64_MAX)
+        ^ ((node_index * 0x517CC1B727220A95) & U64_MAX)
+        ^ ((node_kind * 0x94D049BB133111EB) & U64_MAX)
+        ^ (((reroll_count + 1) * 0xBF58476D1CE4E5B9) & U64_MAX)
+    ) & U64_MAX
+    state = mix_seed_u64(seed_in)
+
+    def _pick_from(candidates: list[int], max_add: int) -> None:
+        nonlocal state
+        added = 0
+        while candidates and len(offers) < WUXING_TOWER_OFFER_COUNT and added < max_add:
+            state = mix_seed_u64(state)
+            idx = state % len(candidates)
+            chosen = candidates.pop(idx)
+            if chosen not in offers:
+                offers.append(chosen)
+                added += 1
+
+    if 1 <= preferred_element <= 5:
+        elem_pool = [d.id for d in WUXING_REALM_BOONS if d.element == preferred_element and d.id not in owned_set]
+        _pick_from(elem_pool, 2)
+    if node_kind == REALM_NODE_ELITE and len(offers) < WUXING_TOWER_OFFER_COUNT:
+        high_pool = [d.id for d in WUXING_REALM_BOONS if d.rarity >= 2 and d.id not in owned_set]
+        _pick_from(high_pool, 2)
+    pool = [
+        d.id
+        for d in WUXING_REALM_BOONS
+        if d.id not in owned_set and not (node_index <= 1 and node_kind == REALM_NODE_NORMAL and d.rarity >= 3)
+    ]
+    _pick_from(pool, WUXING_TOWER_OFFER_COUNT)
+    if len(offers) < WUXING_TOWER_OFFER_COUNT:
+        fallback = [d.id for d in WUXING_REALM_BOONS if d.id not in owned_set]
+        _pick_from(fallback, WUXING_TOWER_OFFER_COUNT)
+    return offers
+
+
+def roll_realm_encounter_boon(week_key: int, run_id: int, owned: Sequence[int]) -> int:
+    """第 2 关奇遇「道缘寻策」：确定性发放 1 枚未持有灵品奇策（无未持有灵品时回退任意未持有奇策）。"""
+    owned_set = set(owned)
+    pool = [d.id for d in WUXING_REALM_BOONS if d.rarity == 2 and d.id not in owned_set]
+    if not pool:
+        pool = [d.id for d in WUXING_REALM_BOONS if d.id not in owned_set]
+    if not pool:
+        return 0
+    h = mix_seed_u64((((week_key & 0xFFFFFFFF) << 32) ^ mix_seed_u64(run_id & U64_MAX) ^ 0xA0761D6478BD642F) & U64_MAX)
+    return pool[h % len(pool)]
 
 
 # -- 万象残局坊 V1 引擎侧共享规则与白名单（与 C++ tactical_puzzle_rules.h 逐项同源）----------------

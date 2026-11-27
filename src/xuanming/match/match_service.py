@@ -94,6 +94,7 @@ from .outbox import OutcomeOutboxWorker
 from .ranked import RankedManager, _default_config_tables
 from .rating import RankOutboxPublisher
 from .spectate import SpectateManager
+from .spectate_chat import SpectateChatManager
 from .store import MatchStore, StrandedFormationEntry
 from .tactical_puzzle import WORKSHOP_DUNGEON_ID, TacticalPuzzleManager
 from .team_service import TeamGrpcService
@@ -128,6 +129,7 @@ class MatchGrpcService:
         jianghu: JianghuManager | None = None,
         trial_cards: TrialChallengeCardManager | None = None,
         tactical_puzzles: TacticalPuzzleManager | None = None,
+        spectate_chat: SpectateChatManager | None = None,
         inline_gather: bool = False,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -168,6 +170,19 @@ class MatchGrpcService:
         )
         if self.tactical_puzzles.battle_launcher is None:
             self.tactical_puzzles.battle_launcher = self._launch_tactical_puzzle_formation
+        self.spectate_chat = (
+            spectate_chat
+            if spectate_chat is not None
+            else SpectateChatManager(
+                protocol,
+                store,
+                config.spectate_chat,
+                display_name_lookup=self._lookup_player_display_name,
+                clock_ms=self._clock_ms,
+            )
+        )
+        if getattr(self.spectate, "on_battle_forgotten", None) is None:
+            self.spectate.on_battle_forgotten = self.spectate_chat.mark_battle_ended
         if self.gather.on_tournament_profiles is None:
             self.gather.on_tournament_profiles = self.tournament.sync_member_profiles
         if getattr(self.gather, "on_tournament_captains", None) is None:
@@ -237,6 +252,8 @@ class MatchGrpcService:
                 "StartTacticalPuzzleBattle": self.start_tactical_puzzle_battle,
                 "LikeTacticalPuzzle": self.like_tactical_puzzle,
                 "GetTacticalPuzzleSolutionReplay": self.get_tactical_puzzle_solution_replay,
+                "SendBattleSpectateChat": self.send_battle_spectate_chat,
+                "PullBattleSpectateChat": self.pull_battle_spectate_chat,
             },
             SERVICE_MATCH_INTERNAL: {
                 "CommitBattleOutcome": self.commit_battle_outcome,
@@ -926,6 +943,16 @@ class MatchGrpcService:
         caller = await self._admit_client(context, path)
         return await self.tactical_puzzles.get_solution_replay(caller, request)
 
+    # -- 局外人观战交流模式 V1 客户端 RPCs（587..588）------------------------------------------------
+
+    async def send_battle_spectate_chat(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.spectate_chat.send_chat(caller, request)
+
+    async def pull_battle_spectate_chat(self, request: Message, context, path: str) -> Message:
+        caller = await self._admit_client(context, path)
+        return await self.spectate_chat.pull_chat(caller, request)
+
     async def _on_tactical_puzzle_outcome_committed(self, request: Message) -> None:
         battle_id = int(request.battle_id)
         formation = await self.store.get_formation(battle_id)
@@ -961,6 +988,7 @@ class MatchGrpcService:
             await self._on_tactical_puzzle_outcome_committed(request)
         if decision in (OUTCOME_DECISION_COMPLETE, OUTCOME_DECISION_ABORT):
             self.spectate.forget_battle(int(request.battle_id))
+            self.spectate_chat.mark_battle_ended(int(request.battle_id))
 
         reply = self.protocol.message("match.CommitBattleOutcomeResponse", decision=decision)
         sign_internal_reply(path, request, reply, "match", self.config.battle_outcome_secret, int(self._clock_ms()))
@@ -1509,6 +1537,8 @@ class MatchGrpcService:
                 "replica_instance": replica,
             },
         )
+        self.spectate.forget_battle(battle_id)
+        self.spectate_chat.mark_battle_ended(battle_id)
         logger.warning("%s", audit_line)
         resp.verdict = 1  # ELIGIBLE (committed)
         return resp

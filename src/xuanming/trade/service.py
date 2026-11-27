@@ -96,6 +96,7 @@ from .model import (
     MarketLimits,
     MergedZones,
     RoleOriginal,
+    TableWantedSkillCatalog,
     WantedBoardCursor,
     clamp_page_size,
     clamp_uint32,
@@ -138,6 +139,18 @@ _VERDICT_VERSION_CHANGED = 4
 _VERDICT_RETRY = 5
 
 _AUTO = object()
+
+
+def validate_wanted_skill_tables(tables) -> TableWantedSkillCatalog:
+    """校验 trade 候选配置表包必须包含合法 Skill 与 SkillScrollCraft 表（对齐 Go svc.ValidateTables）。"""
+    if tables is None:
+        raise ValueError("trade validate tables: tables is None")
+    table_map = getattr(tables, "tables", None)
+    if table_map is None or "Skill" not in table_map or "SkillScrollCraft" not in table_map:
+        raise ValueError("trade validate tables: missing required Skill or SkillScrollCraft table")
+    if len(tables["Skill"]) == 0 or len(tables["SkillScrollCraft"]) == 0:
+        raise ValueError("trade validate tables: Skill or SkillScrollCraft table is empty")
+    return TableWantedSkillCatalog(tables)
 
 
 def _has_session_metadata(context) -> bool:

@@ -17,6 +17,25 @@ from typing import TYPE_CHECKING
 from google.protobuf.message import DecodeError, Message
 
 from .battle_dropin_effects import (
+    BOON_EARTH_CLUTCH_SHIELD,
+    BOON_EARTH_DOUBLE_REFLECT,
+    BOON_EARTH_SHIELD_STRIKE,
+    BOON_FIRE_LOW_HP_FURY,
+    BOON_FIRE_ROUND_END_BURN,
+    BOON_FIRE_SHIELD_BLAST,
+    BOON_MAX_PROC_DEPTH,
+    BOON_METAL_BREAK_REFUND,
+    BOON_METAL_CRIT_SPLASH,
+    BOON_METAL_FIRST_PIERCE,
+    BOON_ROUND_END_BURN_CAP,
+    BOON_SHIELD_ATTACK_BONUS_CAP,
+    BOON_SHIELD_SHATTER_DAMAGE_CAP,
+    BOON_WATER_EXTEND_CONTROL,
+    BOON_WATER_FREE_FIRST_CAST,
+    BOON_WATER_SKILL_ECHO,
+    BOON_WOOD_DOT_SPREAD,
+    BOON_WOOD_HEAL_EMPOWER,
+    BOON_WOOD_PET_FOLLOW_UP,
     BOSS_AFFIX_FIRE,
     BOSS_AFFIX_FIRE_EXPOSED_BURN_CAP,
     BOSS_AFFIX_FIRE_EXPOSED_BURN_MAX_HP_PCT,
@@ -87,7 +106,14 @@ from .battle_dropin_effects import (
     VOW_NO_PET,
     VOW_SINGLE_ARTIFACT,
     VOW_TIGHT_ROUNDS,
+    WUXING_ELEMENT_EARTH,
+    WUXING_ELEMENT_FIRE,
+    WUXING_ELEMENT_METAL,
+    WUXING_ELEMENT_WATER,
+    WUXING_ELEMENT_WOOD,
     WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
+    WUXING_REALM_V2_MAX_NODES,
+    WUXING_REALM_V2_VERSION,
     WUXING_SYNERGY_BONUS_PCT,
     WUXING_TOWER_MAX_FLOORS,
     BattleEffectOp,
@@ -103,10 +129,13 @@ from .battle_dropin_effects import (
     SeasonBattleRules,
     TrialContext,
     TrialFactTracker,
+    WuxingBoonRuntime,
     WuxingTowerSigilBonuses,
     aggregate_tower_sigils,
     are_elements_mutually_generating,
     choose_monster_action,
+    compute_active_resonance_element,
+    compute_realm_boon_mask,
     discount_water_mana_cost,
     element_of_class,
     element_of_pet,
@@ -114,16 +143,21 @@ from .battle_dropin_effects import (
     formation_counter_bonus_pct,
     formation_of,
     is_boss_trial_kind,
+    is_realm_combat_node_kind,
     is_synergy_round,
     is_valid_boss_affix_override,
     is_valid_custom_duel_round_limit,
     is_valid_formation_id,
+    is_valid_realm_boon_id,
     is_valid_tactical_puzzle_context,
     is_valid_tower_sigil_id,
     is_valid_vow_mask,
     minor_play_deadline_reached,
     minor_ticket_expire_at_ms,
     mix_seed_u64,
+    realm_boon_bit,
+    realm_monster_attack_pct,
+    realm_monster_health_pct,
     tactical_puzzle_apply_speed_delta,
     tactical_puzzle_enemy_buff_table_id,
     tactical_puzzle_player_debuff_table_id,
@@ -191,6 +225,19 @@ class _Connection:
 class _Observer:
     operation_id: int | str
     expires_ms: int
+    was_connected: bool = False
+
+
+@dataclass(slots=True)
+class BattleEventCounters:
+    """战斗节点事件累计计数器（对齐 C++ BattleRoomManager::EventCounters，由 collect_metrics_text 导出）。"""
+
+    frames_dropped_no_direct: int = 0
+    fingerprint_rejected: int = 0
+    fingerprint_continued: int = 0
+    observer_seats_reclaimed_connect_timeout: int = 0
+    observer_seats_reclaimed_reconnect_timeout: int = 0
+    spectate_frames_not_sent: int = 0
 
 
 @dataclass(slots=True)
@@ -292,22 +339,41 @@ class TurnEngine:
         self.rng = _Mt19937_64(request.seed)
         self.item_rules = items
 
-        # 提取并校验五行幻境周常爬塔上下文（仅单人 PVE 携带且符印/层数合法）。
+        # 提取并校验五行幻境 V2/V1 上下文（仅单人 PVE 携带，V2 校验战斗节点与 601..643 奇策共鸣）。
         self.tower_context: Message | None = None
         self.tower_sigil_bonuses: WuxingTowerSigilBonuses = WuxingTowerSigilBonuses()
+        self.boon_runtime: WuxingBoonRuntime = WuxingBoonRuntime()
         for snap in request.players:
             if "tower_context" in snap.DESCRIPTOR.fields_by_name and snap.HasField("tower_context"):
                 tc = snap.tower_context
                 if tc.run_id != 0 or tc.floor != 0 or tc.active_sigil_ids:
+                    is_v2 = int(getattr(tc, "realm_version", 0)) >= WUXING_REALM_V2_VERSION
+                    max_floor = WUXING_REALM_V2_MAX_NODES if is_v2 else WUXING_TOWER_MAX_FLOORS
                     if (
                         not self.pve
                         or len(request.players) != 1
-                        or not (1 <= tc.floor <= WUXING_TOWER_MAX_FLOORS)
-                        or any(not is_valid_tower_sigil_id(sid) for sid in tc.active_sigil_ids)
+                        or tc.run_id == 0
+                        or not (1 <= tc.floor <= max_floor)
+                        or (is_v2 and not is_realm_combat_node_kind(int(getattr(tc, "node_kind", 0))))
                     ):
                         raise BattleError("invalid wuxing tower battle context")
-                    self.tower_context = tc
+                    boon_mask = 0
+                    for sid in tc.active_sigil_ids:
+                        if is_valid_tower_sigil_id(sid):
+                            continue
+                        if is_v2 and is_valid_realm_boon_id(sid):
+                            boon_mask |= realm_boon_bit(sid)
+                        else:
+                            raise BattleError("invalid wuxing tower battle context")
+                    tc_copy = self.protocol.message("WuxingTowerBattleContext")
+                    tc_copy.CopyFrom(tc)
+                    self.tower_context = tc_copy
                     self.tower_sigil_bonuses = aggregate_tower_sigils(tc.active_sigil_ids)
+                    if is_v2:
+                        computed_resonance = compute_active_resonance_element(tc.active_sigil_ids)
+                        self.boon_runtime.boon_mask = boon_mask
+                        self.boon_runtime.resonance_element = computed_resonance
+                        self.tower_context.active_resonance_element = computed_resonance
                     break
 
         # 排位默认回合上限收敛到 20，物法易势 5V5 默认 16，天墉生死状默认 30，瑞兽迎春硬性校验并取冻结 round_limit。
@@ -593,8 +659,12 @@ class TurnEngine:
                 actor.ClearField("runtime_skills")
                 actor.capture_pet_table_id = 0
             if self.tower_context is not None and not self.encounter.is_festival_beast:
-                hp_pct = tower_monster_health_pct(self.tower_context.floor)
-                atk_pct = tower_monster_attack_pct(self.tower_context.floor)
+                if self.is_wuxing_realm_v2:
+                    hp_pct = realm_monster_health_pct(self.tower_context.floor, self.tower_context.node_kind)
+                    atk_pct = realm_monster_attack_pct(self.tower_context.floor, self.tower_context.node_kind)
+                else:
+                    hp_pct = tower_monster_health_pct(self.tower_context.floor)
+                    atk_pct = tower_monster_attack_pct(self.tower_context.floor)
                 actor.max_health = max(1, (actor.max_health * hp_pct) // 100)
                 actor.attributes.health = actor.max_health
                 if actor.physical_attack > 0:
@@ -1310,7 +1380,55 @@ class TurnEngine:
         return (
             (self.ranked_context is not None and bool(self.ranked_context.use_free_preset))
             or (self.custom_duel_rules is not None and bool(self.custom_duel_rules.use_free_preset))
+            or (self.tower_context is not None and bool(getattr(self.tower_context, "use_free_preset", False)))
         )
+
+    @property
+    def is_wuxing_realm_v2(self) -> bool:
+        """当前战斗是否为五行幻境 V2（6 关分岔奇策秘境）。"""
+        return (
+            self.tower_context is not None
+            and int(getattr(self.tower_context, "realm_version", 0)) >= WUXING_REALM_V2_VERSION
+        )
+
+    def has_realm_boon(self, boon_id: int) -> bool:
+        """判定本场五行幻境 V2 是否激活指定奇策。"""
+        return self.is_wuxing_realm_v2 and (self.boon_runtime.boon_mask & realm_boon_bit(boon_id)) != 0
+
+    def has_realm_resonance(self, element: int) -> bool:
+        """判定本场五行幻境 V2 是否点亮指定五行 3 同系共鸣。"""
+        return self.is_wuxing_realm_v2 and element != 0 and self.boon_runtime.resonance_element == element
+
+    def is_wuxing_free_first_cast(self, actor: Message) -> bool:
+        """621 润脉免耗：判定该友方单位本回合首招主动技能是否免蓝耗。"""
+        return (
+            actor.team_index == 0
+            and self.has_realm_boon(BOON_WATER_FREE_FIRST_CAST)
+            and actor.actor_id not in self.boon_runtime.free_mana_used_this_round
+        )
+
+    def mark_wuxing_free_first_cast_used(self, actor: Message) -> None:
+        """消耗 621 润脉免耗本回合首招免蓝标记。"""
+        if actor.team_index == 0 and self.has_realm_boon(BOON_WATER_FREE_FIRST_CAST):
+            self.boon_runtime.free_mana_used_this_round.add(actor.actor_id)
+
+    def mark_wuxing_heal_shield_empowered(self, target: Message) -> None:
+        """612 灵露蓄势：友方获得治疗或护盾后标记下次直击 +20% 伤害。"""
+        if target.team_index == 0 and self.has_realm_boon(BOON_WOOD_HEAL_EMPOWER):
+            self.boon_runtime.heal_shield_empowered_actors.add(target.actor_id)
+
+    def current_total_shield_of(self, target: Message) -> int:
+        """统计单位当前全部未耗尽护盾容量之和（首领灵障盾 + 开场盾 + 配置盾 Buff）。"""
+        total = 0
+        if target.is_boss and self.encounter.boss_barrier_shield > 0:
+            total = min(U64_MAX, total + self.encounter.boss_barrier_shield)
+        opening = self.opening_shield_by_actor.get(target.actor_id, 0)
+        if opening > 0:
+            total = min(U64_MAX, total + opening)
+        for entry in target.buffs:
+            if entry.remaining_capacity > 0:
+                total = min(U64_MAX, total + entry.remaining_capacity)
+        return total
 
     @property
     def active_leyline(self) -> int:
@@ -1453,6 +1571,10 @@ class TurnEngine:
                 pct += formation_of(self.team_formation_ids[actor.team_index]).opening_shield_pct
             if actor.team_index == 0 and self.tower_context is not None:
                 pct += self.tower_sigil_bonuses.opening_shield_pct
+                if self.has_realm_boon(BOON_EARTH_SHIELD_STRIKE):
+                    pct += 18
+                if self.has_realm_resonance(WUXING_ELEMENT_EARTH):
+                    pct += 10
             if metal_boss_affix and actor.team_index == 1:
                 pct += BOSS_AFFIX_METAL_ENEMY_OPENING_SHIELD_PCT
             if pct > 0:
@@ -1680,7 +1802,7 @@ class TurnEngine:
         return 0  # BATTLE_HIGHLIGHT_NONE
 
     def build_tower_settlement_echo(self) -> Message | None:
-        """构建五行幻境单层结算回传载荷（非幻境局返回 None）。"""
+        """构建五行幻境 V2/V1 单关结算回传载荷（非幻境局返回 None）。"""
         if self.tower_context is None:
             return None
         return self.protocol.message(
@@ -1689,6 +1811,9 @@ class TurnEngine:
             run_id=self.tower_context.run_id,
             floor=self.tower_context.floor,
             total_rounds=self.completed_rounds(),
+            realm_version=int(getattr(self.tower_context, "realm_version", 0)),
+            node_kind=int(getattr(self.tower_context, "node_kind", 0)),
+            use_free_preset=bool(getattr(self.tower_context, "use_free_preset", False)),
         )
 
     @property
@@ -1869,6 +1994,7 @@ class TurnEngine:
             "BattleStateS2C", battle_id=self.battle_id, round_index=self.round_index,
             action_deadline_ms=deadline_ms, outcome=self.outcome, pending_actor_ids=self.pending_players(),
             round_limit=self.max_rounds,
+            spectate_chat_enabled=bool(getattr(self.create_request, "spectate_chat_enabled", False)),
         )
         state.actors.extend(self.actors.values())
         self.encounter.fill_state_snapshot(state)
@@ -1976,9 +2102,18 @@ class TurnEngine:
             if rule is not None and self.is_control_banned_for_actor(actor) and self.is_control_skill(rule):
                 return 7004
             error = self.skills.validate(actor, action)
-            if error == 7004 and actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
-                rule = self.skills.rules.get(action.skill_table_id)
-                if rule is not None and rule.castable:
+            if error == 7004 and rule is not None and rule.castable:
+                if self.is_wuxing_free_first_cast(actor):
+                    orig_mana = actor.attributes.mana
+                    needed = mana_cost(actor, rule)
+                    if needed > orig_mana:
+                        actor.attributes.mana = needed
+                        try:
+                            if self.skills.validate(actor, action) == 0:
+                                return 0
+                        finally:
+                            actor.attributes.mana = orig_mana
+                if actor.HasField("equipment_effects") and actor.equipment_effects.mana_reduction_bps:
                     discounted = self.equipment_effects.discount_skill_mana(actor, rule, mana_cost(actor, rule))
                     if discounted <= actor.attributes.mana:
                         return 0
@@ -2060,7 +2195,10 @@ class TurnEngine:
             return turn
         if self.prep_active:
             self.finalize_prep_phase()
-        # 回合初：五行相生合击判定与广播 + 水润灵脉 / 云垂阵 / 幻境符印回合初气血法力回复。
+        # 回合初：五行相生合击判定与广播 + 水润灵脉 / 云垂阵 / 幻境符印与共鸣回合初气血法力回复。
+        self.boon_runtime.free_mana_used_this_round.clear()
+        self.boon_runtime.first_attack_used_this_round.clear()
+        self.boon_runtime.pet_assist_used_this_round.clear()
         self.synergy_active_actor_ids.clear()
         for player_actor, pet_actor in self._synergy_pairs_this_round():
             self.synergy_active_actor_ids.add(player_actor.actor_id)
@@ -2080,16 +2218,16 @@ class TurnEngine:
                 mana_pct += self.tower_sigil_bonuses.round_mana_regen_pct
             if mana_pct > 0 and actor.max_mana > 0 and actor.attributes.mana < actor.max_mana:
                 regen = max(1, (actor.max_mana * mana_pct) // 100)
+                if actor.team_index == 0 and self.has_realm_resonance(WUXING_ELEMENT_WATER):
+                    regen = (regen * 130) // 100
                 actor.attributes.mana = min(actor.max_mana, actor.attributes.mana + regen)
-            if (
-                actor.team_index == 0
-                and self.tower_context is not None
-                and self.tower_sigil_bonuses.round_hp_regen_pct > 0
-                and actor.max_health > 0
-                and actor.attributes.health < actor.max_health
-            ):
-                hp_regen = max(1, (actor.max_health * self.tower_sigil_bonuses.round_hp_regen_pct) // 100)
+            hp_regen_pct = self.tower_sigil_bonuses.round_hp_regen_pct if (actor.team_index == 0 and self.tower_context is not None) else 0
+            if actor.team_index == 0 and self.has_realm_resonance(WUXING_ELEMENT_WOOD):
+                hp_regen_pct += 6
+            if hp_regen_pct > 0 and actor.max_health > 0 and actor.attributes.health < actor.max_health:
+                hp_regen = max(1, (actor.max_health * hp_regen_pct) // 100)
                 actor.attributes.health = min(actor.max_health, actor.attributes.health + hp_regen)
+        self._apply_wuxing_round_start_boon_effects(turn)
         self._fill_default_actions()
         order = sorted((actor for actor in self.actors.values() if _active(actor)), key=self._sort_key)
         self.round_start_speeds = {actor.actor_id: self.configured.effective_speed(actor) for actor in order}
@@ -2109,11 +2247,13 @@ class TurnEngine:
                 tick_start = len(turn.events)
                 self.effects.tick(actor, turn, self._group)
                 self._post_process_buff_ticks(actor, turn, tick_start)
+        self._apply_wuxing_round_end_boon_effects(turn)
         for actor in self.actors.values():
             actor.is_defending = False
+            cd_step = 2 if (actor.team_index == 0 and self.has_realm_resonance(WUXING_ELEMENT_WATER)) else 1
             for skill_id, remaining in list(actor.skill_cooldown_rounds.items()):
                 if remaining:
-                    actor.skill_cooldown_rounds[skill_id] = remaining - 1
+                    actor.skill_cooldown_rounds[skill_id] = (remaining - cd_step) if remaining > cd_step else 0
         self._update_outcome()
         if not self.outcome and self.is_boss_trial_battle:
             self._group += 1
@@ -2203,6 +2343,12 @@ class TurnEngine:
                         self._death(turn, event.group_id, target, caster.actor_id)
             elif rule.buff_type in (40, 42):
                 self.trial_tracker.record_monster_heal(caster, target, event.value)
+            if (
+                (rule.buff_type in (50, 51) or rule.battle_op == BattleEffectOp.PERIODIC_DAMAGE)
+                and target.team_index == 1
+                and event.value > 0
+            ):
+                self._apply_wuxing_periodic_spread(event.source_id, target, event.value, turn, event.group_id)
 
     def _fill_default_actions(self) -> None:
         self.scripts.fill()
@@ -2314,10 +2460,17 @@ class TurnEngine:
         """执行技能并接入装备减耗、治疗增幅、法宝触发与试炼志事件追踪。"""
         event_start = len(turn.events)
         rule = self.skills.rules.get(action.skill_table_id)
+        is_legacy_skill = rule is not None and rule.battle_model != 1
+        legacy_free_first = is_legacy_skill and self.is_wuxing_free_first_cast(actor)
         discount_saved = 0
         original_cost = 0
         borrowed_mana = 0
-        if (
+        if legacy_free_first:
+            original_cost = mana_cost(actor, rule)
+            if original_cost > actor.attributes.mana:
+                borrowed_mana = original_cost - actor.attributes.mana
+                actor.attributes.mana += borrowed_mana
+        elif (
             rule is not None
             and actor.HasField("equipment_effects")
             and actor.equipment_effects.mana_reduction_bps
@@ -2331,7 +2484,27 @@ class TurnEngine:
 
         self.skills.execute(actor, action, turn, group)
 
-        if discount_saved > 0:
+        if legacy_free_first:
+            self.mark_wuxing_free_first_cast_used(actor)
+            if original_cost > 0:
+                mana_indices = [
+                    idx for idx in range(event_start, len(turn.events))
+                    if turn.events[idx].event_type == 14
+                    and turn.events[idx].source_id == actor.actor_id
+                    and turn.events[idx].target_id == actor.actor_id
+                    and turn.events[idx].mana_delta < 0
+                ]
+                if mana_indices:
+                    spent_actual = abs(turn.events[mana_indices[0]].mana_delta)
+                    refund = spent_actual - borrowed_mana
+                    if refund > 0:
+                        actor.attributes.mana = min(actor.max_mana, actor.attributes.mana + refund)
+                    elif refund < 0:
+                        actor.attributes.mana = max(0, actor.attributes.mana + refund)
+                    del turn.events[mana_indices[0]]
+                elif borrowed_mana > 0:
+                    actor.attributes.mana = max(0, actor.attributes.mana - borrowed_mana)
+        elif discount_saved > 0:
             mana_events = [
                 ev for ev in turn.events[event_start:]
                 if ev.event_type == 14 and ev.source_id == actor.actor_id and ev.target_id == actor.actor_id and ev.mana_delta < 0
@@ -2351,6 +2524,7 @@ class TurnEngine:
 
         new_events = list(turn.events[event_start:])
         first_heal = True
+        legacy_extend_ctrl = is_legacy_skill and actor.team_index == 0 and self.has_realm_boon(BOON_WATER_EXTEND_CONTROL)
         for event in new_events:
             if event.event_type == 4 and event.value > 0:
                 target = self.actors.get(event.target_id)
@@ -2360,8 +2534,20 @@ class TurnEngine:
                         is_primary_first_hit=(first_heal and event.skill_table_id == action.skill_table_id),
                     )
                     first_heal = False
+                    self.mark_wuxing_heal_shield_empowered(target)
                     self.trial_tracker.record_effective_contribution(actor)
                     self.trial_tracker.record_monster_heal(actor, target, event.value)
+            elif event.event_type == 5 and legacy_extend_ctrl and self._is_hard_control_buff(event.buff_table_id):
+                target = self.actors.get(event.target_id)
+                if target is not None and target.team_index != 0:
+                    for b_entry in reversed(target.buffs):
+                        if b_entry.buff_table_id == event.buff_table_id and b_entry.remain_rounds > 0:
+                            b_entry.remain_rounds += 1
+                            break
+            elif event.event_type == 15 and legacy_extend_ctrl and self._is_hard_control_buff(event.buff_table_id):
+                target = self.actors.get(event.target_id)
+                if target is not None and target.team_index != 0:
+                    self.boon_runtime.vulnerable_until_round[target.actor_id] = self.round_index + 2
             elif event.event_type == 6:
                 target = self.actors.get(event.target_id)
                 if target is not None:
@@ -2393,7 +2579,10 @@ class TurnEngine:
             raw_heal *= (100.0 + support_bonus_pct) / 100.0
         if self.escalation_stacks > 0:
             raw_heal *= self.escalation_support_pct / 100.0
-        target.attributes.health = old_health + landed_heal(target, raw_heal)
+        healed_hp = landed_heal(target, raw_heal)
+        target.attributes.health = old_health + healed_hp
+        if healed_hp > 0:
+            self.mark_wuxing_heal_shield_empowered(target)
         target.attributes.mana = old_mana + min(rule.heal_mana, max(0, target.max_mana - old_mana))
         item = next(entry for entry in self.items[actor.actor_id]
                     if entry.item_table_id == action.item_table_id and entry.count)
@@ -2484,6 +2673,10 @@ class TurnEngine:
             bonus += formation_of(self.team_formation_ids[actor.team_index]).crit_bonus_pct
         if actor.team_index == 0 and self.tower_context is not None:
             bonus += self.tower_sigil_bonuses.crit_pct
+        if actor.team_index == 0 and self.has_realm_boon(BOON_FIRE_LOW_HP_FURY) and actor.max_health > 0:
+            hp_pct = (actor.attributes.health * 100) // actor.max_health
+            if hp_pct < 60:
+                bonus += ((60 - hp_pct) * 20) // 60
         base = min(100, actor.attributes.critchance + bonus) / 100
         if not actor.HasField("equipment_effects"):
             return base
@@ -2585,13 +2778,28 @@ class TurnEngine:
                     wuxing_out_pct += sb.first3_rounds_damage_pct
                 if not is_multi_target:
                     wuxing_out_pct += sb.single_target_damage_pct
-                if sb.shield_break_bonus_pct > 0 and (
-                    any(e.remaining_capacity > 0 for e in target.buffs)
-                    or self.opening_shield_by_actor.get(target.actor_id, 0) > 0
-                ):
+                if sb.shield_break_bonus_pct > 0 and self.has_any_active_shield(target):
                     wuxing_out_pct += sb.shield_break_bonus_pct
+                if self.has_realm_boon(BOON_METAL_FIRST_PIERCE) and actor.actor_id not in self.boon_runtime.first_attack_used_this_round:
+                    wuxing_out_pct += 35
+                if self.has_realm_boon(BOON_WOOD_HEAL_EMPOWER) and actor.actor_id in self.boon_runtime.heal_shield_empowered_actors:
+                    wuxing_out_pct += 20
+                if self.has_realm_boon(BOON_FIRE_LOW_HP_FURY) and actor.max_health > 0:
+                    hp_pct = (actor.attributes.health * 100) // actor.max_health
+                    if hp_pct < 60:
+                        wuxing_out_pct += ((60 - hp_pct) * 35) // 60
+            if self.is_wuxing_realm_v2:
+                if self.boon_runtime.vulnerable_until_round.get(target.actor_id, 0) >= self.round_index:
+                    wuxing_out_pct += 18
+                if self.boon_runtime.armor_broken_until_round.get(target.actor_id, 0) >= self.round_index:
+                    wuxing_out_pct += 15
             if wuxing_out_pct > 0:
                 damage *= (100.0 + wuxing_out_pct) / 100.0
+            if actor.team_index == 0 and self.has_realm_boon(BOON_EARTH_SHIELD_STRIKE):
+                cur_shield = self.current_total_shield_of(actor)
+                if cur_shield > 0:
+                    shield_bonus = min(BOON_SHIELD_ATTACK_BONUS_CAP, max(1, (cur_shield * 25) // 100))
+                    damage += float(shield_bonus)
             wuxing_reduce_pct = 0
             if target.team_index in (0, 1) and target.team_index != actor.team_index:
                 wuxing_reduce_pct += formation_of(self.team_formation_ids[target.team_index]).damage_taken_reduce_pct
@@ -2609,6 +2817,8 @@ class TurnEngine:
         if self.escalation_stacks > 0 and hit_kind != 3:
             damage *= self.escalation_damage_pct / 100.0
 
+        shield_cap_before = self.current_total_shield_of(target)
+        had_shield_before = shield_cap_before > 0
         splash_reduced = False
         if self.encounter.has_active_damage_modifiers:
             scaled_dmg = damage * (0.5 if target.is_defending else 1.0)
@@ -2642,6 +2852,9 @@ class TurnEngine:
         if dealt > 0 and self.opening_shield_by_actor:
             dealt, opening_absorbed = self._absorb_opening_shield(target.actor_id, dealt)
         absorbed = buff_absorbed + opening_absorbed
+        shield_cap_after = self.current_total_shield_of(target)
+        total_shield_absorbed = max(absorbed, max(0, shield_cap_before - shield_cap_after))
+        shield_broke = had_shield_before and not self.has_any_active_shield(target)
         if dealt > 0 or opening_absorbed > 0 or not absorbed:
             self._apply_damage(
                 turn, group, actor, target, dealt, critical=critical, skill_id=skill_id,
@@ -2676,29 +2889,295 @@ class TurnEngine:
             )
             if fire_burn > 0:
                 self._apply_damage(turn, group, actor, target, fire_burn, hit_kind=hit_kind, hit_index=hit_index)
-        if hit_kind != 3 and dealt > 0 and self.tower_context is not None:
-            sb = self.tower_sigil_bonuses
-            # 403 祝融烈焰：暴击附加目标最大气血 3% 灼伤（单段封顶 1500）。
-            if critical and actor.team_index == 0 and sb.crit_burn_max_hp_pct > 0 and _active(target) and target.max_health > 0:
-                burn = min(
-                    target.attributes.health,
-                    WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
-                    max(1, (target.max_health * sb.crit_burn_max_hp_pct) // 100),
-                )
-                if burn > 0:
-                    self._apply_damage(turn, group, actor, target, burn, hit_kind=hit_kind, hit_index=hit_index)
-            # 302 玄冰护心：受直接伤害回复 4% 最大法力。
-            if target.team_index == 0 and sb.on_hit_mana_regen_pct > 0 and _active(target) and target.max_mana > 0:
-                gain = max(1, (target.max_mana * sb.on_hit_mana_regen_pct) // 100)
-                target.attributes.mana = min(target.max_mana, target.attributes.mana + gain)
-            # 502 坤元反震 / 503 昆仑镇岳：受直接攻击反震实际伤害百分比。
-            if target.team_index == 0 and sb.reflect_pct > 0 and _active(actor) and _active(target):
-                tower_reflected = min(actor.attributes.health, max(1, (dealt * sb.reflect_pct) // 100))
-                if tower_reflected > 0:
-                    self._apply_damage(turn, group, target, actor, tower_reflected, hit_kind=3, hit_index=hit_index)
+        if hit_kind not in (2, 3) and (dealt > 0 or total_shield_absorbed > 0) and self.tower_context is not None:
+            self._apply_wuxing_post_direct_hit_effects(
+                turn, group, actor, target, dealt, critical,
+                hit_kind=hit_kind, hit_index=hit_index,
+                shield_absorbed=total_shield_absorbed, shield_broke=shield_broke,
+                broken_shield_cap=shield_cap_before, skill_id=skill_id,
+                is_multi_target=is_multi_target,
+            )
         if not skill_id and hit_kind != 2 and dealt and _active(actor) and _active(target) and self.rng.percent(target.combat.reflect_rate):
-            reflected = min(actor.attributes.health, (dealt + 1) // 2)
+            base_reflected = max(1, (dealt + 1) // 2)
+            if target.team_index == 0 and self.has_realm_boon(BOON_EARTH_DOUBLE_REFLECT):
+                base_reflected *= 2
+                self.boon_runtime.armor_broken_until_round[actor.actor_id] = self.round_index + 2
+            reflected = min(actor.attributes.health, base_reflected)
             self._apply_damage(turn, group, target, actor, reflected, hit_kind=3, hit_index=hit_index)
+
+    def _deal_true_proc_damage(self, turn: Message, group: int, source_id: int, dst: Message, dmg: int) -> None:
+        """五行幻境 V2 派生真伤结算（直接扣血、产出伤害事件并触发死亡判定）。"""
+        if dmg <= 0 or not _active(dst):
+            return
+        applied = min(dst.attributes.health, dmg)
+        if applied <= 0:
+            return
+        dst.attributes.health -= applied
+        turn.events.add(
+            event_type=3,
+            source_id=source_id,
+            target_id=dst.actor_id,
+            group_id=group,
+            value=applied,
+            target_health_after=dst.attributes.health,
+            target_mana_after=dst.attributes.mana,
+        )
+        self._death(turn, group, dst, source_id)
+
+    def _apply_wuxing_periodic_spread(
+        self, source_actor_id: int, victim: Message, dealt: int, turn: Message, group: int,
+    ) -> None:
+        """611 毒蔓蔓延：敌方持续伤害跳字向其余存活敌方传染 50%（封顶 1500，受 proc_depth 守卫）。"""
+        if (
+            dealt <= 0
+            or not self.has_realm_boon(BOON_WOOD_DOT_SPREAD)
+            or self.boon_runtime.proc_depth >= BOON_MAX_PROC_DEPTH
+        ):
+            return
+        spread = min(BOON_ROUND_END_BURN_CAP, max(1, dealt // 2))
+        self.boon_runtime.proc_depth += 1
+        try:
+            for other in self.actors.values():
+                if other.actor_id == victim.actor_id or other.team_index != 1 or not _active(other):
+                    continue
+                self._deal_true_proc_damage(turn, group, source_actor_id, other, spread)
+        finally:
+            self.boon_runtime.proc_depth -= 1
+
+    def _apply_wuxing_round_start_boon_effects(self, turn: Message) -> None:
+        """3 木共鸣·生生不息：敌方持续灼伤/玄毒在回合初额外结算 1 次 50% 伤害。"""
+        if not self.has_realm_resonance(WUXING_ELEMENT_WOOD) or self.boon_runtime.proc_depth >= BOON_MAX_PROC_DEPTH:
+            return
+        owner_id = next(
+            (a.actor_id for a in self.actors.values() if a.team_index == 0 and a.actor_type == _PLAYER),
+            0,
+        )
+        self.boon_runtime.proc_depth += 1
+        try:
+            for enemy in self.actors.values():
+                if enemy.team_index != 1 or not _active(enemy):
+                    continue
+                extra = 0
+                stacks = self.boon_runtime.fire_burn_stacks.get(enemy.actor_id, 0)
+                if stacks > 0 and enemy.max_health > 0:
+                    stack_burn = min(BOON_ROUND_END_BURN_CAP, max(1, (enemy.max_health * 4 * stacks) // 100))
+                    extra = min(U64_MAX, extra + max(1, stack_burn // 2))
+                for b in enemy.buffs:
+                    row = self.effects.rules.get(b.buff_table_id)
+                    if row is None:
+                        continue
+                    if row.buff_type in (50, 51) or row.battle_op == BattleEffectOp.PERIODIC_DAMAGE:
+                        tick_val = b.snapshot_value
+                        if tick_val <= 0 and row.health_damage is not None:
+                            tick_val = max(1, int(row.health_damage(enemy.level, enemy.max_health)))
+                        if tick_val > 0:
+                            extra = min(U64_MAX, extra + max(1, tick_val // 2))
+                if extra > 0:
+                    self._deal_true_proc_damage(turn, 0, owner_id, enemy, min(BOON_ROUND_END_BURN_CAP, extra))
+        finally:
+            self.boon_runtime.proc_depth -= 1
+
+    def _apply_wuxing_round_end_boon_effects(self, turn: Message) -> None:
+        """633 离火燃魂：回合末对最高气血敌人叠 1 层灼伤（至多 3 层，每层 4% 上限 1500）并联动 611 传染。"""
+        if not self.has_realm_boon(BOON_FIRE_ROUND_END_BURN) or self.boon_runtime.proc_depth >= BOON_MAX_PROC_DEPTH:
+            return
+        owner_id = next(
+            (a.actor_id for a in self.actors.values() if a.team_index == 0 and a.actor_type == _PLAYER),
+            0,
+        )
+        highest_enemy: Message | None = None
+        for actor in self.actors.values():
+            if actor.team_index == 1 and _active(actor):
+                if (
+                    highest_enemy is None
+                    or actor.attributes.health > highest_enemy.attributes.health
+                    or (
+                        actor.attributes.health == highest_enemy.attributes.health
+                        and actor.actor_id < highest_enemy.actor_id
+                    )
+                ):
+                    highest_enemy = actor
+        if highest_enemy is None or highest_enemy.max_health <= 0:
+            return
+        stacks = min(3, self.boon_runtime.fire_burn_stacks.get(highest_enemy.actor_id, 0) + 1)
+        self.boon_runtime.fire_burn_stacks[highest_enemy.actor_id] = stacks
+        raw_burn = max(1, (highest_enemy.max_health * 4 * stacks) // 100)
+        burn = min(highest_enemy.attributes.health, BOON_ROUND_END_BURN_CAP, raw_burn)
+        if burn <= 0:
+            return
+        self._group += 1
+        self._deal_true_proc_damage(turn, self._group, owner_id, highest_enemy, burn)
+        self._apply_wuxing_periodic_spread(owner_id, highest_enemy, burn, turn, self._group)
+
+    def _apply_wuxing_post_direct_hit_effects(
+        self,
+        turn: Message,
+        group: int,
+        attacker: Message,
+        target: Message,
+        dealt: int,
+        is_critical: bool,
+        *,
+        hit_kind: int = 0,
+        hit_index: int = 0,
+        shield_absorbed: int = 0,
+        shield_broke: bool = False,
+        broken_shield_cap: int = 0,
+        skill_id: int = 0,
+        is_multi_target: bool = False,
+    ) -> None:
+        """统一处理五行幻境 V1 符印与 V2 奇策/共鸣的全部直击后派生效果（对齐 ApplyWuxingPostDirectHitEffects）。"""
+        if self.tower_context is None or (dealt == 0 and shield_absorbed == 0):
+            return
+        # 消耗本回合首攻与治疗增伤标记（仅一次行动主段生效）。
+        if attacker.team_index == 0 and self.boon_runtime.proc_depth == 0:
+            if self.has_realm_boon(BOON_METAL_FIRST_PIERCE):
+                self.boon_runtime.first_attack_used_this_round.add(attacker.actor_id)
+            if self.has_realm_boon(BOON_WOOD_HEAL_EMPOWER):
+                self.boon_runtime.heal_shield_empowered_actors.discard(attacker.actor_id)
+
+        sb = self.tower_sigil_bonuses
+        # V1 403 祝融烈焰：暴击附加目标最大气血 3% 灼伤（单段封顶 1500）。
+        if dealt > 0 and is_critical and attacker.team_index == 0 and sb.crit_burn_max_hp_pct > 0 and _active(target) and target.max_health > 0:
+            burn = min(
+                target.attributes.health,
+                WUXING_FIRE_CRIT_BURN_CAP_PER_HIT,
+                max(1, (target.max_health * sb.crit_burn_max_hp_pct) // 100),
+            )
+            if burn > 0:
+                self._apply_damage(turn, group, attacker, target, burn, hit_kind=hit_kind, hit_index=hit_index)
+        # V1 302 玄冰护心：受直接伤害回复 4% 最大法力。
+        if dealt > 0 and target.team_index == 0 and sb.on_hit_mana_regen_pct > 0 and _active(target) and target.max_mana > 0:
+            gain = max(1, (target.max_mana * sb.on_hit_mana_regen_pct) // 100)
+            target.attributes.mana = min(target.max_mana, target.attributes.mana + gain)
+        # 土系反震（V1 502/503 + V2 641 镇岳倍反 ×2 破甲 + 3 土共鸣护盾承伤亦反震）。
+        reflect_base = (dealt + shield_absorbed) if self.has_realm_resonance(WUXING_ELEMENT_EARTH) else dealt
+        reflect_pct = sb.reflect_pct + (12 if self.has_realm_boon(BOON_EARTH_DOUBLE_REFLECT) else 0)
+        if target.team_index == 0 and _active(target) and _active(attacker) and attacker.team_index != 0 and reflect_base > 0 and reflect_pct > 0:
+            raw_reflect = max(1, (reflect_base * reflect_pct) // 100)
+            if self.has_realm_boon(BOON_EARTH_DOUBLE_REFLECT):
+                raw_reflect *= 2
+                self.boon_runtime.armor_broken_until_round[attacker.actor_id] = self.round_index + 2
+            tower_reflected = min(attacker.attributes.health, raw_reflect)
+            if tower_reflected > 0:
+                self._apply_damage(turn, group, target, attacker, tower_reflected, hit_kind=3, hit_index=hit_index)
+
+        if not self.is_wuxing_realm_v2 or self.boon_runtime.proc_depth >= BOON_MAX_PROC_DEPTH:
+            return
+
+        # 全部 V2 奇策与共鸣派生段均受 proc_depth 守卫（最大深度 1），杜绝循环递归。
+        self.boon_runtime.proc_depth += 1
+        try:
+            # 642 绝境磐石：每战首次气血跌破 35% 自动获得 25% 最大气血护盾。
+            if (
+                target.team_index == 0
+                and _active(target)
+                and self.has_realm_boon(BOON_EARTH_CLUTCH_SHIELD)
+                and target.max_health > 0
+                and target.attributes.health * 100 < target.max_health * 35
+                and target.actor_id not in self.boon_runtime.emergency_shield_triggered
+            ):
+                self.boon_runtime.emergency_shield_triggered.add(target.actor_id)
+                shield_cap = max(1, (target.max_health * 25) // 100)
+                self.opening_shield_by_actor[target.actor_id] = min(
+                    U64_MAX, self.opening_shield_by_actor.get(target.actor_id, 0) + shield_cap,
+                )
+                self.mark_wuxing_heal_shield_empowered(target)
+
+            # 601 破盾返元：击碎敌方任意护盾时返还 50% 最大法力并追加 60% 威力斩击。
+            if (
+                shield_broke
+                and attacker.team_index == 0
+                and target.team_index == 1
+                and self.has_realm_boon(BOON_METAL_BREAK_REFUND)
+                and _active(attacker)
+            ):
+                if attacker.max_mana > 0:
+                    refund = max(1, attacker.max_mana // 2)
+                    attacker.attributes.mana = min(attacker.max_mana, attacker.attributes.mana + refund)
+                if _active(target):
+                    atk = max(self.configured.effective_physical_attack(attacker), attacker.magic_attack, 1)
+                    self._deal_true_proc_damage(turn, group, attacker.actor_id, target, max(1, (atk * 60) // 100))
+
+            # 631 焚盾爆炎：任意护盾碎裂时对敌方全体造成护盾上限 30% 真伤（封顶 1800）。
+            if shield_broke and broken_shield_cap > 0 and self.has_realm_boon(BOON_FIRE_SHIELD_BLAST):
+                blast = min(BOON_SHIELD_SHATTER_DAMAGE_CAP, max(1, (broken_shield_cap * 30) // 100))
+                src_id = attacker.actor_id if attacker.team_index == 0 else target.actor_id
+                for enemy in self.actors.values():
+                    if enemy.team_index == 1 and _active(enemy):
+                        self._deal_true_proc_damage(turn, group, src_id, enemy, blast)
+
+            # 602 绝锋连斩：单体暴击向另一存活敌方溅射 40% 实伤。
+            if (
+                dealt > 0
+                and attacker.team_index == 0
+                and is_critical
+                and not is_multi_target
+                and self.has_realm_boon(BOON_METAL_CRIT_SPLASH)
+            ):
+                for other in self.actors.values():
+                    if other.team_index == 1 and other.actor_id != target.actor_id and _active(other):
+                        self._deal_true_proc_damage(turn, group, attacker.actor_id, other, max(1, (dealt * 40) // 100))
+                        break
+
+            # 613 灵宠协战：主角普攻/单体技能后存活灵宠免费追击 70% 普攻（每回合 1 次）。
+            if (
+                attacker.team_index == 0
+                and attacker.actor_type == _PLAYER
+                and not is_multi_target
+                and self.has_realm_boon(BOON_WOOD_PET_FOLLOW_UP)
+                and attacker.actor_id not in self.boon_runtime.pet_assist_used_this_round
+            ):
+                pet = next(
+                    (
+                        c for c in self.actors.values()
+                        if c.actor_type == _PET and c.owner_player_id == attacker.actor_id and _active(c)
+                    ),
+                    None,
+                )
+                if pet is not None:
+                    assist_target = target if _active(target) else next(
+                        (e for e in self.actors.values() if e.team_index == 1 and _active(e)),
+                        None,
+                    )
+                    if assist_target is not None:
+                        self.boon_runtime.pet_assist_used_this_round.add(attacker.actor_id)
+                        pet_atk = max(self.configured.effective_physical_attack(pet), pet.magic_attack, 1)
+                        self._deal_true_proc_damage(turn, group, pet.actor_id, assist_target, max(1, (pet_atk * 70) // 100))
+
+            # 623 镜花水月：主角每第 3 次施放主动进攻技能额外以 55% 威力连发 1 次。
+            if (
+                dealt > 0
+                and attacker.team_index == 0
+                and attacker.actor_type == _PLAYER
+                and skill_id != 0
+                and self.has_realm_boon(BOON_WATER_SKILL_ECHO)
+            ):
+                casts = self.boon_runtime.skill_cast_counts.get(attacker.actor_id, 0) + 1
+                self.boon_runtime.skill_cast_counts[attacker.actor_id] = casts
+                if casts % 3 == 0 and _active(target):
+                    self._deal_true_proc_damage(turn, group, attacker.actor_id, target, max(1, (dealt * 55) // 100))
+
+            # 3 火共鸣·焚城烈焰：己方直击附带 15% 溅射灼伤至另一存活敌方。
+            if dealt > 0 and attacker.team_index == 0 and self.has_realm_resonance(WUXING_ELEMENT_FIRE):
+                for other in self.actors.values():
+                    if other.team_index == 1 and other.actor_id != target.actor_id and _active(other):
+                        self._deal_true_proc_damage(turn, group, attacker.actor_id, other, max(1, (dealt * 15) // 100))
+                        break
+
+            # 3 金共鸣·破军锋芒：敌方受击后气血跌至斩杀阈值（首领 12% / 非首领 20%）直接斩杀。
+            if (
+                attacker.team_index == 0
+                and target.team_index == 1
+                and _active(target)
+                and self.has_realm_resonance(WUXING_ELEMENT_METAL)
+                and target.max_health > 0
+            ):
+                exec_pct = 12 if target.is_boss else 20
+                if target.attributes.health * 100 <= target.max_health * exec_pct:
+                    self._deal_true_proc_damage(turn, group, attacker.actor_id, target, target.attributes.health)
+        finally:
+            self.boon_runtime.proc_depth -= 1
 
     def _apply_damage(self, turn: Message, group: int, source: Message, target: Message, value: int,
                       *, critical: bool = False, skill_id: int = 0, hit_kind: int = 0, hit_index: int = 0,
@@ -2773,6 +3252,7 @@ class _Room:
     outcome_retry_ms: int = 0
     outcome_finished_ms: int = 0
     outcome_since_ms: int = 0
+    outcome_exhausted: bool = False
     outcome_payload: bytes = b""
     confirm_retry_steady_ms: int = 0
     confirm_until_ms: int = 0
@@ -2843,6 +3323,7 @@ class BattleNode:
         self._observer_deadlines: list[tuple[int, tuple[int, int, str]]] = []
         self.admitting = True
         self._draining = False
+        self.event_counters = BattleEventCounters()
 
     @staticmethod
     def _error(response: Message, error: int) -> Message:
@@ -2893,13 +3374,17 @@ class BattleNode:
         fingerprint_mismatches = self._fingerprint_mismatches(request)
         if fingerprint_mismatches:
             mode = self.fingerprint_mode
-            _LOG.warning("battle table fingerprint mismatch battle=%s mode=%s fields=%s",
-                         request.battle_id, mode, fingerprint_mismatches)
             if mode == "enforce":
+                self.event_counters.fingerprint_rejected += 1
+                _LOG.error("metric=battle_table_fingerprint_reject battle_id=%s mode=%s fields=%s",
+                           request.battle_id, mode, fingerprint_mismatches)
                 response.error_message.parameters.append(
                     f"battle table fingerprint mismatch: node={self.tables.fingerprint} request={request.table_fingerprint}"
                 )
                 return self._error(response, _FEATURE)
+            self.event_counters.fingerprint_continued += 1
+            _LOG.warning("metric=battle_table_fingerprint_mismatch battle_id=%s mode=%s fields=%s",
+                         request.battle_id, mode, fingerprint_mismatches)
         try:
             reward_profile = (self.tables.reward_profile(request.battle_config_id)
                               if self.tables and request.match_mode in _PVE_MODES else None)
@@ -3162,7 +3647,9 @@ class BattleNode:
         old = room.connections.get(ticket.player_id)
         room.connections[ticket.player_id] = _Connection(emit, close, is_live)
         if ticket.role == _OBSERVER:
-            room.observers[ticket.player_id].expires_ms = 0
+            obs = room.observers[ticket.player_id]
+            obs.expires_ms = 0
+            obs.was_connected = True
         if old is not None and old.close is not close:
             self._publish(old.close)
 
@@ -3379,7 +3866,16 @@ class BattleNode:
             event = type(original)()
             event.CopyFrom(original)
             event.target_gate_id, event.target_instance_id = gate_id, gate_instance
-            self._publish(self.on_spectate_frame, channel, gate_id, event.battle_id, event)
+            try:
+                self.on_spectate_frame(channel, gate_id, event.battle_id, event)
+            except Exception:
+                failures = self.event_counters.spectate_frames_not_sent
+                self.event_counters.spectate_frames_not_sent = failures + 1
+                if (failures & 0x3FF) == 0:
+                    _LOG.warning(
+                        "metric=battle_spectate_frame_send_failed channel=%s kind=%s failed_total=%s",
+                        channel, kind, failures + 1,
+                    )
 
     def dispatch(self, ticket: Ticket, message_id: int, request: Message) -> Message:
         steady = self._steady_ms()
@@ -3600,7 +4096,8 @@ class BattleNode:
         }
 
     def _broadcast_turn(self, room: _Room, original: Message) -> None:
-        for player in tuple(room.connections):
+        recipients = list(dict.fromkeys((*room.routing, *room.connections)))
+        for player in recipients:
             viewer = player if player in room.routing else 0
             turn = self.protocol.message("TurnResultS2C")
             turn.CopyFrom(original)
@@ -3629,6 +4126,8 @@ class BattleNode:
                 room.outcome_replay = room.replay.freeze(outcome, result.total_rounds, now)
                 room.replay = None
         age = steady - room.outcome_since_ms
+        if age >= 6 * 3_600_000:
+            room.outcome_exhausted = True
         room.outcome_retry_ms = steady + (5000 if age < 6 * 3_600_000 else 60_000)
         if self.on_outcome:
             self._publish(self.on_outcome, room.engine.battle_id, outcome)
@@ -3853,6 +4352,16 @@ class BattleNode:
         for room in tuple(self.rooms.values()):
             for player, observer in tuple(room.observers.items()):
                 if 0 < observer.expires_ms <= steady:
+                    if observer.was_connected:
+                        self.event_counters.observer_seats_reclaimed_reconnect_timeout += 1
+                        cause = "reconnect_timeout"
+                    else:
+                        self.event_counters.observer_seats_reclaimed_connect_timeout += 1
+                        cause = "connect_timeout"
+                    _LOG.info(
+                        "metric=battle_observer_seat_reclaimed cause=%s battle_id=%s observer=%s",
+                        cause, room.engine.battle_id, player,
+                    )
                     self._drop_observer(room, player)
             if room.proposed_outcome:
                 if steady - room.outcome_since_ms >= 30 * 3_600_000:
@@ -3921,10 +4430,48 @@ class BattleNode:
         self.begin_shutdown()
 
     @staticmethod
-    def _emit(room: _Room, player: int, message_id: int, message: Message) -> None:
+    def _outcome_stuck(room: _Room) -> bool:
+        """判定房间是否处于 SQL 终局迟迟未决定的滞留状态（对齐 C++ OutcomeStuck）。"""
+        return bool(room.proposed_outcome and room.outcome_exhausted)
+
+    def collect_metrics_text(self) -> str:
+        """导出与 C++ BattleRoomManager::CollectMetrics 同口径的 Prometheus 文本指标。"""
+        stuck_rooms = sum(1 for room in self.rooms.values() if self._outcome_stuck(room))
+        c = self.event_counters
+        lines = [
+            "# HELP battle_rooms Battle rooms on this node, including aborted rooms still waiting for a SQL outcome decision.",
+            "# TYPE battle_rooms gauge",
+            f"battle_rooms {len(self.rooms)}",
+            "# HELP battle_sql_outcome_stuck_rooms Battle rooms on this node whose SQL outcome still has no decision after the fast replay span.",
+            "# TYPE battle_sql_outcome_stuck_rooms gauge",
+            f"battle_sql_outcome_stuck_rooms {stuck_rooms}",
+            "# HELP battle_frames_dropped_no_direct_total Battle frames dropped because the player had no live direct connection.",
+            "# TYPE battle_frames_dropped_no_direct_total counter",
+            f"battle_frames_dropped_no_direct_total {c.frames_dropped_no_direct}",
+            "# HELP battle_table_fingerprint_mismatches_total CreateBattle requests whose battle table fingerprint did not match this node.",
+            "# TYPE battle_table_fingerprint_mismatches_total counter",
+            f'battle_table_fingerprint_mismatches_total{{result="rejected"}} {c.fingerprint_rejected}',
+            f'battle_table_fingerprint_mismatches_total{{result="continued"}} {c.fingerprint_continued}',
+            "# HELP battle_observer_seats_reclaimed_total Observer seats reclaimed due to connect or reconnect timeout.",
+            "# TYPE battle_observer_seats_reclaimed_total counter",
+            f'battle_observer_seats_reclaimed_total{{cause="connect_timeout"}} {c.observer_seats_reclaimed_connect_timeout}',
+            f'battle_observer_seats_reclaimed_total{{cause="reconnect_timeout"}} {c.observer_seats_reclaimed_reconnect_timeout}',
+            "# HELP battle_spectate_frames_not_sent_total Spectate relay and broadcast frames not handed to the sink.",
+            "# TYPE battle_spectate_frames_not_sent_total counter",
+            f"battle_spectate_frames_not_sent_total {c.spectate_frames_not_sent}",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _emit(self, room: _Room, player: int, message_id: int, message: Message) -> None:
         connection = room.connections.get(player)
-        if connection is not None:
+        if connection is not None and (connection.is_live is None or connection.is_live()):
             BattleNode._publish(connection.emit, message_id, message)
+            return
+        self.event_counters.frames_dropped_no_direct += 1
+        _LOG.info(
+            "metric=battle_frame_dropped_no_direct battle_id=%s player_id=%s message_id=%s",
+            room.engine.battle_id, player, message_id,
+        )
 
     @staticmethod
     def _publish(callback: Callable, *args: object) -> None:

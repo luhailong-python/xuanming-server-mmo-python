@@ -8,11 +8,35 @@ import time
 from ..data import StoreRejected, StoreUnavailable, client_request
 from ..data.asset_inventory import INVALID, UNAVAILABLE, balance, clone
 from .battle_dropin_effects import (
+    DEFAULT_FAIR_CHAR_PRESET_ID,
+    DEFAULT_FAIR_PET_PRESET_ID,
     MAX_SAVED_BUILD_BOOKMARKS,
+    REALM_BRANCH_ELITE,
+    REALM_BRANCH_SPECIAL,
+    REALM_EVENT_ENCOUNTER,
+    REALM_EVENT_NONE,
+    REALM_EVENT_REST,
+    REALM_NODE_ELITE,
+    REALM_NODE_EVENT,
+    REALM_NODE_NEED_BRANCH,
+    REALM_NODE_NORMAL,
+    REALM_NODE_REST,
+    WUXING_REALM_V2_MAX_NODES,
+    WUXING_REALM_V2_VERSION,
     WUXING_TOWER_MAX_FLOORS,
     SeasonBattleRules,
+    compute_active_resonance_element,
+    dominant_boon_element,
+    is_realm_combat_node_kind,
+    is_valid_fair_char_preset_id,
+    is_valid_fair_pet_preset_id,
     is_valid_formation_id,
-    is_valid_tower_sigil_id,
+    is_valid_tower_or_boon_id,
+    next_upgrade_boon_id,
+    realm_node_default_kind,
+    realm_node_dungeon_id,
+    roll_realm_boon_offer,
+    roll_realm_encounter_boon,
     roll_tower_sigil_offer,
     tower_floor_dungeon_id,
     tower_floor_leyline_element,
@@ -29,8 +53,10 @@ _MAX_UINT64 = (1 << 64) - 1
 _MAX_CACHED_RECEIPTS = 256
 _MAX_BOOKMARK_TITLE_BYTES = 48
 _MAX_BOOKMARK_SKILLS = 12
+_MAX_BOOKMARK_SIGILS = 10
 _MAX_TOWER_ACTIVE_SIGILS = 9
 _TOWER_LEADERBOARD_TOP_N = 20
+_FEATURE_UNAVAILABLE = 1006
 
 # 赛季规则硬安全边界（与 C++ season_rules.h 保持一致）。
 HARD_STAT_CAP_BPS = 500
@@ -505,26 +531,45 @@ def is_seal_effect_recommended_for_affix(affix_id: int, effect_id: int) -> bool:
     return False
 
 
-def _sync_tower_week(tower, week_key: int) -> bool:
-    """跨周自动重置五行幻境周位图与在途轮次，保留单调 run_id 与 revision。"""
-    if tower.week_key == week_key:
-        if tower.current_floor == 0:
-            tower.current_floor = 1
+def _rotate_tower_weekly_stats_if_needed(tower, week_key: int) -> bool:
+    """跨周仅重置周统计位图与周最佳，绝不清空跨周在途轮次（对齐 C++ RotateTowerWeeklyStatsIfNeeded）。"""
+    if int(tower.week_key) == week_key:
         return False
     tower.week_key = week_key
-    tower.run_active = False
-    tower.current_floor = 1
-    tower.run_total_rounds = 0
-    tower.ClearField("active_sigil_ids")
-    tower.ClearField("pending_offer_sigil_ids")
     tower.weekly_cleared_mask = 0
     tower.weekly_best_floor = 0
     tower.weekly_best_rounds = 0
+    tower.weekly_best_floor_preset = 0
+    tower.weekly_best_rounds_preset = 0
     return True
 
 
+def _effective_run_week_key(tower) -> int:
+    """返回本轮开局冻结周键（兼容 V1 旧存档无 run_week_key 时回退 week_key）。"""
+    return int(tower.run_week_key) if int(tower.run_week_key) != 0 else int(tower.week_key)
+
+
+def _compute_leaderboard_score(best_floor: int, best_rounds: int) -> int:
+    """与 C++ ComputeLeaderboardScore 同口径的周榜排序分（单调递增，越大越靠前）。"""
+    effective_rounds = 999_999 if best_rounds == 0 else min(int(best_rounds), 999_999)
+    return int(best_floor) * 1_000_000 - effective_rounds
+
+
+def realm_leaderboard_zset_key(week_key: int, use_free_preset: bool) -> str:
+    """水平扩展周榜 Redis Cluster ZSET 键（带 {week_key} hash-tag 与 self/preset 隔离）。"""
+    return f"wuxing:realm:lb:{{{int(week_key)}}}:{'preset' if use_free_preset else 'self'}"
+
+
+def realm_leaderboard_meta_key(week_key: int, use_free_preset: bool) -> str:
+    """水平扩展周榜 Redis Cluster 元信息 HASH 键（与 ZSET 共享 {week_key} hash-tag）。"""
+    return f"wuxing:realm:lb_meta:{{{int(week_key)}}}:{'preset' if use_free_preset else 'self'}"
+
+
 class SceneSeason:
-    """Scene 赛季技能与单槽赛季印服务，管理状态快照、切换、快捷追赶、五行阵法/幻境爬塔与配装收藏。"""
+    """Scene 赛季技能与单槽赛季印服务，管理状态快照、切换、快捷追赶、五行阵法/幻境 V2 与配装收藏。"""
+
+    realm_leaderboard_zset_key = staticmethod(realm_leaderboard_zset_key)
+    realm_leaderboard_meta_key = staticmethod(realm_leaderboard_meta_key)
 
     def __init__(self, scene, tables, assets=None, *, clock=now_ms) -> None:
         self.scene = scene
@@ -535,11 +580,11 @@ class SceneSeason:
         tx_types = self.protocol.pool.FindEnumTypeByName("TransactionType")
         self._debit_tx = tx_types.values_by_name["TX_CURRENCY_DEDUCT"].number
         self._catchup_receipts: dict[tuple[int, int], tuple[int, int]] = {}
-        # 五行幻境周最速榜内存快照：week_key -> {player_id: (best_floor, best_rounds, player_name, formation_id, sigil_ids)}
-        self._tower_leaderboards: dict[int, dict[int, tuple[int, int, str, int, tuple[int, ...]]]] = {}
+        # 五行幻境周最速双榜内存快照：(week_key, use_free_preset) -> {player_id: (best_floor, best_rounds, player_name, formation_id, resonance_element, sigil_ids)}
+        self._tower_leaderboards: dict[tuple[int, bool], dict[int, tuple[int, int, str, int, int, tuple[int, ...]]]] = {}
 
     def register(self) -> None:
-        """向 SceneNode 注册赛季及五行玩法扩展客户端 RPC（含 515..521）。"""
+        """向 SceneNode 注册赛季及五行玩法扩展客户端 RPC（含 515..521、569、585..586）。"""
         self.scene.register(_SERVICE, "GetSeasonState", self.get_state)
         self.scene.register(_SERVICE, "EquipSeasonSeal", self.equip_seal, mutating=True)
         self.scene.register(_SERVICE, "CatchupSeasonSeal", self.catchup, mutating=True)
@@ -551,6 +596,8 @@ class SceneSeason:
         self.scene.register(_SERVICE, "SaveBattleBuildBookmark", self.save_battle_build_bookmark, mutating=True)
         self.scene.register(_SERVICE, "DeleteBattleBuildBookmark", self.delete_battle_build_bookmark, mutating=True)
         self.scene.register(_SERVICE, "SetRetroHonorTarget", self.set_retro_honor_target, mutating=True)
+        self.scene.register(_SERVICE, "ChooseWuxingRealmBranch", self.choose_wuxing_realm_branch, mutating=True)
+        self.scene.register(_SERVICE, "ResolveWuxingRealmEvent", self.resolve_wuxing_realm_event, mutating=True)
 
     def validate_tables(self) -> bool:
         """启动前校验 SeasonRule 与 SeasonSeal 配表一致性（含无限循环与共鸣校验）。"""
@@ -1204,44 +1251,120 @@ class SceneSeason:
         data.season_component.equipped_formation_id = fid
         return 0
 
+    def _upsert_tower_leaderboard(
+        self,
+        week_key: int,
+        player_id: int,
+        player_name: str,
+        best_floor: int,
+        best_rounds: int,
+        formation_id: int,
+        use_free_preset: bool,
+        resonance_element: int,
+        sigil_ids: tuple[int, ...],
+    ) -> None:
+        """单调防倒退更新本周流派榜（本人/公平双榜隔离，新分必须严格高于旧分才覆盖）。"""
+        if not player_id or not best_floor:
+            return
+        board = self._tower_leaderboards.setdefault((int(week_key), bool(use_free_preset)), {})
+        new_score = _compute_leaderboard_score(best_floor, best_rounds)
+        prev = board.get(player_id)
+        if prev is not None and _compute_leaderboard_score(prev[0], prev[1]) >= new_score:
+            return
+        board[player_id] = (
+            int(best_floor),
+            int(best_rounds),
+            player_name,
+            int(formation_id),
+            int(resonance_element),
+            tuple(sigil_ids),
+        )
+
     def _fill_tower_state(self, data, stamp: int, out) -> None:
         out.Clear()
         wk = wuxing_week_key(stamp)
-        view_tower = self.protocol.message("WuxingTowerCompState")
-        if data.HasField("season_component") and data.season_component.HasField("wuxing_tower"):
-            view_tower.CopyFrom(data.season_component.wuxing_tower)
-        _sync_tower_week(view_tower, wk)
-        floor = view_tower.current_floor if 1 <= view_tower.current_floor <= WUXING_TOWER_MAX_FLOORS else 1
         out.week_key = wk
-        out.run_active = bool(view_tower.run_active)
-        out.run_id = view_tower.run_id
-        out.current_floor = floor
-        out.max_floors = WUXING_TOWER_MAX_FLOORS
-        out.current_floor_dungeon_id = tower_floor_dungeon_id(floor)
-        out.current_floor_leyline_element = tower_floor_leyline_element(wk, floor)
-        out.run_total_rounds = view_tower.run_total_rounds
-        out.active_sigil_ids.extend(view_tower.active_sigil_ids)
-        out.pending_offer_sigil_ids.extend(view_tower.pending_offer_sigil_ids)
-        out.weekly_cleared_mask = view_tower.weekly_cleared_mask
-        out.weekly_best_floor = view_tower.weekly_best_floor
-        out.weekly_best_rounds = view_tower.weekly_best_rounds
-        out.revision = view_tower.revision
+        out.realm_version = WUXING_REALM_V2_VERSION
+        out.max_floors = WUXING_REALM_V2_MAX_NODES
 
-        board = self._tower_leaderboards.get(wk, {})
-        ranked = sorted(
-            board.items(),
-            key=lambda kv: (-kv[1][0], kv[1][1] if kv[1][1] > 0 else (1 << 30), kv[0]),
-        )[:_TOWER_LEADERBOARD_TOP_N]
-        for rank_idx, (pid, (best_floor, best_rounds, pname, fid, sigils)) in enumerate(ranked, start=1):
-            entry = out.weekly_leaderboard.add(
-                rank=rank_idx,
-                player_id=pid,
-                player_name=pname,
-                best_floor=best_floor,
-                best_rounds=best_rounds,
-                formation_id=fid,
-            )
-            entry.sigil_ids.extend(sigils)
+        floor = 1
+        node_kind = REALM_NODE_NORMAL
+        effective_version = WUXING_REALM_V2_VERSION
+        run_week_key = wk
+        if data.HasField("season_component") and data.season_component.HasField("wuxing_tower"):
+            tower = data.season_component.wuxing_tower
+            out.best_rounds_self = tower.best_rounds_self
+            out.best_rounds_preset = tower.best_rounds_preset
+            out.revision = tower.revision
+            # 本周首通位图与周最佳按当前周键过滤，跨周在途轮次绝不清空。
+            if int(tower.week_key) == wk:
+                out.weekly_cleared_mask = tower.weekly_cleared_mask
+                out.weekly_best_floor = tower.weekly_best_floor
+                out.weekly_best_rounds = tower.weekly_best_rounds
+                out.weekly_best_floor_preset = tower.weekly_best_floor_preset
+                out.weekly_best_rounds_preset = tower.weekly_best_rounds_preset
+            if tower.run_active:
+                effective_version = (
+                    int(tower.realm_version)
+                    if int(tower.realm_version) >= WUXING_REALM_V2_VERSION
+                    else 1
+                )
+                max_floors = (
+                    WUXING_REALM_V2_MAX_NODES
+                    if effective_version >= WUXING_REALM_V2_VERSION
+                    else WUXING_TOWER_MAX_FLOORS
+                )
+                out.realm_version = effective_version
+                out.max_floors = max_floors
+                out.run_active = True
+                out.run_id = tower.run_id
+                run_week_key = _effective_run_week_key(tower) or wk
+                out.run_week_key = run_week_key
+                floor = int(tower.current_floor) if 1 <= int(tower.current_floor) <= max_floors else 1
+                node_kind = (
+                    int(tower.current_node_kind)
+                    if effective_version >= WUXING_REALM_V2_VERSION
+                    else REALM_NODE_NORMAL
+                )
+                out.use_free_preset = bool(tower.use_free_preset)
+                out.character_preset_id = tower.character_preset_id
+                out.pet_preset_id = tower.pet_preset_id
+                out.current_node_kind = node_kind
+                out.pending_event_kind = tower.pending_event_kind
+                out.route_choice_mask = tower.route_choice_mask
+                out.run_total_rounds = tower.run_total_rounds
+                out.active_sigil_ids.extend(tower.active_sigil_ids)
+                out.pending_offer_sigil_ids.extend(tower.pending_offer_sigil_ids)
+                if effective_version >= WUXING_REALM_V2_VERSION:
+                    out.active_resonance_element = compute_active_resonance_element(tower.active_sigil_ids)
+
+        out.current_floor = floor
+        out.current_floor_dungeon_id = (
+            realm_node_dungeon_id(floor, node_kind)
+            if effective_version >= WUXING_REALM_V2_VERSION
+            else tower_floor_dungeon_id(floor)
+        )
+        out.current_floor_leyline_element = tower_floor_leyline_element(run_week_key, floor)
+
+        for use_preset in (False, True):
+            board = self._tower_leaderboards.get((wk, use_preset), {})
+            ranked = sorted(
+                board.items(),
+                key=lambda kv: (-kv[1][0], kv[1][1] if kv[1][1] > 0 else (1 << 32), kv[0]),
+            )[:_TOWER_LEADERBOARD_TOP_N]
+            target_list = out.weekly_leaderboard_preset if use_preset else out.weekly_leaderboard
+            for rank_idx, (pid, (best_floor, best_rounds, pname, fid, resonance, sigils)) in enumerate(ranked, start=1):
+                entry = target_list.add(
+                    rank=rank_idx,
+                    player_id=pid,
+                    player_name=pname,
+                    best_floor=best_floor,
+                    best_rounds=best_rounds,
+                    formation_id=fid,
+                    use_free_preset=use_preset,
+                    resonance_element=resonance,
+                )
+                entry.sigil_ids.extend(sigils)
 
     def _finish_tower(self, response, data, stamp: int, error: int = 0):
         if error:
@@ -1249,8 +1372,72 @@ class SceneSeason:
         self._fill_tower_state(data, stamp, response.state)
         return response
 
+    def prepare_wuxing_tower_context(
+        self,
+        data,
+        battle_config_id: int,
+        *,
+        now_ms_val: int | None = None,
+    ) -> tuple[int, object | None, int, int]:
+        """构建并校验五行幻境 V2/V1 开战上下文与公平预设 ID（对齐 C++ PrepareWuxingTowerContext）。"""
+        _ = now_ms_val
+        if not data.HasField("season_component") or not data.season_component.HasField("wuxing_tower"):
+            return _FEATURE_UNAVAILABLE, None, 0, 0
+        tower = data.season_component.wuxing_tower
+        is_v2 = int(tower.realm_version) >= WUXING_REALM_V2_VERSION
+        max_floors = WUXING_REALM_V2_MAX_NODES if is_v2 else WUXING_TOWER_MAX_FLOORS
+        if (
+            not tower.run_active
+            or tower.run_id == 0
+            or not (1 <= int(tower.current_floor) <= max_floors)
+            or bool(tower.pending_offer_sigil_ids)
+            or int(tower.pending_event_kind) != REALM_EVENT_NONE
+        ):
+            return _FEATURE_UNAVAILABLE, None, 0, 0
+        node_kind = int(tower.current_node_kind) if is_v2 else REALM_NODE_NORMAL
+        if is_v2 and not is_realm_combat_node_kind(node_kind):
+            return _FEATURE_UNAVAILABLE, None, 0, 0
+        expected_dungeon = (
+            realm_node_dungeon_id(int(tower.current_floor), node_kind)
+            if is_v2
+            else tower_floor_dungeon_id(int(tower.current_floor))
+        )
+        if int(battle_config_id) != expected_dungeon:
+            return INVALID, None, 0, 0
+
+        run_wk = _effective_run_week_key(tower)
+        ctx = self.protocol.message(
+            "WuxingTowerBattleContext",
+            week_key=run_wk,
+            run_id=tower.run_id,
+            floor=tower.current_floor,
+            leyline_element=tower_floor_leyline_element(run_wk, int(tower.current_floor)),
+            realm_version=int(tower.realm_version) if is_v2 else 1,
+            node_kind=node_kind,
+            use_free_preset=bool(tower.use_free_preset),
+        )
+        for sid in tower.active_sigil_ids:
+            if is_valid_tower_or_boon_id(int(sid)):
+                ctx.active_sigil_ids.append(int(sid))
+        if is_v2:
+            ctx.active_resonance_element = compute_active_resonance_element(ctx.active_sigil_ids)
+        char_id = 0
+        pet_id = 0
+        if tower.use_free_preset:
+            char_id = (
+                int(tower.character_preset_id)
+                if is_valid_fair_char_preset_id(int(tower.character_preset_id))
+                else DEFAULT_FAIR_CHAR_PRESET_ID
+            )
+            pet_id = (
+                int(tower.pet_preset_id)
+                if is_valid_fair_pet_preset_id(int(tower.pet_preset_id))
+                else DEFAULT_FAIR_PET_PRESET_ID
+            )
+        return 0, ctx, char_id, pet_id
+
     def get_wuxing_tower_state(self, _world, player, _route, _request):
-        """516 查询五行幻境周常爬塔状态与本周最速流派榜（只读）。"""
+        """516 查询五行幻境 V2 状态与本周本人/公平最速双榜（只读）。"""
         response = self.protocol.message("GetWuxingTowerStateResponse")
         data = self.scene.rows.assemble(player.snapshot)
         if not data.HasField("level_component"):
@@ -1258,8 +1445,8 @@ class SceneSeason:
             return response
         return self._finish_tower(response, data, self.clock())
 
-    async def start_wuxing_tower_run(self, _world, player, _route, _request):
-        """517 开启新一轮五行幻境周常爬塔（从第 1 层起，清空旧局内符印）。"""
+    async def start_wuxing_tower_run(self, _world, player, _route, request):
+        """517 开启新一轮五行幻境 V2 6 关分岔探索（支持本人流派 / 公平 3x3 试炼）。"""
         response = self.protocol.message("StartWuxingTowerRunResponse")
         stamp = self.clock()
         data = self.scene.rows.assemble(player.snapshot)
@@ -1269,16 +1456,33 @@ class SceneSeason:
         if writable_err := self._writable_error(player):
             return self._finish_tower(response, data, stamp, writable_err)
 
+        use_free_preset = bool(getattr(request, "use_free_preset", False))
+        char_preset_id = 0
+        pet_preset_id = 0
+        if use_free_preset:
+            req_char = int(getattr(request, "character_preset_id", 0))
+            req_pet = int(getattr(request, "pet_preset_id", 0))
+            char_preset_id = req_char if req_char != 0 else DEFAULT_FAIR_CHAR_PRESET_ID
+            pet_preset_id = req_pet if req_pet != 0 else DEFAULT_FAIR_PET_PRESET_ID
+            if not is_valid_fair_char_preset_id(char_preset_id) or not is_valid_fair_pet_preset_id(pet_preset_id):
+                return self._finish_tower(response, data, stamp, INVALID)
+
         wk = wuxing_week_key(stamp)
         tower = data.season_component.wuxing_tower
-        _sync_tower_week(tower, wk)
-        if tower.run_active:
-            return self._finish_tower(response, data, stamp, INVALID)
-
+        _rotate_tower_weekly_stats_if_needed(tower, wk)
+        tower.realm_version = WUXING_REALM_V2_VERSION
+        tower.run_week_key = wk
         tower.run_active = True
         if tower.run_id < _MAX_UINT64:
             tower.run_id += 1
         tower.current_floor = 1
+        tower.current_node_kind = REALM_NODE_NORMAL
+        tower.pending_event_kind = REALM_EVENT_NONE
+        tower.event_reroll_count = 0
+        tower.route_choice_mask = 0
+        tower.use_free_preset = use_free_preset
+        tower.character_preset_id = char_preset_id
+        tower.pet_preset_id = pet_preset_id
         tower.run_total_rounds = 0
         tower.ClearField("active_sigil_ids")
         tower.ClearField("pending_offer_sigil_ids")
@@ -1289,11 +1493,14 @@ class SceneSeason:
             await self.scene.commit_player_data(player, data)
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
-        logger.info("Started wuxing tower run player_id=%s week_key=%s run_id=%s", player.player_id, wk, tower.run_id)
+        logger.info(
+            "Started wuxing realm v2 run player_id=%s week_key=%s run_id=%s use_free_preset=%s",
+            player.player_id, wk, tower.run_id, use_free_preset,
+        )
         return self._finish_tower(response, data, stamp)
 
     async def pick_wuxing_tower_sigil(self, _world, player, _route, request):
-        """518 通关一层后从三选一候选中确定选择一枚局内五行符印。"""
+        """518 从三选一候选中确定选择一枚局内奇策/符印并推进至下一关（跨周在途局有效）。"""
         response = self.protocol.message("PickWuxingTowerSigilResponse")
         stamp = self.clock()
         data = self.scene.rows.assemble(player.snapshot)
@@ -1303,23 +1510,27 @@ class SceneSeason:
         if writable_err := self._writable_error(player):
             return self._finish_tower(response, data, stamp, writable_err)
 
-        wk = wuxing_week_key(stamp)
         tower = data.season_component.wuxing_tower
-        _sync_tower_week(tower, wk)
+        is_v2 = int(tower.realm_version) >= WUXING_REALM_V2_VERSION
+        max_floors = WUXING_REALM_V2_MAX_NODES if is_v2 else WUXING_TOWER_MAX_FLOORS
         sigil_id = int(request.sigil_id)
         if (
             not tower.run_active
             or request.expected_run_id != tower.run_id
             or not tower.pending_offer_sigil_ids
             or sigil_id not in tower.pending_offer_sigil_ids
-            or not is_valid_tower_sigil_id(sigil_id)
+            or not is_valid_tower_or_boon_id(sigil_id)
             or sigil_id in tower.active_sigil_ids
-            or len(tower.active_sigil_ids) >= _MAX_TOWER_ACTIVE_SIGILS
         ):
             return self._finish_tower(response, data, stamp, INVALID)
 
         tower.active_sigil_ids.append(sigil_id)
         tower.ClearField("pending_offer_sigil_ids")
+        if int(tower.current_floor) < max_floors:
+            next_floor = int(tower.current_floor) + 1
+            tower.current_floor = next_floor
+            if is_v2:
+                tower.current_node_kind = realm_node_default_kind(next_floor)
         if tower.revision < _MAX_UINT64:
             tower.revision += 1
 
@@ -1328,13 +1539,13 @@ class SceneSeason:
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
         logger.info(
-            "Picked wuxing tower sigil player_id=%s run_id=%s sigil_id=%s active_count=%s",
-            player.player_id, tower.run_id, sigil_id, len(tower.active_sigil_ids),
+            "Picked wuxing realm boon/sigil player_id=%s run_id=%s sigil_id=%s next_floor=%s active_count=%s",
+            player.player_id, tower.run_id, sigil_id, tower.current_floor, len(tower.active_sigil_ids),
         )
         return self._finish_tower(response, data, stamp)
 
     async def abandon_wuxing_tower_run(self, _world, player, _route, request):
-        """519 放弃当前在途五行幻境爬塔轮次并立即清空局内符印。"""
+        """519 放弃当前在途五行幻境轮次并立即清空局内奇策/分岔状态（保留本周首通位图）。"""
         response = self.protocol.message("AbandonWuxingTowerRunResponse")
         stamp = self.clock()
         data = self.scene.rows.assemble(player.snapshot)
@@ -1344,15 +1555,17 @@ class SceneSeason:
         if writable_err := self._writable_error(player):
             return self._finish_tower(response, data, stamp, writable_err)
 
-        wk = wuxing_week_key(stamp)
         tower = data.season_component.wuxing_tower
-        _sync_tower_week(tower, wk)
         if not tower.run_active or (request.expected_run_id and request.expected_run_id != tower.run_id):
             return self._finish_tower(response, data, stamp, INVALID)
 
         abandoned_run = tower.run_id
         tower.run_active = False
         tower.current_floor = 1
+        tower.current_node_kind = REALM_NODE_NORMAL
+        tower.pending_event_kind = REALM_EVENT_NONE
+        tower.route_choice_mask = 0
+        tower.event_reroll_count = 0
         tower.run_total_rounds = 0
         tower.ClearField("active_sigil_ids")
         tower.ClearField("pending_offer_sigil_ids")
@@ -1366,6 +1579,167 @@ class SceneSeason:
         logger.info("Abandoned wuxing tower run player_id=%s run_id=%s", player.player_id, abandoned_run)
         return self._finish_tower(response, data, stamp)
 
+    async def choose_wuxing_realm_branch(self, _world, player, _route, request):
+        """585 在第 2/4 关二选一分岔节点选择行进路线（1=左路精英强敌，2=右路奇遇/休整）。"""
+        response = self.protocol.message("ChooseWuxingRealmBranchResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        if writable_err := self._writable_error(player):
+            return self._finish_tower(response, data, stamp, writable_err)
+
+        tower = data.season_component.wuxing_tower
+        branch = int(request.branch)
+        if (
+            not tower.run_active
+            or int(tower.realm_version) < WUXING_REALM_V2_VERSION
+            or int(request.expected_run_id) != int(tower.run_id)
+            or int(tower.current_node_kind) != REALM_NODE_NEED_BRANCH
+            or bool(tower.pending_offer_sigil_ids)
+            or int(tower.pending_event_kind) != REALM_EVENT_NONE
+            or branch not in (REALM_BRANCH_ELITE, REALM_BRANCH_SPECIAL)
+        ):
+            return self._finish_tower(response, data, stamp, INVALID)
+
+        if branch == REALM_BRANCH_ELITE:
+            tower.current_node_kind = REALM_NODE_ELITE
+        else:
+            is_node_2 = int(tower.current_floor) <= 2
+            tower.route_choice_mask |= 1 if is_node_2 else 2
+            tower.current_node_kind = REALM_NODE_EVENT if is_node_2 else REALM_NODE_REST
+            tower.pending_event_kind = REALM_EVENT_ENCOUNTER if is_node_2 else REALM_EVENT_REST
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info(
+            "Chose wuxing realm branch player_id=%s run_id=%s floor=%s branch=%s node_kind=%s",
+            player.player_id, tower.run_id, tower.current_floor, branch, tower.current_node_kind,
+        )
+        return self._finish_tower(response, data, stamp)
+
+    async def resolve_wuxing_realm_event(self, _world, player, _route, request):
+        """586 在奇遇事件（第2关右路）或秘境休整（第4关右路）节点执行二选一抉择。"""
+        response = self.protocol.message("ResolveWuxingRealmEventResponse")
+        stamp = self.clock()
+        data = self.scene.rows.assemble(player.snapshot)
+        if not data.HasField("level_component"):
+            response.error_message.id = SEASON_UNAVAILABLE
+            return response
+        if writable_err := self._writable_error(player):
+            return self._finish_tower(response, data, stamp, writable_err)
+
+        tower = data.season_component.wuxing_tower
+        event_kind = int(tower.pending_event_kind)
+        option_index = int(request.option_index)
+        if (
+            not tower.run_active
+            or int(tower.realm_version) < WUXING_REALM_V2_VERSION
+            or int(request.expected_run_id) != int(tower.run_id)
+            or bool(tower.pending_offer_sigil_ids)
+            or event_kind not in (REALM_EVENT_ENCOUNTER, REALM_EVENT_REST)
+            or option_index not in (1, 2)
+        ):
+            return self._finish_tower(response, data, stamp, INVALID)
+
+        current_wk = wuxing_week_key(stamp)
+        run_wk = _effective_run_week_key(tower) or current_wk
+        floor = int(tower.current_floor)
+        owned = [int(x) for x in tower.active_sigil_ids]
+
+        def _mark_node_cleared_if_same_week() -> None:
+            if run_wk == current_wk and 1 <= floor <= WUXING_REALM_V2_MAX_NODES:
+                _rotate_tower_weekly_stats_if_needed(tower, current_wk)
+                tower.weekly_cleared_mask |= 1 << (floor - 1)
+
+        if event_kind == REALM_EVENT_ENCOUNTER:
+            if option_index == 1:
+                # 道缘寻策：免战确定性获赠 1 枚未持有灵品奇策，直接推进至下一关。
+                boon_id = roll_realm_encounter_boon(run_wk, int(tower.run_id), owned)
+                if boon_id != 0:
+                    tower.active_sigil_ids.append(boon_id)
+                    response.granted_boon_id = boon_id
+                _mark_node_cleared_if_same_week()
+                tower.pending_event_kind = REALM_EVENT_NONE
+                next_floor = min(WUXING_REALM_V2_MAX_NODES, floor + 1)
+                tower.current_floor = next_floor
+                tower.current_node_kind = realm_node_default_kind(next_floor)
+            else:
+                # 五行悟道：弹出 3 选 1 奇策候选（选完推进至下一关）。
+                _mark_node_cleared_if_same_week()
+                tower.pending_event_kind = REALM_EVENT_NONE
+                offers = roll_realm_boon_offer(
+                    run_wk, int(tower.run_id), floor, REALM_NODE_NORMAL, int(tower.event_reroll_count), owned,
+                )
+                tower.ClearField("pending_offer_sigil_ids")
+                tower.pending_offer_sigil_ids.extend(offers)
+        else:
+            # 第 4 关右路：秘境休整
+            if option_index == 1:
+                # 奇策淬炼升品：将指定或首枚可升品奇策升级为同五行更高品质奇策（全仙品兜底赠 1 枚未持有奇策）。
+                target_idx = -1
+                upgraded_id = 0
+                req_target = int(request.target_boon_id)
+                if req_target != 0:
+                    for idx, existing_id in enumerate(tower.active_sigil_ids):
+                        if int(existing_id) == req_target:
+                            cand = next_upgrade_boon_id(req_target, owned)
+                            if cand != 0:
+                                target_idx = idx
+                                upgraded_id = cand
+                            break
+                if target_idx < 0:
+                    for idx, existing_id in enumerate(tower.active_sigil_ids):
+                        cand = next_upgrade_boon_id(int(existing_id), owned)
+                        if cand != 0:
+                            target_idx = idx
+                            upgraded_id = cand
+                            break
+                if target_idx >= 0 and upgraded_id != 0:
+                    tower.active_sigil_ids[target_idx] = upgraded_id
+                    response.granted_boon_id = upgraded_id
+                else:
+                    fallback_id = roll_realm_encounter_boon(run_wk, int(tower.run_id), owned)
+                    if fallback_id != 0:
+                        tower.active_sigil_ids.append(fallback_id)
+                        response.granted_boon_id = fallback_id
+                _mark_node_cleared_if_same_week()
+                tower.pending_event_kind = REALM_EVENT_NONE
+                next_floor = min(WUXING_REALM_V2_MAX_NODES, floor + 1)
+                tower.current_floor = next_floor
+                tower.current_node_kind = realm_node_default_kind(next_floor)
+            else:
+                # 同源寻策：偏向当前持有最多同系五行的 3 选 1 奇策，冲刺 3 同系共鸣。
+                _mark_node_cleared_if_same_week()
+                tower.pending_event_kind = REALM_EVENT_NONE
+                tower.event_reroll_count = int(tower.event_reroll_count) + 1
+                preferred_elem = dominant_boon_element(owned)
+                offers = roll_realm_boon_offer(
+                    run_wk, int(tower.run_id), floor, REALM_NODE_ELITE,
+                    int(tower.event_reroll_count), owned, preferred_elem,
+                )
+                tower.ClearField("pending_offer_sigil_ids")
+                tower.pending_offer_sigil_ids.extend(offers)
+
+        if tower.revision < _MAX_UINT64:
+            tower.revision += 1
+
+        try:
+            await self.scene.commit_player_data(player, data)
+        except (StoreRejected, StoreUnavailable, OSError):
+            response.granted_boon_id = 0
+            return self._finish_tower(response, self.scene.rows.assemble(player.snapshot), stamp, UNAVAILABLE)
+        logger.info(
+            "Resolved wuxing realm event player_id=%s run_id=%s event_kind=%s option=%s granted=%s",
+            player.player_id, tower.run_id, event_kind, option_index, response.granted_boon_id,
+        )
+        return self._finish_tower(response, data, stamp)
+
     def settle_wuxing_tower_battle(
         self,
         data,
@@ -1374,8 +1748,8 @@ class SceneSeason:
         now_ms_val: int | None = None,
         player_name: str = "",
     ) -> bool:
-        """幂等推进五行幻境单层结算：校验 (week_key, run_id, floor) 与待选符印为空，通关 1..9 层生成三选一，第 10 层入榜。"""
-        if not settlement.HasField("tower_settlement"):
+        """幂等推进五行幻境 V2/V1 战斗节点结算（跨周在途轮次允许完局且绝不污染新周榜）。"""
+        if not settlement.HasField("tower_settlement") or int(settlement.tower_settlement.floor) == 0:
             return False
         player_won = (
             (settlement.outcome == 1 and settlement.player_team_index == 0)
@@ -1385,46 +1759,88 @@ class SceneSeason:
             return False
         echo = settlement.tower_settlement
         stamp = self.clock() if now_ms_val is None else now_ms_val
-        wk = wuxing_week_key(stamp)
-        if echo.week_key != wk or not (1 <= echo.floor <= WUXING_TOWER_MAX_FLOORS):
-            return False
         tower = data.season_component.wuxing_tower
-        _sync_tower_week(tower, wk)
+        is_v2 = int(tower.realm_version) >= WUXING_REALM_V2_VERSION
+        max_floors = WUXING_REALM_V2_MAX_NODES if is_v2 else WUXING_TOWER_MAX_FLOORS
+        run_week = _effective_run_week_key(tower)
+        floor = int(echo.floor)
         if (
             not tower.run_active
-            or tower.run_id != echo.run_id
-            or tower.current_floor != echo.floor
-            or tower.pending_offer_sigil_ids
+            or run_week != int(echo.week_key)
+            or int(tower.run_id) != int(echo.run_id)
+            or int(tower.current_floor) != floor
+            or bool(tower.pending_offer_sigil_ids)
+            or int(tower.pending_event_kind) != REALM_EVENT_NONE
+            or not (1 <= floor <= max_floors)
         ):
             return False
 
-        floor = int(echo.floor)
-        tower.weekly_cleared_mask |= 1 << (floor - 1)
-        tower.run_total_rounds += max(1, int(echo.total_rounds or settlement.total_rounds or 1))
-        if floor > tower.weekly_best_floor:
-            tower.weekly_best_floor = floor
+        current_wk = wuxing_week_key(stamp)
+        same_week_run = run_week == current_wk
+        tower.run_total_rounds = int(tower.run_total_rounds) + max(1, int(echo.total_rounds or settlement.total_rounds or 1))
 
-        if floor < WUXING_TOWER_MAX_FLOORS:
-            tower.current_floor = floor + 1
-            offers = roll_tower_sigil_offer(wk, tower.run_id, floor, list(tower.active_sigil_ids))
-            tower.pending_offer_sigil_ids.extend(offers)
-        else:
-            if tower.weekly_best_rounds == 0 or tower.run_total_rounds < tower.weekly_best_rounds:
-                tower.weekly_best_rounds = tower.run_total_rounds
-            pname = player_name or (data.profile_component.name if data.HasField("profile_component") else "")
-            fid = int(data.season_component.equipped_formation_id)
-            sigil_tuple = tuple(tower.active_sigil_ids)
-            board = self._tower_leaderboards.setdefault(wk, {})
-            prev = board.get(data.player_id)
-            if prev is None or floor > prev[0] or (floor == prev[0] and tower.weekly_best_rounds < prev[1]):
-                board[data.player_id] = (floor, tower.weekly_best_rounds, pname, fid, sigil_tuple)
+        if same_week_run:
+            _rotate_tower_weekly_stats_if_needed(tower, current_wk)
+            tower.weekly_cleared_mask |= 1 << (floor - 1)
+            if tower.use_free_preset:
+                if floor > int(tower.weekly_best_floor_preset):
+                    tower.weekly_best_floor_preset = floor
+                    if floor == max_floors:
+                        tower.weekly_best_rounds_preset = tower.run_total_rounds
+                elif floor == max_floors and (
+                    int(tower.weekly_best_rounds_preset) == 0 or int(tower.run_total_rounds) < int(tower.weekly_best_rounds_preset)
+                ):
+                    tower.weekly_best_rounds_preset = tower.run_total_rounds
+            else:
+                if floor > int(tower.weekly_best_floor):
+                    tower.weekly_best_floor = floor
+                    if floor == max_floors:
+                        tower.weekly_best_rounds = tower.run_total_rounds
+                elif floor == max_floors and (
+                    int(tower.weekly_best_rounds) == 0 or int(tower.run_total_rounds) < int(tower.weekly_best_rounds)
+                ):
+                    tower.weekly_best_rounds = tower.run_total_rounds
+
+        if floor >= max_floors:
             tower.run_active = False
-            tower.current_floor = 1
-            tower.ClearField("active_sigil_ids")
             tower.ClearField("pending_offer_sigil_ids")
+            tower.pending_event_kind = REALM_EVENT_NONE
+            if tower.use_free_preset:
+                if int(tower.best_rounds_preset) == 0 or int(tower.run_total_rounds) < int(tower.best_rounds_preset):
+                    tower.best_rounds_preset = tower.run_total_rounds
+            else:
+                if int(tower.best_rounds_self) == 0 or int(tower.run_total_rounds) < int(tower.best_rounds_self):
+                    tower.best_rounds_self = tower.run_total_rounds
+        else:
+            owned = [int(x) for x in tower.active_sigil_ids]
+            offers = (
+                roll_realm_boon_offer(
+                    run_week, int(tower.run_id), floor, int(tower.current_node_kind),
+                    int(tower.event_reroll_count), owned,
+                )
+                if is_v2
+                else roll_tower_sigil_offer(run_week, int(tower.run_id), floor, owned)
+            )
+            tower.ClearField("pending_offer_sigil_ids")
+            tower.pending_offer_sigil_ids.extend(offers)
 
         if tower.revision < _MAX_UINT64:
             tower.revision += 1
+
+        # 本周最速双榜同步（对齐 C++ OnTowerSettlementApplied 单调防倒退守卫）。
+        if same_week_run and int(tower.week_key) == current_wk:
+            preset = bool(tower.use_free_preset)
+            best_floor = int(tower.weekly_best_floor_preset if preset else tower.weekly_best_floor)
+            best_rounds = int(tower.weekly_best_rounds_preset if preset else tower.weekly_best_rounds)
+            if best_floor > 0 and floor >= best_floor:
+                if not (floor == max_floors and best_rounds > 0 and int(tower.run_total_rounds) > best_rounds):
+                    pname = player_name or (data.profile_component.name if data.HasField("profile_component") else "")
+                    fid = int(data.season_component.equipped_formation_id)
+                    resonance = compute_active_resonance_element(tower.active_sigil_ids)
+                    self._upsert_tower_leaderboard(
+                        current_wk, data.player_id, pname, best_floor, best_rounds,
+                        fid, preset, resonance, tuple(int(x) for x in tower.active_sigil_ids),
+                    )
         return True
 
     async def save_battle_build_bookmark(self, _world, player, _route, request):
@@ -1486,10 +1902,10 @@ class SceneSeason:
                     break
         seen_sigils: set[int] = set()
         for sg in incoming.wuxing_sigil_ids:
-            if is_valid_tower_sigil_id(sg) and sg not in seen_sigils:
+            if is_valid_tower_or_boon_id(sg) and sg not in seen_sigils:
                 seen_sigils.add(sg)
                 target.wuxing_sigil_ids.append(sg)
-                if len(target.wuxing_sigil_ids) >= _MAX_TOWER_ACTIVE_SIGILS:
+                if len(target.wuxing_sigil_ids) >= _MAX_BOOKMARK_SIGILS:
                     break
         target.saved_at_ms = stamp
 

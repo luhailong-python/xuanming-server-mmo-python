@@ -126,6 +126,7 @@ def _normalize_owner_revision(comp, current_owner_rev: int) -> None:
         _clear_badge_fields(comp)
         comp.pending_silver_fee_battle_id = 0
         comp.pending_silver_fee_amount = 0
+        comp.pending_silver_fee_review_after_ms = 0
     comp.owner_revision = current_owner_rev
 
 
@@ -398,6 +399,11 @@ class SceneJianghu:
         payer_data = self.scene.rows.assemble(payer.snapshot)
         writ_tier = int(request.writ_tier)
         if writ_tier == WRIT_TIER_SILVER:
+            # 另一局预扣的银两还没结清时，备战一定会拒绝：在发战书前提前告知发起方，避免应战后备战作废。
+            if int(payer_data.jianghu_component.pending_silver_fee_battle_id) != 0:
+                response.payer_silver_fee_pending = True
+                response.payer_has_sufficient_fee = False
+                return response
             silver_cost = int(request.silver_cost) if request.silver_cost else rule.silver_writ_cost
             response.payer_has_sufficient_fee = (
                 0 < silver_cost <= _INT64_MAX and balance(payer_data, CURRENCY_GOLD) >= silver_cost
@@ -435,8 +441,18 @@ class SceneJianghu:
             silver_cost = int(fee.silver_cost) if fee.silver_cost else rule.silver_writ_cost
             if not silver_cost or silver_cost != rule.silver_writ_cost or silver_cost > _INT64_MAX:
                 return INVALID, 0
-            if data.jianghu_component.pending_silver_fee_battle_id == battle_id:
+            pending_bid = int(data.jianghu_component.pending_silver_fee_battle_id)
+            if pending_bid == battle_id:
                 return 0, 0
+            if pending_bid != 0:
+                logger.warning(
+                    "Jianghu duel prepare rejected metric=jianghu_duel_fee_pending_other_battle "
+                    "battle_id=%s pending_battle_id=%s pending_review_after_ms=%s",
+                    battle_id,
+                    pending_bid,
+                    int(data.jianghu_component.pending_silver_fee_review_after_ms),
+                )
+                return FEATURE_UNAVAILABLE, 0
             if balance(data, CURRENCY_GOLD) < silver_cost:
                 return JIANGHU_INSUFFICIENT_WRIT_OR_SILVER, 0
             return 0, silver_cost
@@ -450,8 +466,17 @@ class SceneJianghu:
             return INVALID
         comp = data.jianghu_component
         comp.SetInParent()
-        if comp.pending_silver_fee_battle_id == battle_id:
+        pending_bid = int(comp.pending_silver_fee_battle_id)
+        if pending_bid == battle_id:
             return 0
+        if pending_bid != 0:
+            logger.warning(
+                "Jianghu duel commit rejected metric=jianghu_duel_fee_pending_other_battle "
+                "battle_id=%s pending_battle_id=%s where=commit",
+                battle_id,
+                pending_bid,
+            )
+            return FEATURE_UNAVAILABLE
         deduct_err = self._inventory().deduct_currency(data, CURRENCY_GOLD, silver_to_deduct)
         if deduct_err:
             return JIANGHU_INSUFFICIENT_WRIT_OR_SILVER if deduct_err == 27001 else FEATURE_UNAVAILABLE

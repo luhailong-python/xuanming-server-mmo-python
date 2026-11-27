@@ -27,12 +27,15 @@ from .errors import (
     ERR_JIANGHU_BLOCKED_BY_PEER,
     ERR_JIANGHU_DAILY_INVITE_LIMIT_REACHED,
     ERR_JIANGHU_DUEL_DISABLED,
+    ERR_JIANGHU_DUEL_SILVER_FEE_PENDING,
     ERR_JIANGHU_GRUDGE_NOT_FOUND,
     ERR_JIANGHU_INSUFFICIENT_WRIT_OR_SILVER,
     ERR_JIANGHU_INVITE_PENDING_OR_EXPIRED,
     ERR_JIANGHU_NOT_INVITE_PARTICIPANT,
     ERR_JIANGHU_SAME_TARGET_COOLDOWN,
+    ERR_JIANGHU_SELF_REFUSES_STRANGERS,
     ERR_JIANGHU_SERVICE_BUSY,
+    ERR_JIANGHU_TARGET_REFUSES_STRANGERS,
     ERR_JIANGHU_TEAM_CHANGED_ABORTED,
     ERR_JIANGHU_TEAM_SIZE_MISMATCH,
     ERR_MATCH_CHALLENGE_SELF,
@@ -155,6 +158,35 @@ def normalize_jianghu_team_ids(captain_id: int, provided: Sequence[int]) -> tupl
     if not 1 <= len(out) <= MAX_TEAM_SIZE:
         return [], False
     return out, True
+
+
+def evaluate_scene_eligibility_response(
+    resp: Message,
+    *,
+    payer_player_id: int,
+    side_a_ids: Sequence[int] = (),
+    all_are_friends: bool = False,
+) -> tuple[int, str]:
+    """解析 Scene CheckJianghuDuelEligibilityResponse（对齐 Go jianghu_duel_logic.go）。
+
+    优先拦截发起方上一场普通战书预扣银两尚未结清（``payer_silver_fee_pending`` -> 40014），
+    其次校验资费、在线与闭关免战开关。
+    """
+    if resp is None or int(resp.error_message.id) != 0:
+        return ERR_JIANGHU_SERVICE_BUSY, "参战资格校验暂不可用"
+    if payer_player_id != 0 and bool(getattr(resp, "payer_silver_fee_pending", False)):
+        return ERR_JIANGHU_DUEL_SILVER_FEE_PENDING, "上一场普通战书的银两还没结清"
+    if payer_player_id != 0 and not bool(getattr(resp, "payer_has_sufficient_fee", False)):
+        return ERR_JIANGHU_INSUFFICIENT_WRIT_OR_SILVER, "银两或金帖生死状不足"
+    side_a_set = {int(pid) for pid in side_a_ids}
+    for entry in getattr(resp, "players", ()):
+        if not bool(getattr(entry, "online_on_node", False)):
+            return ERR_MATCH_CHALLENGE_TARGET_OFFLINE, "有参战道友当前不在线"
+        if bool(getattr(entry, "duel_refuse_strangers", False)) and not all_are_friends:
+            if int(entry.player_id) in side_a_set:
+                return ERR_JIANGHU_SELF_REFUSES_STRANGERS, "本方有成员开启了闭关免战，请先关闭或互加好友"
+            return ERR_JIANGHU_TARGET_REFUSES_STRANGERS, "对方开启了闭关免战，暂不接受陌生人战书"
+    return 0, ""
 
 
 # -- 内部状态与结算摘要 -----------------------------------------------------------------------------

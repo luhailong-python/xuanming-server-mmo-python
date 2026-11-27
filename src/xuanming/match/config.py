@@ -27,6 +27,65 @@ DEFAULT_LEASE_TTL_SEC = 60
 DATABASE_NAME = "mmorpg_match"
 MIN_HMAC_SECRET_BYTES = 32
 
+DEFAULT_SPECTATE_CHAT_MAX_CONTENT_BYTES = 180
+DEFAULT_SPECTATE_CHAT_PARTICIPANT_COOLDOWN_MS = 2000
+DEFAULT_SPECTATE_CHAT_SPECTATOR_COOLDOWN_MS = 4000
+DEFAULT_SPECTATE_CHAT_ROOM_RATE_LIMIT_PER_SEC = 8
+
+
+@dataclass(frozen=True, slots=True)
+class SpectateChatConfig:
+    """局外人观战交流模式全局策略与限流配置（与 Go SpectateChatConf 零值默认严格对齐）。"""
+
+    disabled: bool = False
+    default_forbid_when_unset: bool = False
+    team_pvp_captain_only: bool = False
+    tournament_disabled: bool = False
+    max_content_bytes: int = DEFAULT_SPECTATE_CHAT_MAX_CONTENT_BYTES
+    participant_cooldown_ms: int = DEFAULT_SPECTATE_CHAT_PARTICIPANT_COOLDOWN_MS
+    spectator_cooldown_ms: int = DEFAULT_SPECTATE_CHAT_SPECTATOR_COOLDOWN_MS
+    room_rate_limit_per_sec: int = DEFAULT_SPECTATE_CHAT_ROOM_RATE_LIMIT_PER_SEC
+
+    @property
+    def is_enabled(self) -> bool:
+        return not self.disabled
+
+    @property
+    def default_allows_when_unset(self) -> bool:
+        return not self.default_forbid_when_unset
+
+    @property
+    def is_tournament_enabled(self) -> bool:
+        return not self.tournament_disabled
+
+    @property
+    def effective_max_content_bytes(self) -> int:
+        return self.max_content_bytes if self.max_content_bytes > 0 else DEFAULT_SPECTATE_CHAT_MAX_CONTENT_BYTES
+
+    @property
+    def effective_participant_cooldown_ms(self) -> int:
+        return (
+            self.participant_cooldown_ms
+            if self.participant_cooldown_ms > 0
+            else DEFAULT_SPECTATE_CHAT_PARTICIPANT_COOLDOWN_MS
+        )
+
+    @property
+    def effective_spectator_cooldown_ms(self) -> int:
+        return (
+            self.spectator_cooldown_ms
+            if self.spectator_cooldown_ms > 0
+            else DEFAULT_SPECTATE_CHAT_SPECTATOR_COOLDOWN_MS
+        )
+
+    @property
+    def effective_room_rate_limit_per_sec(self) -> int:
+        return (
+            self.room_rate_limit_per_sec
+            if self.room_rate_limit_per_sec > 0
+            else DEFAULT_SPECTATE_CHAT_ROOM_RATE_LIMIT_PER_SEC
+        )
+
 _TOML_FORBIDDEN_FIELDS = frozenset((
     "battle_outcome_secret",
     "scene_secret",
@@ -112,6 +171,7 @@ class MatchConfig:
     table_fingerprint_mode: str = "warn"
     pve_team_sizes: dict[int, int] = field(default_factory=lambda: {1: 5, 2: 5, 3: 5})
     manual_resolution_env: str = ""
+    spectate_chat: SpectateChatConfig = field(default_factory=SpectateChatConfig)
 
     # 密钥材料（仅从环境变量注入，禁止落盘配置）
     battle_outcome_secret: bytes = b""
@@ -153,6 +213,10 @@ class MatchConfig:
 
         allowed = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in raw.items() if k in allowed}
+        raw_sc = kwargs.get("spectate_chat")
+        if isinstance(raw_sc, dict):
+            sc_allowed = {f.name for f in fields(SpectateChatConfig)}
+            kwargs["spectate_chat"] = SpectateChatConfig(**{k: v for k, v in raw_sc.items() if k in sc_allowed})
         kwargs.setdefault("zone_id", settings.zone_id)
         kwargs.setdefault("physical_region", settings.physical_region)
         kwargs.setdefault("release_track", settings.release_track)

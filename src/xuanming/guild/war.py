@@ -704,6 +704,7 @@ class GuildWarManager:
         self._jianghu_seen: set[tuple[int, int]] = set()
         self._idempotency: dict[tuple[str, int, int], Message] = {}
         self.alerts: list[Message] = []  # 记录已触发警报，便于推送/观测
+        self.war_credit_owed_backlog: int = 0  # 帮战待入账积压行数 gauge（至多数到 10000）
 
     # -- 辅助方法 ------------------------------------------------------------------------------------
 
@@ -898,6 +899,17 @@ class GuildWarManager:
                     ll.owner_guild_id = 0
                     ll.banner_hp = self.rule.leyline_max_banner_hp
                     ll.shield_until_ms = 0
+
+    async def purge_player_war_data(self, player_id: int) -> None:
+        """注销删角收尾清理玩家个人帮战状态与全部帮会守旗快照（对齐 Go purgeWarRowsOfPlayer）。"""
+        async with self._lock:
+            for gid, slots in list(self._garrisons.items()):
+                kept = [s for s in slots if s.player_id != player_id]
+                if len(kept) != len(slots):
+                    for idx, s in enumerate(kept, start=1):
+                        s.slot_index = idx
+                    self._garrisons[gid] = kept
+            self._players.pop(player_id, None)
 
     # -- 视图投影构建 --------------------------------------------------------------------------------
 
@@ -3260,4 +3272,18 @@ class GuildWarManager:
             if len(page) < page_size:
                 next_cursor = WarCreditOwedCursor()
                 break
+        await self.report_war_credit_owed_backlog()
         return next_cursor, stats
+
+    async def report_war_credit_owed_backlog(self, *, limit: int = 10_000) -> int:
+        """上报帮战待入账积压行数（对齐 Go reportWarCreditOwedBacklog）；读失败只记日志并保留上一轮值。"""
+        count_fn = getattr(self.store, "count_war_credit_owed", None)
+        if not callable(count_fn):
+            return self.war_credit_owed_backlog
+        try:
+            n = int(await count_fn(limit))
+        except Exception as exc:
+            logger.error("Count owed war credits failed, backlog gauge not updated: %s", exc)
+            return self.war_credit_owed_backlog
+        self.war_credit_owed_backlog = n
+        return n

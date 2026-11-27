@@ -1,6 +1,7 @@
 """EnterGame: synchronous admission, then the background enter chain (Go ``entergamelogic.go``)."""
 
 import asyncio
+import contextvars
 import logging
 from dataclasses import dataclass
 
@@ -16,6 +17,16 @@ logger = logging.getLogger(__name__)
 _COMMIT_ATTEMPTS = 3
 _COMPENSATION_TIMEOUT = 10
 _PROBE_TIMEOUT = 2
+
+# 后台入场链显式绑定的 player_id 日志上下文字段（对齐 Go entergamelogic.go tracing.Detach + player_id）。
+ENTER_GAME_PLAYER_ID: contextvars.ContextVar[int] = contextvars.ContextVar("enter_game_player_id", default=0)
+
+
+def detach_enter_context(player_id: int) -> contextvars.Context:
+    """白名单剥离触发请求的会话元数据/鉴权上下文，仅显式附带 player_id 供后台入场链使用。"""
+    detached = contextvars.Context()
+    detached.run(ENTER_GAME_PLAYER_ID.set, int(player_id))
+    return detached
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +103,18 @@ async def run(ctx, request, details):
             request_id=request.request_id, ticket_target_zone_id=details.ticket_target_zone_id, conn=conn,
             fence_gen=fence_gen, owner_revision=owned.owner_revision,
         )
-        if not ctx.submit(_chain(ctx, state, lock)):
+        detached = detach_enter_context(state.player_id)
+
+        async def _run_detached() -> None:
+            inner = asyncio.create_task(_chain(ctx, state, lock), context=detached)
+            try:
+                await inner
+            except asyncio.CancelledError:
+                inner.cancel()
+                await asyncio.gather(inner, return_exceptions=True)
+                raise
+
+        if not ctx.submit(_run_detached()):
             return fail(tips.IN_PROGRESS)
         handed_off = True
     finally:

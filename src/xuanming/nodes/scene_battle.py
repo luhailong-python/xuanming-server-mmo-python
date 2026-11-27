@@ -5,6 +5,7 @@ import logging
 import time
 from collections import Counter
 from dataclasses import dataclass
+from enum import IntEnum
 
 import grpc
 from google.protobuf.message import DecodeError
@@ -43,6 +44,7 @@ _MATCH_MODE_SEASON_TOURNAMENT = 11
 _MAX_STANDBY_PETS = 5
 _SETTLEMENT_GRACE_MS = 120_000  # Match 终局宽限和收件箱投递余量各 60 秒。
 _HOLD_CAP_MS = 15 * 60_000
+_OVERDUE_LOG_INTERVAL_MS = 10 * 60_000
 _LOCK_EXTRA_SECONDS = 60
 _REAPER_INTERVAL_MS = 30_000
 _UINT64_MAX = (1 << 64) - 1
@@ -50,6 +52,34 @@ _TIDE_CANDIDATES = (2, 3, 5)
 _TIDE_INTERVAL_SEC = 3600
 _TIDE_DURATION_SEC = 2400
 _GUILD_WAR_MODES = frozenset({9, 10})
+
+
+class FreezeHoldEvent(IntEnum):
+    """战斗冻结 reaper、道具预留与待退银两复核事件枚举（与 C++ battle_freeze_hold::FreezeHoldEvent 对齐）。"""
+
+    HELD_COMPLETE = 0
+    HELD_UNKNOWN = 1
+    CAP_REACHED = 2
+    QUERY_LOST = 3
+    HELD_PENDING = 4
+    PREPARE_EXPIRED = 5
+    EXPIRED_RELEASED = 6
+    ITEM_HOLD_OVERDUE = 7
+    DUEL_FEE_OVERDUE = 8
+
+
+FREEZE_HOLD_EVENT_NAMES: tuple[str, ...] = (
+    "held_complete",
+    "held_unknown",
+    "cap_reached",
+    "query_lost",
+    "held_pending",
+    "prepare_expired",
+    "expired_released",
+    "item_hold_overdue",
+    "duel_fee_overdue",
+)
+assert len(FREEZE_HOLD_EVENT_NAMES) == len(FreezeHoldEvent)
 
 
 def is_world_tide_active_on_scene(now_unix_sec: int, scene_config_id: int) -> bool:
@@ -131,7 +161,26 @@ class SceneBattle:
         self._hold_reviews: dict[int, asyncio.Task] = {}
         self._hold_review_at: dict[int, int] = {}
         self._hold_checked_seq: dict[int, int] = {}
+        self._overdue_logged_at: dict[tuple[int, int], int] = {}
+        self._freeze_events: list[int] = [0] * len(FREEZE_HOLD_EVENT_NAMES)
         self._inventory = AssetInventory(self.protocol, tables)
+
+    def _count_freeze_event(self, event: FreezeHoldEvent) -> None:
+        self._freeze_events[int(event)] += 1
+
+    def freeze_hold_event_count(self, event: FreezeHoldEvent) -> int:
+        """读取进程内指定冻结/复核事件累计计数（对齐 C++ PlayerBattleSystem::FreezeHoldEventCount）。"""
+        return self._freeze_events[int(event)]
+
+    def render_battle_freeze_metrics(self) -> str:
+        """导出 Prometheus 文本格式 scene_battle_freeze_events_total 指标（对齐 WriteBattleFreezeMetrics）。"""
+        lines = [
+            "# HELP scene_battle_freeze_events_total Battle freeze reaper events on this scene node since process start, by event.",
+            "# TYPE scene_battle_freeze_events_total counter",
+        ]
+        for idx, name in enumerate(FREEZE_HOLD_EVENT_NAMES):
+            lines.append(f'scene_battle_freeze_events_total{{event="{name}"}} {self._freeze_events[idx]}')
+        return "\n".join(lines) + "\n"
 
     def current(self, player_id: int) -> int:
         entry = self._freezes.get(player_id)
@@ -207,11 +256,12 @@ class SceneBattle:
             now = self._clock()
             cur_bid = self.current(player_id)
             data = self.scene.rows.assemble(player.snapshot)
-            hold_bids = {
-                int(hold.hold_id)
+            hold_review_by_bid = {
+                int(hold.hold_id): int(hold.review_after_ms)
                 for hold in data.item_holds.holds
                 if hold.kind == 1 and hold.hold_id and hold.review_after_ms <= now and hold.hold_id != cur_bid
             }
+            hold_bids = set(hold_review_by_bid)
             fee_bid = int(data.jianghu_component.pending_silver_fee_battle_id)
             fee_review = int(data.jianghu_component.pending_silver_fee_review_after_ms)
             fee_due_bid = fee_bid if (fee_bid and fee_bid != cur_bid and fee_review <= now) else 0
@@ -223,6 +273,29 @@ class SceneBattle:
             for battle_id in candidates:
                 has_hold = battle_id in hold_bids
                 has_fee = battle_id == fee_due_bid
+                review_after = hold_review_by_bid.get(battle_id, fee_review)
+                if has_hold and has_fee:
+                    review_after = min(hold_review_by_bid[battle_id], fee_review)
+                overdue_key = (player_id, battle_id)
+                last_overdue = self._overdue_logged_at.get(overdue_key, 0)
+                overdue_due = (
+                    now > min(_UINT64_MAX, review_after + _HOLD_CAP_MS)
+                    and (not last_overdue or now - last_overdue >= _OVERDUE_LOG_INTERVAL_MS)
+                )
+                if overdue_due:
+                    self._overdue_logged_at[overdue_key] = now
+                    if has_hold:
+                        logger.error(
+                            "Battle item hold overdue metric=battle_item_hold_overdue player_id=%s battle_id=%s review_after_ms=%s now_ms=%s",
+                            player_id, battle_id, review_after, now,
+                        )
+                        self._count_freeze_event(FreezeHoldEvent.ITEM_HOLD_OVERDUE)
+                    if has_fee:
+                        logger.error(
+                            "Jianghu duel fee overdue metric=jianghu_duel_fee_overdue player_id=%s battle_id=%s review_after_ms=%s now_ms=%s",
+                            player_id, battle_id, review_after, now,
+                        )
+                        self._count_freeze_event(FreezeHoldEvent.DUEL_FEE_OVERDUE)
                 applied_here = self._applied(player, battle_id)
                 # 仅道具预留且本地已应用结算：直接释放预留；待退银两必须查 SQL 终局（防作废结算退款失败被误吞）。
                 if has_hold and not has_fee and applied_here:
@@ -287,10 +360,32 @@ class SceneBattle:
                     return
                 if context.state == 1:
                     # 迟到的确认仍可凭匹配的 Redis 锁恢复正式战斗。
+                    logger.warning(
+                        "Battle prepare expired metric=battle_prepare_expired player_id=%s battle_id=%s prepare_deadline_ms=%s now_ms=%s",
+                        player_id, context.battle_id, entry.due, self._clock(),
+                    )
+                    self._count_freeze_event(FreezeHoldEvent.PREPARE_EXPIRED)
                     self._thaw(player_id)
                     return
+                if not player_id or not context.battle_id:
+                    logger.error(
+                        "Battle freeze expired metric=battle_freeze_expired player_id=%s battle_id=%s terminal=no_identity",
+                        player_id, context.battle_id,
+                    )
+                    self._count_freeze_event(FreezeHoldEvent.EXPIRED_RELEASED)
+                    await self._release_expired(player_id, entry, self._player(player_id))
+                    return
                 player = self._player(player_id)
-                if self._applied(player, context.battle_id) or self._past_cap(player_id, entry):
+                if self._applied(player, context.battle_id):
+                    logger.warning(
+                        "Battle freeze expired metric=battle_freeze_expired player_id=%s battle_id=%s terminal=applied_here",
+                        player_id, context.battle_id,
+                    )
+                    self._count_freeze_event(FreezeHoldEvent.EXPIRED_RELEASED)
+                    await self._release_expired(player_id, entry, player)
+                    return
+                if self._past_cap(player_id, entry):
+                    self._count_freeze_event(FreezeHoldEvent.CAP_REACHED)
                     await self._release_expired(player_id, entry, player)
                     return
             verdict = await self._decision(context.battle_id)
@@ -298,17 +393,29 @@ class SceneBattle:
                 if self._freezes.get(player_id) is not entry or entry.due >= self._clock():
                     return
                 player = self._player(player_id)
-                if (verdict in ((2, False), (0, False)) or self._applied(player, context.battle_id)
-                        or self._past_cap(player_id, entry)):
+                if verdict in ((2, False), (0, False)):
+                    logger.warning(
+                        "Battle freeze expired metric=battle_freeze_expired player_id=%s battle_id=%s verdict=%s",
+                        player_id, context.battle_id, verdict,
+                    )
+                    self._count_freeze_event(FreezeHoldEvent.EXPIRED_RELEASED)
                     await self._release_expired(player_id, entry, player)
                     # ABORT / 无可裁决原件：不会再有结算，一并释放道具预留并退还待退银两。
-                    if (
-                        verdict in ((2, False), (0, False))
-                        and player is not None
-                        and self.scene.mutable(player)
-                    ):
+                    if player is not None and self.scene.mutable(player):
                         await self._release_hold_and_fee_on_abort(player, context.battle_id)
+                elif self._applied(player, context.battle_id):
+                    self._count_freeze_event(FreezeHoldEvent.EXPIRED_RELEASED)
+                    await self._release_expired(player_id, entry, player)
+                elif self._past_cap(player_id, entry):
+                    self._count_freeze_event(FreezeHoldEvent.CAP_REACHED)
+                    await self._release_expired(player_id, entry, player)
                 else:
+                    if verdict == (1, False):
+                        self._count_freeze_event(FreezeHoldEvent.HELD_COMPLETE)
+                    elif verdict == (0, True):
+                        self._count_freeze_event(FreezeHoldEvent.HELD_PENDING)
+                    else:
+                        self._count_freeze_event(FreezeHoldEvent.HELD_UNKNOWN)
                     entry.retry_at = self._clock() + _REAPER_INTERVAL_MS
                     await self._store(_RENEW, player_id, entry)
         except Exception:
@@ -474,6 +581,8 @@ class SceneBattle:
             task.cancel()
         self._hold_review_at.pop(player.player_id, None)
         self._hold_checked_seq.pop(player.player_id, None)
+        for key in [k for k in self._overdue_logged_at if k[0] == player.player_id]:
+            self._overdue_logged_at.pop(key, None)
 
     def notify_reconnect(self, player) -> None:
         entry = self._freezes.get(player.player_id)
@@ -710,22 +819,33 @@ class SceneBattle:
                 )
                 return 1006
         tower_ctx_source = None
+        prepared_tower_ctx = None
         if is_wuxing_tower:
-            wk = wuxing_week_key(now_stamp)
-            if not data.HasField("season_component") or not data.season_component.HasField("wuxing_tower"):
-                return 1006
-            tower = data.season_component.wuxing_tower
-            if (
-                tower.week_key != wk
-                or not tower.run_active
-                or not (1 <= tower.current_floor <= WUXING_TOWER_MAX_FLOORS)
-                or tower.pending_offer_sigil_ids
-            ):
-                return 1006
-            expected_dungeon = tower_floor_dungeon_id(tower.current_floor)
-            if request is not None and request.battle_config_id and request.battle_config_id != expected_dungeon:
-                return 1006
-            tower_ctx_source = tower
+            season_sys = getattr(self.scene, "season", None)
+            if season_sys is not None and hasattr(season_sys, "prepare_wuxing_tower_context"):
+                t_err, prepared_tower_ctx, _t_char_preset, _t_pet_preset = season_sys.prepare_wuxing_tower_context(
+                    data,
+                    int(request.battle_config_id) if request is not None else 0,
+                    now_ms_val=now_stamp,
+                )
+                if t_err:
+                    return t_err
+            else:
+                wk = wuxing_week_key(now_stamp)
+                if not data.HasField("season_component") or not data.season_component.HasField("wuxing_tower"):
+                    return 1006
+                tower = data.season_component.wuxing_tower
+                if (
+                    tower.week_key != wk
+                    or not tower.run_active
+                    or not (1 <= tower.current_floor <= WUXING_TOWER_MAX_FLOORS)
+                    or tower.pending_offer_sigil_ids
+                ):
+                    return 1006
+                expected_dungeon = tower_floor_dungeon_id(tower.current_floor)
+                if request is not None and request.battle_config_id and request.battle_config_id != expected_dungeon:
+                    return 1006
+                tower_ctx_source = tower
 
         # 瑞兽迎春准入硬隔离：boss_trial_kind=7 必须且仅能携带合法 FESTIVAL_BEAST 上下文。
         if (boss_trial_kind == BOSS_TRIAL_KIND_FESTIVAL_BEAST) != is_festival_beast:
@@ -771,6 +891,8 @@ class SceneBattle:
         profile = data.profile_component
         snapshot.player_id, snapshot.player_name = player.player_id, profile.name
         snapshot.appearance_id, snapshot.gender = profile.appearance_id, profile.gender
+        if "spectate_chat_pref" in snapshot.DESCRIPTOR.fields_by_name and "spectate_chat_pref" in profile.DESCRIPTOR.fields_by_name:
+            snapshot.spectate_chat_pref = profile.spectate_chat_pref
         from .scene_appearance import fill_battle_skill_vfx
         fill_battle_skill_vfx(self.tables, data, snapshot)
         snapshot.class_id, snapshot.level = class_id(data), effective_level(data)
@@ -788,13 +910,22 @@ class SceneBattle:
             fid = int(data.season_component.equipped_formation_id)
             if is_valid_formation_id(fid):
                 snapshot.formation_id = fid
-        if tower_ctx_source is not None:
+        tower_fair_preset = bool(
+            (prepared_tower_ctx is not None and getattr(prepared_tower_ctx, "use_free_preset", False))
+            or (tower_ctx_source is not None and getattr(tower_ctx_source, "use_free_preset", False))
+        )
+        effective_free_preset = use_free_preset or tower_fair_preset
+        if prepared_tower_ctx is not None:
+            snapshot.tower_context.CopyFrom(prepared_tower_ctx)
+        elif tower_ctx_source is not None:
             tc = snapshot.tower_context
             tc.week_key = tower_ctx_source.week_key
             tc.run_id = tower_ctx_source.run_id
             tc.floor = tower_ctx_source.current_floor
             tc.leyline_element = tower_floor_leyline_element(tower_ctx_source.week_key, tower_ctx_source.current_floor)
             tc.active_sigil_ids.extend(tower_ctx_source.active_sigil_ids)
+            if "use_free_preset" in tc.DESCRIPTOR.fields_by_name:
+                tc.use_free_preset = tower_fair_preset
         routing = snapshot.routing
         routing.session_id, routing.gate_node_id, routing.gate_instance_id = player.session_id, player.session_id >> 17, player.gate_uuid
         routing.scene_node_id, routing.scene_instance_id = self.scene.info.node_id, self.scene.info.node_uuid
@@ -837,7 +968,7 @@ class SceneBattle:
                     snapshot.pets.add().CopyFrom(wire)
         # 论剑 V3 战前 15 秒明牌变阵：仅正式自养论剑与赛季锦标赛打包备选灵宠（至多 5 只）与当季全部赛季印。
         is_tournament = request is not None and int(getattr(request, "match_mode", 0)) == _MATCH_MODE_SEASON_TOURNAMENT
-        if not use_free_preset and (is_formal_ranked or is_tournament):
+        if not effective_free_preset and (is_formal_ranked or is_tournament):
             active_pet_id = snapshot.pets[0].pet_id if snapshot.pets else 0
             standby_pets = build_standby_battle_snapshots(
                 self.tables, player.player_id, data, active_pet_id, _MAX_STANDBY_PETS,
