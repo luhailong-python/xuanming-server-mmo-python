@@ -7,6 +7,36 @@ KILL, LEVEL, COMPLETE = 1, 6, 8
 MAX_COUNT = (1 << 32) - 1
 
 
+def _has_bit(bits: bytes, index: int | None) -> bool:
+    if index is None or index < 0:
+        return False
+    byte_idx, bit_off = divmod(index, 8)
+    return byte_idx < len(bits) and bool(bits[byte_idx] & (1 << bit_off))
+
+
+def _set_bit(bits: bytes, index: int | None) -> bytes:
+    if index is None or index < 0:
+        return bits
+    byte_idx, bit_off = divmod(index, 8)
+    buf = bytearray(bits)
+    if byte_idx >= len(buf):
+        buf.extend(b"\x00" * (byte_idx + 1 - len(buf)))
+    buf[byte_idx] |= 1 << bit_off
+    return bytes(buf).rstrip(b"\x00")
+
+
+def _or_bits(a: bytes, b: bytes) -> bytes:
+    if not a:
+        return b
+    if not b:
+        return a
+    n = max(len(a), len(b))
+    out = bytearray(n)
+    for i in range(n):
+        out[i] = (a[i] if i < len(a) else 0) | (b[i] if i < len(b) else 0)
+    return bytes(out).rstrip(b"\x00")
+
+
 def now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -45,33 +75,29 @@ class Missions:
         self.scene.register(name, "AcceptMission", self.accept, mutating=True)
         self.scene.register(name, "ClaimMissionReward", self.claim, mutating=True)
 
+    def is_completed(self, scope, mission_id: int) -> bool:
+        """按 MissionListComp.complete_missions 位图判断任务是否已完成。"""
+        table = self.tables["Mission"]
+        return _has_bit(scope.mission_list.complete_missions, table.bit_index(mission_id))
+
+    def mark_completed(self, scope, mission_id: int) -> None:
+        """在 MissionListComp.complete_missions 位图中置位已完成任务。"""
+        table = self.tables["Mission"]
+        scope.mission_list.complete_missions = _set_bit(
+            scope.mission_list.complete_missions, table.bit_index(mission_id),
+        )
+
+    def completed_ids(self, scope) -> set[int]:
+        """从 MissionListComp.complete_missions 位图还原已配置任务 ID 集合。"""
+        bits = scope.mission_list.complete_missions
+        if not bits:
+            return set()
+        table = self.tables["Mission"]
+        return {row.id for row in table.rows() if _has_bit(bits, table.bit_index(row.id))}
+
     def scopes(self, data):
-        """合并重复 scope，并按 C++ 兼容旧任务存档。"""
+        """合并重复 scope（按 C++ 2026-11-20 位图契约保留 complete_missions 与 claimable_mission_ids）。"""
         state = data.mission_component
-        if not state.scoped_state_present and not state.scopes:
-            scope = state.scopes.add(scope=0)
-            finished = {entry.config_id for entry in state.active if entry.state == 3}
-            done, claimable = set(state.completed) | finished, set()
-            for entry in state.active:
-                key = entry.config_id
-                if key in finished:
-                    continue
-                if entry.state == 2:
-                    done.add(key)
-                    claimable.add(key)
-                    scope.mission_list.missions.pop(key, None)
-                    scope.mission_list.mission_begin_time[key] = entry.accepted_at_ms
-                elif key not in claimable and key not in scope.mission_list.missions:
-                    row = self.tables["Mission"].get(key)
-                    progress = [entry.progress]
-                    if row:
-                        progress.extend([0] * (len(row.condition_id) - 1))
-                    scope.mission_list.missions[key].CopyFrom(
-                        self.protocol.message("MissionComp", id=key, progress=progress),
-                    )
-                    scope.mission_list.mission_begin_time[key] = entry.accepted_at_ms
-            scope.completed_mission_ids.extend(sorted(done))
-            scope.claimable_mission_ids.extend(sorted(claimable))
         canonical = {}
         for original in state.scopes:
             if original.scope not in canonical:
@@ -83,23 +109,17 @@ class Missions:
             for key, mission in original.mission_list.missions.items():
                 if key not in first.mission_list.missions:
                     first.mission_list.missions[key].CopyFrom(mission)
-            for key, stamp in original.mission_list.mission_begin_time.items():
-                if key not in first.mission_list.mission_begin_time:
-                    first.mission_list.mission_begin_time[key] = stamp
-            first.completed_mission_ids.extend(original.completed_mission_ids)
+            first.mission_list.complete_missions = _or_bits(
+                first.mission_list.complete_missions, original.mission_list.complete_missions,
+            )
             first.claimable_mission_ids.extend(original.claimable_mission_ids)
         canonical.setdefault(0, self.protocol.message("QuestScopeData"))
-        state.ClearField("active")
-        state.ClearField("completed")
         state.ClearField("scopes")
-        state.scoped_state_present = True
         for key, value in sorted(canonical.items()):
             value.mission_list.type = key
-            value.mission_list.ClearField("complete_missions")
-            for field in (value.completed_mission_ids, value.claimable_mission_ids):
-                ordered = sorted(set(field))
-                del field[:]
-                field.extend(ordered)
+            ordered = sorted(set(value.claimable_mission_ids))
+            del value.claimable_mission_ids[:]
+            value.claimable_mission_ids.extend(ordered)
             state.scopes.add().CopyFrom(value)
         return {scope.scope: scope for scope in state.scopes}
 
@@ -116,11 +136,11 @@ class Missions:
             return 1002
         if row.id in scope.mission_list.missions:
             return 5004
-        if row.id in scope.completed_mission_ids or row.id in scope.claimable_mission_ids:
+        if self.is_completed(scope, row.id) or row.id in scope.claimable_mission_ids:
             return 5001
         for key in scope.mission_list.missions:
             # Native RebuildIndexes preserves completed progress without reserving its type.
-            if key in scope.completed_mission_ids:
+            if self.is_completed(scope, key):
                 continue
             existing = self.tables["Mission"].get(key)
             if existing and (existing.mission_type, existing.mission_sub_type) == (row.mission_type, row.mission_sub_type):
@@ -152,7 +172,7 @@ class Missions:
         return 0
 
     def _claim_error(self, scope, row, mission_id) -> int:
-        done = mission_id in scope.completed_mission_ids
+        done = self.is_completed(scope, mission_id)
         if mission_id not in scope.claimable_mission_ids:
             return 12000 if done else 5002
         return 0 if done and row and row.reward_id and reward_items(self.tables, row.reward_id) else 1002
@@ -174,10 +194,9 @@ class Missions:
         mission = scope.mission_list.missions[row.id]
         mission.id = row.id
         mission.progress.extend([0] * len(row.condition_id))
-        scope.mission_list.mission_begin_time[row.id] = stamp
         level = effective_level(data)
         await self._event(data, scope, LEVEL, level, level, stamp, only=row.id, gains=gains)
-        for completed in sorted(set(scope.completed_mission_ids)):
+        for completed in sorted(self.completed_ids(scope)):
             await self._event(data, scope, COMPLETE, completed, 1, stamp, only=row.id, gains=gains)
         return 0
 
@@ -195,7 +214,7 @@ class Missions:
             row = self.tables["Mission"].get(mission_id)
             mission = active.get(mission_id)
             if (row is None or mission is None or mission.id != mission_id or mission.status in (3, 4)
-                    or mission_id in scope.completed_mission_ids or len(mission.progress) != len(row.condition_id)):
+                    or self.is_completed(scope, mission_id) or len(mission.progress) != len(row.condition_id)):
                 continue
             requirements = list(self._requirements(row))
             changed = False
@@ -215,7 +234,7 @@ class Missions:
                                for (condition, target), value in zip(requirements, mission.progress)):
                 completed.append(row)
                 del active[mission_id]
-                scope.completed_mission_ids.append(mission_id)
+                self.mark_completed(scope, mission_id)
                 if row.reward_id:
                     scope.claimable_mission_ids.append(mission_id)
         for row in completed:
@@ -263,12 +282,12 @@ class Missions:
         keys = {(0, row.id) for row in self.tables["Mission"].rows()}
         for key, scope in scopes.items():
             keys.update((key, mission) for mission in (
-                set(scope.mission_list.missions) | set(scope.completed_mission_ids) | set(scope.claimable_mission_ids)
+                set(scope.mission_list.missions) | self.completed_ids(scope) | set(scope.claimable_mission_ids)
             ))
         for key, mission_id in sorted(keys):
             scope = scopes[key]
             active = scope.mission_list.missions.get(mission_id)
-            status = (3 if mission_id in scope.claimable_mission_ids else 2 if mission_id in scope.completed_mission_ids
+            status = (3 if mission_id in scope.claimable_mission_ids else 2 if self.is_completed(scope, mission_id)
                       else 0 if active is None else 4 if active.status in (3, 4) else 1)
             info = response.missions.add(mission_id=mission_id, scope=key, status=status)
             row = self.tables["Mission"].get(mission_id)

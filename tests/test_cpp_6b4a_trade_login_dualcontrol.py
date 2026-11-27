@@ -198,7 +198,12 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
             m_path = "/mailpb.MailAdmin/SendPersonalMail"
             # admin 无批准记录 -> PERMISSION_DENIED
             req_no_app = protocol.message(
-                "mailpb.SendMailRequest", request_id=7001, recipient_player_id=101, title="hi", body="body"
+                "mailpb.SendMailRequest",
+                sender_kind=1,
+                request_id=7001,
+                recipient_player_id=101,
+                title="hi",
+                body="body",
             )
             sign_service_call(m_path, req_no_app, "admin", now_ms, sec_admin)
             with pytest.raises(grpc.aio.AioRpcError) as err:
@@ -208,6 +213,7 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
             # admin 带合格批准记录且 approval_id == str(request_id) -> 成功
             req_ok = protocol.message(
                 "mailpb.SendMailRequest",
+                sender_kind=1,
                 request_id=7002,
                 recipient_player_id=101,
                 title="hi",
@@ -221,7 +227,12 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
 
             # 系统发件方 rank 无需批准记录照常放行
             req_sys = protocol.message(
-                "mailpb.SendMailRequest", request_id=7003, recipient_player_id=101, title="rank", body="reward"
+                "mailpb.SendMailRequest",
+                sender_kind=3,
+                request_id=7003,
+                recipient_player_id=101,
+                title="rank",
+                body="reward",
             )
             sign_service_call(m_path, req_sys, "rank", now_ms, sec_sys)
             raw_sys = await m_client.call(m_path, req_sys.SerializeToString())
@@ -276,7 +287,12 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
             await r_server.stop(None)
 
         # -- PlayerInboxService (strict allow_unapproved=False) --
+        from xuanming.player_inbox.model import MSG_GM_BLOCK_CURRENCY_GAIN
+
         class _FakeInboxDir:
+            async def player_exists(self, player_id: int) -> bool:
+                return True
+
             async def get_role_fence_state(self, player_id: int):
                 return protocol.message(
                     "rolefence.RoleFenceState",
@@ -286,7 +302,13 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
                     version=1,
                 )
 
-        inbox_store = MemoryInboxStore(protocol, InboxRegistry(protocol), _FakeInboxDir(), clock_ms=clock)
+        inbox_store = MemoryInboxStore(
+            protocol,
+            InboxRegistry(protocol),
+            _FakeInboxDir(),
+            allowed_types=frozenset((MSG_GM_BLOCK_CURRENCY_GAIN,)),
+            clock_ms=clock,
+        )
         inbox_svc = PlayerInboxService(
             protocol,
             inbox_store,
@@ -308,7 +330,7 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
                 issued_at_ms=now_ms,
                 operator="alice.w",
                 reason="abuse",
-                block_gain={"currency_type": 0, "until_ms": now_ms + 3600_000},
+                block_gain=protocol.message("player_inbox.GmCurrencyGainPayload", currency_type=0),
             )
             with pytest.raises(grpc.aio.AioRpcError) as err:
                 await i_client.call(s_path, sanction_no_app.SerializeToString(), metadata=md)
@@ -321,7 +343,7 @@ def test_mail_rank_player_inbox_strict_dualcontrol():
                 issued_at_ms=now_ms,
                 operator="alice.w",
                 reason="abuse",
-                block_gain={"currency_type": 0, "until_ms": now_ms + 3600_000},
+                block_gain=protocol.message("player_inbox.GmCurrencyGainPayload", currency_type=0),
                 approval=_mk_approval(protocol, approval_id="9002", proposer="alice.w", approver="bob.k"),
             )
             raw_s = await i_client.call(s_path, sanction_ok.SerializeToString(), metadata=md)

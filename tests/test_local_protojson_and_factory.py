@@ -308,7 +308,8 @@ def test_protojson_preserves_unknown_wire_fields_without_polluting_normal_rows(t
         store = JsonPlayerStore(path, protocol=protocol)
 
         player = _build_sample_player(protocol, 77, name="未知字段保真")
-        scope = player.mission_component.scopes.add(scope=0, completed_mission_ids=[4])
+        scope = player.mission_component.scopes.add(scope=0)
+        scope.mission_list.complete_missions = b"\x01"
         mission = scope.mission_list.missions[4]
         mission.id = 4
         mission.MergeFromString(b"\x98\x06\x01")

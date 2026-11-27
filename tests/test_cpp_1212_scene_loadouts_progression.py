@@ -238,61 +238,27 @@ def test_equip_loadout_save_atomic_zero_free_slot_swap_linked_and_unlock(tmp_pat
         env = await _make_full_scene(tmp_path, level=60, gold=50_000, diamond=1000, bind_diamond=500)
         player = env.scene.locations[1].players[1]
 
-        # 初始仅解锁 1 套，最大 5 套
+        # 方案 A 统一 7 格席位：60 级免费解锁 2 套，上限 7 套；旧独立 UnlockEquipLoadout 退役拒绝
         get_resp = await env.rpc("SceneBagClientPlayer", "GetEquipLoadouts")
         assert not get_resp.error_message.id
-        assert get_resp.snapshot.unlocked_scheme_count == 1
-        assert get_resp.snapshot.max_scheme_count == 5
+        assert get_resp.snapshot.unlocked_scheme_count == 2
+        assert get_resp.snapshot.max_scheme_count == 7
         assert get_resp.snapshot.state_version == 1
 
-        # 扩容到第 2 套：优先扣绑定灵石（60），幂等重放不重复扣款
-        unlock2 = await env.rpc(
+        retired = await env.rpc(
             "SceneBagClientPlayer", "UnlockEquipLoadout",
-            client_request_id=9001, expected_unlocked_count=1, use_bind_diamond_first=True,
+            client_request_id=9001, expected_unlocked_count=2, use_bind_diamond_first=True,
         )
-        assert not unlock2.error_message.id
-        assert unlock2.snapshot.unlocked_scheme_count == 2
-        assert unlock2.spent_bind_diamond == 60
-        assert unlock2.spent_diamond == 0
-        replay2 = await env.rpc(
-            "SceneBagClientPlayer", "UnlockEquipLoadout",
-            client_request_id=9001, expected_unlocked_count=1, use_bind_diamond_first=True,
-        )
-        assert not replay2.error_message.id and replay2.replayed
-        assert replay2.spent_bind_diamond == 60
+        assert retired.error_message.id != 0
+        assert retired.snapshot.unlocked_scheme_count == 2
 
-        # 第 3 套用 3413 扩容符解锁（背包持有 3413 时自动优先消耗）
-        data = env.scene.rows.assemble(player.snapshot)
-        _add_item(env, data, item_id=4001, config_id=UNLOCK_ITEM_CONFIG_ID, size=1, bound=True)
-        await env.scene.commit_player_data(player, data)
-        unlock3 = await env.rpc(
-            "SceneBagClientPlayer", "UnlockEquipLoadout",
-            client_request_id=9002, expected_unlocked_count=2, use_bind_diamond_first=True,
-        )
-        assert not unlock3.error_message.id
-        assert unlock3.snapshot.unlocked_scheme_count == 3
-        assert unlock3.used_item_config_id == UNLOCK_ITEM_CONFIG_ID
-        assert unlock3.spent_diamond == 0
-
-        # 第 4 套（strict diamond = 180），验证灵石不足拒绝 28034，充足后严格只扣非绑灵石
-        data = env.scene.rows.assemble(player.snapshot)
-        data.currency.values[CURRENCY_DIAMOND] = 100  # 非绑不足但绑灵石还有 440
-        await env.scene.commit_player_data(player, data)
-        fail4 = await env.rpc(
-            "SceneBagClientPlayer", "UnlockEquipLoadout",
-            client_request_id=9003, expected_unlocked_count=3, use_bind_diamond_first=True,
-        )
-        assert fail4.error_message.id == EQUIP_LOADOUT_DIAMOND_NOT_ENOUGH
-        data = env.scene.rows.assemble(player.snapshot)
-        data.currency.values[CURRENCY_DIAMOND] = 500
-        await env.scene.commit_player_data(player, data)
-        unlock4 = await env.rpc(
-            "SceneBagClientPlayer", "UnlockEquipLoadout",
-            client_request_id=9004, expected_unlocked_count=3, use_bind_diamond_first=True,
-        )
-        assert not unlock4.error_message.id
-        assert unlock4.snapshot.unlocked_scheme_count == 4
-        assert unlock4.spent_diamond == 180 and unlock4.spent_bind_diamond == 0
+        # 开通轻享卡后装备方案同步扩容至 4 套（基础 2 + 轻享卡 2）
+        gm_pass = await env.rpc("SceneAfkPassClientPlayer", "GmSetAfkPass", remaining_seconds=86400)
+        assert not gm_pass.error_message.id
+        after_pass = await env.rpc("SceneBagClientPlayer", "GetEquipLoadouts")
+        assert not after_pass.error_message.id
+        assert after_pass.snapshot.unlocked_scheme_count == 4
+        assert after_pass.snapshot.light_card_bonus_schemes == 2
 
         # 准备第 2 个加点方案以便联动切换
         create_attr = await env.rpc(

@@ -126,10 +126,10 @@
 
 - **已校对 C++ 基线提交**：
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
-  - Commit SHA：`60b0bd6b30feb6fd60bc0654ebff73a4b5bdf11b`（短哈希 `60b0bd6b3`，并已同步 C++ 工作区至消息号 `573` / 83 张配表 v101）
-  - 追平范围：涵盖 `1212e017e..60b0bd6b3` 及 C++ 最新工作区全部 28 条新 RPC（`545~573`）与 83 张最新配表 version 101（`battle_table_fingerprint = ce5439a9b9ee673e070a1eeb5dc769c1`，544 条路由）：江湖恩怨与决斗约战（`545~557`、`564`、`566`，含世界公告模板、批量好友/黑名单核查、帮会恩怨墙、Match 约战状态机与 Scene 资格/备战费托管）、帮会战世仇宣战与应战（`567~568`）、试炼志第四章荒境/试炼誓约/战帖挑战卡与共享回放（`570~572`）、野外首领试炼 `12~14` 与 Battle V6 江湖决斗/誓约结算、装备批量洗炼 V3（保底目标品质+步进轨迹+幂等重放）、技能书悬赏单（`560~563`）/残卷收集里程碑（`558`）/批量分解（`559`）/名匠代工离线战报确认（`573`）、战法与属性统一 7 方案扩容与月租（`565`，2 基础+1 85级+2 轻享卡+月租封顶 7），并完整保留 Python 仓既有的赛季 V3 与邮件外发箱改动。
+  - Commit SHA：`f4947968a99725c088e5328ed642063094438a3a`（短哈希 `f4947968a`，555 条路由 / 83 张配表 version 104 / `battle_table_fingerprint = c51ba644116ac1ee8bdd8a2ed1fc055e`）
+  - 追平范围：涵盖 `60b0bd6b3..f4947968a` 全部 14 笔提交（含 11 条新 RPC `574~584`）：万象残局坊 V1/V1.5（`575~581` 残局草稿校验、作者自证发布、官方通关回放、点赞、五行灵脉阵眼与预设禁招、Dungeon 314 战斗规则与回合耗尽败北）、Battle 未成年人游玩截止强制断开与 Gate 预鉴权池/心跳期限/租约世代护栏/分层观战中枢、聚宝斋技能书求购单（`582~584`，严格拒收绑银 `CURRENCY_TYPE_BIND_GOLD=3` 与绑定书）、跨服务共享双人复核（`src/xuanming/dualcontrol.py` 覆盖 LoginAdmin/Trade/Mail/Rank/PlayerInbox/DataService）、Login 通行证事件 `574 HandlePassportEvent` 与 Token 家族撤销、Chat 平台复检与运维鉴权、ContentGuard 逃逸检测加固、Scene 装备方案 A 统一 7 格席位与宠物/阵法联动、任务完成位图 `complete_missions` 迁移、帮会战欠账恢复 `guild_war_credit_owed`、DataService 合服 etcd 副本读取与 SceneManager 宿主网关实例护栏。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：
-  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline 60b0bd6b30feb6fd60bc0654ebff73a4b5bdf11b..HEAD`。
+  1. 在 `xuanming-server-mmo-cpp` 查看该基线之后的新提交：`git log --oneline f4947968a99725c088e5328ed642063094438a3a..HEAD`。
   2. 按需同步底层/框架及新增业务逻辑，确保 Python 端持续具备平替 C++ 服务端的能力；回归通过后同步更新本节、[README.md](../../README.md) 与 [AGENTS.md](../../AGENTS.md) 的基线 Commit SHA。

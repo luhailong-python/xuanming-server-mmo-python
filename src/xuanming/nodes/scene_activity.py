@@ -179,7 +179,7 @@ class Activities:
                 response.activities.append(info)
                 continue
             info.completion_count_known = True
-            info.completed_count = int(mission.id in scope.completed_mission_ids)
+            info.completed_count = int(self.missions.is_completed(scope, mission.id))
             info.completion_limit, info.completion_period = 1, "每角色一次"
             counts = reward_items(self.tables, mission.reward_id)
             if counts is None:

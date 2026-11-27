@@ -37,7 +37,7 @@ def _defend(p, engine):
 
 
 def test_battle_fingerprint_matches_native_protobuf_for_same_tables():
-    expected = "ce5439a9b9ee673e070a1eeb5dc769c1"
+    expected = "c51ba644116ac1ee8bdd8a2ed1fc055e"
     assert battle_table_fingerprint(ConfigTables()) == expected
     assert battle_table_fingerprint(ConfigTables(fmt="pb")) == expected
 

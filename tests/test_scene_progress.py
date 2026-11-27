@@ -63,7 +63,7 @@ def test_client_mission_dungeon_and_durable_battle_inbox(tmp_path):
                     data = await control.call("/scene_node.SceneNodeGrpc/PrepareBattle", prepare.SerializeToString())
                     ready = p.parse("PrepareBattleResponse", data)
                     assert not ready.error_message.id
-                    assert ready.table_fingerprint == "ce5439a9b9ee673e070a1eeb5dc769c1"
+                    assert ready.table_fingerprint == "c51ba644116ac1ee8bdd8a2ed1fc055e"
                     assert ready.snapshot.max_health >= ready.snapshot.base_attributes.health > 0
                     await scene.battle.confirm(p.message("BattleConfirmedEvent", player_id=1, battle_id=42,
                                                          deadline_ms=now + 60000))
@@ -86,7 +86,7 @@ def test_client_mission_dungeon_and_durable_battle_inbox(tmp_path):
                     assert saved.currency.values[0] == 700
                     assert saved.level_component.level == 4
                     assert saved.derived_attributes_component.health == player_stats(p, scene.tables, saved).max_health
-                    assert 4 in saved.mission_component.scopes[0].completed_mission_ids
+                    assert scene.missions.is_completed(saved.mission_component.scopes[0], 4)
                     assert 4 not in saved.mission_component.scopes[0].claimable_mission_ids
                     assert saved.bag_component.items
                     assert len(saved.battle_results.entries) == 1

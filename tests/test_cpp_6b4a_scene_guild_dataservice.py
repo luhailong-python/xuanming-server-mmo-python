@@ -102,17 +102,9 @@ from xuanming.scene_manager.owner_authority import OwnerAuthorityConfig
 from xuanming.scene_manager.service import (
     PlacementIdentity,
     PlacementVerdict,
-    SceneManagerService,
     decide_placement_identity,
     identity_is_hosted_login,
     same_gate_instance,
-)
-from xuanming.scene_manager.config import SceneManagerConfig
-from xuanming.scene_manager.store import (
-    MemorySceneControlStore,
-    MemoryScenePlayerStore,
-    NodeRecord,
-    SceneRecord,
 )
 
 
@@ -427,20 +419,23 @@ def test_mystery_merchant_validate_tables(tmp_path):
         assert merchant.validate_tables() is True
 
         # 构造坏表验证返回 False
-        bad_tables = SimpleNamespace(
-            tables={
-                "MysteryMerchantRule": SimpleNamespace(rows=lambda: [SimpleNamespace(interact_range=0)]),
-                "MysteryMerchantGoods": SimpleNamespace(
-                    rows=lambda: [
-                        SimpleNamespace(id=1, weight=0, price=100, limit_count=1, currency_type=0, item_id=1, item_count=1)
-                    ]
-                ),
-                "MysteryMerchantSpot": SimpleNamespace(rows=lambda: []),
-                "Item": SimpleNamespace(get=lambda _id: None),
-            }
-        )
-        bad_tables.__getitem__ = lambda self, k: self.tables[k]
-        bad_merchant = SceneMerchant(env.scene, bad_tables, env.assets)
+        class _BadTables:
+            def __init__(self):
+                self.tables = {
+                    "MysteryMerchantRule": SimpleNamespace(rows=lambda: [SimpleNamespace(interact_range=0)]),
+                    "MysteryMerchantGoods": SimpleNamespace(
+                        rows=lambda: [
+                            SimpleNamespace(id=1, weight=0, price=100, limit_count=1, currency_type=0, item_id=1, item_count=1)
+                        ]
+                    ),
+                    "MysteryMerchantSpot": SimpleNamespace(rows=lambda: []),
+                    "Item": SimpleNamespace(get=lambda _id: None),
+                }
+
+            def __getitem__(self, key):
+                return self.tables[key]
+
+        bad_merchant = SceneMerchant(env.scene, _BadTables(), env.assets)
         assert bad_merchant.validate_tables() is False
 
     asyncio.run(run())
@@ -538,17 +533,17 @@ def test_guild_war_rules_credit_owed_fence_and_bounty_lifecycle():
     async def run():
         protocol = Protocol()
         now = [1_800_000_000_000]
-        store = MemoryGuildStore(protocol, catalog=GuildTableCatalog.defaults(), clock_ms=lambda: now[0])
+        store = MemoryGuildStore(protocol, clock_ms=lambda: now[0])
         war = GuildWarManager(protocol, store, clock_ms=lambda: now[0])
 
         # 创建两个帮会（帮主 101 -> 帮会 A，帮主 201 -> 帮会 B）
-        a_orig = RoleOriginal(account="acc-a", player_id=101, owner_revision=1, home_zone=1)
-        b_orig = RoleOriginal(account="acc-b", player_id=201, owner_revision=1, home_zone=1)
-        c_orig = RoleOriginal(account="acc-c", player_id=301, owner_revision=1, home_zone=1)
-        g_a = await store.create_guild(a_orig, "青云阁", 1)
-        g_b = await store.create_guild(b_orig, "玄冥殿", 1)
-        g_c = await store.create_guild(c_orig, "落星宗", 1)
-        await store.credit_guild_funds(g_a.guild_id, 5000)
+        a_orig = RoleOriginal(account="acc-a", player_id=101, owner_revision=1)
+        b_orig = RoleOriginal(account="acc-b", player_id=201, owner_revision=1)
+        c_orig = RoleOriginal(account="acc-c", player_id=301, owner_revision=1)
+        g_a = await store.create_guild(a_orig, name="青云阁", name_norm="青云阁", zone_id=1, now_ms=now[0])
+        g_b = await store.create_guild(b_orig, name="玄冥殿", name_norm="玄冥殿", zone_id=1, now_ms=now[0])
+        g_c = await store.create_guild(c_orig, name="落星宗", name_norm="落星宗", zone_id=1, now_ms=now[0])
+        await war._credit_guild_funds(g_a.guild_id, 5000)
 
         # 发布帮内私有追杀令（public_board=False）
         post_priv = await war.post_bounty(
@@ -673,9 +668,9 @@ def test_guild_war_rules_credit_owed_fence_and_bounty_lifecycle():
         assert stats_done.converted == 1
         assert stats_done.abandoned == 1
         assert await store.list_war_credit_owed() == []
-        assert owed_op_id in store._state.asset_ops
-        assert store._state.asset_ops[owed_op_id].stream == ASSET_STREAM_GUILD_CREDIT
-        assert store._state.asset_ops[owed_op_id].player_id == 101
+        assert owed_op_id in store.state.asset_ops
+        assert store.state.asset_ops[owed_op_id].stream == ASSET_STREAM_GUILD_CREDIT
+        assert store.state.asset_ops[owed_op_id].player_id == 101
 
         # r2-gw#2 公费追杀令到期退帮会资金 + r2-gw#7 终态保留期清理
         funds_before = (await store.get_guild(g_a.guild_id)).funds
@@ -885,66 +880,46 @@ def test_scene_manager_gate_instance_identity_hosted_forward_and_oa_enforce_refu
 
     # 端到端 EnterScene：先常规带 gate_instance_id 入场写 location，再 hosted_placement 透传 gate_instance_id
     async def run():
-        protocol = Protocol()
-        control = MemorySceneControlStore()
-        players = MemoryScenePlayerStore()
-        published_scene_cmds: list[tuple[int, int, object]] = []
-        published_gate_cmds: list[tuple[int, int, object]] = []
+        from test_scene_manager import Harness, SCENE_NODE_TYPE_MAIN_WORLD, SCENE_TYPE_MAIN_WORLD
 
-        class _Publisher:
-            async def publish_gate_command(self, gate_id, player_id, cmd):
-                published_gate_cmds.append((gate_id, player_id, cmd))
+        async with Harness() as h:
+            h.registry.add_scene_node(
+                zone_id=1, node_id=10, scene_node_type=SCENE_NODE_TYPE_MAIN_WORLD, node_uuid="scene-uuid-10",
+            )
+            await h.service.sync_nodes_to_control_store(1)
+            h.data.register_player(42, revision=1, home_zone=1)
+            created = await h.create_scene(scene_conf_id=1, scene_type=SCENE_TYPE_MAIN_WORLD, zone_id=1)
+            assert created.scene_id > 0
 
-            async def publish_scene_command(self, scene_node_id, player_id, cmd):
-                published_scene_cmds.append((scene_node_id, player_id, cmd))
+            # 1) 常规带 gate_instance_id="gate-uuid-1" 入场
+            r1 = await h.enter_scene(
+                player_id=42,
+                scene_id=created.scene_id,
+                zone_id=1,
+                gate_id="7",
+                gate_instance_id="gate-uuid-1",
+                gate_zone_id=1,
+                session_id=(7 << 17) | 1,
+                login_generation=10,
+                owner_revision=1,
+            )
+            assert r1.error_code == 0
+            loc1 = await h.read_location(42)
+            assert loc1 is not None and loc1.gate_instance_id == "gate-uuid-1"
 
-        cfg = SceneManagerConfig(node_id=1, zone_id=1, advertise_host="127.0.0.1", grpc_port=0)
-        svc = SceneManagerService(
-            protocol,
-            cfg,
-            control,
-            players,
-            publisher=_Publisher(),
-        )
-        now_s = int(svc._now_sec())
-        await control.register_node(1, NodeRecord(node_id="10", zone_id=1, instance_id="scene-uuid-10", last_heartbeat=now_s))
-        await control.create_scene(1, SceneRecord(scene_id=1001, scene_conf_id=1, node_id="10", zone_id=1))
-
-        # 1) 常规带 gate_instance_id="gate-uuid-1" 入场
-        enter_req = protocol.message(
-            "scene_manager.EnterSceneRequest",
-            player_id=42,
-            scene_id=1001,
-            zone_id=1,
-            gate_id="7",
-            gate_instance_id="gate-uuid-1",
-            session_id=(7 << 17) | 1,
-            login_generation=10,
-            owner_revision=1,
-            home_zone_id=1,
-        )
-        r1 = await svc.enter_scene(enter_req)
-        assert r1.error_code == 0
-        raw_loc = await players.get_location(42)
-        loc1 = protocol.parse("storage.PlayerLocation", raw_loc)
-        assert loc1.gate_instance_id == "gate-uuid-1"
-
-        # 2) 托管落点（不带 gate_instance_id）同场景重推 -> PlayerHostedPlacementEvent 携带 "gate-uuid-1"
-        hosted_req = protocol.message(
-            "scene_manager.EnterSceneRequest",
-            player_id=42,
-            scene_id=1001,
-            zone_id=1,
-            hosted_placement=True,
-            session_id=(7 << 17) | 1,
-            login_generation=10,
-            owner_revision=1,
-            home_zone_id=1,
-        )
-        r2 = await svc.enter_scene(hosted_req)
-        assert r2.error_code == 0
-        assert len(published_scene_cmds) == 1
-        hosted_ev = protocol.parse("PlayerHostedPlacementEvent", published_scene_cmds[0][2].payload)
-        assert hosted_ev.gate_instance_id == "gate-uuid-1"
+            # 2) 托管落点（不带 gate_instance_id）同场景重推 -> PlayerHostedPlacementEvent 携带 "gate-uuid-1"
+            r2 = await h.enter_scene(
+                player_id=42,
+                scene_id=created.scene_id,
+                zone_id=1,
+                hosted_placement=True,
+                session_id=(7 << 17) | 1,
+                login_generation=10,
+                owner_revision=1,
+            )
+            assert r2.error_code == 0
+            assert len(h.publisher.scene_commands) == 1
+            hosted_ev = h.protocol.parse("PlayerHostedPlacementEvent", h.publisher.scene_commands[0][2].payload)
+            assert hosted_ev.gate_instance_id == "gate-uuid-1"
 
     asyncio.run(run())

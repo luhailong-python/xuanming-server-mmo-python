@@ -1271,7 +1271,7 @@ def test_scene_prepare_confirm_cannot_be_cancelled_by_late_compensation(runtime)
         result = await battle.prepare(prepare)
         assert not result.error_message.id
         assert result.snapshot.base_attributes.speed > 0 and result.snapshot.level == 8
-        assert result.table_fingerprint == result.snapshot.table_fingerprint == "ce5439a9b9ee673e070a1eeb5dc769c1"
+        assert result.table_fingerprint == result.snapshot.table_fingerprint == "c51ba644116ac1ee8bdd8a2ed1fc055e"
         assert result.snapshot.routing.gate_node_id == 7 and result.snapshot.routing.scene_node_id == 10
         assert [(item.item_table_id, item.count) for item in result.snapshot.items] == [(medicine, 2)]
         assert [(h.hold_id, [(line.config_id, line.count) for line in h.lines]) for h in data.item_holds.holds] == [
