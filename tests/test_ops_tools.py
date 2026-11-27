@@ -325,7 +325,7 @@ def test_pack_verify_and_unpack_real_tables_deterministic(tmp_path: Path) -> Non
     assert res_a.manifest == res_b.manifest
     assert is_lower_hex(res_a.manifest.bundle_sha256, 64)
     assert is_lower_hex(res_a.manifest.content_digest, 64)
-    assert res_a.manifest.version == "101"
+    assert res_a.manifest.version == "104"
 
     # 168 个 tables/ 文件（83 json + 83 pb + manifest.json + tip_text.json）+ 1 个 _table_descriptors.pb = 169。
     manifest_paths = {entry.path for entry in res_a.manifest.files}

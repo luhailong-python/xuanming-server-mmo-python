@@ -753,7 +753,8 @@ def test_guild_war_v2_full_rules_and_invariants():
                 101, "GetGuildWarBattleResult", "GetGuildWarBattleResultRequest", "GetGuildWarBattleResultResponse", battle_id=b1.battle_id
             )
             assert res_win.settled and res_win.material_units_added == 15 and res_win.material_tradable_added == 1
-            assert res_win.diminish_percent == 100 and res_win.banner_hp_before == 1000 and res_win.banner_hp_after == 900
+            # r2-gw#1：野外活人点杀（TARGET_KIND_LIVE_PLAYER）不采信客户端传入的 leyline_id，不直接扣灵脉旗势
+            assert res_win.diminish_percent == 100 and res_win.banner_hp_before == 0 and res_win.banner_hp_after == 0
 
             res_loss = await call_guild(
                 201, "GetGuildWarBattleResult", "GetGuildWarBattleResultRequest", "GetGuildWarBattleResultResponse", battle_id=b1.battle_id

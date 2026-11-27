@@ -86,7 +86,11 @@ def test_client_mission_dungeon_and_durable_battle_inbox(tmp_path):
                     assert saved.currency.values[0] == 700
                     assert saved.level_component.level == 4
                     assert saved.derived_attributes_component.health == player_stats(p, scene.tables, saved).max_health
-                    assert scene.missions.is_completed(saved.mission_component.scopes[0], 4)
+                    from xuanming.nodes.scene_mission import _has_bit
+                    assert _has_bit(
+                        saved.mission_component.scopes[0].mission_list.complete_missions,
+                        scene.tables["Mission"].bit_index(4),
+                    )
                     assert 4 not in saved.mission_component.scopes[0].claimable_mission_ids
                     assert saved.bag_component.items
                     assert len(saved.battle_results.entries) == 1

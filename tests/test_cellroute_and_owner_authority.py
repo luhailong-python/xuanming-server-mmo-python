@@ -699,10 +699,15 @@ def test_owner_authority_config_validation_and_resolve_dsn():
             dsn="mysql://user:pass@127.0.0.1:3306/owner", skew_margin_ms=-1,
         ).resolve_dsn()
 
-    # 合法 dsn_env + enforce
-    valid = OwnerAuthorityConfig(mode="enforce", dsn_env="OWNER_DSN", backend="tidb", skew_margin_ms=2000)
-    assert valid.enabled() and valid.effective_mode() == "enforce"
-    assert valid.resolve_dsn(lambda name: "resolved_dsn" if name == "OWNER_DSN" else None) == "resolved_dsn"
+    # 合法 dsn_env + shadow 可解析 DSN；enforce 在准入屏障落地前被安全拒绝（r2-oa#1）
+    valid_shadow = OwnerAuthorityConfig(mode="shadow", dsn_env="OWNER_DSN", backend="tidb", skew_margin_ms=2000)
+    assert valid_shadow.enabled() and valid_shadow.effective_mode() == "shadow"
+    assert valid_shadow.resolve_dsn(lambda name: "resolved_dsn" if name == "OWNER_DSN" else None) == "resolved_dsn"
+
+    refused_enforce = OwnerAuthorityConfig(mode="enforce", dsn_env="OWNER_DSN", backend="tidb", skew_margin_ms=2000)
+    assert refused_enforce.enabled() and refused_enforce.effective_mode() == "enforce"
+    with pytest.raises(ValueError, match="enforce is refused"):
+        refused_enforce.resolve_dsn(lambda name: "resolved_dsn" if name == "OWNER_DSN" else None)
 
     # SceneManagerConfig.validate 同步校验非法 owner_authority 配置
     with pytest.raises(ValueError):

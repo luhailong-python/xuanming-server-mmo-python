@@ -299,7 +299,8 @@ def test_jianghu_tcp_rpc_eligibility_fee_settlement_and_clear_mark(tmp_path):
                         ).SerializeToString(),
                     )
                     saved = scene.rows.assemble(player.snapshot)
-                    assert balance(saved, 0) == 4500
+                    # 6b4ae7852 废除客户端/上游 skip_jianghu_silver_refund：CancelBattlePrepare 始终幂等退还 500 银两防扣留
+                    assert balance(saved, 0) == 5000
                     assert saved.jianghu_component.pending_silver_fee_battle_id == 0
 
                     # 再次预扣 500 银两 + 作废局（outcome=4）原子退还银两
@@ -336,7 +337,7 @@ def test_jianghu_tcp_rpc_eligibility_fee_settlement_and_clear_mark(tmp_path):
                         while await asyncio.to_thread(runtime.local_inbox._fetch, 1):
                             await asyncio.sleep(0.02)
                     saved = scene.rows.assemble(player.snapshot)
-                    assert balance(saved, 0) == 4500
+                    assert balance(saved, 0) == 5000
                     assert saved.jianghu_component.pending_silver_fee_battle_id == 0
                     assert saved.jianghu_component.defeat_mark_expires_at_ms == 0
 

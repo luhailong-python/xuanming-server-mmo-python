@@ -121,9 +121,9 @@ def test_seven_new_config_tables_json_and_pb_parity():
         "SkillScrollCraft": 7,
         "TournamentReward": 9,
         "TournamentRule": 1,
-        "TrialJournalEntry": 15,
-        "TrialJournalMilestone": 13,
-        "TrialJournalSeal": 42,
+        "TrialJournalEntry": 42,
+        "TrialJournalMilestone": 31,
+        "TrialJournalSeal": 96,
         "JianghuRule": 1,
     }
     for name, expected in expected_counts.items():
