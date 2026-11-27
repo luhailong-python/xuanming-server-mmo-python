@@ -1254,7 +1254,7 @@ class SceneEquipCraft:
             return 0
         if proxy_master_id == buyer_id:
             return EQUIP_PROXY_MASTER_UNAVAILABLE
-        stall = get_proxy_stall_directory(self.scene).find(proxy_master_id)
+        stall = get_proxy_stall_directory(self.scene).find(proxy_master_id, scene=self.scene)
         if (
             stall is None
             or stall.forge_mastery_tier < MASTERY_MASTER

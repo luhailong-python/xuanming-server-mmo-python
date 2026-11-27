@@ -128,6 +128,8 @@
   - 仓库：`xuanming-server-mmo-cpp`（分支 `main`）
   - Commit SHA：`da97bfb11afc864a5778b67d95136d51ce148e7d`（短哈希 `da97bfb11`，557 条路由 / 83 张配表 version 106 / `battle_table_fingerprint = c51ba644116ac1ee8bdd8a2ed1fc055e`）
   - 追平范围：涵盖 `f4947968a..da97bfb11` 全部 9 笔提交（退役旧 Scene 技能书悬赏单 `560~563` 统一迁聚宝斋 `582~584`，新增 6 条 RPC `585~590`）：五行秘境 V2（`585 ChooseWuxingRealmBranch`、`586 ResolveWuxingRealmEvent`、6 节点分支与奇遇/休整事件、15 枚 V2 秘宝与 5 元素 3 联动共鸣、公平 3x3 预设与自养/预设双榜、Battle 6 组 Prometheus 指标）、观战聊天全链路（Match `587 SendBattleSpectateChat` / `588 PullBattleSpectateChat` 60 条环形缓冲与 fail-closed 内容风控 + Scene `589 GetSpectateChatSetting` / `590 SetSpectateChatSetting` 与战斗脱敏透传）、Gate 请求/场景通道排空与入场重试统计、Scene 生命周期/释放护栏与冻结指标、江湖决斗未结清预扣银两重发拦截、帮会资产人工核销静默证人与角色围栏清理、Trade 尝试次数限流/RMB 缺口重发隔离及 PlayerInbox 启动建表校验。
+- **基线外的专题对齐（不改基线 SHA）**：
+  - 2026-11-27 名匠代打共享摊位目录、口碑待回账与西市热榜从进程内存改走按区控制 Redis，键、字段与取走脚本同 C++ r2-craft#4 → [craft-proxy-shared-ledger-redis.md](craft-proxy-shared-ledger-redis.md)（代码与单测已写，未运行）。
 - **本地/多节点运行范式（已写入 [docs/rules/runtime-modes-and-startup.md](../rules/runtime-modes-and-startup.md)）**：
   - Windows 单进程一键启动（`启动玄冥服务器.bat`）、PB 直转可读 ProtoJSON 本地存档（`JsonPlayerStore` v2 `rows_json`）、条件路由工厂（`create_player_store`，集群模式严禁静默降级）以及纯标准库并行多进程监管器（`tools/supervisor.py` + `启动-本地存档.bat` + `启动-多节点集群.bat`）。
 - **后续增量移植流程**：

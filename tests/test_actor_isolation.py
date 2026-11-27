@@ -6,10 +6,12 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+from test_craft_proxy_reputation_ledger import craft_ledger_redis
 from xuanming.nodes.gate import GateNode, Session
 from xuanming.nodes.local_login import LocalLogin
 from xuanming.nodes.scene_skill_craft import (
-    get_proxy_stall_directory,
+    CraftProxyStallDirectory,
+    proxy_reputation_ledger_key,
     record_proxy_order_reputation,
 )
 from xuanming.protocol import Protocol
@@ -80,6 +82,8 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
     async def scenario() -> None:
         protocol = Protocol()
         commits: list[int] = []
+        redis = craft_ledger_redis()
+        ledger = proxy_reputation_ledger_key(1).encode()
 
         class _FakeRows:
             def assemble(self, snap):
@@ -88,6 +92,7 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
         class _FakePlayer:
             def __init__(self, pid: int, data_msg) -> None:
                 self.player_id = pid
+                self.pending_save = None
                 self.snapshot = SimpleNamespace(
                     owner_epoch=1,
                     released=False,
@@ -100,7 +105,8 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
                 self.rows = _FakeRows()
                 self._locks: dict[int, asyncio.Lock] = {}
                 self._actor_tasks: set[asyncio.Task] = set()
-                self.locations = {1: SimpleNamespace(players={master.player_id: master})}
+                self.locations = {master.player_id: SimpleNamespace(players={master.player_id: master})}
+                self.craft_proxy_directory = CraftProxyStallDirectory(protocol, control_redis=redis, zone_id=1)
                 self.commit_observed_locked: list[bool] = []
 
             def player_lock(self, pid: int) -> asyncio.Lock:
@@ -127,22 +133,26 @@ def test_proxy_reputation_defers_to_master_actor_when_master_lock_is_busy() -> N
         real_data = protocol.message("player_database", player_id=200)
         master = _FakePlayer(200, real_data)
         scene = _FakeScene(master)
+        directory = scene.craft_proxy_directory
 
-        # 模拟宗师 200 正处于自己的 Actor 锁内：另一玩家触发口碑写入绝不能死锁，也不能无锁落盘。
+        # 宗师 200 正处于自己的 Actor 锁内：买家记口碑绝不等他的锁（防 A↔B 互购死锁）、不写他的存档，只记按区台账。
         async with scene.player_lock(200):
             await asyncio.wait_for(
                 record_proxy_order_reputation(scene, 200, supreme_delta=1, net_gold_earned=500, buyer_name="买家甲"),
                 timeout=1.0,
             )
             assert commits == []
-            assert get_proxy_stall_directory(scene).peek_pending_reputation(200) is not None
+            assert redis.data[ledger][b"200:o"] == b"1"
+            assert directory.has_pending(200)
 
-        # 宗师释放锁后，异步排队的 Actor 回账任务在持有宗师锁的情况下自动完成落盘。
+        # 宗师释放锁后，排在他串行队列里的回账任务从台账原子取走，并在持宗师锁的状态下落盘。
         await asyncio.gather(*tuple(scene._actor_tasks))
         assert commits == [200]
         assert scene.commit_observed_locked == [True]
-        assert get_proxy_stall_directory(scene).peek_pending_reputation(200) is None
-        assert master.snapshot.data.craft_component.proxy_orders_completed == 1
-        assert master.snapshot.data.craft_component.unread_proxy_digest_net_gold == 500
+        assert redis.data[ledger] == {b"200:24o": b"1", b"200:24s": b"1"}
+        assert not directory.has_pending(200)
+        craft = master.snapshot.data.craft_component
+        assert craft.proxy_orders_completed == 1 and craft.supreme_forged_count == 1
+        assert craft.unread_proxy_digest_net_gold == 500 and craft.unread_proxy_digest_last_buyer == "买家甲"
 
     asyncio.run(scenario())

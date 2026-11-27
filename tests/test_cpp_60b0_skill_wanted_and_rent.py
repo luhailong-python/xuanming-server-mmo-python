@@ -499,8 +499,8 @@ def test_573_proxy_stall_v2_v5_team_free_reputation_hot_rank_and_ack_digest(tmp_
             assert m_state.state.unread_proxy_digest.last_buyer_name == "甲侠士"
 
             # 模拟离线/跨线待回账口碑后调用 573 AckCraftProxyDigest 幂等回账并清零未读战报
-            get_proxy_stall_directory(env.scene).record_pending_reputation(
-                2, supreme_delta=1, rare_delta=0, net_gold_earned=95, buyer_name="丙侠士", already_applied_live=False,
+            await get_proxy_stall_directory(env.scene).record_order(
+                2, supreme_delta=1, rare_delta=0, net_gold_earned=95, buyer_name="丙侠士",
             )
             acked = await env.rpc(2, "SceneSkillClientPlayer", "AckCraftProxyDigest")
             assert not acked.error_message.id

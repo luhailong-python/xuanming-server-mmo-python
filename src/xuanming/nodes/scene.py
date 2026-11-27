@@ -629,7 +629,7 @@ class SceneNode:
                 if await drain_pending_proxy_reputation(self, player):
                     saved = self.rows.assemble(player.snapshot)
                 if saved.HasField("craft_component") and saved.craft_component.proxy_stall_open:
-                    proxy_dir.sync_player(request.player_id, saved)
+                    await proxy_dir.sync_player(request.player_id, saved)
             if admission:
                 await self.travel.confirm(admission)
             return player

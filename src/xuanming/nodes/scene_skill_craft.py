@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, replace
 import logging
 import random
 from collections.abc import Callable
+
+from google.protobuf.message import DecodeError
 
 from ..data import StoreRejected, StoreUnavailable, client_request
 from ..data.asset_inventory import (
@@ -26,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _SERVICE = "SceneSkillClientPlayer"
 _MAX_UINT64 = (1 << 64) - 1
+_MAX_INT64 = (1 << 63) - 1
 _MAX_UINT32 = (1 << 32) - 1
 
 # 客户端幂等请求种类（与 C++ ClientRequestKind 严格对齐）。
@@ -357,6 +361,10 @@ class PendingProxyReputation:
     net_gold: int = 0
     last_buyer: str = ""
 
+    @property
+    def is_empty(self) -> bool:
+        return not (self.orders or self.supreme or self.rare or self.net_gold)
+
 
 @dataclass(slots=True)
 class HotProxyCounters:
@@ -364,14 +372,93 @@ class HotProxyCounters:
     supreme_24h: int = 0
 
 
+# ── 名匠代打共享摊位目录与口碑台账：按区控制 Redis 的两个哈希，键、字段与取走脚本和 C++ player_craft.cpp 逐字节一致，
+#    混跑时两版读写同一份（设计见 docs/design/craft-proxy-shared-ledger-redis.md）。
+PROXY_DIRECTORY_REFRESH_INTERVAL_SEC = 5.0
+# 取走 = 同一段脚本里先 HMGET 再 HDEL：两个节点同时取同一名宗师，只有先执行的一方拿到值；热榜的 :24o / :24s 不取。
+TAKE_PROXY_REPUTATION_LUA = (
+    "local k=KEYS[1] local p=ARGV[1] "
+    "local v=redis.call('HMGET',k,p..':o',p..':s',p..':r',p..':g',p..':b') "
+    "redis.call('HDEL',k,p..':o',p..':s',p..':r',p..':g',p..':b') "
+    "return v"
+)
+_PENDING_FIELD_BY_SUFFIX = {b"o": "orders", b"s": "supreme", b"r": "rare", b"g": "net_gold"}
+_HOT_FIELD_BY_SUFFIX = {b"24o": "orders_24h", b"24s": "supreme_24h"}
+
+
+def proxy_stall_directory_key(zone_id: int) -> str:
+    """按区共享摊位目录：field = 宗师 player_id 十进制，value = CraftProxyStallInfo 二进制。"""
+    return f"craft_proxy_stall:{{ctl:{zone_id}}}"
+
+
+def proxy_reputation_ledger_key(zone_id: int) -> str:
+    """按区口碑台账：<id>:o/s/r/g/b 是待回账，<id>:24o / <id>:24s 是热榜；与摊位目录同一 hash tag。"""
+    return f"craft_proxy_reputation:{{ctl:{zone_id}}}"
+
+
+def _redis_failure(exc: BaseException) -> bool:
+    # 不在模块顶层 import redis：本地单进程模式不装它。
+    return isinstance(exc, OSError) or type(exc).__module__.startswith("redis")
+
+
+def _ledger_count(raw) -> int:
+    """台账计数按非负整数读：缺失、负数（旧版回账多扣出来的）、非数字按 0，超出 int64 封顶（同 C++ ParseNonNegativeInt64）。"""
+    if not isinstance(raw, bytes) or not raw.isdigit():
+        return 0
+    return min(int(raw), _MAX_INT64)
+
+
+def _parse_taken_reputation(reply) -> PendingProxyReputation | None:
+    """取走脚本的应答是 5 项数组，缺的字段为 None。形状不对 = 结果未知（可能已取走也可能没有），返回 None。"""
+    if (
+        not isinstance(reply, (list, tuple))
+        or len(reply) != 5
+        or any(value is not None and not isinstance(value, bytes) for value in reply)
+    ):
+        return None
+    orders, supreme, rare, net_gold, buyer = reply
+    return PendingProxyReputation(
+        orders=min(_ledger_count(orders), _MAX_UINT32),
+        supreme=min(_ledger_count(supreme), _MAX_UINT32),
+        rare=min(_ledger_count(rare), _MAX_UINT32),
+        net_gold=_ledger_count(net_gold),
+        last_buyer=buyer.decode("utf-8", "replace") if buyer else "",
+    )
+
+
+def _parse_reputation_ledger(raw: dict) -> tuple[dict[int, PendingProxyReputation], dict[int, HotProxyCounters]]:
+    """把台账整表解析成待回账与热榜镜像（同 C++ OnProxyReputationReply）；认不出的字段跳过，全 0 的待回账不留。"""
+    pending: dict[int, PendingProxyReputation] = {}
+    hot: dict[int, HotProxyCounters] = {}
+    for field, value in raw.items():
+        if not isinstance(field, bytes) or not isinstance(value, bytes):
+            continue
+        master_text, sep, suffix = field.partition(b":")
+        master_id = int(master_text) if master_text.isdigit() else 0
+        if not sep or not suffix or not 0 < master_id <= _MAX_UINT64:
+            continue
+        if suffix == b"b":
+            pending.setdefault(master_id, PendingProxyReputation()).last_buyer = value.decode("utf-8", "replace")
+            continue
+        count = _ledger_count(value)
+        if count == 0:
+            continue
+        if suffix in _PENDING_FIELD_BY_SUFFIX:
+            attr = _PENDING_FIELD_BY_SUFFIX[suffix]
+            entry = pending.setdefault(master_id, PendingProxyReputation())
+            setattr(entry, attr, count if attr == "net_gold" else min(count, _MAX_UINT32))
+        elif suffix in _HOT_FIELD_BY_SUFFIX:
+            entry = hot.setdefault(master_id, HotProxyCounters())
+            setattr(entry, _HOT_FIELD_BY_SUFFIX[suffix], min(count, _MAX_UINT32))
+    return {mid: entry for mid, entry in pending.items() if not entry.is_empty}, hot
+
+
 def _iter_online_players(scene):
-    """按 player_id 去重遍历场景中全部在线玩家（兼容 locations 按 player_id 或 world_id 索引）。"""
-    seen: set[int] = set()
-    for world in getattr(scene, "locations", {}).values():
-        for pid, target in world.players.items():
-            if pid and pid not in seen:
-                seen.add(pid)
-                yield pid, target
+    """遍历本节点全部在线玩家，一人一次：locations 按 player_id 索引到所在世界（按世界遍历会是在线人数的平方）。"""
+    for pid, world in scene.locations.items():
+        target = world.players.get(pid)
+        if pid and target is not None:
+            yield pid, target
 
 
 def _share_active_team(scene, player_a_id: int, player_b_id: int) -> bool:
@@ -386,10 +473,17 @@ def _share_active_team(scene, player_a_id: int, player_b_id: int) -> bool:
 
 
 class CraftProxyStallDirectory:
-    """同区跨节点/离线名匠代打共享摊位目录与口碑/24h 热榜异步台账。"""
+    """同区跨节点/离线名匠代打共享摊位目录与口碑/24h 热榜台账（r2-craft#4）。
 
-    def __init__(self, protocol) -> None:
+    权威数据在按区控制 Redis 的两个哈希里，本对象只持本节点镜像：摊位与热榜供西市列表读，待回账镜像只说明
+    「谁可能有待回账」，入账数额以原子取走的为准。没配控制 Redis（本地单进程模式）时镜像就是台账本身。
+    """
+
+    def __init__(self, protocol, *, control_redis=None, zone_id: int = 0) -> None:
         self.protocol = protocol
+        self._redis = control_redis
+        self._stall_key = proxy_stall_directory_key(zone_id)
+        self._ledger_key = proxy_reputation_ledger_key(zone_id)
         self._stalls: dict[int, object] = {}
         self._pending_reputation: dict[int, PendingProxyReputation] = {}
         self._hot_counters: dict[int, HotProxyCounters] = {}
@@ -445,47 +539,48 @@ class CraftProxyStallDirectory:
         )
         return forge_ready or scroll_ready
 
-    def sync_player(self, player_id: int, data) -> None:
+    async def sync_player(self, player_id: int, data) -> None:
+        """按存档重建本节点镜像里这名宗师的摊位，并写穿到按区目录（同 C++ SyncPlayerProxyStall：营业 HSET，下架 HDEL）。"""
         if not player_id:
             return
         info = self.build_stall_info(player_id, data)
         if info is not None:
             self._stalls[player_id] = info
+            if self._redis is not None:
+                await self._guarded_write(
+                    "publish stall", player_id,
+                    self._redis.hset(self._stall_key, str(player_id), info.SerializeToString()),
+                )
+            return
+        removed = self._stalls.pop(player_id, None) is not None
+        closed = data.HasField("craft_component") and not data.craft_component.proxy_stall_open
+        if (removed or closed) and self._redis is not None:
+            await self._guarded_write("remove stall", player_id, self._redis.hdel(self._stall_key, str(player_id)))
+
+    def find(self, master_player_id: int, *, scene=None):
+        """买家下单时解析宗师摊位（同 C++ ResolveSharedProxyStall）：宗师在本节点在线以他的存档为准，否则查镜像。"""
+        target = _find_online_player_in_scene(scene, master_player_id) if scene is not None else None
+        if target is None:
+            info = self._stalls.get(master_player_id)
+            return info if self.is_valid_stall(info) else None
+        if not scene.mutable(target):
+            return None
+        info = self.build_stall_info(master_player_id, scene.rows.assemble(target.snapshot))
+        if info is None:
+            self._stalls.pop(master_player_id, None)
         else:
-            self._stalls.pop(player_id, None)
+            self._stalls[master_player_id] = info
+        return info
 
-    def remove(self, master_player_id: int) -> None:
-        self._stalls.pop(master_player_id, None)
-        self._pending_reputation.pop(master_player_id, None)
-        self._hot_counters.pop(master_player_id, None)
-
-    def clear(self) -> None:
-        self._stalls.clear()
-        self._pending_reputation.clear()
-        self._hot_counters.clear()
-
-    def find(self, master_player_id: int):
-        info = self._stalls.get(master_player_id)
-        return info if self.is_valid_stall(info) else None
-
-    def record_pending_reputation(
-        self,
-        master_player_id: int,
-        supreme_delta: int,
-        rare_delta: int,
-        net_gold_earned: int,
-        buyer_name: str,
-        *,
-        already_applied_live: bool = False,
+    async def record_order(
+        self, master_player_id: int, supreme_delta: int, rare_delta: int, net_gold_earned: int, buyer_name: str,
     ) -> None:
-        """记录 24h 热榜计数，若宗师离线/跨线则同时累积到待回账口碑台账。"""
+        """记一笔代打成交：热榜与待回账一律 HINCRBY / HSET 进按区台账，本节点镜像同步累加供西市列表叠加展示。"""
         if not master_player_id:
             return
         hot = self._hot_counters.setdefault(master_player_id, HotProxyCounters())
         hot.orders_24h = _sat_add_u32(hot.orders_24h, 1)
         hot.supreme_24h = _sat_add_u32(hot.supreme_24h, supreme_delta)
-        if already_applied_live:
-            return
         pending = self._pending_reputation.setdefault(master_player_id, PendingProxyReputation())
         pending.orders = _sat_add_u32(pending.orders, 1)
         pending.supreme = _sat_add_u32(pending.supreme, supreme_delta)
@@ -493,32 +588,131 @@ class CraftProxyStallDirectory:
         pending.net_gold = _sat_add_u64(pending.net_gold, net_gold_earned)
         if buyer_name:
             pending.last_buyer = buyer_name
-
-    def peek_pending_reputation(self, master_player_id: int) -> PendingProxyReputation | None:
-        pending = self._pending_reputation.get(master_player_id)
-        if pending is None or (
-            pending.orders == 0 and pending.supreme == 0 and pending.rare == 0 and pending.net_gold == 0
-        ):
-            self._pending_reputation.pop(master_player_id, None)
-            return None
-        return PendingProxyReputation(
-            orders=pending.orders,
-            supreme=pending.supreme,
-            rare=pending.rare,
-            net_gold=pending.net_gold,
-            last_buyer=pending.last_buyer,
+        await self._add_to_ledger(
+            "record reputation", master_player_id,
+            {":24o": 1, ":24s": supreme_delta, ":o": 1, ":s": supreme_delta, ":r": rare_delta, ":g": net_gold_earned},
+            buyer_name,
         )
 
-    def consume_pending_reputation(self, master_player_id: int, drained: PendingProxyReputation) -> None:
+    def has_pending(self, master_player_id: int) -> bool:
+        """本节点镜像里这名宗师可能有待回账（只是提示，数额以取走的为准）。"""
+        pending = self._pending_reputation.get(master_player_id)
+        if pending is not None and pending.is_empty:
+            del self._pending_reputation[master_player_id]
+            return False
+        return pending is not None
+
+    async def take_pending(self, master_player_id: int) -> PendingProxyReputation | None:
+        """从台账原子取走一名宗师的待回账；None = 结果未知（断连、应答畸形），调用方什么都不入账。只在宗师自己的串行任务里调用。"""
+        if self._redis is None:
+            # 本地单进程：镜像就是台账，宗师锁已串行化他的回账；读出即算取走，落盘后再由 settle_taken 扣掉。
+            return replace(self._pending_reputation.get(master_player_id) or PendingProxyReputation())
+        try:
+            reply = await self._redis.eval(TAKE_PROXY_REPUTATION_LUA, 1, self._ledger_key, str(master_player_id))
+        except Exception as exc:
+            if not _redis_failure(exc):
+                raise
+            logger.warning(
+                "Craft proxy reputation take failed on scene control Redis; nothing applied, the pending delta is "
+                "either still in Redis or lost (display-only counters) master_id=%s error=%s", master_player_id, exc,
+            )
+            return None
+        taken = _parse_taken_reputation(reply)
+        if taken is None:
+            logger.warning(
+                "Craft proxy reputation take reply malformed; nothing applied master_id=%s reply=%r",
+                master_player_id, reply,
+            )
+        return taken
+
+    async def give_back(self, master_player_id: int, taken: PendingProxyReputation) -> None:
+        """取走的数额确定没写进存档：原样 HINCRBY 还回台账，下一次再取（本地单进程模式镜像没扣，不用还）。"""
+        await self._add_to_ledger(
+            "give back reputation", master_player_id,
+            {":o": taken.orders, ":s": taken.supreme, ":r": taken.rare, ":g": taken.net_gold},
+            taken.last_buyer,
+        )
+
+    def settle_taken(self, master_player_id: int, taken: PendingProxyReputation) -> None:
+        """取走的数额已归宗师存档：镜像扣掉这部分，取走之后本节点又记下的增量留着。"""
         cur = self._pending_reputation.get(master_player_id)
         if cur is None:
             return
-        cur.orders = max(0, cur.orders - drained.orders)
-        cur.supreme = max(0, cur.supreme - drained.supreme)
-        cur.rare = max(0, cur.rare - drained.rare)
-        cur.net_gold = max(0, cur.net_gold - drained.net_gold)
-        if cur.orders == 0 and cur.supreme == 0 and cur.rare == 0 and cur.net_gold == 0:
-            self._pending_reputation.pop(master_player_id, None)
+        cur.orders = max(0, cur.orders - taken.orders)
+        cur.supreme = max(0, cur.supreme - taken.supreme)
+        cur.rare = max(0, cur.rare - taken.rare)
+        cur.net_gold = max(0, cur.net_gold - taken.net_gold)
+        if cur.is_empty:
+            del self._pending_reputation[master_player_id]
+
+    def forget_pending(self, master_player_id: int) -> None:
+        """取到全 0：别的节点已回过账，或镜像过时；作废这条提示，下一次刷新以台账为准。"""
+        self._pending_reputation.pop(master_player_id, None)
+
+    async def refresh(self, scene) -> None:
+        """整表读回按区目录与台账覆盖本节点镜像（同 C++ RequestProxyDirectoryRefresh），再给本节点在线且镜像里
+        可能有待回账的宗师投回账任务。Redis 故障只告警，保留镜像。"""
+        if self._redis is None:
+            return
+        try:
+            stalls_raw = await self._redis.hgetall(self._stall_key)
+            ledger_raw = await self._redis.hgetall(self._ledger_key)
+        except Exception as exc:
+            if not _redis_failure(exc):
+                raise
+            logger.warning("Craft proxy directory refresh failed; keeping cached stalls and counters error=%s", exc)
+            return
+        self._stalls = self._parse_stalls(stalls_raw)
+        self._pending_reputation, self._hot_counters = _parse_reputation_ledger(ledger_raw)
+        for master_id in tuple(self._pending_reputation):
+            if _find_online_player_in_scene(scene, master_id) is not None:
+                _schedule_proxy_reputation_drain(scene, master_id)
+
+    async def refresh_loop(self, scene) -> None:
+        """每 5 秒刷新一次本节点镜像（同 C++ StartProxyStallDirectory 的定时器），启动时先刷一次。"""
+        logger.info(
+            "Craft proxy directory refresh started interval_sec=%s", PROXY_DIRECTORY_REFRESH_INTERVAL_SEC,
+        )
+        while True:
+            await self.refresh(scene)
+            await asyncio.sleep(PROXY_DIRECTORY_REFRESH_INTERVAL_SEC)
+
+    def _parse_stalls(self, raw: dict) -> dict[int, object]:
+        stalls: dict[int, object] = {}
+        for value in raw.values():
+            try:
+                info = self.protocol.parse("CraftProxyStallInfo", value)
+            except (DecodeError, TypeError):
+                continue
+            if self.is_valid_stall(info):
+                info.viewer_gets_free_proxy = False
+                stalls[int(info.master_player_id)] = info
+        return stalls
+
+    async def _add_to_ledger(
+        self, action: str, master_player_id: int, increments: dict[str, int], buyer_name: str,
+    ) -> None:
+        if self._redis is None:
+            return
+        pipe = self._redis.pipeline(transaction=False)
+        for suffix, delta in increments.items():
+            if 0 < delta <= _MAX_INT64:
+                pipe.hincrby(self._ledger_key, f"{master_player_id}{suffix}", delta)
+        if buyer_name:
+            pipe.hset(self._ledger_key, f"{master_player_id}:b", buyer_name.encode())
+        await self._guarded_write(action, master_player_id, pipe.execute())
+
+    @staticmethod
+    async def _guarded_write(action: str, master_player_id: int, command) -> None:
+        # 写失败只告警（同 C++）：这些是展示用计数，不能让已提交的订单或已落盘的开摊失败。
+        try:
+            await command
+        except Exception as exc:
+            if not _redis_failure(exc):
+                raise
+            logger.warning(
+                "Craft proxy %s failed on scene control Redis master_id=%s error=%s", action, master_player_id, exc,
+            )
 
     def list_stalls(self, *, scene=None, viewer_player_id: int = 0) -> list:
         merged: dict[int, object] = {}
@@ -577,7 +771,7 @@ class CraftProxyStallDirectory:
 
 
 def get_proxy_stall_directory(scene) -> CraftProxyStallDirectory:
-    """获取或按需初始化挂在 scene 上的共享名匠代打摊位目录。"""
+    """取挂在 scene 上的共享摊位目录：运行时按控制 Redis 装好；单测与直接建的场景按需建本节点内存版。"""
     directory = getattr(scene, "craft_proxy_directory", None)
     if directory is None:
         directory = CraftProxyStallDirectory(scene.protocol)
@@ -586,16 +780,19 @@ def get_proxy_stall_directory(scene) -> CraftProxyStallDirectory:
 
 
 def _find_online_player_in_scene(scene, player_id: int):
-    for location in getattr(scene, "locations", {}).values():
-        target = location.players.get(player_id)
+    world = scene.locations.get(player_id)
+    return None if world is None else world.players.get(player_id)
+
+
+def _schedule_proxy_reputation_drain(scene, master_player_id: int) -> None:
+    """向宗师自己的串行任务投一次回账；执行时按 player_id 重新找人，已离开就什么都不做，数额留在台账。"""
+
+    async def drain_master() -> None:
+        target = _find_online_player_in_scene(scene, master_player_id)
         if target is not None:
-            return target
-    return None
+            await drain_pending_proxy_reputation(scene, target)
 
-
-def _get_player_lock(scene, player_id: int):
-    getter = getattr(scene, "player_lock", None) or getattr(scene, "_lock", None)
-    return None if getter is None else getter(int(player_id))
+    scene.schedule_player_task(master_player_id, drain_master)
 
 
 async def record_proxy_order_reputation(
@@ -606,97 +803,65 @@ async def record_proxy_order_reputation(
     net_gold_earned: int = 0,
     buyer_name: str = "",
 ) -> None:
-    """统一记录名匠代打/代制订单口碑与 24h 热榜计数（严禁无锁跨玩家写盘，宗师忙碌时异步投递回宗师 Actor）。"""
+    """买家的任务里记一笔名匠代打/代制口碑与热榜：只写按区台账，不碰宗师存档、不拿宗师的锁（防 A↔B 互购死锁
+    与跨玩家写）；宗师在本节点在线时，投他自己的串行任务去取走入账。"""
     if not master_player_id:
         return
-    directory = get_proxy_stall_directory(scene)
-    master_lock = _get_player_lock(scene, master_player_id)
-    # 若宗师当前正在执行自身 Actor 回合（锁已占用），严禁嵌套等锁（防 A↔B 互购死锁）或无锁脏写：
-    # 先记录待回账台账，再向宗师独立串行队列异步投递回账任务。
-    if master_lock is not None and master_lock.locked():
-        directory.record_pending_reputation(
-            master_player_id, supreme_delta, rare_delta, net_gold_earned, buyer_name,
-            already_applied_live=False,
-        )
-        scheduler = getattr(scene, "schedule_player_task", None)
-        if scheduler is not None:
-            async def _drain_master() -> None:
-                target = _find_online_player_in_scene(scene, master_player_id)
-                if target is not None and scene.mutable(target):
-                    await drain_pending_proxy_reputation(scene, target)
-
-            scheduler(master_player_id, _drain_master)
-        return
-
-    async def _commit_live() -> bool:
-        master_player = _find_online_player_in_scene(scene, master_player_id)
-        if master_player is None or not scene.mutable(master_player):
-            return False
-        master_data = scene.rows.assemble(master_player.snapshot)
-        staged = clone(master_data)
-        apply_reputation_to_craft(
-            staged.craft_component, 1, supreme_delta, rare_delta, net_gold_earned, buyer_name,
-        )
-        try:
-            await scene.commit_player_data(master_player, staged)
-            directory.sync_player(master_player_id, staged)
-            directory.record_pending_reputation(
-                master_player_id, supreme_delta, rare_delta, net_gold_earned, buyer_name,
-                already_applied_live=True,
-            )
-            return True
-        except (StoreRejected, StoreUnavailable, OSError):
-            logger.warning(
-                "Failed to commit live proxy reputation, buffering pending delta master_id=%s",
-                master_player_id,
-            )
-            return False
-
-    if master_lock is not None:
-        async with master_lock:
-            if await _commit_live():
-                return
-    elif await _commit_live():
-        return
-    directory.record_pending_reputation(
+    await get_proxy_stall_directory(scene).record_order(
         master_player_id, supreme_delta, rare_delta, net_gold_earned, buyer_name,
-        already_applied_live=False,
     )
+    if _find_online_player_in_scene(scene, master_player_id) is not None:
+        _schedule_proxy_reputation_drain(scene, master_player_id)
 
 
 async def drain_pending_proxy_reputation(scene, player) -> bool:
-    """将离线/跨线期间累积的代打口碑与未读战报原子落盘到宗师存档（先落盘再核销）。"""
+    """在宗师自己的串行任务内回账（同 C++ DrainPendingProxyReputation + ApplyTakenProxyReputation）：先从台账原子
+    取走，再记进存档落盘；确定没写进去就原样还回，取走结果未知只告警、什么都不记。回 True = 已入账并落盘。"""
     if player is None or not player.player_id or not scene.mutable(player):
         return False
     directory = getattr(scene, "craft_proxy_directory", None)
-    if directory is None:
+    master_id = player.player_id
+    # 有待确认的存档时这次提交必被拒：先不取，等它落定后的下一次回账。
+    if directory is None or player.pending_save is not None or not directory.has_pending(master_id):
         return False
-    delta = directory.peek_pending_reputation(player.player_id)
-    if delta is None:
+    taken = await directory.take_pending(master_id)
+    if taken is None:
         return False
-    data = scene.rows.assemble(player.snapshot)
-    staged = clone(data)
-    apply_reputation_to_craft(
-        staged.craft_component,
-        delta.orders,
-        delta.supreme,
-        delta.rare,
-        delta.net_gold,
-        delta.last_buyer,
-    )
-    try:
-        await scene.commit_player_data(player, staged)
-    except (StoreRejected, StoreUnavailable, OSError):
-        logger.warning(
-            "Failed to persist drained proxy reputation, retaining pending delta master_id=%s orders=%s",
-            player.player_id, delta.orders,
+    if taken.is_empty:
+        directory.forget_pending(master_id)
+        return False
+    if not scene.mutable(player) or player.pending_save is not None:
+        await directory.give_back(master_id, taken)
+        logger.info(
+            "Master is no longer writable here; taken reputation given back master_id=%s orders=%s",
+            master_id, taken.orders,
         )
         return False
-    directory.consume_pending_reputation(player.player_id, delta)
-    directory.sync_player(player.player_id, staged)
+    staged = clone(scene.rows.assemble(player.snapshot))
+    apply_reputation_to_craft(
+        staged.craft_component, taken.orders, taken.supreme, taken.rare, taken.net_gold, taken.last_buyer,
+    )
+    rejected = False
+    try:
+        await scene.commit_player_data(player, staged)
+    except Exception as exc:
+        # 待存盘行没留下 = 确定没写进去；留下了 = 结果未知，场景会在下次落盘时重试这批行。
+        rejected = player.pending_save is None
+        logger.warning(
+            "Failed to persist drained proxy reputation master_id=%s orders=%s given_back=%s error=%r",
+            master_id, taken.orders, rejected, exc,
+        )
+        if rejected:
+            await directory.give_back(master_id, taken)
+        return False
+    finally:
+        if not rejected:
+            # 已落盘，或这批已在待确认存档里等重试（含任务被取消）：镜像扣掉、绝不还回，否则重试成功后会记两次。
+            directory.settle_taken(master_id, taken)
+    await directory.sync_player(master_id, staged)
     logger.info(
         "Drained offline proxy reputation master_id=%s orders=%s supreme=%s rare=%s net_gold=%s",
-        player.player_id, delta.orders, delta.supreme, delta.rare, delta.net_gold,
+        master_id, taken.orders, taken.supreme, taken.rare, taken.net_gold,
     )
     return True
 
@@ -1162,8 +1327,7 @@ class SceneSkillCraft:
         if proxy_master_id != 0:
             if proxy_master_id == player.player_id:
                 return self._finish(response, data, EQUIP_PROXY_MASTER_UNAVAILABLE)
-            directory = get_proxy_stall_directory(self.scene)
-            stall = directory.find(proxy_master_id)
+            stall = get_proxy_stall_directory(self.scene).find(proxy_master_id, scene=self.scene)
             if (
                 stall is None
                 or stall.scroll_mastery_tier < MASTERY_MASTER
@@ -1705,7 +1869,7 @@ class SceneSkillCraft:
                 await self.scene.commit_player_data(player, staged)
             except (StoreRejected, StoreUnavailable, OSError):
                 return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
-            get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
+            await get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
             return self._finish(response, staged)
 
         if not forge_master and not scroll_master:
@@ -1732,7 +1896,7 @@ class SceneSkillCraft:
             await self.scene.commit_player_data(player, staged)
         except (StoreRejected, StoreUnavailable, OSError):
             return self._finish(response, self.scene.rows.assemble(player.snapshot), UNAVAILABLE)
-        get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
+        await get_proxy_stall_directory(self.scene).sync_player(player.player_id, staged)
         return self._finish(response, staged)
 
     def list_proxy_stalls(self, _world, player, _route, _request):

@@ -1,7 +1,8 @@
 """In-memory Redis for login tests: commands plus Python twins of the login Lua scripts.
 
 fakeredis/lupa are not installed, so each script is emulated by identity; the twins follow the Go Lua
-line by line. Real-Redis byte compatibility is not exercised here.
+line by line. Real-Redis byte compatibility is not exercised here. Other suites (e.g. the scene craft
+proxy ledger) reuse the generic commands and register their own script twins in ``scripts``.
 """
 
 import json
@@ -197,6 +198,34 @@ class FakeRedis:
 
     async def hmget(self, key, *fields):
         return [self._hget(key, field) for field in fields]
+
+    async def hset(self, key, field, value):
+        if "hset" in self.fail:
+            raise ConnectionError("redis down")
+        record = self._hash(key)
+        added = _b(field) not in record
+        record[_b(field)] = _b(value)
+        return int(added)
+
+    async def hdel(self, key, *fields):
+        key = self._alive(key)
+        if key is None:
+            return 0
+        return sum(self.data[key].pop(_b(field), None) is not None for field in fields)
+
+    async def hgetall(self, key):
+        if "hgetall" in self.fail:
+            raise ConnectionError("redis down")
+        key = self._alive(key)
+        return {} if key is None else dict(self.data[key])
+
+    async def hincrby(self, key, field, amount=1):
+        if "hincrby" in self.fail:
+            raise ConnectionError("redis down")
+        record = self._hash(key)
+        value = int(record.get(_b(field), b"0")) + int(amount)
+        record[_b(field)] = str(value).encode()
+        return value
 
     def pipeline(self, transaction=True):
         return Pipeline(self)

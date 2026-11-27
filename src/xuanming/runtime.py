@@ -46,7 +46,7 @@ from .nodes.scene_planned_drain import budget_from_env, planned_drain
 from .nodes.scene_rename import SceneRename
 from .nodes.scene_rewarded_ad import SceneRewardedAd
 from .nodes.scene_season import SceneSeason
-from .nodes.scene_skill_craft import SceneSkillCraft
+from .nodes.scene_skill_craft import CraftProxyStallDirectory, SceneSkillCraft
 from .nodes.scene_skills import SceneSkills, initialize_skill_list
 from .nodes.scene_spirit_shop import SceneSpiritShop
 from .nodes.scene_travel_pass import SceneTravelPass
@@ -737,6 +737,17 @@ class Runtime:
         scene.season.register()
         scene.trial_journal = SceneTrialJournal(scene, tables, scene.assets)
         scene.trial_journal.register()
+        # 名匠代打摊位目录与口碑台账按区放控制 Redis（与 C++ 同键同字段）；没配时只能留在本节点内存。
+        scene.craft_proxy_directory = CraftProxyStallDirectory(
+            self.protocol, control_redis=control_redis, zone_id=info.zone_id,
+        )
+        if control_redis is not None:
+            self._spawn(scene.craft_proxy_directory.refresh_loop(scene), "craft-proxy-directory")
+        elif not self.local:
+            logger.warning(
+                "Scene control Redis is not configured; craft proxy stalls and reputation stay node-local zone_id=%s",
+                info.zone_id,
+            )
         scene.equip_craft = SceneEquipCraft(scene, tables, scene.assets)
         scene.equip_craft.register()
         if not self.local and data_service is not None:
