@@ -426,6 +426,94 @@ def test_battle_v5_pre_battle_3_ban_captain_tiebreak_and_7028_enforcement():
     assert validate_custom_duel_rules(duel_ok)
 
 
+def test_battle_prep_skill_ban_v2_protect_counter_and_teammate_equipped():
+    protocol = Protocol()
+    tables = ConfigTables()
+    bt = BattleTables(protocol, tables)
+    clock = _FakeClock(70_000)
+    lobby_pushes: list = []
+    outcomes: list = []
+    node = _make_node(protocol, tables, clock, lobby_pushes, outcomes)
+
+    candidates = bt.ban_eligible_skill_ids(active_season_id=1)
+    assert len(candidates) >= 5
+    s1, s2, s3, s4, s5 = candidates[:5]
+
+    p101 = _player(protocol, 101, 0, skills=(10002, s1, s4), is_team_captain=True)
+    p102 = _player(protocol, 102, 0, skills=(10002, s2))
+    p201 = _player(protocol, 201, 1, skills=(10002, s1, s3, s4), is_team_captain=True)
+    req = _create_ranked_request(protocol, 55091, [p101, p102, p201], now_ms=clock(), skill_ban_slots=3)
+    assert not node.create(req).error_message.id
+
+    inbox = {pid: [] for pid in (101, 102, 201)}
+    tks = {pid: _attach_player(node, protocol, 55091, pid, inbox[pid]) for pid in inbox}
+    st101 = node.dispatch(tks[101], 140, protocol.message("GetBattleStateRequest", battle_id=55091))
+    assert st101.prep_state.skill_protect_slots_per_team == 1
+    assert list(st101.prep_state.teammate_equipped_skill_ids) == [s2]
+
+    # 观众视角脱敏
+    obs = node.rooms[55091].engine.build_prep_state_for_viewer(0, 99999)
+    assert obs.skill_protect_slots_per_team == 1
+    assert obs.team_effective_protected_skill_id == 0
+    assert not obs.teammate_equipped_skill_ids
+
+    # 非法护招（豁免技或与本人禁招冲突）必须拒绝
+    assert node.dispatch(
+        tks[101], 504,
+        protocol.message("UpdateBattlePrepRequest", battle_id=55091, update_protected_skill=True, protected_skill_id=10002),
+    ).error_message.id == 1005
+    assert not node.dispatch(
+        tks[101], 504,
+        protocol.message("UpdateBattlePrepRequest", battle_id=55091, update_banned_skills=True, banned_skill_ids=[s1, s3]),
+    ).error_message.id
+    assert node.dispatch(
+        tks[101], 504,
+        protocol.message("UpdateBattlePrepRequest", battle_id=55091, update_protected_skill=True, protected_skill_id=s1),
+    ).error_message.id == 1005
+
+    # 101 队长保 s4，102 非队长保 s2 -> 1:1 队长胜出为 s4
+    assert not node.dispatch(
+        tks[101], 504,
+        protocol.message("UpdateBattlePrepRequest", battle_id=55091, update_protected_skill=True, protected_skill_id=s4, ready=True),
+    ).error_message.id
+    r102 = node.dispatch(
+        tks[102], 504,
+        protocol.message("UpdateBattlePrepRequest", battle_id=55091, update_protected_skill=True, protected_skill_id=s2, ready=True),
+    )
+    assert not r102.error_message.id
+    assert r102.prep_state.team_effective_protected_skill_id == s4
+
+    # B 队禁 [s3, s4]（撞车 s3 + 禁了 A 队护招 s4）、护招 s1（反制 A 队禁招 s1）
+    assert not node.dispatch(
+        tks[201], 504,
+        protocol.message(
+            "UpdateBattlePrepRequest", battle_id=55091,
+            update_banned_skills=True, banned_skill_ids=[s3, s4],
+            update_protected_skill=True, protected_skill_id=s1,
+            ready=True,
+        ),
+    ).error_message.id
+
+    live = node.dispatch(tks[101], 140, protocol.message("GetBattleStateRequest", battle_id=55091))
+    assert live.team_a_protected_skill_id == s4
+    assert live.team_b_protected_skill_id == s1
+    assert list(live.countered_ban_skill_ids) == sorted([s1, s4])
+    assert list(live.banned_skill_ids) == [s3]
+
+    # 被破禁化解的 s1 可正常施放；未被化解的双边撞车 s3 仍返回 7028
+    cast_s1 = protocol.message("SubmitBattleActionRequest", battle_id=55091)
+    cast_s1.action.action_type = 2
+    cast_s1.action.skill_table_id = s1
+    cast_s1.action.target_id = 201
+    assert not node.dispatch(tks[101], 149, cast_s1).error_message.id
+
+    cast_s3 = protocol.message("SubmitBattleActionRequest", battle_id=55091)
+    cast_s3.action.action_type = 2
+    cast_s3.action.skill_table_id = s3
+    cast_s3.action.target_id = 101
+    assert node.dispatch(tks[201], 149, cast_s3).error_message.id == ERR_SKILL_BANNED_IN_BATTLE
+
+
 # ===========================================================================
 # 2. Battle V5: 532/533 队内战术标点（同队推送、阵营校验、每回合限 2 次、回放裁剪）
 # ===========================================================================

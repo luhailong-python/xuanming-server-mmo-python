@@ -279,6 +279,9 @@ def evaluate_seal_condition(
     self_triggered_anti_control_or_season_skill: bool = False,
     heal_interrupt_backlash_count: int = 0,
     all_self_cleaves_parried: bool = False,
+    self_cast_season_skill: bool = False,
+    self_triggered_season_resonance: bool = False,
+    self_season_resonance_mask: int = 0,
 ) -> bool:
     """按 C++ trial_journal_rules.h 口径判定单条战法印是否达成。"""
     if total_rounds <= 0:
@@ -319,6 +322,14 @@ def evaluate_seal_condition(
         ) and (boss_guard_heal_total == 0 or heal_interrupt_backlash_count > 0)
     if condition_type == 14:  # kPerfectCleaveParry
         return won and all_self_cleaves_parried
+    if condition_type == 15:  # kSeasonSkillCast
+        return (won or participated) and self_cast_season_skill
+    if condition_type == 16:  # kSeasonResonance
+        if not (won or participated):
+            return False
+        if condition_param == 0:
+            return self_triggered_season_resonance or self_season_resonance_mask != 0
+        return (int(self_season_resonance_mask) & int(condition_param)) != 0
     return False
 
 
@@ -790,6 +801,9 @@ class SceneTrialJournal:
         self_triggered_anti_control_or_season_skill: bool = False,
         heal_interrupt_backlash_count: int = 0,
         all_self_cleaves_parried: bool = False,
+        self_cast_season_skill: bool = False,
+        self_triggered_season_resonance: bool = False,
+        self_season_resonance_mask: int = 0,
         used_pet_table_id: int = 0,
         used_artifact_effect_ids: tuple[int, ...] = (),
         used_season_seal_id: int = 0,
@@ -844,6 +858,9 @@ class SceneTrialJournal:
             self_triggered_anti_control_or_season_skill = bool(facts.self_triggered_anti_control_or_season_skill)
             heal_interrupt_backlash_count = int(getattr(facts, "heal_interrupt_backlash_count", 0))
             all_self_cleaves_parried = bool(getattr(facts, "all_self_cleaves_parried", False))
+            self_cast_season_skill = bool(getattr(facts, "self_cast_season_skill", False))
+            self_triggered_season_resonance = bool(getattr(facts, "self_triggered_season_resonance", False))
+            self_season_resonance_mask = int(getattr(facts, "self_season_resonance_mask", 0))
             used_pet_table_id = facts.used_pet_table_id
             used_artifact_effect_ids = tuple(facts.used_artifact_effect_ids)
             used_season_seal_id = facts.used_season_seal_id
@@ -887,6 +904,9 @@ class SceneTrialJournal:
                     self_triggered_anti_control_or_season_skill=self_triggered_anti_control_or_season_skill,
                     heal_interrupt_backlash_count=heal_interrupt_backlash_count,
                     all_self_cleaves_parried=all_self_cleaves_parried,
+                    self_cast_season_skill=self_cast_season_skill,
+                    self_triggered_season_resonance=self_triggered_season_resonance,
+                    self_season_resonance_mask=self_season_resonance_mask,
                 )
             )
             if matched and self._mark_seal_lit(comp, seal.id, entry.season_id):

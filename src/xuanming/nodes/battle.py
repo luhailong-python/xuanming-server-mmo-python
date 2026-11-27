@@ -53,7 +53,9 @@ from .battle_dropin_effects import (
     MAX_BATTLE_PINGS_PER_ROUND,
     MIN_WIN_STREAK_HIGHLIGHT,
     POLARITY_DEFAULT_MAX_ROUNDS,
+    PREP_PROTECT_HASH_SALT,
     PREP_SKILL_BAN_SLOTS_PER_TEAM,
+    PREP_SKILL_PROTECT_SLOTS_PER_TEAM,
     PVP_ESCALATION_DAMAGE_STEP_PCT,
     PVP_ESCALATION_LEAD_ROUNDS,
     PVP_ESCALATION_MIN_MAX_ROUNDS,
@@ -209,6 +211,7 @@ class _PrepPlayerOptions:
     available_seals: list[Message] = field(default_factory=list)
     available_pets: list[Message] = field(default_factory=list)
     nominated_ban_skill_ids: list[int] = field(default_factory=list)
+    nominated_protect_skill_id: int = 0
 
 
 def _uuid(value: str) -> bool:
@@ -392,10 +395,14 @@ class TurnEngine:
         self.ai_controlled_players: set[int] = set()
         self.prep_active: bool = False
         self.prep_skill_ban_slots_per_team: int = 0
+        self.prep_skill_protect_slots_per_team: int = 0
         self.ban_candidate_skill_ids: list[int] = []
         self.ban_candidate_skill_set: set[int] = set()
         self.team_a_banned_skill_ids: list[int] = []
         self.team_b_banned_skill_ids: list[int] = []
+        self.team_a_protected_skill_id: int = 0
+        self.team_b_protected_skill_id: int = 0
+        self.countered_ban_skill_ids: list[int] = []
         self.banned_skill_ids: list[int] = []
         self.banned_skill_set: set[int] = set()
         self.validated_pets_by_player: dict[int, list[Message]] = {}
@@ -644,10 +651,14 @@ class TurnEngine:
         """初始化论剑 V3~V5 战前明牌变阵与 3-Ban 禁招配置（对照 C++ `InitTacticalPrep`）。"""
         self.prep_active = False
         self.prep_skill_ban_slots_per_team = 0
+        self.prep_skill_protect_slots_per_team = 0
         self.ban_candidate_skill_ids.clear()
         self.ban_candidate_skill_set.clear()
         self.team_a_banned_skill_ids.clear()
         self.team_b_banned_skill_ids.clear()
+        self.team_a_protected_skill_id = 0
+        self.team_b_protected_skill_id = 0
+        self.countered_ban_skill_ids.clear()
         self.banned_skill_ids.clear()
         self.banned_skill_set.clear()
         self.prep_options_by_player.clear()
@@ -693,6 +704,7 @@ class TurnEngine:
             self.ban_candidate_skill_ids.sort()
             if self.ban_candidate_skill_ids:
                 self.prep_skill_ban_slots_per_team = requested_ban_slots
+                self.prep_skill_protect_slots_per_team = PREP_SKILL_PROTECT_SLOTS_PER_TEAM
 
         all_battle_pet_ids = {
             actor.pet_id
@@ -772,6 +784,7 @@ class TurnEngine:
             self.prep_active = True
         else:
             self.prep_skill_ban_slots_per_team = 0
+            self.prep_skill_protect_slots_per_team = 0
             self.ban_candidate_skill_ids.clear()
             self.ban_candidate_skill_set.clear()
             self.prep_options_by_player.clear()
@@ -809,6 +822,36 @@ class TurnEngine:
         )
         return [sid for sid, _ in ordered[: self.prep_skill_ban_slots_per_team]]
 
+    def aggregate_team_protect(self, team_index: int) -> int:
+        """按队内得票 → 队长优先 → SplitMix64(seed^SALT^sid) → sid 确定性聚合本队护招。"""
+        if self.prep_skill_protect_slots_per_team == 0:
+            return 0
+        tally: dict[int, list[int | bool]] = {}
+        for opt in self.prep_options_by_player.values():
+            if opt.ai_controlled or opt.team_index != team_index or opt.nominated_protect_skill_id == 0:
+                continue
+            sid = opt.nominated_protect_skill_id
+            entry = tally.get(sid)
+            if entry is None:
+                tally[sid] = [1, opt.is_team_captain]
+            else:
+                entry[0] = int(entry[0]) + 1
+                if opt.is_team_captain:
+                    entry[1] = True
+        if not tally:
+            return 0
+        seed = int(self.create_request.seed)
+        ordered = sorted(
+            tally.items(),
+            key=lambda item: (
+                -int(item[1][0]),
+                not bool(item[1][1]),
+                mix_seed_u64(seed ^ PREP_PROTECT_HASH_SALT ^ item[0]),
+                item[0],
+            ),
+        )
+        return ordered[0][0]
+
     def all_prep_players_ready(self) -> bool:
         """判定全部非 AI 参战者是否已完成变阵锁定。"""
         if not self.prep_active:
@@ -825,8 +868,10 @@ class TurnEngine:
         deadline_ms: int = 0,
         update_banned_skills: bool = False,
         banned_skill_ids: Iterable[int] = (),
+        update_protected_skill: bool = False,
+        protected_skill_id: int = 0,
     ) -> tuple[int, Message | None]:
-        """处理单个参战者的战前变阵与 3-Ban 提名提交，返回 `(tip_error, viewer_prep_state)`。"""
+        """处理单个参战者的战前变阵与 3-Ban + 1-Protect 提名提交，返回 `(tip_error, viewer_prep_state)`。"""
         if self.outcome != 0 or not self.prep_active:
             return _FEATURE, None
         opt = self.prep_options_by_player.get(player_id)
@@ -834,11 +879,13 @@ class TurnEngine:
             return _INVALID, None
 
         ban_list = [int(sid) for sid in banned_skill_ids]
+        protect_id = int(protected_skill_id)
         if opt.ready:
             seal_changed = selected_seal_id != 0 and selected_seal_id != opt.selected_seal_id
             pet_changed = selected_pet_id != 0 and selected_pet_id != opt.selected_pet_id
             ban_changed = update_banned_skills and ban_list != opt.nominated_ban_skill_ids
-            if seal_changed or pet_changed or ban_changed:
+            protect_changed = update_protected_skill and protect_id != opt.nominated_protect_skill_id
+            if seal_changed or pet_changed or ban_changed or protect_changed:
                 return _FEATURE, None
             return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
 
@@ -858,6 +905,16 @@ class TurnEngine:
                     if sid not in self.ban_candidate_skill_set or sid in seen_bans:
                         return _INVALID, None
                     seen_bans.add(sid)
+        if update_protected_skill:
+            if self.prep_skill_protect_slots_per_team == 0:
+                if protect_id != 0:
+                    return _FEATURE, None
+            elif protect_id != 0 and protect_id not in self.ban_candidate_skill_set:
+                return _INVALID, None
+        resulting_bans = ban_list if update_banned_skills else opt.nominated_ban_skill_ids
+        resulting_protect = protect_id if update_protected_skill else opt.nominated_protect_skill_id
+        if resulting_protect != 0 and resulting_protect in resulting_bans:
+            return _INVALID, None
 
         if selected_seal_id != 0:
             opt.selected_seal_id = selected_seal_id
@@ -865,20 +922,42 @@ class TurnEngine:
             opt.selected_pet_id = selected_pet_id
         if update_banned_skills:
             opt.nominated_ban_skill_ids = ban_list
+        if update_protected_skill:
+            opt.nominated_protect_skill_id = protect_id
         if ready:
             opt.ready = True
         return 0, self.build_prep_state_for_viewer(player_id, deadline_ms)
 
     def finalize_prep_phase(self) -> bool:
-        """锁定战前变阵与双方 3-Ban：应用赛季印、首发宠，重建中局唤灵池并初始化全部开场光环/被动。"""
+        """锁定战前变阵与双方 3-Ban + 1-Protect：应用赛季印、首发宠，重建中局唤灵池并初始化全部开场光环/被动。"""
         if not self.prep_active:
             return False
 
         if self.prep_skill_ban_slots_per_team > 0:
             self.team_a_banned_skill_ids = self.aggregate_team_bans(0)
             self.team_b_banned_skill_ids = self.aggregate_team_bans(1)
-            self.banned_skill_set = set(self.team_a_banned_skill_ids) | set(self.team_b_banned_skill_ids)
-            self.banned_skill_ids = sorted(self.banned_skill_set)
+            self.team_a_protected_skill_id = (
+                self.aggregate_team_protect(0) if self.prep_skill_protect_slots_per_team > 0 else 0
+            )
+            self.team_b_protected_skill_id = (
+                self.aggregate_team_protect(1) if self.prep_skill_protect_slots_per_team > 0 else 0
+            )
+            banned_set: set[int] = set()
+            countered_set: set[int] = set()
+            for sid in self.team_a_banned_skill_ids:
+                if self.team_b_protected_skill_id and sid == self.team_b_protected_skill_id:
+                    countered_set.add(sid)
+                else:
+                    banned_set.add(sid)
+            for sid in self.team_b_banned_skill_ids:
+                if self.team_a_protected_skill_id and sid == self.team_a_protected_skill_id:
+                    countered_set.add(sid)
+                else:
+                    banned_set.add(sid)
+            countered_set -= banned_set
+            self.banned_skill_set = banned_set
+            self.banned_skill_ids = sorted(banned_set)
+            self.countered_ban_skill_ids = sorted(countered_set)
 
         snap_by_player = {snap.player_id: snap for snap in self.create_request.players}
         for player_id, opt in sorted(self.prep_options_by_player.items()):
@@ -1088,6 +1167,7 @@ class TurnEngine:
         out.deadline_ms = deadline_ms
         out.duration_seconds = self.prep_duration_seconds
         out.skill_ban_slots_per_team = self.prep_skill_ban_slots_per_team
+        out.skill_protect_slots_per_team = self.prep_skill_protect_slots_per_team
         if not viewer_player_id:
             return out
         self_opt = self.prep_options_by_player.get(viewer_player_id)
@@ -1098,6 +1178,7 @@ class TurnEngine:
         for pet in self_opt.available_pets:
             self._populate_pet_option(pet, out.self_available_pets.add())
         out.ban_candidate_skill_ids.extend(self.ban_candidate_skill_ids)
+        teammate_equipped: set[int] = set()
         for member_id, opt in sorted(self.prep_options_by_player.items()):
             if opt.team_index != self_opt.team_index:
                 continue
@@ -1109,12 +1190,40 @@ class TurnEngine:
                 ready=opt.ready,
             )
             ps.nominated_ban_skill_ids.extend(opt.nominated_ban_skill_ids)
+            if opt.nominated_protect_skill_id:
+                ps.nominated_protect_skill_id = opt.nominated_protect_skill_id
             if opt.selected_pet_id != 0:
                 chosen = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
                 if chosen is not None:
                     ps.selected_pet_table_id = chosen.pet_table_id
                     ps.selected_pet_name = chosen.pet_name
+            if member_id != viewer_player_id and self.ban_candidate_skill_set:
+                member_actor = self.actors.get(member_id)
+                if member_actor is not None:
+                    for sid in member_actor.skill_table_ids:
+                        if sid in self.ban_candidate_skill_set:
+                            teammate_equipped.add(int(sid))
+                pet_handled = False
+                if opt.selected_pet_id != 0:
+                    chosen_pet = next((p for p in opt.available_pets if p.pet_id == opt.selected_pet_id), None)
+                    if chosen_pet is not None:
+                        for sid in chosen_pet.skill_table_ids:
+                            if sid in self.ban_candidate_skill_set:
+                                teammate_equipped.add(int(sid))
+                        pet_handled = True
+                if not pet_handled:
+                    for actor in self.actors.values():
+                        if actor.actor_type == _PET and actor.owner_player_id == member_id:
+                            for sid in actor.skill_table_ids:
+                                if sid in self.ban_candidate_skill_set:
+                                    teammate_equipped.add(int(sid))
         out.team_effective_ban_skill_ids.extend(self.aggregate_team_bans(self_opt.team_index))
+        if self.prep_skill_protect_slots_per_team > 0:
+            effective_protect = self.aggregate_team_protect(self_opt.team_index)
+            if effective_protect:
+                out.team_effective_protected_skill_id = effective_protect
+        if teammate_equipped:
+            out.teammate_equipped_skill_ids.extend(sorted(teammate_equipped))
         if self.ranked_context is not None:
             for enc in getattr(self.ranked_context, "rivalry_encounters", ()):
                 if enc.player_id != viewer_player_id or not enc.opponent_id:
@@ -1640,6 +1749,12 @@ class TurnEngine:
             state.team_a_banned_skill_ids.extend(self.team_a_banned_skill_ids)
         if self.team_b_banned_skill_ids:
             state.team_b_banned_skill_ids.extend(self.team_b_banned_skill_ids)
+        if self.team_a_protected_skill_id:
+            state.team_a_protected_skill_id = self.team_a_protected_skill_id
+        if self.team_b_protected_skill_id:
+            state.team_b_protected_skill_id = self.team_b_protected_skill_id
+        if self.countered_ban_skill_ids:
+            state.countered_ban_skill_ids.extend(self.countered_ban_skill_ids)
         if self.summon_pet_unlock_round:
             state.summon_pet_unlock_round = self.summon_pet_unlock_round
         if unredacted:
@@ -1647,6 +1762,7 @@ class TurnEngine:
                 state.prep_state.active = True
                 state.prep_state.duration_seconds = self.prep_duration_seconds
                 state.prep_state.skill_ban_slots_per_team = self.prep_skill_ban_slots_per_team
+                state.prep_state.skill_protect_slots_per_team = self.prep_skill_protect_slots_per_team
                 if prep_deadline_ms:
                     state.prep_state.deadline_ms = prep_deadline_ms
         else:
@@ -3101,6 +3217,8 @@ class BattleNode:
                 deadline_ms=room.prep_deadline_ms,
                 update_banned_skills=bool(getattr(request, "update_banned_skills", False)),
                 banned_skill_ids=getattr(request, "banned_skill_ids", ()),
+                update_protected_skill=bool(getattr(request, "update_protected_skill", False)),
+                protected_skill_id=int(getattr(request, "protected_skill_id", 0)),
             )
             if err:
                 return self._error(response, err)

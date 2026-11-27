@@ -481,6 +481,8 @@ class GatherPipeline:
                 int(formation.config_id),
                 vow_mask=trial_vow_mask,
                 has_activity_context=has_activity,
+                ranked_season_id=int(ranked_ctx.season_id) if ranked_ctx is not None else 0,
+                now_ms=created_at_ms,
             )
         trial_entry_id = int(trial_ctx.journal_entry_id) if trial_ctx is not None else 0
         create_req = self.protocol.message(

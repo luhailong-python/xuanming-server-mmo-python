@@ -68,6 +68,8 @@ TACTICAL_PREP_DURATION_SECONDS = 15
 TACTICAL_PREP_WITH_BAN_TIMEOUT_MS = 25_000
 TACTICAL_PREP_WITH_BAN_DURATION_SECONDS = 25
 PREP_SKILL_BAN_SLOTS_PER_TEAM = 3
+PREP_SKILL_PROTECT_SLOTS_PER_TEAM = 1
+PREP_PROTECT_HASH_SALT = 0x50524F54454354
 MAX_BATTLE_PINGS_PER_ROUND = 2
 PVP_SUMMON_PET_UNLOCK_ROUND = 2
 MIN_WIN_STREAK_HIGHLIGHT = 3
@@ -523,6 +525,8 @@ class SealConditionType(IntEnum):
     ANTI_CONTROL_OR_SEASON_SKILL = 12
     DUAL_GUARD_BREAK = 13
     PERFECT_CLEAVE_PARRY = 14
+    SEASON_SKILL_CAST = 15
+    SEASON_RESONANCE = 16
 
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1400,10 @@ class EquipmentBattleEffects:
             value=value,
             success=True,
         )
+        if resonance_effect_id > SeasonBattleRules.RESONANCE_EVENT_BASE:
+            self.engine.trial_tracker.record_season_resonance(
+                actor, resonance_effect_id - SeasonBattleRules.RESONANCE_EVENT_BASE
+            )
 
     def set_actor_bonus(
         self,
@@ -2745,6 +2753,15 @@ def evaluate_seal_condition(condition_type: int, condition_param: int, settlemen
         )
     if cond == SealConditionType.PERFECT_CLEAVE_PARRY:
         return won and facts.all_self_cleaves_parried
+    if cond == SealConditionType.SEASON_SKILL_CAST:
+        return (won or settlement.participated) and bool(getattr(facts, "self_cast_season_skill", False))
+    if cond == SealConditionType.SEASON_RESONANCE:
+        if not (won or settlement.participated):
+            return False
+        mask = int(getattr(facts, "self_season_resonance_mask", 0))
+        if condition_param == 0:
+            return bool(getattr(facts, "self_triggered_season_resonance", False)) or mask != 0
+        return (mask & int(condition_param)) != 0
     return False
 
 
@@ -2764,6 +2781,8 @@ class TrialFactTracker:
         self.min_hp_bps: dict[int, int] = {}
         self.shield_break_players: set[int] = set()
         self.anti_control_or_season_skill_players: set[int] = set()
+        self.cast_season_skill_players: set[int] = set()
+        self.season_resonance_mask_by_player: dict[int, int] = {}
         self.manual_action_rounds: dict[int, set[int]] = {}
         self.effective_contribution_players: set[int] = set()
 
@@ -2945,6 +2964,20 @@ class TrialFactTracker:
             self.anti_control_or_season_skill_players.add(actor.actor_id)
             self.effective_contribution_players.add(actor.actor_id)
 
+    def record_season_skill_cast(self, actor: Message) -> None:
+        """记录玩家主动施放了当季免费赛季技能（同时计入 anti_control_or_season_skill）。"""
+        if actor.actor_type == _ACTOR_PLAYER:
+            self.cast_season_skill_players.add(actor.actor_id)
+            self.anti_control_or_season_skill_players.add(actor.actor_id)
+            self.effective_contribution_players.add(actor.actor_id)
+
+    def record_season_resonance(self, actor: Message, resonance_kind: int) -> None:
+        """记录玩家触发技印共鸣 R1..R8（bit = resonance_kind - 1）。"""
+        if actor.actor_type == _ACTOR_PLAYER and 1 <= resonance_kind <= 31:
+            mask = self.season_resonance_mask_by_player.get(actor.actor_id, 0) | (1 << (resonance_kind - 1))
+            self.season_resonance_mask_by_player[actor.actor_id] = mask
+            self.effective_contribution_players.add(actor.actor_id)
+
     def record_death(self, target: Message) -> None:
         """记录单位阵亡事实（复活不清除）并更新玩家死亡计数与最低血线。"""
         self.ever_died_actors.add(target.actor_id)
@@ -3042,6 +3075,10 @@ class TrialFactTracker:
         self_parried = self.self_cleaves_parried_by_player.get(player_id, 0)
         facts.self_parried_cleave_at_least_once = self_parried > 0
         facts.all_self_cleaves_parried = self_targeted > 0 and self_parried == self_targeted
+        facts.self_cast_season_skill = player_id in self.cast_season_skill_players
+        resonance_mask = self.season_resonance_mask_by_player.get(player_id, 0)
+        facts.self_triggered_season_resonance = resonance_mask != 0
+        facts.self_season_resonance_mask = resonance_mask
 
         settlement.manual_action_rounds = len(self.manual_action_rounds.get(player_id, ()))
         settlement.effective_combat_contribution = player_id in self.effective_contribution_players
@@ -5185,6 +5222,8 @@ class ConfiguredAbilitiesController:
             skill_table_id=skill_id,
             hit_kind=(_HIT_MIRROR if is_mirror else 0),
         )
+        if not is_mirror and actor.actor_type == _ACTOR_PLAYER and rule.season_id != 0:
+            self.engine.trial_tracker.record_season_skill_cast(actor)
         paid_mana = 0
         eq = self.engine.equipment_effects
         if not is_mirror:

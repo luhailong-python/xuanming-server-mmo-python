@@ -21,6 +21,7 @@ from google.protobuf.message import DecodeError, Message
 from ..protocol import Protocol
 from .errors import ERR_MATCH_BATTLE_REPORT_NOT_FOUND, MatchBusinessError, set_tip
 from .model import (
+    MODE_POLARITY_5V5,
     MODE_PVE_SOLO,
     MODE_PVE_TEAM,
     OUTCOME_DECISION_COMPLETE,
@@ -62,8 +63,25 @@ class TrialCatalogEntry:
     boss_trial_kind: int
 
 
-def lookup_trial_catalog_entry(config_id: int, tables=None) -> TrialCatalogEntry | None:
-    """按 Dungeon.id 查对应的 TrialJournalEntry（对齐 Go catalog.buildTrialContexts）。"""
+def _resolve_active_season_id(tables, now_ms: int | None = None) -> int:
+    """按 SeasonRule 无限循环排期解析指定时刻的活跃赛季 ID（缺表或无活跃赛季返回 0）。"""
+    if tables is None or "SeasonRule" not in tables.tables:
+        return 0
+    from ..nodes.scene_season import find_active_season_rule
+
+    stamp = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    rule = find_active_season_rule(tables, stamp)
+    return int(getattr(rule, "id", 0)) if rule is not None else 0
+
+
+def lookup_trial_catalog_entry(
+    config_id: int,
+    tables=None,
+    *,
+    active_season_id: int | None = None,
+    now_ms: int | None = None,
+) -> TrialCatalogEntry | None:
+    """按 Dungeon.id 与活跃赛季查对应的 TrialJournalEntry（对齐 Go catalog.TrialContextForAt）。"""
     source = tables if tables is not None else _default_config_tables()
     if source is None or "Dungeon" not in source.tables or "TrialJournalEntry" not in source.tables:
         return None
@@ -76,6 +94,8 @@ def lookup_trial_catalog_entry(config_id: int, tables=None) -> TrialCatalogEntry
         return None
     source_kind, variant_key = variant
     difficulty = int(getattr(d_row, "difficulty", 0))
+    resolved_season_id: int | None = int(active_season_id) if active_season_id is not None else None
+    seasonal_matches: dict[int, TrialCatalogEntry] = {}
     for entry in source["TrialJournalEntry"].rows():
         if not getattr(entry, "enabled", True):
             continue
@@ -84,11 +104,41 @@ def lookup_trial_catalog_entry(config_id: int, tables=None) -> TrialCatalogEntry
             and int(getattr(entry, "difficulty", 0)) == difficulty
             and str(getattr(entry, "variant_key", "")) == variant_key
         ):
+            entry_season = int(getattr(entry, "season_id", 0))
+            cat = TrialCatalogEntry(
+                journal_entry_id=int(getattr(entry, "id", 0)),
+                trial_rule_version=int(getattr(entry, "rule_version", 1)) or 1,
+                season_id=entry_season,
+                boss_trial_kind=kind,
+            )
+            if entry_season == 0:
+                return cat
+            seasonal_matches.setdefault(entry_season, cat)
+    if not seasonal_matches:
+        return None
+    if resolved_season_id is None:
+        resolved_season_id = _resolve_active_season_id(source, now_ms)
+    if resolved_season_id > 0:
+        return seasonal_matches.get(resolved_season_id)
+    return None
+
+
+def lookup_ranked_trial_catalog_entry(season_id: int, tables=None) -> TrialCatalogEntry | None:
+    """按正式自养竞技赛季 ID 查卷三对应正式竞技条目（source_kind=4）。"""
+    if int(season_id) <= 0:
+        return None
+    source = tables if tables is not None else _default_config_tables()
+    if source is None or "TrialJournalEntry" not in source.tables:
+        return None
+    for entry in source["TrialJournalEntry"].rows():
+        if not getattr(entry, "enabled", True):
+            continue
+        if int(getattr(entry, "source_kind", 0)) == 4 and int(getattr(entry, "season_id", 0)) == int(season_id):
             return TrialCatalogEntry(
                 journal_entry_id=int(getattr(entry, "id", 0)),
                 trial_rule_version=int(getattr(entry, "rule_version", 1)) or 1,
-                season_id=int(getattr(entry, "season_id", 0)),
-                boss_trial_kind=kind,
+                season_id=int(season_id),
+                boss_trial_kind=0,
             )
     return None
 
@@ -112,14 +162,35 @@ def build_trial_battle_context(
     *,
     vow_mask: int = 0,
     has_activity_context: bool = False,
+    ranked_season_id: int = 0,
+    active_season_id: int | None = None,
+    now_ms: int | None = None,
     tables=None,
 ) -> Message | None:
-    """为试炼志 PVE 副本构造 TrialBattleContext（含 challenge_vow_mask）。"""
-    if has_activity_context or mode not in (MODE_PVE_SOLO, MODE_PVE_TEAM):
+    """为试炼志常驻首领、卷三季游（含护卫救援/物法易势/正式天梯）构造 TrialBattleContext。"""
+    if has_activity_context:
         return None
-    entry = lookup_trial_catalog_entry(config_id, tables=tables)
+    if int(ranked_season_id) > 0:
+        entry = lookup_ranked_trial_catalog_entry(int(ranked_season_id), tables=tables)
+        if entry is None or entry.journal_entry_id <= 0:
+            return None
+        return protocol.message(
+            "TrialBattleContext",
+            journal_entry_id=entry.journal_entry_id,
+            trial_rule_version=entry.trial_rule_version,
+            season_id=entry.season_id,
+            challenge_vow_mask=0,
+        )
+    if mode not in (MODE_PVE_SOLO, MODE_PVE_TEAM, MODE_POLARITY_5V5):
+        return None
+    entry = lookup_trial_catalog_entry(
+        config_id,
+        tables=tables,
+        active_season_id=active_season_id,
+        now_ms=now_ms,
+    )
     if entry is None or entry.journal_entry_id <= 0:
-        if vow_mask:
+        if vow_mask and mode in (MODE_PVE_SOLO, MODE_PVE_TEAM):
             return protocol.message("TrialBattleContext", challenge_vow_mask=int(vow_mask))
         return None
     return protocol.message(
@@ -127,7 +198,7 @@ def build_trial_battle_context(
         journal_entry_id=entry.journal_entry_id,
         trial_rule_version=entry.trial_rule_version,
         season_id=entry.season_id,
-        challenge_vow_mask=int(vow_mask),
+        challenge_vow_mask=int(vow_mask) if entry.season_id == 0 else 0,
     )
 
 
