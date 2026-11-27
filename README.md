@@ -2,6 +2,27 @@
 
 这是一个独立的纯 Python 服务端项目，已将玄冥 C++ 运行层（Gate、Scene、Battle 完整引擎）、全部 Go/Java 业务微服务及配套运维/离线工具移植为纯 Python，可直接平替 C++ 服务端。当前已校对的 C++ 仓库对照基线为 `main` 提交 `f4947968a`（完整 SHA：`f4947968a99725c088e5328ed642063094438a3a`，含消息号 `574~584`、83 张配表 v104 与 555 条路由，2026-11-27；运行模式与一键启动规范见 [docs/rules/runtime-modes-and-startup.md](docs/rules/runtime-modes-and-startup.md)，移植记录见 [全服务移植与基线记录](docs/design/python-full-service-port-plan.md)）。协议快照、消息号、事件号和启动代码都在本项目内，运行和构建仅需此目录。
 
+## 游戏预览与类型简介（《五行奇谈》）
+
+![《五行奇谈》5v5 人宠满编回合制战斗站位预览](docs/assets/battle-formation-preview.jpg)
+
+> *配套 Unity 客户端实机研发画面（2560×1080）：5v5 人宠满编 20 单位四排阵位（双方各 5 名角色 + 5 只灵宠）、脚下名牌避让、队伍状态栏与回合指令轮盘。*
+
+- **游戏类型**：东方道家五行题材**人宠回合制 MMORPG**（大世界场景探索 + 1v1～5v5 独立战斗节点直连回合对战）。
+- **核心理念**：主打**“有空就玩、随时能停”**（零每日打卡签到、零日清活跃条、零固定钟点排班），强调人宠技能配合与五行阵法博弈，免费玩家可达 100% 相同战力上限。
+- **跨端生态**：配合双形态 Unity 6 客户端（[`mmorpg-client`](https://github.com/luhailong-cpp/mmorpg-client)，面向微信/抖音小游戏与 iOS/Android App），支持**单进程零依赖本地存档一键起服**与**全 Python 微服务集群**两种运行形态。
+
+## 项目完成进度（截至 2026-11-27，未上线研发中）
+
+| 领域 | 当前状态 | 现状说明 |
+|---|---|---|
+| **纯 Python 全栈平替** | ✅ 主体已落地 | 完整移植 Gate / Scene / Battle 运行节点与全部业务微服务（Login / Portal / DataService / DB / PlayerLocator / Router / Inbox / SceneManager / Match / Guild / Chat / Friend / Mail / Rank / Trade / Payment / ContentGuard / Mall / GM 等）及纯 Python Robot 与运维工具 |
+| **玩法与基线对齐** | ✅ 持续对齐中 | 已校对至 C++ 基线 `f4947968a`（83 张配表 v104、555 条路由），覆盖首领试炼与试炼志 V4、十季赛季技印（S1–S10）、战前禁选 V2、万象残局坊 V1.5、反打卡治理 V1 及扩展大富翁棋盘等；最新增量（如五行幻境 V2 等）持续按 C++ 基线跟进 |
+| **本地开发与集群验证** | ✅ 已支持 | 已支持 Windows 双击单进程 ProtoJSON 存档一键启动、多节点并行启动器、TCP/WebSocket 双承载及本地隔离整栈/TiDB 验收工具 |
+| **上线前待办** | ⏳ 发版前待补齐 | 生产级容量压测与容灾演练、正式客户端双端转包联调及发版合规门禁（商业化开关默认关闭） |
+
+## 核心节点运行路径
+
 | 节点 | 当前运行路径 |
 | --- | --- |
 | Gate | TCP 票据、心跳和限流、登录态续租、场景交接期间的保序重投、直连 Go 服务或经 Router、Kafka 推送、世界聊天、跨区重定向和大厅观战 |
